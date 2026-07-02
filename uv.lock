@@ -1135,15 +1135,6 @@ wheels = [
 ]
 
 [[package]]
-name = "py3dmol"
-version = "2.5.5"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/8f/ce/8fa27aa0fcf37a99df16f72d59300040dec61f3a5126c28d6b625bcb7f9e/py3dmol-2.5.5.tar.gz", hash = "sha256:cb102cc3370800a9ca7679774759f008e34a0f3a283778d85b0410849d370298", size = 7832, upload-time = "2026-05-23T14:08:08.553Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/8e/5a/7fd1b784a87e96e0078f49a0a13a98b4c5f644ba5597a4a3b70a2ba3e613/py3dmol-2.5.5-py2.py3-none-any.whl", hash = "sha256:9717ea9a899ec641b458f53de538e5bae758281f5053be78bc2db0706ae60bcb", size = 7153, upload-time = "2026-05-23T14:08:07.733Z" },
-]
-
-[[package]]
 name = "pycparser"
 version = "3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1315,21 +1306,6 @@ wheels = [
 ]
 
 [[package]]
-name = "racerts"
-version = "0.1.6"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "ipython" },
-    { name = "numpy" },
-    { name = "py3dmol" },
-    { name = "rdkit" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/4f/82/af45a58edba5264a38cb73be1d303d530e9597e8ff59284ed566c1d76750/racerts-0.1.6.tar.gz", hash = "sha256:d004e45249a08b0a1da75adae072aba5d26cfc2a742ed1d168e6596a0185a128", size = 23508, upload-time = "2026-01-15T09:51:50.373Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/cc/59/3922dd2644db21ae9da870a2a341964b03a126d209bd13b069450027c52e/racerts-0.1.6-py3-none-any.whl", hash = "sha256:19cc8afbd94b3fdab30877f915cdfb43ae53bc0d554299759b777d8acdba376b", size = 23394, upload-time = "2026-01-15T09:51:49.343Z" },
-]
-
-[[package]]
 name = "rdkit"
 version = "2026.3.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1449,69 +1425,83 @@ name = "rxembed"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "networkx" },
     { name = "numpy" },
+    { name = "openconf" },
     { name = "prism-pruner" },
     { name = "rdkit" },
-]
-
-[package.optional-dependencies]
-ase = [
-    { name = "ase" },
-]
-mc = [
-    { name = "openconf" },
-]
-nci = [
     { name = "scikit-learn" },
     { name = "xyzgraph" },
 ]
-racerts = [
-    { name = "racerts" },
-]
-umap = [
+
+[package.optional-dependencies]
+all = [
+    { name = "ase" },
+    { name = "matplotlib" },
+    { name = "seaborn" },
     { name = "umap-learn" },
+    { name = "xyzrender" },
+]
+ase = [
+    { name = "ase" },
 ]
 viz = [
     { name = "matplotlib" },
-    { name = "scikit-learn" },
     { name = "seaborn" },
+    { name = "umap-learn" },
     { name = "xyzrender" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "ase" },
+    { name = "ipykernel" },
+    { name = "matplotlib" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
+    { name = "seaborn" },
     { name = "ty" },
+    { name = "umap-learn" },
+    { name = "xyzrender" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "ase", marker = "extra == 'all'" },
     { name = "ase", marker = "extra == 'ase'" },
+    { name = "matplotlib", marker = "extra == 'all'" },
     { name = "matplotlib", marker = "extra == 'viz'" },
+    { name = "networkx" },
     { name = "numpy" },
-    { name = "openconf", marker = "extra == 'mc'" },
+    { name = "openconf" },
     { name = "prism-pruner" },
-    { name = "racerts", marker = "extra == 'racerts'" },
     { name = "rdkit" },
-    { name = "scikit-learn", marker = "extra == 'nci'" },
-    { name = "scikit-learn", marker = "extra == 'viz'" },
+    { name = "scikit-learn" },
+    { name = "seaborn", marker = "extra == 'all'" },
     { name = "seaborn", marker = "extra == 'viz'" },
-    { name = "umap-learn", marker = "extra == 'umap'" },
-    { name = "xyzgraph", marker = "extra == 'nci'" },
+    { name = "umap-learn", marker = "extra == 'all'" },
+    { name = "umap-learn", marker = "extra == 'viz'" },
+    { name = "xyzgraph" },
+    { name = "xyzrender", marker = "extra == 'all'" },
     { name = "xyzrender", marker = "extra == 'viz'" },
 ]
-provides-extras = ["mc", "nci", "racerts", "ase", "viz", "umap"]
+provides-extras = ["ase", "viz", "all"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "ase" },
+    { name = "ipykernel" },
+    { name = "matplotlib" },
     { name = "pre-commit", specifier = ">=3.5.0" },
     { name = "pytest", specifier = ">=8.3.5" },
     { name = "pytest-cov", specifier = ">=5.0.0" },
     { name = "ruff", specifier = ">=0.14.14" },
+    { name = "seaborn" },
     { name = "ty", specifier = ">=0.0.14" },
+    { name = "umap-learn" },
+    { name = "xyzrender" },
 ]
 
 [[package]]

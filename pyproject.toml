@@ -45,7 +45,7 @@ dev = [
     "ipykernel", 
     "seaborn", 
     "matplotlib", 
-    "umap-learn", 
+    "umap-learn>=0.5.10", 
     "ase", 
     "xyzrender", 
 ]
