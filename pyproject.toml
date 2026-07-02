@@ -9,11 +9,13 @@ description = "Fast, flexible molecular embedding for reactive chemistry."
 authors = [{name = "Alister S. Goodfellow"}]
 readme = "README.md"
 requires-python = ">=3.12"
-# Core: light, stable, always needed. Heavy/specialised backends are optional extras below.
 dependencies = [
     "numpy",
     "rdkit",
-    "prism_pruner",   # MIT (N. Tampellini) — descriptor / moi / rmsd de-duplication engine
+    "prism_pruner", 
+    "openconf",
+    "xyzgraph",
+    "scikit-learn"
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -22,19 +24,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# torsional Monte-Carlo search backend (embed-then-search)
-mc = ["openconf"]
-# rich NCI perception (constraints + binding-mode signatures) and HDBSCAN clustering
-nci = ["xyzgraph", "scikit-learn"]
-# the constrained-bounds embed + CREGEN-style dedup reference impl (importable on its own)
-racerts = ["racerts"]
-# optional ASE calculator wrapper (MACE / AIMNet2 / xtb-python / ORCA via ASE) — used by refine.calculator.ASE
 ase = ["ase"]
-# plotting / rendering / latent-space playground — everything viz.py actually imports (all lazy)
-viz = ["matplotlib", "seaborn", "scikit-learn", "xyzrender"]
-# UMAP landscape projection — optional; its numba/llvmlite stack can be build-fragile on new Pythons
+viz = ["matplotlib", "seaborn", "xyzrender"]
 umap = ["umap-learn"]
-# xTB / g-xTB refinement is called via subprocess — no python dep, just the `xtb` binary on PATH
 
 [project.urls]
 homepage = "https://github.com/aligfellow/rxembed"
@@ -61,7 +53,7 @@ src = ["src", "tests"]
 # Demonstration notebooks are pedagogical, not library code — they legitimately use top-of-cell imports,
 # single-letter demo variables, inline lambdas, and undocumented cell helpers. `ruff format` still applies;
 # only the library-strictness *lint* rules are scoped off the notebooks. Every .py module IS linted.
-exclude = ["examples/*.ipynb"]
+exclude = ["examples/*.ipynb", "playground/*ipynb"]
 select = [
     "B",      # bugbear
     "D",      # pydocstyle

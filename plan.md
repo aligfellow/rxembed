@@ -3,6 +3,15 @@
 Forward-looking work on the clean base. The package is working, validated, and demonstrated; nothing below is
 blocking. (The old `nci_embed`→`rxembed` migration playbook is retired — this is only what's still open.)
 
+## Next up: embedding constraint-API redesign — see `DESIGN.md`
+
+Collapse the six-kwarg constraint surface (`freeze`/`distances`/`angles`/`planes`/`template`/`match`/`anchor`)
+into three intent-clear verbs — **`fix`** (rigid), **`constrain`** (soft), **`template`** (reference sugar) —
+feeding one `resolve_core()`. Clean break, no back-compat. It is a **spec-layer change only** — the graft,
+restrained-UFF, pose-freeze and bounds-matrix mechanics already consume `self.cons` unchanged. Adds a
+`rx.minimize(source, fix=…, constrain=…)` entry (relax an existing structure toward the targets with the same
+vocabulary). Full spec, invariants, grammar, and worked examples in **`DESIGN.md`**.
+
 ## Two bigger threads
 
 1. **NCI seeding: keep CH-π / ring-π subordinate (don't over-prioritise).** Ring/π kinds (`CHPI`, `HBPI`,

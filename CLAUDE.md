@@ -4,8 +4,7 @@
 composable chain that embeds conformers for anything from a bare SMILES to a frozen bimetallic transition
 state with NCI-seeded binding modes, then searches, dedups, and scores them with real energies.
 
-It is a **library, not a CLI** — you drive it from Python / notebooks. Import it as `rxembed` (no alias in the
-package; notebooks use the full name).
+It is a **library, not a CLI** — you drive it from Python / notebooks. The convention is `import rxembed as rx`.
 
 ## The one chain
 
@@ -21,6 +20,10 @@ ens.score("gxtb").lowest(3).optimize("gxtb")   # real energies, then optimise th
 `rx.embed(source, *, metal, freeze, distances, angles, planes, contacts, coordinate, template, match,
 anchor, charge, n, seed, knowledge, stereo)` returns an **`Ensemble`** (or an **`EnsembleSet`** when the input
 is inherently several candidates — metal isomers, NCI binding modes, ambiguous coordination).
+
+> The constraint-spec surface (`freeze`/`distances`/`angles`/`template`/`match`/`anchor`) is slated for a
+> clean-break redesign into three verbs — **`fix` / `constrain` / `template`** — see **`DESIGN.md`**. That is
+> a spec-layer change only; the embed mechanics below are unaffected.
 
 | Want | Call |
 |---|---|
@@ -107,4 +110,4 @@ calculator. `mc()` needs openconf; without it the ETKDG seeds are still returned
 - `src/rxembed/stereo.py` — chirality fingerprints + the auto-preserve gate.
 - `examples/*.ipynb` — the 8-notebook breadth tour; `examples/structures/` — static TS `.xyz` geometries.
 
-See `plan.md` for the forward roadmap and open threads.
+See `plan.md` for the forward roadmap and open threads, and `DESIGN.md` for the planned `fix`/`constrain`/`template` constraint-API redesign.

@@ -17,10 +17,8 @@ env/
 # Claude
 .claude*
 CLAUDE*
-!CLAUDE.md
 *plan*
 *PLAN*
-!plan.md
 
 # VSCode config (optional)
 .vscode/
