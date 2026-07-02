@@ -1,10 +1,14 @@
 # DESIGN — the embedding constraint API (`fix` / `constrain` / `template`)
 
-**Status: planned, not yet implemented.** This is the spec for a focused redesign of how a user *specifies*
-what geometry to hold or bias during `embed`. The embed *mechanics* (graft, restrained-UFF, pose-freeze,
-bounds-matrix editing) already exist and already work — **this change is confined to the specification /
-resolver layer.** A fresh session should implement this, then update `README.md` + `CLAUDE.md` to the new
-grammar.
+**Status: IMPLEMENTED.** The spec below is realised in `constraints/builders.py::resolve_core` (the single
+resolver), `pipeline.embed` / `embed/dispatch.py` (routed through it), and `pipeline.minimize` (the
+search-free companion). `README.md` + `CLAUDE.md` carry the new grammar; the old
+`freeze`/`distances`/`angles`/`planes`/`template`+`match`+`anchor` kwargs are gone (clean break). Tests:
+`tests/test_constraints.py` (resolver units), `tests/test_embed_core.py` + `tests/test_frozen.py`
+(integration: constrain windows, fix graft/numbers, template, stacking, minimize). **Deferred:** the
+example notebooks (`examples/*.ipynb`) still call the old kwargs and need porting; π-stack `None`-ring
+auto-detection is not implemented (pass explicit ring atom indices). This document is kept as the rationale
+and grammar reference for the shipped API.
 
 ---
 
@@ -97,8 +101,12 @@ user hit identical syntax; only the input differs.
 4. **Chirality needs a graft.** A distance matrix is reflection-invariant, so soft `constrain` can embed the
    mirror image. A stereo-defined core ⇒ `fix` with coordinates (the Kabsch graft picks the correct hand),
    never `constrain`.
-5. **`fix` numbers past one bond require the angle.** Two bonds among three named atoms leave the angle free
-   (the 1–3 diagonal is not implied) — raise a clear error rather than silently under-constraining.
+5. **`fix` numbers past one bond leave the angle free.** Two distances among three named atoms don't imply
+   the 1–3 diagonal. *Implemented as an advisory `WARNING`, not a raise* (`_warn_underdetermined`): a hard
+   raise over-fires on a legitimate rich network — the FLP worked example (§9) fixes five distances over four
+   atoms with **no** angles and deliberately leaves some diagonals to the FF. So the warning is scoped to the
+   genuinely ambiguous case (exactly two shared-atom distances over ≤3 atoms, no angle, no coords) and the
+   embed proceeds; add the angle to `fix={…}` if it must be exact.
 6. **`fix` delivers the values.** Numbers-`fix` runs the constrained-UFF pull (and snaps a lone 2-atom distance
    exactly, as `_graft_frozen` already does); the workflow ends with `.measure()` confirming. "fix" earns its
    name only if the realized geometry matches.

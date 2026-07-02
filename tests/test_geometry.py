@@ -125,35 +125,5 @@ def test_report_is_falsy_and_asserts():
         rep.assert_ok()
 
 
-# --- Phase-A scaffolds: the real frozen/constrained/template embeds -----------
-# These assert the SAME gate on rxembed's own embed().
-
-
-@pytest.mark.skip(reason="Phase A: rx.embed not yet ported")
-def test_frozen_ts_embed_has_no_bad_geometry():
-    import rxembed as rx
-
-    ens = rx.embed("tests/fixtures/ts_core.xyz", freeze=[11, 14, 15]).mc().prune()
-    core = rx.embed("tests/fixtures/ts_core.xyz")  # the reference geometry
-    for cid in ens.ids:
-        geom.check(ens.mol, cid, frozen=[11, 14, 15], reference=core.mol).assert_ok()
-
-
-@pytest.mark.skip(reason="Phase A: rx.embed not yet ported")
-def test_constrained_embed_keeps_periphery_clean():
-    import rxembed as rx
-
-    cons = {"distances": {(1, 9): (2.6, 3.0)}}
-    ens = rx.embed("OC(=O)CCCCc1ccccc1", distances=cons["distances"])
-    for cid in ens.ids:
-        geom.check(ens.mol, cid, constraints=cons).assert_ok()
-
-
-@pytest.mark.skip(reason="Phase A: rx.embed / template not yet ported")
-def test_templated_ts_across_substituents_clean():
-    import rxembed as rx
-
-    for r in ("C", "C(C)C", "C(C)(C)C"):  # B-methyl / B-isopropyl / B-tert-butyl analogues on one core
-        ens = rx.embed(f"...{r}...", template="tests/fixtures/flp_core.xyz", match="[B]")
-        for cid in ens.ids:
-            geom.check(ens.mol, cid).assert_ok()
+# The real frozen / constrained / templated embeds assert this SAME gate on rxembed's own embed() in
+# test_embed_core.py (constrain windows), test_frozen.py (fix graft + template), and test_organic.py (NCI).

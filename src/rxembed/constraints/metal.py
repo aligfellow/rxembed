@@ -257,7 +257,7 @@ def coordination(mol, metal, donors, geometry, order, real_z, frozen=()):
     `donors` may be padded with ``VACANT`` for empty vertices (a coordination pocket) -- those get no
     constraints.
 
-    `frozen` is the set of donor atoms held rigid by a ``freeze=`` reacting core: an angle between **two
+    `frozen` is the set of donor atoms held rigid by a ``fix=`` reacting core: an angle between **two
     frozen donors** is *omitted* — the freeze already pins that sub-triangle exactly (Mn-d1, Mn-d2, d1-d2),
     so an ideal-polyhedron angle there only over-determines it and makes triangle-smoothing widen (then
     lock in) a distorted core. A free-vs-frozen angle is kept — it's what seats a free donor at its vertex.
@@ -531,7 +531,7 @@ def _resolve_center(mol, metals, center):
     raise ValueError(f"{len(hits)} {center} centres ({hits}) — disambiguate with center=<atom index>")
 
 
-def enumerate_isomers(mol, geometry=None, center=None, freeze=None):
+def enumerate_isomers(mol, geometry=None, center=None, fix=None):
     """Enumerate all distinct coordination isomers as ready-to-embed `Isomer` objects (metal surrogated).
 
     Returns an `IsomerSet`; each `Isomer` carries `.geometry` + `.label` -- pick with ``IsomerSet.select(…)``.
@@ -598,21 +598,21 @@ def enumerate_isomers(mol, geometry=None, center=None, freeze=None):
             len(spectators),
             len(retain.distances),
         )
-    freeze_cons = Constraints()
+    fix_cons = Constraints()
     frozen_donors = set()
-    if freeze:  # hold a reacting TS core at the input geometry
-        from .builders import from_spec  # while the rest of the coordination sphere is
+    if fix:  # hold a reacting TS core at the input geometry
+        from .builders import resolve_core  # while the rest of the coordination sphere is
 
         if base.GetNumConformers() == 0:  # enumerated (mer/fac of a tridentate while a
             raise ValueError(
-                "freeze= needs an input geometry (an .xyz / a Mol with a conformer) to hold "
+                "fix= needs an input geometry (an .xyz / a Mol with a conformer) to hold "
                 "the reacting core; got a coordinate-free input (e.g. a SMILES)"
             )
-        freeze_cons = from_spec(base, freeze=freeze, has_geometry=True)  # reacting donor + substrate stay put)
-        frozen_donors = freeze_cons.frozen & set(donors)  # while a reacting donor + substrate stay put)
+        fix_cons, _ = resolve_core(base, fix=fix, has_geometry=True)  # reacting donor + substrate stay put)
+        frozen_donors = fix_cons.frozen & set(donors)  # while a reacting donor + substrate stay put)
         logger.info(
-            "metal: freezing %d atom(s) at the input geometry; enumerating the free coordination sites around them",
-            len(freeze_cons.frozen),
+            "metal: fixing %d atom(s) at the input geometry; enumerating the free coordination sites around them",
+            len(fix_cons.frozen),
         )
     n = len(donors)
     if geometry is None:
@@ -662,8 +662,8 @@ def enumerate_isomers(mol, geometry=None, center=None, freeze=None):
         for order in isomers(base, padded, geom, perms=perms):
             cons = coordination(base, m, padded, geom, order, real_z, frozen=frozen_donors)
             cons.distances.update(retain.distances)  # hold any spectator metal(s)' shape (relative)
-            cons.distances.update(freeze_cons.distances)  # hold the frozen reacting core (relative pairwise)
-            cons.frozen |= freeze_cons.frozen  # + pin it in the relax
+            cons.distances.update(fix_cons.distances)  # hold the frozen reacting core (relative pairwise)
+            cons.frozen |= fix_cons.frozen  # + pin it in the relax
             od = [padded[k] for k in order]  # vertex -> donor atom (or VACANT)
             out.append(
                 Isomer(
@@ -743,7 +743,7 @@ def _input_ordering(mol, metal, donors, geometry):
     """Find the vertex ordering that best matches the **input geometry** (which donor at which vertex).
 
     ``od[vertex] = donors[order[vertex]]``, read from the conformer (orthogonal Procrustes over the
-    candidate vertex orderings). Lets a ``freeze=`` hold each frozen donor at its *real* vertex so only the
+    candidate vertex orderings). Lets a ``fix=`` hold each frozen donor at its *real* vertex so only the
     free sites are enumerated -- otherwise the enumeration permutes a frozen donor into a vertex it cannot
     occupy, producing isomers that contradict the frozen core (a hydride forced off its TS site).
     """
@@ -793,7 +793,7 @@ def isomers(mol, donors, geometry, perms=None):
     Bar one topological impossibility: a tridentate's central donor trans to its own arm (see
     `_central_trans`).
 
-    `perms` overrides the candidate vertex orderings (default ``PERMUTATIONS[geometry]``) — a ``freeze=``
+    `perms` overrides the candidate vertex orderings (default ``PERMUTATIONS[geometry]``) — a ``fix=``
     enumeration passes the subset that keeps each frozen donor pinned to its input vertex.
 
     Whether a chelate can physically reach a given arrangement is a question of *geometry*, not topology, so

@@ -18,7 +18,7 @@ from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
 
 from rxembed import refine as _refine
 from rxembed import stereo as _stereo
-from rxembed.constraints import add_distance, from_spec, from_template, resolve_atom
+from rxembed.constraints import add_distance, resolve_atom, resolve_core
 from rxembed.constraints import metal as _metal
 from rxembed.constraints import nci as _nci
 from rxembed.log import logger
@@ -30,6 +30,9 @@ _PT = Chem.GetPeriodicTable()
 _EPS = 1e-6  # near-zero norm floor for the graft axis
 _AROMATIC_BO_TOL = 0.25  # |bond_order - 1.5| within this reads as aromatic
 _BOND_ATOMS = 2  # a two-atom frozen core is a bond: fix its length, not an orientation
+_XYZ_DIM = 3  # an (x, y, z) coordinate
+_TEMPLATE_LEN = 2  # template= is (reference, mapping)
+_MIN_FRAGS = 2  # below this there is no inter-fragment separation to enforce
 
 
 def _xyz_to_mol(path, charge=0):
@@ -209,13 +212,13 @@ class _MetalCtx:
         logger.debug("metal: settled %d donor proton(s) with coordination bonds restored", len(donor_h))
 
 
-def _merge_contacts(distances, angles, contacts):
-    """Fold ``Contact`` orientation into the distance/angle spec.
+def _nci_windows(contacts):
+    """Fold NCI ``contacts`` into ``(distances, angles)`` windows (soft, releasable by ``mc(explore=)``).
 
     `contacts` may be a single Contact, a list of them, a ``{label: Contact}`` dict (uses all), or a raw
-    ``{(i,j):(lo,hi)}`` distance dict.
+    ``{(i,j):(lo,hi)}`` distance dict (indices, already windowed).
     """
-    distances, angles = dict(distances or {}), dict(angles or {})
+    distances, angles = {}, {}
     if contacts is None:
         return distances, angles
     items: list[_nci.Contact] = []
@@ -237,6 +240,33 @@ def _merge_contacts(distances, angles, contacts):
         distances.update(ct.distances)
         angles.update(ct.angles)
     return distances, angles
+
+
+def _add_soft(cons, distances, angles):
+    """Add soft (releasable) distance/angle windows to `cons`, recording them in the ``contacts`` provenance.
+
+    Used for NCI ``contacts=`` grips folded on top of the resolved ``fix``/``constrain`` core. ``mc(explore=)``
+    releases exactly these (and any ``constrain=`` windows) while structural holds stay put. **Explicit wins**
+    (DESIGN §5.2): a soft window that lands on a pair the user already pinned with a ``fix`` number (a
+    structural distance/angle *not* already soft) is dropped — the rigid fix is neither overwritten nor made
+    releasable.
+    """
+    dk, ak = set(cons.contacts[0]), set(cons.contacts[1])
+    struct_d = {k for k in cons.distances if k not in dk}  # fix numbers / frozen-core shape — non-releasable
+    struct_a = {k for k in cons.angles if k not in ak}
+    for (i, j), (lo, hi) in distances.items():
+        key = (min(i, j), max(i, j))
+        if key in struct_d:  # user fix on this pair overrides a soft grip — leave it rigid
+            continue
+        add_distance(cons.distances, i, j, lo, hi)
+        dk.add(key)
+    for akey, val in angles.items():
+        key = tuple(akey)
+        if key in struct_a:
+            continue
+        cons.angles[key] = val
+        ak.add(key)
+    cons.contacts = (frozenset(dk), frozenset(ak))
 
 
 def _graft_frozen(mol, conf_ids, frozen, ref):
@@ -276,32 +306,28 @@ def _graft_frozen(mol, conf_ids, frozen, ref):
             conf.SetAtomPosition(i, p.tolist())
 
 
-def _embed_isomer(iso, *, coordinate, contacts, distances, angles, n, seed, knowledge, keep_input=False):
+def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowledge, keep_input=False):
     """Embed a metal `Isomer`, optionally binding a substrate; yield one `Ensemble` per binding candidate.
 
     Usually one, but several when ``coordinate=`` is a SMARTS matching several donor atoms (one candidate
     per donor, so the user can `select` the binding they want or keep them all). Each carries a ``.tag``;
     `keep_input` adds the Mol's input conformer to the ensemble (the retain-input-arrangement path).
     """
-    from rxembed.constraints.builders import _window
-
     base = copy.deepcopy(iso.cons)
-    if contacts is not None or distances or angles:  # substrate via NCI contacts
-        d, a = _merge_contacts(distances, angles, contacts)
+    graft_ref: dict = {}  # explicit/own coords the resolver wants Kabsch-grafted (a substrate fix on the metal)
+    if contacts is not None or fix or constrain:  # a substrate bound via fix / constrain / NCI contacts
+        has_geom = iso.mol.GetNumConformers() > 0
+        sub, graft_ref = resolve_core(iso.mol, fix=fix, constrain=constrain, has_geometry=has_geom)
+        _add_soft(sub, *_nci_windows(contacts))
         sphere_d, sphere_a = set(base.distances), set(base.angles)  # the coordination sphere already in base —
-        ckeys, akeys = set(), set()  # never release it, so provenance records
-        for (i, j), val in d.items():  # ONLY genuinely new substrate contacts (a
-            ri, rj = resolve_atom(iso.mol, i), resolve_atom(iso.mol, j)  # spec that lands ON a sphere hold is a
-            key = (min(ri, rj), max(ri, rj))  # user override of that hold, not a
-            add_distance(base.distances, ri, rj, *_window(val, 0.05))  # releasable NCI). mc(explore=) then frees
-            if key not in sphere_d:  # only the substrate grip; the sphere and
-                ckeys.add(key)  # any coordinate= dative bond stay held.
-        for key, val in a.items():
-            rk = tuple(resolve_atom(iso.mol, x) for x in key)
-            base.angles[rk] = _window(val, 3.0)
-            if rk not in sphere_a:
-                akeys.add(rk)
-        base.contacts = (frozenset(ckeys), frozenset(akeys))
+        soft_d, soft_a = sub.contacts  # never release it, so provenance records ONLY genuinely-new
+        base.distances.update(sub.distances)  # substrate contacts: a spec landing ON a sphere hold is a user
+        base.angles.update(sub.angles)  # override of that hold, not a releasable grip. mc(explore=) then frees
+        base.frozen |= sub.frozen  # only the substrate; the sphere + any coordinate= dative bond stay held.
+        base.contacts = (
+            frozenset(k for k in soft_d if k not in sphere_d),
+            frozenset(k for k in soft_a if k not in sphere_a),
+        )
 
     nvac = iso.vertices.count(_metal.VACANT)
     if coordinate is None:
@@ -355,11 +381,14 @@ def _embed_isomer(iso, *, coordinate, contacts, distances, angles, n, seed, know
             if len(choices) > 1:
                 tag["coordinate"] = atoms[0]
         frozen = sorted(cons.frozen)  # capture the input TS core BEFORE the embed
-        ref_core = (
-            mol.GetConformer().GetPositions()[frozen]  # clears the conformer — restored exactly
-            if frozen and mol.GetNumConformers()
-            else None
-        )  # onto each embedded pose below
+        if frozen and mol.GetNumConformers():  # graft each frozen atom to its explicit-fix coord, else own coord
+            own = mol.GetConformer().GetPositions()
+            ref_core = np.array([graft_ref.get(i, own[i]) for i in frozen])
+        elif graft_ref:  # SMILES metal + explicit-coords fix: no conformer, graft only the named atoms
+            frozen = sorted(graft_ref)
+            ref_core = np.array([graft_ref[i] for i in frozen])
+        else:
+            ref_core = None
         try:
             ids = _embed.embed(mol, cons, n or _embed.n_confs(mol, constrained=True), seed=seed, knowledge=knowledge)
         except RuntimeError as e:  # triangle smoothing -> infeasible bounds
@@ -387,7 +416,7 @@ def _embed_isomer(iso, *, coordinate, contacts, distances, angles, n, seed, know
         yield ens
 
 
-def _auto_contacts_embed(source, *, metal, freeze, distances, angles, planes, coordinate, charge, n, seed, knowledge):
+def _auto_contacts_embed(source, *, metal, fix, constrain, coordinate, charge, n, seed, knowledge):
     """Resolve ``contacts='auto'``: discover the inter-fragment NCI binding modes and conf-search each.
 
     One `Ensemble` if there is a single mode, else an `EnsembleSet` (`.tag['nci']` = the mode).
@@ -404,10 +433,8 @@ def _auto_contacts_embed(source, *, metal, freeze, distances, angles, planes, co
         ) from err
     common = {
         "metal": metal,
-        "freeze": freeze,
-        "distances": distances,
-        "angles": angles,
-        "planes": planes,
+        "fix": fix,
+        "constrain": constrain,
         "coordinate": coordinate,
         "charge": charge,
         "n": n,
@@ -469,86 +496,64 @@ def _attach_stereo(result, source, charge, stereo):
             ens._stereo = (spec, ref)
 
 
-def _resolve_template(template, charge):
-    """Resolve a ``template=`` argument to a Mol carrying the TS geometry.
-
-    Accepts an .xyz path, a Mol with a conformer, or an `Ensemble` (its first conformer is used).
-    """
-    if isinstance(template, Ensemble):
-        m = Chem.Mol(template.mol)
-        ids = list(template.ids) or [c.GetId() for c in m.GetConformers()]
-        keep = ids[0]
-        for c in [c.GetId() for c in m.GetConformers() if c.GetId() != keep]:
-            m.RemoveConformer(c)
-        return m
-    if isinstance(template, Chem.Mol):
-        if template.GetNumConformers() == 0:
-            raise ValueError("template= Mol needs a conformer (a 3D geometry)")
-        return template
-    if isinstance(template, os.PathLike):
-        template = os.fspath(template)
-    if isinstance(template, str) and template.lower().endswith(".xyz"):
-        return _xyz_to_mol(template, charge)
-    raise ValueError("template= must be an .xyz path, an RDKit Mol with a conformer, or an Ensemble")
+def _reference_positions(reference, charge=0):
+    """Resolve a template reference to an ``(N, 3)`` positions array (.xyz path / Mol / Ensemble / array)."""
+    if isinstance(reference, Ensemble):
+        cid = reference.ids[0] if reference.ids else reference.mol.GetConformers()[0].GetId()
+        return reference.mol.GetConformer(cid).GetPositions()
+    if isinstance(reference, Chem.Mol):
+        if reference.GetNumConformers() == 0:
+            raise ValueError("template reference Mol needs a conformer (a 3D geometry)")
+        return reference.GetConformer().GetPositions()
+    if isinstance(reference, os.PathLike):
+        reference = os.fspath(reference)
+    if isinstance(reference, str) and reference.lower().endswith(".xyz"):
+        return _xyz_to_mol(reference, charge).GetConformer().GetPositions()
+    arr = np.asarray(reference, float)
+    if arr.ndim == _TEMPLATE_LEN and arr.shape[1] == _XYZ_DIM:
+        return arr
+    raise ValueError("template reference must be an .xyz path, a Mol with a conformer, an Ensemble, or an (N,3) array")
 
 
-def _template_embed(source, *, template, match, anchor, charge, n, seed, knowledge):
-    """Embed `source` with its reacting core pinned onto a `template` TS geometry (SMARTS-matched).
-
-    The matched core is shape-biased in the embed, rigid-grafted onto the exact template coords, then held by a
-    fixed-point relax while the rest conformer-searches — same machinery as a frozen TS core.
-    """
-    if not match:
-        raise ValueError("template= needs match=<SMARTS> identifying the reacting core in the molecule")
-    mol, has_geom = _normalize(source, charge)
-    template_mol = _resolve_template(template, charge)
-    cons, ref = from_template(mol, template_mol, match, anchor=anchor)  # match on the REAL molecule
-    frag_of = {a: fi for fi, f in enumerate(Chem.GetMolFrags(mol)) for a in f}
-    core_frags = {frag_of[a] for a in cons.frozen}  # fragments the matched core lives in
-    if len(set(frag_of.values())) > len(core_frags):  # a STRAY fragment (e.g. a counter-ion) not in
-        for (i, j), w in _encounter_bounds(mol).items():  # the core would float off — give it a sensible
-            if frag_of[i] not in core_frags or frag_of[j] not in core_frags:  # vdW contact instead (the core
-                add_distance(cons.distances, i, j, *w)  # pairs are already pinned by the template)
-        logger.info(
-            "template: %d stray fragment(s) placed at vdW contact to the core",
-            len(set(frag_of.values())) - len(core_frags),
+def _resolve_template_spec(template, charge):
+    """Turn a ``template=(reference, {target_i: ref_i})`` kwarg into ``(positions, mapping)`` for `resolve_core`."""
+    if not (isinstance(template, (tuple, list)) and len(template) == _TEMPLATE_LEN and isinstance(template[1], dict)):
+        raise ValueError(
+            "template= must be (reference, {target_index: reference_index}) — an explicit atom map "
+            "(order-proof, no hidden SMARTS matching). E.g. template=('ts.xyz', {0: 5, 4: 1, 5: 6})."
         )
-    metal_ctx = None
-    if _metal.metal_index(mol) is not None:  # a metal substrate: surrogate it for the FF (the
-        donors = (
-            {
-                mi: [a.GetIdx() for a in mol.GetAtomWithIdx(mi).GetNeighbors()]  # template/graft pins the
-                for mi in _metal.metal_indices(mol)
-            }
-            if has_geom
-            else {}
-        )  # matched core; the rest of
-        mol, metals, _ = _metal.prepare_all(mol)  # the sphere is held by hold_shape if we have a
-        metal_ctx = _MetalCtx(mol, metals[0][0], metals[0][1], extra=metals[1:])  # geometry to read it from)
-        for mi, dons in donors.items():
-            _metal.hold_shape(mol, [mi, *dons], cons)
-    user_frozen = sorted(cons.frozen)
-    ref_core = np.array([ref[i] for i in user_frozen])
-    n = n or _embed.n_confs(mol, constrained=True)
-    ids = list(_embed.embed(mol, cons, n, seed=seed, knowledge=knowledge))
-    _graft_frozen(mol, ids, user_frozen, ref_core)  # restore the exact template core on each pose
-    logger.info("template embed: %d seeds, %d-atom core pinned to the template", len(ids), len(user_frozen))
-    return Ensemble(mol, ids, cons, metal_ctx)
+    reference, mapping = template
+    return _reference_positions(reference, charge), mapping
+
+
+def _float_encounter_bounds(mol, cons):
+    """Bound fragments no constraint pins to vdW contact — so a free / stray fragment can't drift off.
+
+    Generalises the old two cases into one: a fully unconstrained multi-fragment SMILES (every fragment
+    floats -> all pairs bounded) and a fixed/templated core that leaves a spectator fragment (a counter-ion)
+    untethered. A pair already linked by a fix / constrain / contact is left to that constraint.
+    """
+    frags = Chem.GetMolFrags(mol)
+    if len(frags) < _MIN_FRAGS:
+        return {}
+    frag_of = {a: fi for fi, f in enumerate(frags) for a in f}
+    touched = {frag_of[a] for a in cons.constrained_atoms()}
+    if len(touched) >= len(frags):  # every fragment already pinned/linked
+        return {}
+    return {
+        k: v for k, v in _encounter_bounds(mol).items() if frag_of[k[0]] not in touched or frag_of[k[1]] not in touched
+    }
 
 
 def _embed_dispatch(
     source,
     *,
     metal=None,
-    freeze=None,
-    distances=None,
-    angles=None,
-    planes=None,
+    fix=None,
+    constrain=None,
+    template=None,
     contacts=None,
     coordinate=None,
-    template=None,
-    match=None,
-    anchor=None,
     charge=0,
     n=None,
     seed=0xF00D,
@@ -557,81 +562,58 @@ def _embed_dispatch(
     """Dispatch the embed by input type / spec — see the public `embed` for documentation."""
     if isinstance(source, os.PathLike):
         source = os.fspath(source)  # accept pathlib.Path everywhere downstream
-    if template is not None:
-        clash = [
-            k
-            for k, v in {
-                "metal": metal,
-                "freeze": freeze,
-                "contacts": contacts,
-                "coordinate": coordinate,
-                "distances": distances,
-                "angles": angles,
-                "planes": planes,
-            }.items()
-            if v
-        ]
-        if clash:  # don't silently drop them
-            raise ValueError(
-                f"template= pins the matched core and conf-searches the rest; it can't be "
-                f"combined with {', '.join(clash)}="
-            )
-        return _template_embed(
-            source, template=template, match=match, anchor=anchor, charge=charge, n=n, seed=seed, knowledge=knowledge
-        )
-    if match is not None or anchor is not None:
-        raise ValueError("match=/anchor= only apply with template=<a TS geometry>")
     if coordinate is not None and metal is None and not isinstance(source, _metal.Isomer):
         raise ValueError(
             "coordinate= only applies to a metal (pass metal=<geometry> or a metal Isomer "
-            f"from rx.metal(...)); got {type(source).__name__} — use contacts=/distances= otherwise"
+            f"from rx.metal(...)); got {type(source).__name__} — use contacts=/constrain= otherwise"
         )
     if contacts == "auto":  # discover binding modes -> conf-search each
         return _auto_contacts_embed(
             source,
             metal=metal,
-            freeze=freeze,
-            distances=distances,
-            angles=angles,
-            planes=planes,
+            fix=fix,
+            constrain=constrain,
             coordinate=coordinate,
             charge=charge,
             n=n,
             seed=seed,
             knowledge=knowledge,
         )
-    _iso_kw = {
-        "coordinate": coordinate,
-        "contacts": contacts,
-        "distances": distances,
-        "angles": angles,
-        "n": n,
-        "seed": seed,
-        "knowledge": knowledge,
-    }
-    if metal is not None:  # enumerate isomers -> a selectable set
-        if isinstance(source, _metal.Isomer):
-            raise ValueError("pass either a metal Isomer source OR metal=<geometry>, not both")
-        if isinstance(source, str) and source.lower().endswith(".xyz"):
-            source = _normalize(source, charge)[0]  # xyz -> perceived Mol (enumerate wants a Mol/SMILES)
-        out = EnsembleSet(e for iso in _metal.enumerate_isomers(source, metal) for e in _embed_isomer(iso, **_iso_kw))
-        logger.info(
-            "metal: ENUMERATING isomers of %s -> %d distinct candidate(s) (each a separate "
-            "ensemble; .summary() / .select() one to conf-search)",
-            metal,
-            len(out),
-        )
-        return out
-    if isinstance(source, _metal.Isomer):  # a single chosen isomer
-        results = list(_embed_isomer(source, **_iso_kw))
+    if metal is not None or isinstance(source, _metal.Isomer):  # the metal enumerate / isomer paths
+        if template is not None:
+            raise ValueError("template= pins a core by graft; it does not compose with metal=/an Isomer source")
+        _iso_kw = {
+            "coordinate": coordinate,
+            "contacts": contacts,
+            "fix": fix,
+            "constrain": constrain,
+            "n": n,
+            "seed": seed,
+            "knowledge": knowledge,
+        }
+        if metal is not None:
+            if isinstance(source, _metal.Isomer):
+                raise ValueError("pass either a metal Isomer source OR metal=<geometry>, not both")
+            if isinstance(source, str) and source.lower().endswith(".xyz"):
+                source = _normalize(source, charge)[0]  # xyz -> perceived Mol (enumerate wants a Mol/SMILES)
+            out = EnsembleSet(
+                e for iso in _metal.enumerate_isomers(source, metal) for e in _embed_isomer(iso, **_iso_kw)
+            )
+            logger.info(
+                "metal: ENUMERATING isomers of %s -> %d distinct candidate(s) (each a separate "
+                "ensemble; .summary() / .select() one to conf-search)",
+                metal,
+                len(out),
+            )
+            return out
+        results = list(_embed_isomer(source, **_iso_kw))  # a single chosen isomer
         return results[0] if len(results) == 1 else EnsembleSet(results)
 
     mol, has_geom = _normalize(source, charge)
     if (
-        metal is None
-        and has_geom
+        has_geom
         and _metal.metal_index(mol) is not None
-        and not (freeze or distances or angles or contacts or coordinate)
+        and not (fix or constrain or contacts or coordinate or template)
     ):  # retain the input arrangement
         iso = _metal.from_geometry(mol)
         logger.info(
@@ -645,8 +627,8 @@ def _embed_dispatch(
                 iso,
                 coordinate=None,
                 contacts=None,
-                distances=None,
-                angles=None,
+                fix=None,
+                constrain=None,
                 n=n,
                 seed=seed,
                 knowledge=knowledge,
@@ -657,7 +639,7 @@ def _embed_dispatch(
     metal_core = set()
     metals_donors = {}
     hydrides = []
-    if _metal.metal_index(mol) is not None and (freeze or distances or angles or contacts):
+    if _metal.metal_index(mol) is not None and (fix or constrain or contacts or template):
         if has_geom:  # capture each metal's donors BEFORE the bonds
             metals_donors = {
                 mi: [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()] for mi in _metal.metal_indices(mol)
@@ -672,39 +654,35 @@ def _embed_dispatch(
         mol, metals, core_donors = _metal.prepare_all(mol)  # surrogate EVERY metal (bimetallic-safe)
         (m, real_z), extra = metals[0], metals[1:]
         metal_ctx = _MetalCtx(mol, m, real_z, extra=extra)
-        if freeze:  # hold each metal + its donors so the bond-
-            metal_core = {mi for mi, _ in metals} | set(core_donors)  # stripped coordination cores can't drift
+        _metal_core_donors = core_donors  # deferred: only pin the sphere if a core is actually grafted (below)
         logger.debug("metal complex: %d metal(s) swapped to carbon surrogate for the FF", len(metals))
+    else:
+        _metal_core_donors = []
 
-    distances, angles = _merge_contacts(distances, angles, contacts)
-    cons = from_spec(mol, freeze=freeze, distances=distances, angles=angles, planes=planes, has_geometry=has_geom)
-    cons.contacts = (
-        frozenset(
-            k
-            for k in cons.distances  # SEEDED contacts = the non-frozen-pair
-            if not (k[0] in cons.frozen and k[1] in cons.frozen)
-        ),  # distances (a frozen-core SHAPE
-        frozenset(cons.angles),
-    )  # is a frozen-frozen pair) + all angles;
-    #   the metal-sphere / M-H / encounter holds added below are structural and stay out of `contacts` (captured
-    #   here, before them), so mc(explore=) releases only the real NCI/user contacts, never the structure.
-    user_frozen = sorted(cons.frozen)  # the user's reacting TS core — grafted EXACTLY
-    cons.frozen |= metal_core  # pin the metal coordination cores (freeze path);
+    tmpl = _resolve_template_spec(template, charge) if template is not None else None
+    cons, ref = resolve_core(mol, fix=fix, constrain=constrain, template=tmpl, has_geometry=has_geom)
+    _add_soft(cons, *_nci_windows(contacts))  # NCI grips: soft, releasable by mc(explore=)
+    #   fix numbers + the frozen-core SHAPE + the metal-sphere / M-H / encounter holds are all structural and
+    #   stay OUT of `contacts` (resolve_core recorded only constrain=; _add_soft only the NCI grips), so
+    #   mc(explore=) releases exactly the soft grips and never the structure.
+    user_graft = dict(ref)  # atoms to Kabsch-graft onto their exact coords (own / explicit / template)
+    if user_graft and _metal.metal_index(mol) is not None:  # a grafted core -> pin the metal coordination
+        metal_core = set(_metal.metal_indices(mol)) | set(_metal_core_donors)  # cores so they can't drift
+    cons.frozen |= metal_core
     for mi, dons in metals_donors.items():  # a spectator metal is held intact-but-achiral by
         _metal.hold_shape(mol, [mi, *dons], cons)  # hold_shape (NOT grafted — its handedness must
         #                                          stay free for the stereo filter), then pinned at the embed
     for mi, rz, h in hydrides:  # covalent M-H window (no input geometry to read)
         d = _PT.GetRcovalent(rz) + _PT.GetRcovalent(1)
         add_distance(cons.distances, mi, h, d - 0.1, d + 0.15)
-    if not cons.is_constrained and len(Chem.GetMolFrags(mol)) > 1:
-        cons.distances.update(_encounter_bounds(mol))
-        logger.debug("multi-fragment input: added vdW-aware encounter bounds")
+    cons.distances.update(_float_encounter_bounds(mol, cons))  # keep free/stray fragments from drifting off
 
     n = n or _embed.n_confs(mol, constrained=cons.is_constrained)
-    ref_core = mol.GetConformer().GetPositions()[user_frozen] if user_frozen and has_geom else None
+    graft_atoms = sorted(user_graft)
+    ref_core = np.array([user_graft[i] for i in graft_atoms]) if graft_atoms else None
     ids = _embed.embed(mol, cons, n, seed=seed, knowledge=knowledge)
     if ref_core is not None:
-        _graft_frozen(mol, ids, user_frozen, ref_core)  # restore the exact frozen TS core (partial bonds)
+        _graft_frozen(mol, ids, graft_atoms, ref_core)  # restore the exact fixed core (partial bonds preserved)
     n_frag = len(Chem.GetMolFrags(mol))
     logger.info(
         "embed: %d seeds (%d atoms, %d fragment%s, %d constraints)",

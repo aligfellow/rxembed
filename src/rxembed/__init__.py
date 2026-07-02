@@ -8,7 +8,7 @@ from .constraints.nci import Contact
 from .constraints.nci import auto_binding_modes as nci_modes
 from .constraints.nci import candidate_contacts as nci_candidates
 from .log import set_verbose
-from .pipeline import Ensemble, EnsembleSet, embed, wrap
+from .pipeline import Ensemble, EnsembleSet, embed, minimize, wrap
 
 __all__ = [
     "Contact",
@@ -17,6 +17,7 @@ __all__ = [
     "embed",
     "geometry",
     "metal",
+    "minimize",
     "nci_candidates",
     "nci_modes",
     "set_verbose",

@@ -63,9 +63,9 @@ def add_pairwise_shape(cons, atoms, positions, pad):
     """Pin the SHAPE of ``atoms`` by all their pairwise input distances (a frame-independent rigid hold).
 
     Each pair becomes a ``(d-pad, d+pad)`` window in ``cons.distances`` — used to keep a rigid sub-structure
-    intact through a random-frame embed: a frozen TS core (`from_spec`/`from_template`) or a metal
-    coordination sphere (`metal.hold_shape`). ``positions`` is indexable by atom index — an ``[N,3]``
-    conformer array, or a ``{atom: (x,y,z)}`` map (for `from_template`, coords from a different molecule).
+    intact through a random-frame embed: a fixed TS core (`resolve_core`) or a metal coordination sphere
+    (`metal.hold_shape`). ``positions`` is indexable by atom index — an ``[N,3]`` conformer array, or a
+    ``{atom: (x,y,z)}`` map (for a coords-`fix` / `template`, coords from a different molecule).
     """
     for a, b in itertools.combinations(atoms, 2):
         d = float(np.linalg.norm(np.asarray(positions[a]) - np.asarray(positions[b])))

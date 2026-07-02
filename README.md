@@ -8,7 +8,7 @@ one more argument on the same call, not a new code path**, and every embed can b
 physical geometry gate (broken conjugation, bad H positions, clashes, a moved reacting core).
 
 [![PyPI Downloads](https://static.pepy.tech/badge/rxembed)](https://pepy.tech/projects/rxembed)
-[![License](https://img.shields.io/github/license/aligfellow/rxembed)](https://github.com/aligfellow/rxembed/blob/main/LICENSE)
+[![License](https://img.shields.io/github/license/aligfellow/rxembed)](https://github.com/aligfellow/rxembed/LICENSE)
 [![Powered by: uv](https://img.shields.io/badge/-uv-purple)](https://docs.astral.sh/uv)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Typing: ty](https://img.shields.io/badge/typing-ty-EFC621.svg)](https://github.com/astral-sh/ty)
@@ -61,13 +61,20 @@ coordination isomers, discovered NCI binding modes). Every capability is a keywo
 | Want | Call |
 |---|---|
 | free / flexible | `rx.embed("CCO")` |
-| a distance / angle / π-stack | `rx.embed(smi, distances={(i, j): (2.6, 3.0)})` (index **or** SMARTS keys) |
+| a soft distance / angle / π-stack | `rx.embed(smi, constrain={(i, j): (2.6, 3.0)})` |
 | NCI complex, modes discovered | `rx.embed("A.B", contacts="auto")` → one candidate per grip |
-| a frozen TS core (from `.xyz`) | `rx.embed("ts.xyz", freeze=reacting)` — held to 0.000 Å |
-| a TS **from SMILES** | `rx.embed(smi, distances={reacting-atom windows})` |
-| a known TS onto a fresh molecule | `rx.embed(smi, template="ts.xyz", match=core_SMARTS)` |
+| a frozen TS core (from `.xyz`) | `rx.embed("ts.xyz", fix=reacting)` — held to 0.000 Å |
+| a TS **from SMILES** | `rx.embed(smi, fix={(i, j): d, (i, j, k): θ})` — exact numbers, verify with `.measure()` |
+| a known TS onto a fresh molecule | `rx.embed(smi, template=(reference, {target_i: ref_i}))` |
+| relax a structure **toward** a core | `rx.minimize("mol.xyz", fix={(i, j): 2.0, (i, j, k): 178})` |
 | metal coordination isomers | `rx.metal("…[Pd]…", "square_planar")` → cis / trans, mer / fac … |
 | real energies | `ens.score("gxtb")` / `ens.optimize("gxtb", level="loose")` |
+
+**Three constraint verbs** — all **index-driven** (0-based atom indices in xyz/graph order; resolve any
+SMARTS yourself first, two RDKit lines): **`fix`** (rigid — the atoms *will* have this geometry: own
+coords / explicit coords / exact numbers), **`constrain`** (soft — bias the seed, a real energy may win),
+**`template`** (reference sugar for a coords-`fix`). The same verbs drive `rx.minimize`, the search-free
+relax toward the targets.
 
 **Mutation contract:** `mc` / `minimize` / `prune` build in place and chain; `lowest` / `representatives` /
 `align` return a *new* ensemble; looking never mutates. `rx.set_verbose("INFO")` narrates every stage.

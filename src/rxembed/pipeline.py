@@ -1,11 +1,11 @@
 """The user-facing pipeline: one `embed()` entry returning a chainable `Ensemble`.
 
     import rxembed as rx
-    ens = rx.embed("CCO").mc().prune()                          # free, vdW-aware, sanity internal
-    ens = rx.embed("OC(=O)CCc1ccccc1", distances={(1, 9): 2.8}) # constrain a distance (index or SMARTS)
-    ens = rx.embed("ts.xyz", freeze=[11, 14, 15]).mc().prune()  # lock a TS core to its geometry (racerts-style)
+    ens = rx.embed("CCO").mc().prune()                              # free, vdW-aware, sanity internal
+    ens = rx.embed("OC(=O)CCc1ccccc1", constrain={(1, 9): (2.6, 3.0)})  # soft distance window (index-driven)
+    ens = rx.embed("ts.xyz", fix=[11, 14, 15]).mc().prune()        # hold a TS core at its geometry (0.000 A graft)
     for iso in rx.metal("CCCN[Pd](Cl)(Cl)NCCC", "square_planar"):
-        ens = rx.embed(iso).mc().prune()                        # metal surrogate handled internally
+        ens = rx.embed(iso).mc().prune()                           # metal surrogate handled internally
 
 Sanity (bond-perception vs the graph), multi-fragment vdW separation, the metal carbon-surrogate
 swap/restore, and constraint validation all happen inside — the user does not manage them. Every
@@ -95,15 +95,11 @@ def embed(
     source,
     *,
     metal=None,
-    freeze=None,
-    distances=None,
-    angles=None,
-    planes=None,
+    fix=None,
+    constrain=None,
+    template=None,
     contacts=None,
     coordinate=None,
-    template=None,
-    match=None,
-    anchor=None,
     charge=0,
     n=None,
     seed=0xF00D,
@@ -116,19 +112,32 @@ def embed(
     An `EnsembleSet` (of candidates to `.select` from) when the input is inherently several poses -- metal
     coordination isomers, discovered NCI modes, or an ambiguous ``coordinate=``.
 
+    **Three constraint verbs** (all index-driven — 0-based atom indices in xyz/graph order; resolve any
+    SMARTS yourself first):
+
+    - **``fix``** *(rigid — the atoms WILL have this geometry)*:
+      ``fix=[i, j, k]`` holds them at the source's own coords (Kabsch graft; needs a geometry);
+      ``fix={i: (x, y, z)}`` at explicit coords; ``fix={(i, j): d, (i, j, k): θ}`` at exact numbers
+      (tight-window UFF pull — verify with ``.measure()``). A ``fix`` dict may mix coords and numbers.
+    - **``constrain``** *(soft — bias the seed, a real energy may win)*: ``constrain={(i, j): (lo, hi)}``
+      distance/angle windows, plus π-stacks ``constrain={(ring_a, ring_b): separation}``.
+    - **``template``** *(reference sugar for a coords-fix)*: ``template=(reference, {target_i: ref_i})`` —
+      ``reference`` is an .xyz path / Mol / Ensemble / (N,3) array, mapped explicitly (order-proof).
+
     The one surface for every case:
 
     - free / flexible:     ``rx.embed('CCO')``
+    - a distance / angle:  ``rx.embed(smi, constrain={(i, j): (2.6, 3.0)})``
     - NCI / vdW complex:   ``rx.embed('A.B', contacts='auto')``  (or a specific ``rx.nci_modes(mol)['HB:…']``)
+    - frozen TS core:      ``rx.embed('ts.xyz', fix=[14, 15])`` — held to 0.000 Å
+    - a TS from SMILES:    ``rx.embed(smi, fix={(f, c): 2.02, (c, cl): 2.28, (f, c, cl): 178})``
+    - a known TS onto a molecule: ``rx.embed(smi, template=('ts.xyz', {0: 5, 4: 1, 5: 6}))``
     - **metal**:           ``rx.embed('…[Pd]…', metal='square_planar')`` → `EnsembleSet` of isomers
     - metal + substrate:   ``rx.embed('…[Pd]….O1CCCC1', metal='square_planar', coordinate='[OX2]')``
-    - **templated TS**:    ``rx.embed('fresh-SMILES', template='ts.xyz', match='[#1]~[#7]~…~[#6]')``
 
     Keyword detail lives with the machinery each drives: ``contacts=`` / ``contacts='auto'`` → `nci_modes`;
-    ``metal=`` / ``coordinate=`` → `rx.metal`; ``template=`` + ``match=`` (+ ``anchor=`` for TS bonds that
-    don't perceive) pins a reacting core onto a known geometry and searches the rest; ``stereo=`` (chirality
-    the embed can't keep — planar/axial/helical) → `Ensemble.select_stereo`. Raw windows go by index or
-    SMARTS: ``distances={('[#1][NX3]C=S', 'O=C'): (1.6, 2.2)}``, plus ``angles=`` / ``planes=``.
+    ``metal=`` / ``coordinate=`` → `rx.metal` (they reuse ``fix``/``constrain`` for their held cores);
+    ``stereo=`` (chirality the embed can't keep — planar/axial/helical) → `Ensemble.select_stereo`.
     """
     n_alias = kw.pop("n_confs", None)
     n_alias = kw.pop("num_confs", n_alias)
@@ -136,23 +145,19 @@ def embed(
         n = n_alias  # accept n_confs= / num_confs= as friendly aliases of n=
     if kw:
         raise TypeError(
-            f"embed() got unexpected keyword(s) {sorted(kw)} — did you mean one of "
-            f"distances / angles / planes / contacts / metal / freeze / template / n_confs?"
+            f"embed() got unexpected keyword(s) {sorted(kw)} — the constraint verbs are "
+            f"fix / constrain / template (+ contacts / metal / coordinate / n_confs)"
         )
     from .embed.dispatch import _attach_stereo, _embed_dispatch  # lazy: breaks the dispatch<->pipeline cycle
 
     result = _embed_dispatch(
         source,
         metal=metal,
-        freeze=freeze,
-        distances=distances,
-        angles=angles,
-        planes=planes,
+        fix=fix,
+        constrain=constrain,
+        template=template,
         contacts=contacts,
         coordinate=coordinate,
-        template=template,
-        match=match,
-        anchor=anchor,
         charge=charge,
         n=n,
         seed=seed,
@@ -160,6 +165,32 @@ def embed(
     )
     _attach_stereo(result, source, charge, stereo)
     return result
+
+
+def minimize(source, *, fix=None, constrain=None, charge=0, distance_fc=1e4):
+    """Relax an existing structure **toward** ``fix``/``constrain`` targets — the search-free companion to `embed`.
+
+    Same vocabulary and resolver as `embed`, but it does not conf-search: it wraps the input geometry, grafts
+    any coordinate-``fix`` core, and runs the restrained UFF pull toward the targets (a numbers-``fix`` is
+    pulled exact, a ``constrain`` window is respected). Use it to nudge a geometry into a TS-like core or a
+    contact without re-sampling the periphery. Needs an input geometry (an .xyz / a Mol with a conformer).
+
+        rx.minimize('mol.xyz', fix={(i, j): 2.0, (i, j, k): 178})   # pull toward a linear 3-centre core
+    """
+    from .constraints import resolve_core
+    from .embed.dispatch import _graft_frozen, _normalize
+
+    mol, has_geom = _normalize(source, charge)
+    if not has_geom:
+        raise ValueError(
+            "minimize() relaxes an existing geometry — give an .xyz or a Mol with a conformer, not a SMILES"
+        )
+    cons, ref = resolve_core(mol, fix=fix, constrain=constrain, has_geometry=has_geom)
+    ids = [c.GetId() for c in mol.GetConformers()]
+    if ref:
+        graft = sorted(ref)
+        _graft_frozen(mol, ids, graft, np.array([ref[i] for i in graft]))
+    return Ensemble(mol, ids, cons).minimize(distance_fc=distance_fc)
 
 
 def wrap(mol, ids=None, *, energies=None, minimized=False):
@@ -284,6 +315,9 @@ class Ensemble:
             from .embed.dispatch import _encounter_bounds  # lazy: breaks the dispatch<->pipeline cycle
 
             relaxed = self.cons.relaxed()
+            # NB distinct from dispatch's `_float_encounter_bounds`: releasing the grip frees the fragments it
+            # linked, so explore re-bounds ALL inter-fragment pairs (setdefault: never override a surviving
+            # structural hold) — not just the "no constraint touches them" subset that path tethers at embed.
             if len(Chem.GetMolFrags(self.mol)) > 1:  # keep the fragments together once contacts are freed
                 for k, v in _encounter_bounds(self.mol).items():
                     relaxed.distances.setdefault(k, v)
@@ -480,8 +514,8 @@ class Ensemble:
         relaxes. The optimised geometries + energies (kcal/mol) are on a copy (this settles `self` once via
         `minimize`, then moves atoms on the copy -- never the fixed core).
 
-        `cons.frozen` is the reacting core only: a `rx.metal(center=,freeze=)` TS holds its coordination
-        sphere by *soft* shape constraints (so it relaxes here), while `rx.embed(ts.xyz, freeze=[...])` has
+        `cons.frozen` is the reacting core only: a `rx.metal(center=, fix=)` TS holds its coordination
+        sphere by *soft* shape constraints (so it relaxes here), while `rx.embed(ts.xyz, fix=[...])` has
         the metal+donors *in* `cons.frozen` (held). Pass `charge=` for a metal; `refine='gfn2'` for a
         solvated opt (g-xTB has no ALPB).
         """

@@ -17,12 +17,17 @@ ens.representatives()                          # the distinct modes
 ens.score("gxtb").lowest(3).optimize("gxtb")   # real energies, then optimise the best
 ```
 
-`rx.embed(source, *, metal, freeze, distances, angles, planes, contacts, coordinate, template, match,
-anchor, charge, n, seed, knowledge, stereo)` returns an **`Ensemble`** (or an **`EnsembleSet`** when the input
-is inherently several candidates — metal isomers, NCI binding modes, ambiguous coordination).
+`rx.embed(source, *, metal, fix, constrain, template, contacts, coordinate, charge, n, seed, knowledge,
+stereo)` returns an **`Ensemble`** (or an **`EnsembleSet`** when the input is inherently several candidates —
+metal isomers, NCI binding modes, ambiguous coordination). `rx.minimize(source, *, fix, constrain, …)` is the
+search-free companion: same verbs, relax an existing geometry *toward* the targets instead of conf-searching.
 
-> The constraint-spec surface (`freeze`/`distances`/`angles`/`template`/`match`/`anchor`) is slated for a
-> clean-break redesign into three verbs — **`fix` / `constrain` / `template`** — see **`DESIGN.md`**. That is
+> **Constraint spec — three index-driven verbs** (`constraints/builders.py::resolve_core`, the clean-break
+> redesign of the old `freeze`/`distances`/`angles`/`template`/`match`/`anchor`; see **`DESIGN.md`**):
+> **`fix`** (rigid — own-coords list / explicit-coords dict / exact-number dict, grafted or UFF-pulled),
+> **`constrain`** (soft windows + π-stack planes, releasable by `mc(explore=)`), **`template`**
+> (`(reference, {target_i: ref_i})` sugar for a coords-`fix`). Keys are **0-based atom indices** (xyz/graph
+> order) — the resolver never SMARTS-matches internally; the user resolves SMARTS (two RDKit lines). This is
 > a spec-layer change only; the embed mechanics below are unaffected.
 
 | Want | Call |
@@ -30,10 +35,11 @@ is inherently several candidates — metal isomers, NCI binding modes, ambiguous
 | free / flexible | `rx.embed("CCO")` |
 | NCI / vdW complex | `rx.embed("A.B", contacts="auto")` → one candidate per discovered grip |
 | a specific H-bond grip | `rx.embed("A.B", contacts=rx.nci_modes(mol)["HB:…"])` |
-| frozen TS core | `rx.embed(ts_xyz, freeze=reacting)` |
-| constrained TS **from SMILES** | `rx.embed("cat.substrate", distances={core role-distances})` |
+| frozen TS core | `rx.embed(ts_xyz, fix=reacting)` → 0.000 Å graft |
+| constrained TS **from SMILES** | `rx.embed("cat.substrate", fix={(i, j): d, (i, j, k): θ})` → verify `.measure()` |
+| soft distance / angle / π-stack | `rx.embed(smi, constrain={(i, j): (lo, hi)})` |
 | metal coordination isomers | `rx.metal("…[Pd]…", "square_planar")` → cis/trans, mer/fac… |
-| replace a ligand on a known core | `rx.embed(analogue, template=parent, match=core_SMARTS)` |
+| replace a ligand on a known core | `rx.embed(analogue, template=(parent_xyz, {target_i: ref_i}))` |
 
 **Pipeline stages** (the mutation contract is explicit): `mc`, `minimize`, `prune` build in place and chain;
 `lowest`, `representatives`, `align` return a *new* ensemble; `view`, `landscape`, `cluster` never mutate.
@@ -102,7 +108,7 @@ calculator. `mc()` needs openconf; without it the ETKDG seeds are still returned
 - `src/rxembed/embed/` — `dispatch.py` (the embed machinery: `_xyz_to_mol`, metal path, template path,
   `_embed_dispatch`), `bounds.py` (edited-bounds ETKDG embed + seed-count scaling), `mc.py`.
 - `src/rxembed/constraints/` — `base.py` (`Constraints`, `relaxed()`), `nci.py` (KINDS registry, binding
-  modes, acceptor quality, reciprocal split), `metal.py`, `builders.py` (`from_spec`, `from_template`).
+  modes, acceptor quality, reciprocal split), `metal.py`, `builders.py` (`resolve_core` — the fix/constrain/template resolver).
 - `src/rxembed/dedup/` — `prism` moi/rmsd/descriptor prunes + the distinct energy-aware `energy_prune`.
 - `src/rxembed/refine/` — `xtb.py` (executable interface), `calculator.py` (`resolve`, `XTB`, `ASE`).
 - `src/rxembed/geometry.py` — the TS-aware geometry gate (`check`): broken conjugation, bad H positions,

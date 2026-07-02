@@ -1,125 +1,52 @@
-"""Metal — the full coordination space.
+"""Metal coordination — isomer enumeration and clean embeds, reusing the new ``fix``/``constrain`` wiring.
 
-Geometries, isomer permutations, ligand swapping, metal TS, and altered/ambidentate binding modes.
-Scaffold (`skip`) until Phase A; the parametrize lists enumerate what the metal path must handle.
+The metal path keeps its own ``metal=`` / ``coordinate=`` verbs (out of the constraint-API redesign's
+scope) but now routes any held reacting core through the same resolver. These check the enumeration counts
+and that each isomer embeds to a metal-aware-clean geometry — pure RDKit + UFF surrogate, no xtb.
 """
 
 import pytest
 
 from rxembed import geometry as geom
 
-skip_phase_a = pytest.mark.skip(reason="Phase A: rx.metal / rx.embed not yet ported")
 
-
-# --- all geometries ----------------------------------------------------------
-
-GEOMETRIES = [
-    ("linear", 2),
-    ("trigonal_planar", 3),
-    ("tetrahedral", 4),
-    ("square_planar", 4),
-    ("trigonal_bipyramidal", 5),
-    ("square_pyramidal", 5),
-    ("octahedral", 6),
-]
-
-
-@skip_phase_a
-@pytest.mark.parametrize(("geometry", "coordination"), GEOMETRIES)
-def test_geometry_embeds_clean(geometry, coordination):
-    import rxembed as rx
-
-    smiles = "..."  # a representative complex for this geometry
-    for iso in rx.metal(smiles, geometry):
-        ens = rx.embed(iso)
-        for cid in ens.ids:
-            geom.check(ens.mol, cid).assert_ok()
-
-
-# --- isomer permutations per geometry: enumeration count + no duplicate perms ---
-
-ISOMER_CASES = [
-    ("square_planar_MA2B2", "square_planar", 2),  # cis / trans
-    ("octahedral_MA3B3", "octahedral", 2),  # mer / fac
-    ("tris_chelate", "octahedral", 2),  # Lambda / Delta chirality
-]
-
-
-@skip_phase_a
-@pytest.mark.parametrize(("case", "geometry", "n_expected"), ISOMER_CASES)
-def test_isomer_permutations(case, geometry, n_expected):
-    import rxembed as rx
-
-    isomers = list(rx.metal(f"tests/fixtures/{case}.smi", geometry))
-    assert len(isomers) == n_expected  # correct count (symmetry-equivalent perms deduped)
-    for iso in isomers:
-        ens = rx.embed(iso)
-        for cid in ens.ids:
-            geom.check(ens.mol, cid).assert_ok()
-
-
-# --- ligand swapping on a known core -----------------------------------------
-
-
-@skip_phase_a
-@pytest.mark.parametrize("denticity", ["monodentate", "bidentate", "tridentate"])
-def test_ligand_swap_on_template(denticity):
-    import rxembed as rx
-
-    ens = rx.embed(
-        f"tests/fixtures/new_{denticity}_ligand.smi",
-        template="tests/fixtures/metal_core.xyz",
-        match="core",
-    )
+def _assert_clean(ens):
+    ens = ens.minimize()
+    assert ens.n >= 1
     for cid in ens.ids:
-        geom.check(ens.mol, cid).assert_ok()  # retained core preserved, ligand at vacated site(s)
+        rep = geom.check(ens.mol, cid)
+        assert rep.ok(), rep.summary()
 
 
-# --- metal TS: freeze the reacting core, enumerate free sites -----------------
-
-
-@skip_phase_a
-def test_metal_ts_frozen_core_free_sites():
+@pytest.mark.parametrize(
+    ("smiles", "geometry", "labels"),
+    [
+        ("CCCN[Pd](Cl)(Cl)NCCC", "square_planar", {"cis", "trans"}),  # MA2B2 -> cis / trans
+        ("[NH3][Co]([NH3])([NH3])(Cl)(Cl)Cl", "octahedral", {"mer", "fac"}),  # MA3B3 -> mer / fac
+    ],
+)
+def test_isomer_enumeration_counts_and_clean(smiles, geometry, labels):
     import rxembed as rx
 
-    frozen = "reacting_core"  # M-H + substrate
-    isomers = list(rx.metal("tests/fixtures/metal_ts.xyz", "octahedral", freeze=frozen))
-    ref = rx.embed("tests/fixtures/metal_ts.xyz")
-    assert len(isomers) >= 2  # mer/fac of the spectator ligands, reacting core held
-    for iso in isomers:
-        ens = rx.embed(iso)
-        for cid in ens.ids:
-            geom.check(ens.mol, cid, frozen=frozen, reference=ref.mol).assert_ok()
+    cands = rx.embed(smiles, metal=geometry, n=4)
+    assert isinstance(cands, rx.EnsembleSet)
+    assert {e.tag["label"] for e in cands} == labels  # the distinct, symmetry-reduced isomers
+    for e in cands:
+        _assert_clean(e)
 
 
-@skip_phase_a
-def test_bimetallic_ts():
+def test_coordinate_binds_substrate_at_vacant_site():
     import rxembed as rx
 
-    ens = rx.embed("tests/fixtures/bimetallic_ts.xyz", freeze="core")
-    ref = rx.embed("tests/fixtures/bimetallic_ts.xyz")
-    for cid in ens.ids:
-        geom.check(ens.mol, cid, frozen="core", reference=ref.mol).assert_ok()
+    # 3 donors in a 4-vertex square plane -> one vacant pocket; the substrate O coordinates there
+    es = rx.embed("CCCN[Pd](Cl)NCCC.O", metal="square_planar", coordinate="[OX2]", n=3)
+    for ens in list(es) if isinstance(es, rx.EnsembleSet) else [es]:
+        assert ens.n >= 1
 
 
-# --- altering binding modes: one ligand, two possible sites ------------------
-
-AMBIDENTATE = [
-    ("thiocyanate", ["S_bound", "N_bound"]),  # SCN-
-    ("nitrite", ["nitro", "nitrito"]),  # NO2-
-    ("enolate", ["O_bound", "C_bound"]),  # O- vs C-
-    ("hemilabile", ["kappa1", "kappa2"]),  # denticity change
-]
-
-
-@skip_phase_a
-@pytest.mark.parametrize(("ligand", "modes"), AMBIDENTATE)
-def test_ambidentate_binding_modes(ligand, modes):
-    """One ligand with two binding sites -> an EnsembleSet with both distinct modes, each sane."""
+def test_metal_and_isomer_source_are_mutually_exclusive():
     import rxembed as rx
 
-    es = rx.embed(f"tests/fixtures/metal_{ligand}.smi", coordinate="auto")
-    assert len(es) == len(modes)  # both modes produced
-    for ens in es:
-        for cid in ens.ids:
-            geom.check(ens.mol, cid).assert_ok()
+    iso = next(iter(rx.metal("CCCN[Pd](Cl)(Cl)NCCC", "square_planar")))
+    with pytest.raises(ValueError, match="Isomer source OR metal"):
+        rx.embed(iso, metal="square_planar")

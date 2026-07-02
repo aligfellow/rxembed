@@ -1,74 +1,54 @@
-"""Organic — classic reactivity, transition states, and binding modes.
+"""Organic reactivity — NCI binding-mode discovery through the new API.
 
-Scaffold (`skip`) until Phase A. The parametrize lists enumerate the reaction TS cores and NCI modes the
-embed core must handle; each asserts forming-bond windows + frozen core + a clean periphery (geometry gate).
+The complement to ``test_embed_core`` / ``test_frozen``: the inter-fragment NCI path (``contacts='auto'`` →
+one candidate per grip; a specific ``rx.nci_modes(...)`` contact), verifying both that a mode is
+discovered *and* that the seeded grip actually forms (donor-acceptor at an H-bond distance). All xtb-free
+(discovery is RDKit + xyzgraph; enforcement is restrained UFF). Reaction TS cores from SMILES numbers (W3)
+are covered in ``test_embed_core``.
 """
 
 import pytest
 
 from rxembed import geometry as geom
 
-skip_phase_a = pytest.mark.skip(reason="Phase A: rx.embed not yet ported")
 
-
-@skip_phase_a
-@pytest.mark.parametrize("smiles", ["CCO", "OC(=O)CCCCc1ccccc1", "C1CC1C(=O)O", "c1ccc2ccccc2c1"])
-def test_baseline_flexible_rigid_strained(smiles):
-    import rxembed as rx
-
-    ens = rx.embed(smiles).prune()
-    for cid in ens.ids:
-        geom.check(ens.mol, cid).assert_ok()
-
-
-# classic reaction TS cores: (name, forming/breaking atom pairs -> window). Embedded from .xyz freeze
-# AND constrained-from-SMILES; each row is one reaction archetype.
-REACTION_TS = [
-    ("sn2", {"forming": (0, 5), "breaking": (0, 1)}),  # linear 3-centre
-    ("e2", {"c_h": (0, 6), "c_lg": (1, 7)}),  # anti-periplanar
-    ("diels_alder", {"cc_a": (0, 5), "cc_b": (3, 4)}),  # two forming C-C
-    ("aldol", {"cc": (0, 4), "proton": (2, 5)}),  # C-C + proton transfer
-    ("sigmatropic_33", {"break": (0, 1), "form": (5, 6)}),  # [3,3]
-    ("proton_transfer", {"xh": (0, 3), "hy": (3, 4)}),
-]
-
-
-@skip_phase_a
-@pytest.mark.parametrize(("name", "windows"), REACTION_TS)
-def test_reaction_ts_core(name, windows):
-    import rxembed as rx
-
-    ens = rx.embed(f"tests/fixtures/ts_{name}.xyz", freeze="core")
-    ref = rx.embed(f"tests/fixtures/ts_{name}.xyz")
-    for cid in ens.ids:
-        geom.check(ens.mol, cid, frozen="core", reference=ref.mol).assert_ok()
-
-
-@skip_phase_a
 @pytest.mark.parametrize(
     "complex_smiles",
     [
-        "OC(=O)c1ccccc1.n1ccccc1",  # H-bond
-        "IC(F)(F)F.n1ccccc1",  # halogen bond
-        "O=S(c1ccccc1)c1ccccc1.O",  # chalcogen bond
-        "CC(=O)[O-].C[NH3+]",  # salt bridge -> directional anion H-bond
+        "OC(=O)c1ccccc1.n1ccccc1",  # carboxylic acid + pyridine -> O-H···N
+        "CC(=O)[O-].C[NH3+]",  # acetate + methylammonium -> salt-bridge H-bond
     ],
 )
-def test_organic_binding_modes(complex_smiles):
+def test_nci_binding_modes_discovered_and_clean(complex_smiles):
     import rxembed as rx
 
-    es = rx.embed(complex_smiles, contacts="auto")  # -> one candidate per discovered grip
-    assert len(es) >= 1
-    for ens in es:
-        for cid in ens.ids:
-            geom.check(ens.mol, cid).assert_ok()
+    es = rx.embed(complex_smiles, contacts="auto", n=6)  # -> Ensemble or EnsembleSet, one per grip
+    ensembles = list(es) if isinstance(es, rx.EnsembleSet) else [es]
+    assert ensembles
+    for ens in ensembles:
+        assert ens.n >= 1
+        grip = ens.cons.contacts[0]  # the seeded inter-fragment contact pair(s)
+        assert grip, "a discovered binding mode must seed a releasable contact"
+        settled = ens.minimize()
+        for cid in settled.ids:
+            geom.check(settled.mol, cid).assert_ok()
+        for pair in grip:  # the grip actually formed: the contact sits at an H-bond distance, not arbitrary
+            assert settled.measure(pair)["mean"] < 2.6  # H-bond / salt-bridge donor-acceptor distance
 
 
-@skip_phase_a
-def test_ts_with_nci_grip():
-    """A reacting core that also holds a non-covalent contact (template + contacts together)."""
+def test_specific_nci_mode_by_contact():
     import rxembed as rx
 
-    ens = rx.embed("CCCCO.c1ccccc1", template="tests/fixtures/core.xyz", contacts=[(0, 13, 3.2, 3.8)])
+    modes = rx.nci_modes(_pyridine_acid_mol())
+    assert modes  # at least the O-H···N grip
+    label = next(iter(modes))
+    ens = rx.embed("OC(=O)c1ccccc1.n1ccccc1", contacts=modes[label], n=6).minimize()
+    assert ens.n >= 1
     for cid in ens.ids:
         geom.check(ens.mol, cid).assert_ok()
+
+
+def _pyridine_acid_mol():
+    from rxembed.embed.dispatch import _normalize
+
+    return _normalize("OC(=O)c1ccccc1.n1ccccc1")[0]
