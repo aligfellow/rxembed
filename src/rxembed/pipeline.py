@@ -641,7 +641,7 @@ class Ensemble:
         return _dedup.cluster_labels(self.mol, self.ids, min_cluster=min_cluster, reduce=reduce, nci=nci)
 
     def landscape(self, method="pca", color="cluster", *, reduce=None, min_cluster=3, nci=True):
-        """2D ensemble map (method='pca'|'tsne'|'umap'), coloured by 'cluster' or 'energy'."""
+        """2D ensemble map (method='pca'|'tsne'), coloured by 'cluster' or 'energy'."""
         from . import viz
 
         return viz.landscape(self, color=color, method=method, reduce=reduce, min_cluster=min_cluster, nci=nci)

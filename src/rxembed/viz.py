@@ -23,7 +23,7 @@ def _setup():
 
 
 def project(feats, method="pca", seed=42):
-    """Return 2D coordinates for the feature matrix ``feats`` (pca | tsne | umap)."""
+    """Return 2D coordinates for the feature matrix ``feats`` (pca | tsne)."""
     if method == "pca":
         from sklearn.decomposition import PCA
 
@@ -33,10 +33,6 @@ def project(feats, method="pca", seed=42):
 
         perplexity = min(30, max(2, (len(feats) - 1) // 3))
         return TSNE(2, random_state=seed, perplexity=perplexity, init="random").fit_transform(feats)
-    if method == "umap":
-        import umap  # type: ignore  # optional dep, untyped upstream (numba stack is build-fragile)
-
-        return umap.UMAP(n_components=2, random_state=seed, n_neighbors=min(15, len(feats) - 1)).fit_transform(feats)
     raise ValueError(method)
 
 

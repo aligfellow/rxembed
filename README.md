@@ -142,7 +142,7 @@ organocatalysis backbone swap, the metal space, and the g-xTB energy ladder. See
 Core: **RDKit**, **NumPy**, **prism_pruner**. Optional (each capability degrades gracefully if absent):
 **openconf** (`mc` search), **xyzgraph** (metal/TS `.xyz` bond perception), an **`xtb` binary** on `$XTB_EXE`
 (`score`/`optimize` — g-xTB or standard Grimme xtb for GFN-FF), and the `viz` extra (matplotlib / seaborn /
-scikit-learn / umap-learn) for `landscape()`.
+scikit-learn) for `landscape()`.
 
 ## Development
 

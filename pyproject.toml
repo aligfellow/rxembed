@@ -26,8 +26,8 @@ classifiers = [
 
 [project.optional-dependencies]
 ase = ["ase"]
-viz = ["matplotlib", "seaborn", "xyzrender", "umap-learn"]
-all = ["ase", "matplotlib", "seaborn", "xyzrender", "umap-learn"]
+viz = ["matplotlib", "seaborn", "xyzrender"]
+all = ["ase", "matplotlib", "seaborn", "xyzrender"]
 
 [project.urls]
 homepage = "https://github.com/aligfellow/rxembed"
@@ -43,10 +43,9 @@ dev = [
     "ruff>=0.14.14",
     "ty>=0.0.14",
     "ipykernel", 
-    "seaborn", 
-    "matplotlib", 
-    "umap-learn>=0.5.10", 
-    "ase", 
+    "seaborn",
+    "matplotlib",
+    "ase",
     "xyzrender", 
 ]
 

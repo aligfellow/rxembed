@@ -4,7 +4,7 @@ One representation everywhere: rotatable-bond dihedrals (sin/cos), plus a binary
 NCI-contact fingerprint when contacts exist, plus the L-M-L coordination angles
 when a transition metal is present. Blocks are variance-normalised so none
 dominates. The binding-mode clustering (`dedup` clustering, `Ensemble.cluster`) and the
-PCA/t-SNE/UMAP landscape both project *this* matrix, so cluster colours and 2D
+PCA/t-SNE landscape both project *this* matrix, so cluster colours and 2D
 positions are always coherent. Optional blocks appear only when relevant — an
 organic gets dihedrals only; an H-bonded complex adds NCI; a metal adds angles.
 """
