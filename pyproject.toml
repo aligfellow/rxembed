@@ -1,0 +1,127 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rxembed"
+version = "0.1.0"
+description = "Fast, flexible molecular embedding for reactive chemistry."
+authors = [{name = "Alister S. Goodfellow"}]
+readme = "README.md"
+requires-python = ">=3.12"
+# Core: light, stable, always needed. Heavy/specialised backends are optional extras below.
+dependencies = [
+    "numpy",
+    "rdkit",
+    "prism_pruner",   # MIT (N. Tampellini) — descriptor / moi / rmsd de-duplication engine
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+# torsional Monte-Carlo search backend (embed-then-search)
+mc = ["openconf"]
+# rich NCI perception (constraints + binding-mode signatures) and HDBSCAN clustering
+nci = ["xyzgraph", "scikit-learn"]
+# the constrained-bounds embed + CREGEN-style dedup reference impl (importable on its own)
+racerts = ["racerts"]
+# optional ASE calculator wrapper (MACE / AIMNet2 / xtb-python / ORCA via ASE) — used by refine.calculator.ASE
+ase = ["ase"]
+# plotting / rendering / latent-space playground — everything viz.py actually imports (all lazy)
+viz = ["matplotlib", "seaborn", "scikit-learn", "xyzrender"]
+# UMAP landscape projection — optional; its numba/llvmlite stack can be build-fragile on new Pythons
+umap = ["umap-learn"]
+# xTB / g-xTB refinement is called via subprocess — no python dep, just the `xtb` binary on PATH
+
+[project.urls]
+homepage = "https://github.com/aligfellow/rxembed"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=3.5.0",
+    "pytest>=8.3.5",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.14.14",
+    "ty>=0.0.14",
+]
+
+# ===== Ruff =====
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Demonstration notebooks are pedagogical, not library code — they legitimately use top-of-cell imports,
+# single-letter demo variables, inline lambdas, and undocumented cell helpers. `ruff format` still applies;
+# only the library-strictness *lint* rules are scoped off the notebooks. Every .py module IS linted.
+exclude = ["examples/*.ipynb"]
+select = [
+    "B",      # bugbear
+    "D",      # pydocstyle
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming conventions
+    "W",      # pycodestyle warnings
+    "C4",     # comprehensions
+    "PL",     # pylint
+    "PT",     # flake8-pytest-style
+    "PIE",    # misc lints
+    "PYI",    # flake8-pyi
+    "TID",    # tidy imports
+    "TCH",    # type-checking imports
+    "RUF",    # Ruff-specific rules
+    "RSE",    # flake8-raise
+    "ICN001", # unconventional-import-alias
+]
+ignore = [
+    "PLR0911", # Too many returns
+    "PLR0912", # Too many branches
+    "PLR0913", # Too many arguments to function call
+    "PLR0914", # Too many locals
+    "PLR0915", # Too many statements
+    "PLR1702", # Too many nested-blocks
+    "PLC0415", # Local imports which may be performance related
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "F403"]
+"tests/**" = ["D", "PLR2004"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ===== ty =====
+[tool.ty]
+
+[tool.ty.src]
+exclude = ["examples", ".venv"]  # demo notebooks + vendored deps are not our library code
+
+# ===== Pytest =====
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--doctest-modules"
+doctest_optionflags = "NORMALIZE_WHITESPACE"
+
+# ===== Coverage =====
+[tool.coverage.run]
+source = ["src/rxembed"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
