@@ -12,10 +12,10 @@ Run them with the repo on the path (`PYTHONPATH=../src`, or `pip install -e .`).
 | # | Notebook | Showcases |
 |---|----------|-----------|
 | 01 | [`01_basics`](01_basics.ipynb) | the `embed → mc → prune` chain; the mutation contract; all four dedup methods; the geometry gate; the ensemble landscape; `dump` |
-| 02 | [`02_constraints`](02_constraints.ipynb) | `distances` / `angles` / **`planes`** (a π-stack) by index **and** SMARTS; `measure()`; incremental relaxing on a tight core; fail-loud on an impossible constraint |
+| 02 | [`02_constraints`](02_constraints.ipynb) | soft `constrain=` windows — distance / angle / **π-stack plane** (index-driven; resolve SMARTS to indices yourself); `measure()`; incremental relaxing on a tight core; fail-loud on an impossible constraint |
 | 03 | [`03_nci`](03_nci.ipynb) | `contacts='auto'` binding-mode discovery; **halogen / chalcogen / salt-bridge** contacts; the bifurcated thiourea; the gate as an acceptance filter; `mc(explore=True)` |
 | 04 | [`04_organic_ts`](04_organic_ts.ipynb) | frozen TS core from `.xyz` (0.000 Å); constrained TS **from SMILES** (SN2, FLP borylation); the **TS-aware gate** (`frozen=`); **capstone** — the 172-atom bimp TS with **multiple NCI binding modes** at the frozen core |
-| 05 | [`05_templated_ts`](05_templated_ts.ipynb) | **a known TS onto a fresh SMILES** — `template=` + `match=` + `anchor=`; a substrate **series** on one pinned core; an `Ensemble` as a template |
+| 05 | [`05_templated_ts`](05_templated_ts.ipynb) | **a known TS onto a fresh SMILES** — `template=(reference, {target_i: ref_i})`; a substrate **series** on one pinned core; an `Ensemble` as a template |
 | 06 | [`06_organocatalysis`](06_organocatalysis.ipynb) | **TS transfer across scaffolds** — the isothiourea backbone swap (tetramisole → BTM → HyperBTM), conserved amidine core at 0.000 Å; the S···C=O chalcogen activation; a real chiral-phosphoric-acid TS |
 | 07 | [`07_metal`](07_metal.ipynb) | the full metal space (24 cells): **isomers** (cis/trans, mer/fac); across geometries; **chelates** (bidentate en bite); **vacant pockets**; three real bimetallic/organometallic **TS** (mn-h2 / mn-hy / ru-co, spectator ferrocenes, core held 0.000 Å) + free-site enumeration; **seating a substrate and switching its binding mode** (coordinate → bifunctional) |
 | 08 | [`08_energies`](08_energies.ipynb) | the `ff → gfnff → gfn2 → gxtb` tier ladder; the GFN-FF pool re-rank → g-xTB pipeline; honest, non-clobbering energies |
