@@ -100,7 +100,7 @@ docstring-code-format = true
 [tool.ty]
 
 [tool.ty.src]
-exclude = ["examples", ".venv"]
+exclude = ["examples", "playground", ".venv"]
 
 # ===== Pytest =====
 [tool.pytest.ini_options]
