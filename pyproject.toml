@@ -32,6 +32,13 @@ all = ["ase", "matplotlib", "seaborn", "xyzrender"]
 [project.urls]
 homepage = "https://github.com/aligfellow/rxembed"
 
+# openconf's transition-metal support (the `transition_metal` preset + auto metal-move budget) is on the
+# upstream main branch but not yet on a PyPI release, so pull it from git. `uv sync` resolves this for
+# everyone (CI included) and pins the exact commit in uv.lock. To co-develop openconf, clone it as a sibling
+# and override with an editable install: `uv pip install -e ../openconf` (see the README dev section).
+[tool.uv.sources]
+openconf = { git = "https://github.com/rowansci/openconf" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

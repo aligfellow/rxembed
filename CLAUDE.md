@@ -60,8 +60,9 @@ held): **`ff` → `gfnff` → `gfn2` → `gxtb`** (force field → GFN-FF NCI-aw
   choose.
 - **Surrogate the hard bits.** A metal becomes a carbon surrogate for the force field (bonds stripped), held
   by soft shape constraints; the exact frozen TS core is grafted back by Kabsch (0.000 Å).
-- **Fail loud, not silent.** A calculator that produces no energies *raises* (never a silent FF fallback);
-  g-xTB + solvent *raises* rather than quietly running gas-phase.
+- **Fail loud, not silent.** A calculator that produces no energies *raises* (never a silent FF fallback).
+  g-xTB has no ALPB, so solvent is a GFN2 thermodynamic-cycle correction (`E_gxtb(gas) + [E_gfn2(solv) −
+  E_gfn2(gas)]`) — a real solvated energy, never a silent gas-phase.
 - **Physical honesty over cleverness.** σ-holes only on polarisable heavies; a thione C=S is an acceptor, not
   a σ-hole donor; a reciprocal A-H···B / B-H···A 2-cycle can't coexist in one pose. Rules grounded in
   chemistry, each a small testable change.
@@ -100,6 +101,17 @@ non-inferable specifics; comments only for load-bearing *why*.
 `score('gxtb')` / `optimize('gxtb')` need the `xtb` executable on `$XTB_EXE`; **GFN-FF needs a standard Grimme
 `xtb`** on the same path. Embedding / search / prune are pure-Python (RDKit + openconf) and need no external
 calculator. `mc()` needs openconf; without it the ETKDG seeds are still returned (degrades, doesn't crash).
+
+**openconf is git-pinned** (`[tool.uv.sources]` in `pyproject.toml`) — its transition-metal support (the
+`mc(preset="transition_metal")` preset + auto metal-move budget) is on upstream `main`, not yet on PyPI. `uv
+sync` resolves + locks it; `just setup-openconf-dev` swaps in a local editable clone for co-development. NB
+openconf's pose-freeze is *soft* (held atoms drift ~0.1 Å), so a constraint that must truly hold across `mc`
+has to be one the rxembed relax also reads (a distance/angle), not a pose-hold alone.
+
+**Metal M-donor approximations** (`constraints/metal.py::coordination`, SMILES path): M-donor distance =
+covalent-sum bond length, with the donor radius **capped at 0.85 Å for soft dative donors** (P/S/As/Se — their
+dative bond runs shorter than rcov implies; a halide keeps the covalent sum). A conjugated N/O donor's
+**M-donor-neighbour donation angle is held ~120°** so its rigid plane can't fold into the metal during search.
 
 ## Where things live
 

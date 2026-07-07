@@ -93,6 +93,14 @@ def _xyz_to_mol(path, charge=0):
     return mol
 
 
+def parse_smiles(smi):
+    """Parse a SMILES to a Mol, raising a clear error instead of returning ``None`` (which crashes downstream)."""
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        raise ValueError(f"could not parse SMILES: {smi!r}")
+    return mol
+
+
 def _normalize(source, charge=0):
     """Normalise SMILES / an .xyz path / an RDKit Mol to ``(mol with Hs, has_geometry)``.
 
@@ -107,9 +115,7 @@ def _normalize(source, charge=0):
         if mol is None:
             raise ValueError(f"could not read {source}")
     else:
-        mol = Chem.MolFromSmiles(source)
-        if mol is None:
-            raise ValueError(f"bad SMILES: {source!r}")
+        mol = parse_smiles(source)
     has_geom = mol.GetNumConformers() > 0
     return Chem.AddHs(mol, addCoords=has_geom), has_geom
 
@@ -372,7 +378,14 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
         mol = Chem.Mol(iso.mol)  # own copy so candidates don't share conformers
         input_conf = Chem.Conformer(mol.GetConformer()) if (keep_input and mol.GetNumConformers()) else None
         cons = copy.deepcopy(base)
-        tag = {"geometry": iso.geometry, "label": iso.label, "ligands": _metal.arrangement(iso)}
+        # identity is geometric: arrangement (slot map) + metal chirality. `label` (cis/trans/mer/fac) is
+        # kept only as a coarse, sometimes-wrong convenience tag — never the thing you select on.
+        tag = {
+            "geometry": iso.geometry,
+            "arrangement": _metal.arrangement(iso),
+            "chirality": iso.chirality,
+            "label": iso.label,
+        }
         if atoms is not None:
             extra = _metal.coordinate(iso, atoms)
             for (i, j), (lo, hi) in extra.distances.items():
@@ -380,6 +393,10 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
             cons.angles.update(extra.angles)
             if len(choices) > 1:
                 tag["coordinate"] = atoms[0]
+        # tether any free fragment (a co-crystallised solvent / an un-bonded ligand the SMILES wrote as a
+        # separate `.` fragment) at vdW contact, so it embeds as a vdW complex rather than drifting to
+        # infinity — the same encounter-bounds the non-metal multi-fragment path applies.
+        cons.distances.update(_float_encounter_bounds(mol, cons))
         frozen = sorted(cons.frozen)  # capture the input TS core BEFORE the embed
         if frozen and mol.GetNumConformers():  # graft each frozen atom to its explicit-fix coord, else own coord
             own = mol.GetConformer().GetPositions()
@@ -393,7 +410,7 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
             ids = _embed.embed(mol, cons, n or _embed.n_confs(mol, constrained=True), seed=seed, knowledge=knowledge)
         except RuntimeError as e:  # triangle smoothing -> infeasible bounds
             raise ValueError(
-                f"could not embed {iso.geometry} {iso.label}"
+                f"could not embed {iso.geometry} {_metal.arrangement(iso)}"
                 + (f" with atom(s) {atoms} coordinated" if atoms else "")
                 + f": the coordination + substrate constraints are geometrically infeasible "
                 f"(e.g. a substrate that can't chelate the requested vertices). [{e}]"
@@ -404,9 +421,10 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
         if input_conf is not None:  # ETKDG cleared confs; re-add the input as a seed
             ids = [mol.AddConformer(input_conf, assignId=True), *ids]
         logger.info(
-            "embed[%s %s%s]: %d seeds%s",
+            "embed[%s: %s%s%s]: %d seeds%s",  # name-agnostic identity: arrangement (+ chirality), not cis/trans
             iso.geometry,
-            iso.label,
+            _metal.arrangement(iso),
+            f" {iso.chirality}" if iso.chirality else "",
             f" coord@{atoms}" if atoms else "",
             len(ids),
             " (incl. input geometry)" if input_conf else "",
@@ -618,9 +636,9 @@ def _embed_dispatch(
         iso = _metal.from_geometry(mol)
         logger.info(
             "metal: source carries a geometry and no metal= -> RETAINING the input ligand "
-            "arrangement (%s, %s); pass metal=<geometry> to enumerate isomers instead",
+            "arrangement (%s: %s); pass metal=<geometry> to enumerate isomers instead",
             iso.geometry,
-            iso.label,
+            _metal.arrangement(iso),
         )
         return next(
             _embed_isomer(

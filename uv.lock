@@ -818,15 +818,11 @@ wheels = [
 [[package]]
 name = "openconf"
 version = "0.0.16"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/rowansci/openconf#1fa1441096dc2d4ff662894750644b62c82a20ba" }
 dependencies = [
     { name = "numpy" },
     { name = "prism-pruner" },
     { name = "rdkit" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/84/74/4109d8b4de33f8c49a9afcdd85cb822e287fba005a24a3ca87e5e6cef543/openconf-0.0.16.tar.gz", hash = "sha256:7e6f35e109dbcb459992098af63be664754dc547b942a55071c6ee6aa39eca0c", size = 146389, upload-time = "2026-06-16T15:11:31.052Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/2a/ad/25381d2b490e82ff3b07826b2dae0b96a9ff049031a70412229202bb97ca/openconf-0.0.16-py3-none-any.whl", hash = "sha256:13a5eb3d6de3a41acb4b3865c734281ddd6052ae32a5b16239c621f4b424c77d", size = 80576, upload-time = "2026-06-16T15:11:29.957Z" },
 ]
 
 [[package]]
@@ -1439,7 +1435,7 @@ requires-dist = [
     { name = "matplotlib", marker = "extra == 'viz'" },
     { name = "networkx" },
     { name = "numpy" },
-    { name = "openconf" },
+    { name = "openconf", git = "https://github.com/rowansci/openconf" },
     { name = "prism-pruner" },
     { name = "rdkit" },
     { name = "scikit-learn" },

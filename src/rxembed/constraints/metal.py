@@ -20,6 +20,7 @@ from rdkit.Chem import GetPeriodicTable
 
 from rxembed.log import logger  # relative, like builders.py — package convention
 
+from . import polyhedron as _poly
 from .base import Constraints, add_distance, add_pairwise_shape
 
 _PT = GetPeriodicTable()
@@ -65,6 +66,16 @@ RELAX_SURROGATE = 15  # phosphorus — for the donor-proton relax only: UFF-type
 # length (~1.8 A, wrong for real metals) and, at CN>=5, bend the polyhedron (its angle terms don't know
 # the target geometry). Freezing the heavy frame confines P's influence to the protons; the polyhedron
 # and distances stay exactly as the bondless-carbon first pass (constraint-driven) set them.
+
+_SOFT_DATIVE_DONORS = frozenset({15, 16, 33, 34, 51, 52})  # P, S, As, Se, Sb, Te — soft lone-pair donors whose
+# dative M-bond runs SHORTER than their (large) single-bond covalent radius. A HALIDE (Cl/Br/I) donor is X-type
+# covalent, NOT dative — its M-X sits AT the covalent sum (Ni-Br 2.44) and must NOT be capped (capping would give
+# ~2.09, too short, and manufacture the very tears the retry then wastes rounds on). So the cap is soft-donor-only.
+_DONOR_RCOV_CAP = 0.85  # Å: the raw covalent sum gives Ni-P 2.40 (real ~2.15); capping the donor radius to ~0.85
+# (just above carbon's 0.76) fixes P/S/… while C/N/O — already below it — are untouched at their covalent sum.
+_DONOR_DONATION_MIN, _DONOR_DONATION_MAX = 100.0, 150.0  # deg: the M-donor-neighbour window for a conjugated N/O
+# donor (donation along the sp2 lone-pair axis, ~120°) — wide enough for real variation, tight enough to forbid
+# the rigid-unit fold-in (M-O-C collapsing to ~83° swings a carboxylate/pyridine plane into the coordination sphere).
 
 GEOM = {2: "linear", 3: "trigonal_planar", 4: "square_planar", 5: "trigonal_bipyramidal", 6: "octahedral"}
 # catalogue of supported polyhedra per coordination number (the first is the GEOM default) — for
@@ -154,6 +165,11 @@ VERTEX_DIRS = {  # rxembed's, derived to match the TMC angles
 }
 
 
+def _frag_map(mol):
+    """Map each atom index -> its fragment id (same ligand = same fragment)."""
+    return {a: fi for fi, f in enumerate(Chem.GetMolFrags(mol)) for a in f}
+
+
 def metal_index(mol):
     """Index of the first transition-metal atom, or None."""
     return next((a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS), None)
@@ -225,6 +241,26 @@ def geometry_for(n_donors):
     return GEOM.get(n_donors)
 
 
+COPLANAR_GEOMETRIES = frozenset({"linear", "trigonal_planar", "t_shape", "square_planar"})
+_COPLANAR_TOL = 0.25  # Å: RMS out-of-plane of {metal + donors} above which a *planar* geometry isn't planar
+
+
+def coplanar(pos, metal, donors, tol=_COPLANAR_TOL):
+    """Return True if the metal + donors lie in one plane — the defining test of a declared *planar* geometry.
+
+    A square-planar (or T-shape / trigonal-planar) complex **is** coplanar by definition; a bite that squeezes
+    the in-plane angles (a 47° chelate forcing others to 125°) is still planar and fine, but an arrangement
+    that can only satisfy its ligands by *twisting out of plane* (an impossible trans-chelate the stiff relax
+    forces through) is not this geometry. This separates a legitimate distorted-but-planar square (RMS ~0.05 Å)
+    from a puckered phantom (RMS ~0.35 Å). Fewer than 4 points are always coplanar.
+    """
+    pts = np.array([pos[metal]] + [pos[d] for d in donors])
+    if len(pts) < 4:  # noqa: PLR2004 — a plane needs >=3 points; <4 total is trivially coplanar
+        return True
+    dev = (pts - pts.mean(0)) @ np.linalg.svd(pts - pts.mean(0))[2][2]  # signed distance from best-fit plane
+    return float(np.sqrt(np.mean(dev**2))) <= tol
+
+
 VACANT = -1  # a coordination vertex left empty (donors < sites)
 _TRANS_ANGLE = 150  # degrees: a same-element donor pair beyond this is trans (else cis)
 _TRIAD = 3  # a mer/fac triad is exactly three donors
@@ -262,15 +298,16 @@ def coordination(mol, metal, donors, geometry, order, real_z, frozen=()):
     so an ideal-polyhedron angle there only over-determines it and makes triangle-smoothing widen (then
     lock in) a distorted core. A free-vs-frozen angle is kept — it's what seats a free donor at its vertex.
 
-    The L-M-L angle window is **tight (±8°) for an inter-ligand pair** (its angle is free to take the
-    ideal polyhedron value) but **wide (±25°) for an intra-chelate pair** (two donors of one ligand): a
-    chelate's bite is set by its rigid backbone and is distorted well off the ideal (a meridional pincer
-    sits near 80°/165°, not 90°/180°), so forcing the ideal there contradicts the backbone and the
-    distance-geometry bounds become infeasible. The wide window still separates cis from trans (so mer/fac
-    is preserved) while letting the bite be whatever the backbone needs.
+    An **intra-chelate** L-M-L angle (two donors of one ligand fragment) is **not constrained at all**: a
+    chelate's bite is set by its rigid backbone, so the donor-donor distance already in the bounds matrix
+    plus the two M-donor distances *fixes* the bite — imposing the ideal polyhedron angle on top only
+    contradicts the backbone and makes the geometry infeasible (a 3-membered / side-on chelate bites ~45°,
+    nowhere near 90°; even ±25° tore the ligand bond). Only **inter-ligand** angles are held (±8°), which is
+    what seats the separate ligands at their relative polyhedron positions. Impossible chelate placements (a
+    short backbone forced to span *trans*) are dropped upstream in `isomers` and downstream by `bonding_ok`.
     """
     r_m = _PT.GetRcovalent(real_z)
-    frag = {a: fi for fi, f in enumerate(Chem.GetMolFrags(mol)) for a in f}  # same ligand = same fragment
+    frag = _frag_map(mol)  # same ligand = same fragment
     pos = mol.GetConformer().GetPositions() if mol.GetNumConformers() else None
     c = Constraints()
     od = [donors[k] for k in order]  # od[vertex] = donor atom there, or VACANT
@@ -280,17 +317,61 @@ def coordination(mol, metal, donors, geometry, order, real_z, frozen=()):
         if pos is not None:  # use the REALISED metal-donor bond length from the input
             d_md = float(np.linalg.norm(pos[metal] - pos[d]))  # geometry (a covalent-radius guess is wrong for
             add_distance(c.distances, metal, d, d_md - 0.1, d_md + 0.1)  # a hydride/carbonyl and breaks the bounds)
-        else:
-            d_md = 0.9 * (r_m + _PT.GetRcovalent(mol.GetAtomWithIdx(d).GetAtomicNum()))
-            add_distance(c.distances, metal, d, d_md - 0.05, d_md + 0.05)
+        else:  # the covalent-sum bond length — the natural M-donor distance. A tighter guess (the old 0.9x)
+            z_d = mol.GetAtomWithIdx(d).GetAtomicNum()  # pulls the whole sphere in, so a donor's aryl intrudes;
+            r_d = _PT.GetRcovalent(z_d)  # a large SOFT donor (P/S/…) is capped — its dative bond runs shorter than
+            if z_d in _SOFT_DATIVE_DONORS:  # its covalent radius implies; a halide (X-type) keeps the covalent sum
+                r_d = min(r_d, _DONOR_RCOV_CAP)
+            add_distance(c.distances, metal, d, r_m + r_d - 0.05, r_m + r_d + 0.05)
+        # a conjugated heteroatom (N/O) donor donates along its sp2 lone-pair axis, so M-donor-X (X an sp2/
+        # aromatic heavy neighbour) sits near 120° and must never fold acute — otherwise the donor's own rigid
+        # unit (a carboxylate / amide / pyridine / imine plane) swings into the metal under openconf's free-rotor
+        # moves (M-O-C measured collapsing 110°→83°, dragging the carbonyl C to 2.2 Å). A wide window forbids the
+        # fold-in while leaving real variation free. Biases the embed, is held by the UFF relax, AND registers the
+        # atoms for mc's pose-hold (one struct, three uses). A carbon sigma/pi donor (carbanion/carbene/η²) is NOT
+        # held here — its aryl keeps rotating and η² is already pinned by the π-bond distance + both-donor hold.
+        if mol.GetAtomWithIdx(d).GetAtomicNum() in (7, 8):
+            for nb in mol.GetAtomWithIdx(d).GetNeighbors():
+                if nb.GetAtomicNum() > 1 and nb.GetHybridization() == Chem.HybridizationType.SP2:
+                    c.angles.setdefault((metal, d, nb.GetIdx()), (_DONOR_DONATION_MIN, _DONOR_DONATION_MAX))
     for i, j, a in ANGLES[geometry]:
         if od[i] == VACANT or od[j] == VACANT:  # an angle to an empty vertex is unconstrained
             continue
         if od[i] in frozen and od[j] in frozen:  # both held by freeze -> don't over-determine the core
             continue
-        pad = 25.0 if frag[od[i]] == frag[od[j]] else 8.0  # a chelate bite is distorted off the ideal
+        intra = frag[od[i]] == frag[od[j]]  # two donors of one chelating ligand
+        if intra and a < _SPAN_ANGLE:  # a *cis* chelate bite -> the ligand backbone folds it (tight bites embed);
+            continue  # imposing the ideal 90° tore side-on / 3-membered ligands
+        # inter-ligand pairs (±8°) and any *trans*-assigned chelate (kept wide, ±25°) are held: forcing a
+        # trans span makes an unreachable chelate (an en placed trans) tear -> dropped by `bonding_ok`, the
+        # embed-time safety net for anything the `isomers` span filter doesn't pre-drop.
+        pad = 25.0 if intra else 8.0
         c.angles[(od[i], metal, od[j])] = (max(0.0, a - pad), min(180.0, a + pad))
+    # A **side-on η² pair** — two donors π-bonded to each other (a double/triple bond), both coordinating —
+    # must be held at its natural bond length: the two M-donor pulls otherwise stretch the C≡C/C=C apart
+    # (1.2 → 1.7 A) and blow the whole sphere out. Holding just this one bond keeps the side-on unit compact
+    # (no CN reduction, no dummy). A single bond between two coordinating atoms is a two-sigma chelate, not side-on.
+    eta_pairs = [
+        (od[i], od[j])
+        for i in range(len(od))
+        for j in range(i + 1, len(od))
+        if od[i] != VACANT and od[j] != VACANT and _pi_bonded(mol, od[i], od[j])
+    ]
+    if eta_pairs:
+        from rdkit.Chem import rdDistGeom
+
+        bm = rdDistGeom.GetMoleculeBoundsMatrix(mol)  # the accurate π-bond length for this bond order
+        for a, b in eta_pairs:
+            lo, hi = (a, b) if a < b else (b, a)
+            bl = 0.5 * (bm[lo][hi] + bm[hi][lo])
+            add_distance(c.distances, a, b, bl - 0.03, bl + 0.03)
     return c
+
+
+def _pi_bonded(mol, a, b):
+    """Return True if `a`,`b` are directly bonded by a **multiple** bond (a side-on pi unit, not two sigma)."""
+    bond = mol.GetBondBetweenAtoms(a, b)
+    return bond is not None and bond.GetBondTypeAsDouble() >= 2  # noqa: PLR2004 — double/triple = pi
 
 
 def _vertex_angle(u, v):
@@ -328,7 +409,15 @@ def from_geometry(mol):
     cons = coordination_from_geometry(base, m, donors, real_z)
     geom = geometry_for(len(donors)) or f"{len(donors)}-coordinate"
     return Isomer(
-        base, cons, m, donors, real_z, label(base, m, donors, base.GetConformer().GetId(), geom), geom, list(donors)
+        base,
+        cons,
+        m,
+        donors,
+        real_z,
+        label(base, m, donors, base.GetConformer().GetId(), geom),
+        geom,
+        list(donors),
+        chirality=chirality_of(base, donors, geom, list(donors)),
     )
 
 
@@ -359,7 +448,7 @@ def _octahedral_triad(mol, od):
     real = [(p, od[p]) for p in range(len(od)) if od[p] != VACANT]
     if len(real) < _TRIAD:
         return None
-    frag = {a: fi for fi, f in enumerate(Chem.GetMolFrags(mol)) for a in f}
+    frag = _frag_map(mol)
     by_frag = {}
     for p, d in real:
         by_frag.setdefault(frag[d], []).append(p)
@@ -412,6 +501,48 @@ def _order_label(mol, donors, geometry, order):
     return "trans" if trans else "cis"
 
 
+def _donor_classes(mol, donors):
+    """Map each donor atom -> its symmetry-equivalence class (equal for interchangeable donors).
+
+    RDKit canonical rank with ``breakTies=False`` gives the graph automorphism classes, so the two N of one
+    en, or three equivalent chloride, share a class — exactly what the handedness parity must key on. The
+    metal-donor bonds are stripped on the surrogate, so identical ligands sit in identical fragments and
+    rank equal. Falls back to the atomic symbol if canonical ranking is unavailable.
+    """
+    try:
+        ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
+        return {d: ranks[d] for d in donors}
+    except Exception:  # pragma: no cover - canonical ranking is robust, but never let chirality crash embed
+        return {d: mol.GetAtomWithIdx(d).GetSymbol() for d in donors}
+
+
+def _chelate_edges(mol, vertices):
+    """Return ``{frozenset({vertex_i, vertex_j})}`` for vertex pairs whose donors chelate one ligand.
+
+    Two occupied vertices are a *bite* when their donors sit in the same fragment (same ligand). A
+    tris/bis-chelate's Λ/Δ handedness lives in this bite graph, not the per-vertex donor class.
+    """
+    frag = _frag_map(mol)
+    occ = [v for v in range(len(vertices)) if vertices[v] != VACANT]
+    return frozenset(
+        frozenset((a, b)) for i, a in enumerate(occ) for b in occ[i + 1 :] if frag[vertices[a]] == frag[vertices[b]]
+    )
+
+
+def chirality_of(mol, donors, geometry, vertices):
+    """Return the metal centre's Λ/Δ chirality tag (``'Δ'`` / ``'Λ'`` / ``''`` achiral) for one arrangement.
+
+    `vertices[v]` is the donor seated at polyhedron vertex `v` (or ``VACANT``). Name-agnostic and
+    order-invariant: the parity of the frame canonicalising the (donor-class + chelate-bite) labelling over
+    the geometry's point group (see `polyhedron.handedness`). ``''`` when the geometry has no template or a
+    vertex is vacant.
+    """
+    dirs = VERTEX_DIRS.get(geometry)
+    if dirs is None:
+        return ""
+    return _poly.handedness(dirs, list(vertices), _donor_classes(mol, donors), _chelate_edges(mol, vertices))
+
+
 @dataclass
 class Isomer:
     """One coordination isomer ready to embed: surrogate `mol`, polyhedron `cons`, `label`, `restore()`.
@@ -428,6 +559,7 @@ class Isomer:
     label: str
     geometry: str
     vertices: list = field(default_factory=list)
+    chirality: str = ""  # metal-centre handedness 'Δ'/'Λ'/'' — the name-agnostic stereo identity
     extra: list = field(default_factory=list)  # other surrogated metals (idx, real_z) — spectators in a
     # multi-metal complex, restored alongside `metal`
     stereo_ref: object = None  # input-geometry chirality fingerprint (for stereo='preserve')
@@ -437,6 +569,14 @@ class Isomer:
         restore(self.mol, self.metal, self.real_z)
         for mi, rz in self.extra:
             restore(self.mol, mi, rz)
+
+    def summary(self):
+        """Return this isomer's geometric identity string: ``geometry | per-vertex arrangement | chirality``.
+
+        The convenient one-liner for a single isomer (the name-agnostic keys you'd ``select`` on), e.g.
+        ``'square_planar | C25 C44 O27 N37 | achiral'``. Mirrors what `IsomerSet.summary` prints per row.
+        """
+        return f"{self.geometry} | {arrangement(self)} | {self.chirality or 'achiral'}"
 
 
 def arrangement(iso):
@@ -452,56 +592,70 @@ def arrangement(iso):
     return " ".join(sym(d) for d in iso.vertices)
 
 
+arrange = arrangement  # alias so IsomerSet.filter(arrangement=…) can still call the formatter (param shadows it)
+
+
 class IsomerSet(list):
     """The coordination isomers of a metal centre: a ``list`` of `Isomer` to iterate, index, or pick from.
 
-    Pick one to conf-search just the one you want:
+    Pick one to conf-search just the one you want. The identity is **geometric, not a chemistry name**:
+    select on the per-vertex `arrangement` (which donor sits where), the metal-centre `chirality`
+    (``'Δ'``/``'Λ'``/``''``), the `geometry`, or the plain **index** — the cis/trans/mer/fac `label` is a
+    coarse, sometimes-wrong convenience tag and is *never* required to select:
 
         isos = rx.metal('CCCN[Pd](Cl)(Cl)NCCC', ['square_planar', 'tetrahedral']); isos.summary()
-        ens  = rx.embed(isos.select(geometry='square_planar', label='trans')).mc().prune()
-        ens  = rx.embed(isos[0]).mc().prune()                    # or just by index
+        ens  = rx.embed(isos.select(arrangement='N3 Cl6 N7 Cl5')).mc().prune()   # unambiguous
+        ens  = rx.embed(isos.select(geometry='square_planar', chirality='Δ')).mc().prune()
+        ens  = rx.embed(isos[0]).mc().prune()                                    # or just by index
 
     Enumeration is cheap (just the coordination constraints, no embedding); the expensive MC conformer
-    search runs only on the `Isomer` you pick. The cis/trans `label` is a *coarse* tag (a same-element
-    trans pair) — for an unambiguous choice use the **index** or the `arrangement` shown by `summary()`.
+    search runs only on the `Isomer` you pick.
     """
 
-    def select(self, geometry=None, label=None):
-        """Return the single `Isomer` matching `geometry`/`label`.
+    def select(self, geometry=None, label=None, arrangement=None, chirality=None, index=None):
+        """Return the single `Isomer` matching the given keys.
 
-        **Raises** if zero or several match (the label is coarse -- narrow it, or pick by index/`filter`).
+        Key on `arrangement` (the unambiguous per-vertex slot map), `chirality` (``'Δ'``/``'Λ'``/``''``),
+        `geometry`, `index`, or the coarse `label`. **Raises** if zero or several match — the message lists
+        every isomer's ``(index, geometry, chirality, arrangement)`` so you can narrow it.
         """
-        hits = self.filter(geometry=geometry, label=label)
+        hits = self.filter(geometry=geometry, label=label, arrangement=arrangement, chirality=chirality, index=index)
         if len(hits) != 1:
+            have = [(k, i.geometry, i.chirality or "-", arrange(i)) for k, i in enumerate(self)]
             raise ValueError(
-                f"select(geometry={geometry!r}, label={label!r}) matched {len(hits)} isomer(s) — "
-                f"{'narrow it or pick by index' if hits else 'no match'}; have "
-                f"{[(i.geometry, i.label, arrangement(i)) for i in self]}"
+                f"select(geometry={geometry!r}, label={label!r}, arrangement={arrangement!r}, "
+                f"chirality={chirality!r}, index={index!r}) matched {len(hits)} isomer(s) — "
+                f"{'narrow it or pick by index' if hits else 'no match'}; have {have}"
             )
         return hits[0]
 
-    def filter(self, geometry=None, label=None):
-        """Return the subset matching `geometry`/`label`, as an `IsomerSet` (keep several / pick by index).
+    def filter(self, geometry=None, label=None, arrangement=None, chirality=None, index=None):
+        """Return the subset matching the given keys, as an `IsomerSet` (keep several / pick by index).
 
-        `label` matches the **base** tag: ``'fac'`` matches the auto-numbered ``fac1``/``fac2`` (several
-        heteroleptic isomers share a base label and get numbered) as well as a bare ``fac`` -- so ``select``
-        then tells you to narrow, rather than ``filter('fac')`` silently missing ``fac1``.
+        `label` matches the **base** tag (``'fac'`` also matches auto-numbered ``fac1``/``fac2``);
+        `arrangement`/`chirality`/`geometry` match exactly; `index` selects positionally.
         """
 
-        def lab(i):
-            return geometry in (None, i.geometry) and (
-                label is None or i.label == label or i.label.rstrip("0123456789") == label
+        def ok(k, i):
+            return (
+                geometry in (None, i.geometry)
+                and (index is None or index == k)
+                and (arrangement is None or arrange(i) == arrangement)
+                and (chirality is None or i.chirality == chirality)
+                and (label is None or i.label == label or i.label.rstrip("0123456789") == label)
             )
 
-        return IsomerSet(i for i in self if lab(i))
+        return IsomerSet(i for k, i in enumerate(self) if ok(k, i))
 
     def summary(self):
-        """Print each isomer (index, geometry, cis/trans, arrangement) so you can pick one unambiguously.
+        """Print each isomer (index, geometry, per-vertex arrangement, metal chirality) so you can pick one.
 
-        Returns self (chainable).
+        The arrangement (which donor sits at which vertex) is the unambiguous identity; chirality is
+        ``'Δ'``/``'Λ'`` or ``'(achiral)'``. The coarse cis/trans/mer/fac name is deliberately *not* shown —
+        select on ``arrangement=`` / ``chirality=`` / index. Returns self (chainable).
         """
         for k, i in enumerate(self):
-            print(f"  [{k}] {i.geometry:18s} {i.label:6s}  {arrangement(i)}")
+            print(f"  [{k}] {i.geometry:16s} {arrange(i):26s} {i.chirality or '(achiral)'}")
         return self
 
 
@@ -553,7 +707,9 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None):
 
             mol = _xyz_to_mol(mol, 0)  # just rx.embed); the geometry is needed anyway
         else:  # to retain a spectator metal
-            mol = Chem.AddHs(Chem.MolFromSmiles(mol))
+            from rxembed.embed.dispatch import parse_smiles
+
+            mol = Chem.AddHs(parse_smiles(mol))  # clear error on a bad SMILES, not a cryptic AddHs(None)
     metals = metal_indices(mol)
     if not metals:
         raise ValueError("no transition metal found")
@@ -659,7 +815,7 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None):
                     len(frozen_v),
                     len(perms),
                 )
-        for order in isomers(base, padded, geom, perms=perms):
+        for order in isomers(base, padded, geom, perms=perms, r_metal=_PT.GetRcovalent(real_z)):
             cons = coordination(base, m, padded, geom, order, real_z, frozen=frozen_donors)
             cons.distances.update(retain.distances)  # hold any spectator metal(s)' shape (relative)
             cons.distances.update(fix_cons.distances)  # hold the frozen reacting core (relative pairwise)
@@ -675,6 +831,7 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None):
                     _order_label(base, padded, geom, order),
                     geom,
                     od,
+                    chirality=chirality_of(base, donors, geom, od),
                     extra=extra,
                     stereo_ref=ref_sig,
                 )
@@ -700,7 +857,7 @@ def lone_pair_donors(mol, metal, exclude=()):
     without this a ligand-backbone heteroatom (an ether O on a phosphine, etc.) would look like a free
     substrate donor.
     """
-    frag = {a: fi for fi, f in enumerate(Chem.GetMolFrags(mol)) for a in f}
+    frag = _frag_map(mol)
     ligand_frags = {frag[metal]} | {frag[d] for d in exclude}
     return [
         a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _LONE_PAIR_Z and frag[a.GetIdx()] not in ligand_frags
@@ -787,33 +944,94 @@ def _central_trans(od, frag, dmat, dirs):
     return False
 
 
-def isomers(mol, donors, geometry, perms=None):
-    """Enumerate distinct coordination isomers: **every** distinct vertex arrangement, no geometric pre-filter.
+_SPAN_ANGLE = 135  # a same-ligand donor pair at a vertex separation this wide is a *trans*-type span
+_SPAN_TOL = 0.1  # Å slack on the backbone-reach test — tight enough to drop a 5-membered chelate (e.g. an
+# amidate, backbone ~3.7 Å) forced *trans* (need ~3.85 Å), while a genuine long bridge (backbone >> need,
+# e.g. a flexible bis-NHC at ~6.5 Å) still passes. Bigger slack (0.2) let the amidate-trans phantom through.
 
-    Bar one topological impossibility: a tridentate's central donor trans to its own arm (see
-    `_central_trans`).
+
+def _donor_span_bounds(mol, donors, frag):
+    """Return each intra-ligand donor pair's **upper-bound** donor-donor distance (Å), from the bounds matrix.
+
+    RDKit's ``GetMoleculeBoundsMatrix`` gives distance-geometry bounds derived from the ligand's own
+    connectivity + knowledge — i.e. how far *this* ligand's two donors can actually reach (the chemistry of
+    the isolated backbone). Used only by the trans-span feasibility gate. Empty (→ never filter, defer to
+    `bonding_ok`) if the matrix can't be built.
+    """
+    pairs = [
+        (min(a, b), max(a, b))
+        for i, a in enumerate(donors)
+        for b in donors[i + 1 :]
+        if frag[a] == frag[b]  # same ligand only — an inter-ligand pair has no fixed backbone distance
+    ]
+    if not pairs:
+        return {}
+    try:
+        from rdkit.Chem import rdDistGeom
+
+        bm = rdDistGeom.GetMoleculeBoundsMatrix(mol)
+    except Exception:  # pragma: no cover — bounds matrix is robust, but never let the gate crash enumeration
+        return {}
+    return {(a, b): float(bm[a][b]) for a, b in pairs}  # bm[i<j] is the pair's upper bound
+
+
+def _chelate_span_ok(mol, od, frag, dirs, span_bounds, r_metal):
+    """Return False if a chelate is placed *trans* across the metal its backbone can't physically reach.
+
+    A bidentate at *adjacent* (cis) vertices always folds in — no lower span to meet — so only a **wide**
+    vertex separation (`_SPAN_ANGLE`+, i.e. trans) is tested: the two donors would sit on opposite sides of
+    the metal, needing a donor-donor distance ``law_of_cosines(d_Ma, d_Mb, θ)`` (with each ``d_M`` the real
+    metal + donor covalent-radii sum) that a short backbone cannot span. `span_bounds[(a, b)]` is the
+    ligand's own upper-bound donor-donor distance (from the bounds matrix), so a genuine long-bridge /
+    macrocyclic ligand that *can* reach trans is still allowed — geometry, not a topological "bidentate can't
+    span trans" guess. Generalises `_central_trans` to any denticity.
+    """
+    for p in range(len(od)):
+        for q in range(p + 1, len(od)):
+            a, b = od[p], od[q]
+            if VACANT in (a, b) or frag[a] != frag[b]:  # only a same-ligand (chelate) pair
+                continue
+            theta = _vertex_angle(dirs[p], dirs[q])
+            if theta < _SPAN_ANGLE:  # cis / adjacent -> the chelate folds in, always feasible
+                continue
+            d_ma = r_metal + _PT.GetRcovalent(mol.GetAtomWithIdx(a).GetAtomicNum())  # real M-donor covalent sums,
+            d_mb = r_metal + _PT.GetRcovalent(mol.GetAtomWithIdx(b).GetAtomicNum())  # not a fixed 2.0 (Pd-N ~2.1)
+            need = math.sqrt(d_ma**2 + d_mb**2 - 2 * d_ma * d_mb * math.cos(math.radians(theta)))  # law of cosines
+            if span_bounds.get((min(a, b), max(a, b)), math.inf) < need - _SPAN_TOL:  # backbone can't reach
+                return False
+    return True
+
+
+def isomers(mol, donors, geometry, perms=None, r_metal=1.4):
+    """Enumerate distinct coordination isomers: **every** distinct vertex arrangement, minimally pre-filtered.
+
+    Two geometric impossibilities are dropped here so they don't sit in the isomer set as spurious
+    candidates: a tridentate's central donor placed trans to its own arm (`_central_trans`), and a chelate
+    placed *trans* across the metal whose backbone cannot span that far (`_chelate_span_ok` — a
+    bounds-matrix reach test, so a real long-bridge ligand that *can* span trans is kept). Both are
+    geometry-driven, not a topological "bidentate can't span trans" guess.
 
     `perms` overrides the candidate vertex orderings (default ``PERMUTATIONS[geometry]``) — a ``fix=``
     enumeration passes the subset that keeps each frozen donor pinned to its input vertex.
 
-    Whether a chelate can physically reach a given arrangement is a question of *geometry*, not topology, so
-    we do not guess it here (a "bidentate can't span trans" / "tridentate can" rule mis-handles long-bridge
-    ligands either way). Instead every arrangement is enumerated and the geometrically impossible ones (a
-    chelate forced to span a bite it cannot reach) embed with a torn ligand bond and are dropped downstream
-    by `bonding_ok` in `Ensemble.minimize` — geometry is the arbiter.
+    A *cis* chelate placement is always kept (its bite folds to whatever the backbone dictates, tight or
+    wide — a 3-membered / side-on ligand embeds fine); any residual infeasible arrangement still embeds with
+    a torn ligand bond and is dropped downstream by `bonding_ok` in `Ensemble.minimize`.
 
     Dedup is **connectivity-aware**: the signature carries, per donor pair, the elements, the vertex angle,
-    **and** the intra-ligand bond distance for a same-ligand pair. So genuinely distinct arrangements that
-    share an element/angle pattern — a tridentate's terminal-trans (mer) vs the central-trans (impossible)
-    one — are kept apart rather than merged (merging them would let the impossible one mask the real mer).
+    **and** the intra-ligand bond distance for a same-ligand pair, plus the centre's Λ/Δ chirality (so
+    enantiomers stay distinct). Genuinely distinct arrangements that share an element/angle pattern — a
+    tridentate's terminal-trans (mer) vs the central-trans one — are kept apart rather than merged.
     """
     perms = perms if perms is not None else PERMUTATIONS.get(geometry, [list(range(len(donors)))])
     dirs = VERTEX_DIRS.get(geometry)
     if dirs is None:
         return perms
     elem = {d: (mol.GetAtomWithIdx(d).GetSymbol() if d != VACANT else "X") for d in donors}  # vacancy = "X"
-    frag = {a: fi for fi, f in enumerate(Chem.GetMolFrags(mol)) for a in f}  # same ligand = same fragment
+    frag = _frag_map(mol)  # same ligand = same fragment
     dmat = Chem.GetDistanceMatrix(mol)  # topological (bond-count) distances
+    real_donors = [d for d in donors if d != VACANT]
+    span_bounds = _donor_span_bounds(mol, real_donors, frag)
 
     def link(od, p, q):  # intra-ligand bond distance of a same-ligand pair
         a, b = od[p], od[q]  # (distinguishes a chelate's central vs terminal
@@ -826,6 +1044,8 @@ def isomers(mol, donors, geometry, perms=None):
         od = [donors[k] for k in order]  # od[position] = donor atom (or VACANT) at that polyhedron vertex
         if _central_trans(od, frag, dmat, dirs):  # a tridentate's central donor trans to its arm -> impossible
             continue
+        if not _chelate_span_ok(mol, od, frag, dirs, span_bounds, r_metal):  # chelate can't span an unreachable trans
+            continue
         pairs = [(p, q) for p in range(len(od)) for q in range(p + 1, len(od))]
         sig = tuple(
             sorted(
@@ -833,6 +1053,7 @@ def isomers(mol, donors, geometry, perms=None):
                 for p, q in pairs
             )
         )
+        sig = (sig, chirality_of(mol, real_donors, geometry, od))  # keep Λ/Δ enantiomers distinct (else merged)
         if sig not in seen:
             seen.add(sig)
             out.append(order)

@@ -13,6 +13,8 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdForceFieldHelpers
 
+from rxembed.log import logger
+
 
 def _bond_pruned(mol, frozen):
     """Copy `mol` with bonds *between two frozen atoms* removed; return None if there are none.
@@ -100,19 +102,29 @@ def restrained_uff(mol, cons, distance_fc=500.0, angle_fc=None, max_iters=500, e
     confs = mol.GetConformers() if conf_ids is None else [mol.GetConformer(int(i)) for i in conf_ids]
     for conf in confs:
         cid = conf.GetId()
+        ff = build(mol, cid)  # a BUILD failure (UFF can't type the graph) propagates -> caller keeps the embed
         try:
-            ff = build(mol, cid)
             ff.Minimize(maxIts=max_iters)
             energies.append(ff.CalcEnergy())
-        except RuntimeError:  # UFF line search diverged — a pathological frozen-core partial/hypervalent bond
-            if pruned is None:
-                pruned = _bond_pruned(mol, frozen)
-            if pruned is None:
-                raise  # nothing frozen-frozen to drop -> genuinely can't relax; caller keeps the embed
-            ff = build(pruned, cid)
-            ff.Minimize(maxIts=max_iters)
-            src = pruned.GetConformer(cid)  # copy the relaxed FREE-atom positions back (frozen ones unmoved)
-            for a in range(mol.GetNumAtoms()):
-                conf.SetAtomPosition(a, src.GetAtomPosition(a))
-            energies.append(ff.CalcEnergy())
+        except RuntimeError:  # the UFF line search DIVERGED on this conformer — a pathological frozen-core
+            if pruned is None:  # partial/hypervalent bond, or an RDKit BFGS "bad direction" on a hard metal core.
+                pruned = _bond_pruned(mol, frozen)  # NEVER fatal: retry pruned, else keep this conformer unrelaxed.
+            relaxed = False
+            if pruned is not None:  # retry on a copy with the frozen-frozen partial bonds dropped
+                try:
+                    pff = build(pruned, cid)
+                    pff.Minimize(maxIts=max_iters)
+                    src = pruned.GetConformer(cid)  # copy the relaxed FREE-atom positions back (frozen unmoved)
+                    for a in range(mol.GetNumAtoms()):
+                        conf.SetAtomPosition(a, src.GetAtomPosition(a))
+                    energies.append(pff.CalcEnergy())
+                    relaxed = True
+                except RuntimeError:
+                    pass
+            if not relaxed:  # keep this conformer's geometry (frozen core still pinned); bonding_ok is the arbiter
+                logger.debug("restrained_uff: conformer %d could not relax (BFGS diverged); kept unrelaxed", cid)
+                try:
+                    energies.append(float(ff.CalcEnergy()))
+                except RuntimeError:
+                    energies.append(float("nan"))  # can't even score it — placeholder, kept aligned to confs
     return np.array(energies)

@@ -17,29 +17,17 @@ physical geometry gate (broken conjugation, bad H positions, clashes, a moved re
 
 ## Installation
 
-> **Note:** The PyPI badge and install commands below require that you first [publish your package to PyPI](https://docs.astral.sh/uv/guides/package/#publishing-your-package) (e.g. `uv build && twine upload dist/*`).
-
-From PyPI:
-
-```bash
-pip install rxembed
-```
-
-Or with [uv](https://docs.astral.sh/uv/):
-
-```bash
-uv add rxembed
-```
-
-From source:
+Install from source with [uv](https://docs.astral.sh/uv/) (recommended — it resolves the git-pinned
+openconf automatically):
 
 ```bash
 git clone https://github.com/aligfellow/rxembed.git
 cd rxembed
-pip install .
-# or for an editable install:
-pip install -e .
+uv sync            # or: just setup   (also installs pre-commit)
 ```
+
+For real energies, put an `xtb` (or g-xTB) binary on `$XTB_EXE`. Everything else — embed, search, prune —
+is pure-Python.
 
 
 ## Quickstart
@@ -104,6 +92,31 @@ Guiding principles: **edit, don't replace** (ETKDG's knowledge-based bounds are 
 one struct out** (`Constraints` is the single thing builders fill and stages read); **fail loud** (a
 calculator that yields no energy raises — never a silent FF fallback).
 
+**How a constraint travels.** Every verb (`fix`/`constrain`/`template`/`metal`/`contacts`) resolves into
+*one* `Constraints` struct of distance / angle / plane windows + a frozen set. That single struct then drives
+three stages from different views of itself: it **edits the bounds matrix** (the embed bias), it is **held by
+the restrained-UFF relax** (`minimize`), and its named atoms are **pose-frozen during the `mc` search** (so a
+held contact is never broken). Bias the seed, hold it through relax and search — one struct, three readers.
+
+## Approximations
+
+rxembed is honest about where it trades exactness for a robust, stackable embed:
+
+- **Metal = carbon surrogate.** For the force field a metal becomes a bond-stripped carbon (UFF-typeable);
+  the coordination sphere is held by soft **shape constraints**, not real M–L bonds. M–donor distances are
+  the **covalent-sum bond length**, with a cap for large soft donors (P/S — their dative bond runs shorter
+  than the covalent radius implies); a **halide** donor keeps the covalent sum. A conjugated N/O donor's
+  **donation angle** is held (~120°) so its rigid plane can't fold into the metal during search.
+- **Exact frozen cores are grafted back.** A frozen TS core is embedded via the surrogate, then restored by
+  **Kabsch superposition to 0.000 Å** — the exact input geometry, not the FF's version of it.
+- **N good geometries, not N attempts.** For a metal, `embed(n=N)` re-embeds fresh seeds until N conformers
+  pass the geometry gate (a bad seed the relax tears is a *re-embed*, not a kept result), then falls back
+  gracefully if an arrangement is inherently strained.
+- **Solvent for g-xTB is a thermodynamic cycle.** g-xTB has no implicit-solvent model, so a solvated g-xTB
+  energy is `E_gxtb(gas) + [E_gfn2(solv) − E_gfn2(gas)]` — a real solvated energy, never a silent gas-phase one.
+- **The search backend is openconf.** `mc()` pose-freezes the held atoms and runs openconf rotor moves around
+  the bounds-biased seed; for a metal complex pass `mc(preset="transition_metal")` for metal-aware sampling.
+
 ## The geometry gate
 
 A perfect frozen core can coexist with a chemically wrong periphery — a puckered ring, a twisted amide
@@ -117,6 +130,20 @@ rep.assert_ok()      # raises with a readable summary if any check fails
 
 It is **TS-aware** (name the reacting core in `frozen=` and forming/breaking bonds aren't misread as clashes)
 and **metal-aware** (a metal's dative distances aren't vdW clashes).
+
+## Modes and the ensemble map
+
+An ensemble is embedded in a **latent** per conformer — its dihedral angles, plus (when present) an
+inter-fragment NCI-contact signature and metal-coordination features. That one latent drives both the
+dedup and the picture:
+
+- `representatives()` returns **one lowest-energy conformer per mode** — the distinct-shapes summary. A
+  "mode" is whatever the latent separates: a **conformer family** (organic), a **binding-mode / contact
+  pattern** (NCI), or a **ligand arrangement** (metal).
+- `cluster()` labels each conformer by mode (HDBSCAN on the latent; `-1` = rare / noise).
+- `landscape(method="pca"|"tsne", color="cluster"|"energy")` projects that latent to **2D** — so *mode 1, 2,
+  3…* are the cluster families (distinct conformers or binding grips), coloured by cluster or by energy.
+  Pruned-away duplicates are drawn faded, so you see exactly what `prune()` collapsed.
 
 ## Package structure
 
@@ -146,10 +173,15 @@ organocatalysis backbone swap, the metal space, and the g-xTB energy ladder. See
 
 ## Requirements
 
-Core: **RDKit**, **NumPy**, **prism_pruner**. Optional (each capability degrades gracefully if absent):
-**openconf** (`mc` search), **xyzgraph** (metal/TS `.xyz` bond perception), an **`xtb` binary** on `$XTB_EXE`
-(`score`/`optimize` — g-xTB or standard Grimme xtb for GFN-FF), and the `viz` extra (matplotlib / seaborn /
-scikit-learn) for `landscape()`.
+Core: **RDKit**, **NumPy**, **prism_pruner**, **openconf**, **xyzgraph**, **scikit-learn**. An **`xtb`
+binary** on `$XTB_EXE` is needed only for real energies (`score`/`optimize` — g-xTB, or standard Grimme xtb
+for GFN-FF); embedding / search / prune are pure-Python. The `viz` extra (matplotlib / seaborn / xyzrender)
+enables `landscape()`. Each optional capability degrades gracefully if its backend is absent.
+
+> **openconf from git.** The `mc()` search backend uses openconf's transition-metal support, which is on
+> upstream `main` but not yet on a PyPI release, so `pyproject.toml` pins it via `[tool.uv.sources]` to git.
+> `uv sync` resolves and locks it automatically — no manual step. To **co-develop openconf**, run
+> `just setup-openconf-dev` (clones it as a sibling and installs it editable, overriding the git pin).
 
 ## Development
 
@@ -170,21 +202,43 @@ just check   # lint + type-check + tests
 | `just test` | Run pytest with coverage |
 | `just fix` | Auto-fix lint issues |
 | `just build` | Build distribution |
-| `just setup` | Install all dev dependencies |
+| `just setup` | Install deps + pre-commit (openconf pulled from git automatically) |
+| `just setup-openconf-dev` | Clone + editable-install openconf as a sibling (to co-develop it) |
+
+The development discipline — every non-trivial change runs `assess → plan → implement → adversarial review →
+regress` with the test suite as the gate and the `examples/` notebooks as the proof of breadth — is in
+[`CLAUDE.md`](CLAUDE.md); the constraint-API design is in [`DESIGN.md`](DESIGN.md).
 
 ### CI
 
-GitHub Actions runs lint, type-check, and tests on every push to `main` and every PR targeting `main`. Coverage is uploaded to [Codecov](https://codecov.io).
-
-For private repos, add your `CODECOV_TOKEN` as a repository secret under **Settings > Secrets and variables > Actions**. Public repos work without the token.
-
-### Changing the license
-
-This project defaults to the [MIT License](LICENSE). To change it, replace the `LICENSE` file and update the classifier in `pyproject.toml` (e.g. `"License :: OSI Approved :: Apache Software License"`).
+GitHub Actions runs lint, type-check, and tests on every push to `main` and every PR targeting `main`.
+Coverage is uploaded to [Codecov](https://codecov.io).
 
 ## License
 
 [MIT](LICENSE)
+
+## References
+
+**Software rxembed builds on**
+
+- [RDKit](https://github.com/rdkit/rdkit) — distance-geometry embedding (ETKDG), the bounds matrix, UFF / MMFF cleanup, all cheminformatics.
+- [openconf](https://github.com/rowansci/openconf) (rowansci) — the Monte-Carlo torsional conformer search behind `mc()`.
+- [prism_pruner](https://pypi.org/project/prism-pruner/) (N. Tampellini) — the RMSD / moment-of-inertia / descriptor dedup behind `prune()`.
+- [xyzgraph](https://github.com/aligfellow/xyzgraph) — bond perception for `.xyz` metal / TS inputs.
+- [xyzrender](https://github.com/aligfellow/xyzrender) — the publication-quality structure rendering used in the notebooks.
+- [scikit-learn](https://scikit-learn.org) — HDBSCAN clustering for `cluster()` / `landscape()`.
+- [xtb](https://github.com/grimme-lab/xtb) (Grimme group) — the semiempirical engine for GFN-FF / GFN2; g-xTB for the top energy tier.
+
+**Methods**
+
+- ETKDG — S. Riniker, G. A. Landrum, *J. Chem. Inf. Model.* **2015**, *55*, 2562.
+- GFN2-xTB — C. Bannwarth, S. Ehlert, S. Grimme, *J. Chem. Theory Comput.* **2019**, *15*, 1652.
+- GFN-FF — S. Spicher, S. Grimme, *Angew. Chem. Int. Ed.* **2020**, *59*, 15665.
+- UFF — A. K. Rappé *et al.*, *J. Am. Chem. Soc.* **1992**, *114*, 10024.
+- MMFF94 — T. A. Halgren, *J. Comput. Chem.* **1996**, *17*, 490.
+- Kabsch superposition — W. Kabsch, *Acta Crystallogr. A* **1976**, *32*, 922.
+- HDBSCAN — R. J. G. B. Campello, D. Moulavi, J. Sander, *PAKDD* **2013**, 160.
 
 ## Acknowledgements
 
