@@ -386,6 +386,8 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
             "chirality": iso.chirality,
             "label": iso.label,
         }
+        if iso.stereo_label:  # a ligand stereoisomer from the rx.metal coordination x stereo load-in
+            tag["stereo"] = iso.stereo_label
         if atoms is not None:
             extra = _metal.coordinate(iso, atoms)
             for (i, j), (lo, hi) in extra.distances.items():
@@ -406,7 +408,8 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
             ref_core = np.array([graft_ref[i] for i in frozen])
         else:
             ref_core = None
-        try:
+        mol, held = _metal._hold_donor_chirality(mol, iso.metal, iso.donors, cons)  # hold a carbanion/amine donor's
+        try:  # hand (a degree-3 centre with no M-C bond that ETKDG would otherwise let invert -> both hands identical)
             ids = _embed.embed(mol, cons, n or _embed.n_confs(mol, constrained=True), seed=seed, knowledge=knowledge)
         except RuntimeError as e:  # triangle smoothing -> infeasible bounds
             raise ValueError(
@@ -416,6 +419,7 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
                 f"(e.g. a substrate that can't chelate the requested vertices). [{e}]"
             ) from e
         ids = list(ids)
+        mol = _metal._release_donor_chirality(mol, held, cons)  # drop the dummy D's + cons keys, restore charges
         if ref_core is not None:
             _graft_frozen(mol, ids, frozen, ref_core)  # restore the exact frozen TS core
         if input_conf is not None:  # ETKDG cleared confs; re-add the input as a seed
@@ -430,6 +434,10 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
             " (incl. input geometry)" if input_conf else "",
         )
         ens = Ensemble(mol, ids, cons, _MetalCtx(mol, iso.metal, iso.real_z, iso.donors, iso.geometry, extra=iso.extra))
+        if ids:  # the labile-donor hand at the uniform initial embed — minimize() culls any later inverted conformer
+            ens._donor_hand = {
+                d: _metal.donor_chirality_sign(mol, ids[0], d) for d in _metal._labile_donors(mol, iso.donors)
+            }
         ens.tag = tag
         yield ens
 
@@ -498,7 +506,8 @@ def _attach_stereo(result, source, charge, stereo):
             ref = None
     if not ref:
         return
-    if stereo == "auto":  # auto-preserve ONLY a metallocene's PLANAR
+    if stereo in ("racemic", "separate", "auto"):  # for a geometry input these enumeration modes are the auto-
+        #   preserve default. Auto-preserve ONLY a metallocene's PLANAR
         #   chirality — the handedness the embed genuinely cannot keep. xyzgraph's AXIAL/HELICAL perception is
         #   geometry-dependent and over-fires on labile, freely-rotating bonds (an aryl-N or P=N-C reads a
         #   different Rₐ/Sₐ every rotamer, not a real atropisomer), so auto-preserving it rejects perfectly
@@ -512,6 +521,116 @@ def _attach_stereo(result, source, charge, stereo):
     for ens in result if isinstance(result, EnsembleSet) else [result]:
         if isinstance(ens, Ensemble):
             ens._stereo = (spec, ref)
+
+
+_STEREO_CAP = 32  # max stereoisomers embedded per source before truncating (a loud-logged safety valve)
+
+
+def _stereo_expand(source, charge, stereo, cap=_STEREO_CAP):
+    """Return ``(variants, n_unassigned, total, unresolved)`` to enumerate, or ``None`` for the single-embed path.
+
+    ``None`` when: `stereo` is not an enumerating mode (``'auto'``/``'enumerate'``); the source carries a
+    geometry or is a metal `Isomer` (its point stereo is 3D-perceived / the polyhedron path owns its Λ/Δ); or
+    nothing is unspecified. Otherwise the source is coordinate-free (a SMILES / conformer-less Mol) with
+    undefined stereocentres to expand — see `stereo.enumerate_unassigned`.
+    """
+    if stereo not in ("racemic", "separate"):  # 'free' opts out; a dict/'preserve' filter-spec is a geometry input
+        return None
+    if isinstance(source, _metal.Isomer):
+        return None
+    if isinstance(source, os.PathLike):
+        source = os.fspath(source)
+    if isinstance(source, str) and source.lower().endswith(".xyz"):
+        return None  # a geometry defines every stereocentre (AssignStereochemistryFrom3D) — nothing to enumerate
+    if isinstance(source, Chem.Mol):
+        if source.GetNumConformers() > 0:
+            return None  # ditto: a conformer defines the stereo
+        mol = source
+    elif isinstance(source, str):
+        mol = Chem.MolFromSmiles(source)
+        if mol is None:  # a genuine parse error — let _embed_dispatch raise the clear message
+            return None
+    else:
+        return None
+    if _metal.metal_index(mol) is not None:
+        return None  # a metal complex: rx.metal/enumerate_isomers owns its coordination x ligand-stereo load-in
+    expanded = _stereo.enumerate_unassigned(mol, cap=cap)
+    return None if expanded[1] == 0 else expanded
+
+
+def _stereo_enumerated_embed(expanded, stereo, dispatch_kw):
+    """Embed each stereoisomer variant and assemble per `stereo` mode — the racemate/diastereomer load-in stage.
+
+    ``'racemic'`` folds every variant's candidate(s) into ONE flat `EnsembleSet` (the racemate as one set of
+    candidates); ``'separate'`` keeps them apart as a ``list[EnsembleSet]`` (one per stereoisomer, uniform type
+    — a lone organic variant is an `EnsembleSet`-of-one, consistent with the metal path). Each variant is
+    embedded with the SAME effort; each ensemble is tagged ``stereo=<label>`` (composing with any metal
+    ``label``/``nci`` tag). The stereoisomers are never pruned against each other — they are distinct species.
+    """
+    variants, n_unassigned, total, unresolved = expanded
+    labels = ", ".join(lbl or "achiral" for _, lbl in variants)
+    if total > _STEREO_CAP:  # more stereoisomers than the safety valve — embedded a truncated subset
+        logger.warning(
+            "stereo=%r: %d undefined stereocentre(s) -> %d stereoisomers, CAPPED to %d embedded (raise cap= "
+            "to embed all): [%s]",
+            stereo,
+            n_unassigned,
+            total,
+            len(variants),
+            labels,
+        )
+    else:
+        logger.info(
+            "stereo=%r: %d undefined stereocentre(s) detected -> deliberately embedding %d stereoisomer(s) "
+            "as the racemate/diastereomer set [%s]",
+            stereo,
+            n_unassigned,
+            len(variants),
+            labels,
+        )
+    if unresolved:  # an allene/cumulene/atropisomer axis: EnumerateStereoisomers can't encode it from a flat SMILES
+        logger.warning(
+            "stereo=%r: %d stereo axis(es) (allene/cumulene/biaryl atropisomer) cannot be enumerated from a "
+            "flat SMILES — that axis is embedded as a single ARBITRARY hand; pass a geometry (.xyz) to fix it",
+            stereo,
+            unresolved,
+        )
+    groups = []
+    for vmol, label in variants:
+        try:
+            res = _embed_dispatch(vmol, **dispatch_kw)
+        except (ValueError, RuntimeError) as err:  # a single infeasible diastereomer must not abort the set
+            logger.warning(
+                "stereo=%r: stereoisomer [%s] could not be embedded (%s); skipped", stereo, label or "achiral", err
+            )
+            continue
+        es = res if isinstance(res, EnsembleSet) else EnsembleSet([res])
+        live = EnsembleSet()
+        for ens in es:
+            if not ens.ids:  # a 0-conformer embed (e.g. strained trans-cyclooctene) — drop, don't keep a dead candidate
+                logger.warning(
+                    "stereo=%r: stereoisomer [%s] produced no conformers; skipped", stereo, label or "achiral"
+                )
+                continue
+            ens.tag = {**(getattr(ens, "tag", None) or {}), "stereo": label}
+            live.append(ens)
+        if not live:
+            continue
+        logger.info("stereo=%r: stereoisomer [%s] -> %d candidate(s)", stereo, label or "achiral", len(live))
+        groups.append(live)
+    if stereo == "separate":
+        return groups  # list[EnsembleSet] — one per stereoisomer, uniform type across metal & organic
+    if not groups:
+        raise ValueError("stereo enumeration: none of the stereoisomers could be embedded (infeasible bounds)")
+    if len(groups) > 1:
+        logger.info(
+            "stereo=%r: %d stereoisomers folded into one EnsembleSet — select/score each; do NOT energy-prune "
+            "ACROSS them (distinct species, distinct constraint sets, energies not directly comparable)",
+            stereo,
+            len(groups),
+        )
+    flat = EnsembleSet(ens for es in groups for ens in es)  # 'racemic': fold into one candidate set
+    return flat[0] if len(flat) == 1 else flat  # a lone (all-axial-collapsed) variant stays a bare Ensemble
 
 
 def _reference_positions(reference, charge=0):
@@ -576,6 +695,7 @@ def _embed_dispatch(
     n=None,
     seed=0xF00D,
     knowledge=True,
+    stereo="racemic",
 ):
     """Dispatch the embed by input type / spec — see the public `embed` for documentation."""
     if isinstance(source, os.PathLike):
@@ -614,9 +734,8 @@ def _embed_dispatch(
                 raise ValueError("pass either a metal Isomer source OR metal=<geometry>, not both")
             if isinstance(source, str) and source.lower().endswith(".xyz"):
                 source = _normalize(source, charge)[0]  # xyz -> perceived Mol (enumerate wants a Mol/SMILES)
-            out = EnsembleSet(
-                e for iso in _metal.enumerate_isomers(source, metal) for e in _embed_isomer(iso, **_iso_kw)
-            )
+            isos = _metal.enumerate_isomers(source, metal, stereo=stereo)
+            out = EnsembleSet(e for iso in isos for e in _embed_isomer(iso, **_iso_kw))
             logger.info(
                 "metal: ENUMERATING isomers of %s -> %d distinct candidate(s) (each a separate "
                 "ensemble; .summary() / .select() one to conf-search)",

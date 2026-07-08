@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import GetPeriodicTable
+from rdkit.Geometry import Point3D
 
 from rxembed.log import logger  # relative, like builders.py — package convention
 
@@ -76,6 +77,10 @@ _DONOR_RCOV_CAP = 0.85  # Å: the raw covalent sum gives Ni-P 2.40 (real ~2.15);
 _DONOR_DONATION_MIN, _DONOR_DONATION_MAX = 100.0, 150.0  # deg: the M-donor-neighbour window for a conjugated N/O
 # donor (donation along the sp2 lone-pair axis, ~120°) — wide enough for real variation, tight enough to forbid
 # the rigid-unit fold-in (M-O-C collapsing to ~83° swings a carboxylate/pyridine plane into the coordination sphere).
+_DONOR_ORIENT = {  # M-donor-substituent angle window by DONOR hybridisation: the substituents splay away from the
+    Chem.HybridizationType.SP3: (95.0, 130.0),  # metal (lone pair / coordinate bond toward it) — ~109.5 tetrahedral,
+    Chem.HybridizationType.SP2: (_DONOR_DONATION_MIN, _DONOR_DONATION_MAX),  # ~120 trigonal (the conjugated N/O hold)
+}
 
 GEOM = {2: "linear", 3: "trigonal_planar", 4: "square_planar", 5: "trigonal_bipyramidal", 6: "octahedral"}
 # catalogue of supported polyhedra per coordination number (the first is the GEOM default) — for
@@ -175,6 +180,121 @@ def metal_index(mol):
     return next((a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS), None)
 
 
+_MIN_STEREO_NEIGHBOURS = 3  # a tetrahedral stereocentre needs >=3 explicit neighbours (else ETKDG raises)
+_TETRAVALENT = 4  # a fully-substituted (already degree-4) donor is not a candidate for the D-cap chirality hold
+
+
+def _clear_labile_donor_stereo(atom):
+    """Drop a chiral tag on a metal-donor atom that has fallen below 3 neighbours after the sphere strip.
+
+    A donor that is a stereocentre only *while bonded to the metal* — a planar amidate N- (metal + aryl +
+    alpha-C = 3 neighbours, 2 without) — leaves a stale tag that crashes ETKDG (``nbrs.size() >= 3``). A genuine
+    donor stereocentre keeps 3 real substituents after the strip (a chiral-at-P, a carbanion C⁻ donor) and is
+    untouched, so its enantiomers still embed distinctly.
+    """
+    if atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED and atom.GetDegree() < _MIN_STEREO_NEIGHBOURS:
+        atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+
+
+def _labile_donors(mol, donors):
+    """Return the metal-bound donors whose config the surrogate can't hold natively: sp3 **C/N** with a chiral tag.
+
+    A carbanion-C / amine-N donor is a stereocentre only WHILE metal-bound; the surrogate strips that bond, so
+    it becomes a bare degree-3 centre RDKit/UFF will invert. A heavy pnictogen (P/As/Sb) stays configurationally
+    stable as degree-3 and needs no help, so it is excluded. `donors` may be ``None`` (a `_MetalCtx` from the
+    frozen-core / general metal path doesn't track them) -> no labile donors.
+    """
+    return [
+        d
+        for d in (donors or ())
+        if mol.GetAtomWithIdx(d).GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+        and mol.GetAtomWithIdx(d).GetAtomicNum() in (6, 7)
+        and mol.GetAtomWithIdx(d).GetTotalDegree() < _TETRAVALENT
+    ]
+
+
+def donor_chirality_sign(mol, cid, donor):
+    """Geometric hand (+1 / -1, or None) of a donor: the signed volume of its first three neighbours.
+
+    Neighbour order is stable for a fixed mol, so the sign is comparable across that mol's conformers — used to
+    cull a conformer whose labile donor inverted (a relax / re-embed / mc stray) back to the enumerated hand.
+    """
+    nbrs = [n.GetIdx() for n in mol.GetAtomWithIdx(donor).GetNeighbors()]
+    if len(nbrs) < _MIN_STEREO_NEIGHBOURS:
+        return None
+    conf = mol.GetConformer(cid)
+    p = np.array([list(conf.GetAtomPosition(i)) for i in [donor, nbrs[0], nbrs[1], nbrs[2]]])
+    v = float(np.dot(np.cross(p[1] - p[0], p[2] - p[0]), p[3] - p[0]))
+    return int(np.sign(v)) if abs(v) > 1e-6 else None  # noqa: PLR2004 — a near-planar (racemising) centre: no hand
+
+
+_DUMMY_M_LO, _DUMMY_M_HI = 0.8, 1.8  # Å: pin the hold-dummy D near the metal (~ the coordinate-bond / lone-pair side)
+
+
+def _hold_donor_chirality(mol, metal, donors, cons):
+    """Cap each labile (sp3 C/N) metal-bound donor carrying a chiral tag with a dummy D, so the hand is enforced.
+
+    A degree-3 carbanion/amine donor (no M-C bond in the surrogate) is not a stereocentre RDKit/UFF perceives,
+    so its two enumerated hands relax to the *same* geometry. Neutralising its charge (a carbanion cannot be
+    pentavalent) and adding a 4th bond to a **deuterium** makes it a proper, enforced tetrahedral centre — the
+    same appended-D basis the enumeration labelled it in, so the embedded hand matches the tag. When the mol
+    already has conformers (the relax / mc path) each D is placed at the 4th tetrahedral vertex of THIS
+    conformer's current hand (preserving it); a conformer-free mol (the initial embed) gets the hand from ETKDG +
+    the chiral tag. A **(metal, D) distance is added to `cons`** so D is pinned on the coordinate-bond side —
+    WITHOUT it ETKDG thrashes on the free 4th atom's chiral volume (~200x slower); `_release_donor_chirality`
+    drops that key. Returns ``(capped_mol, held)`` where `held` is ``[(dummy_idx, donor_idx, original_charge)]``.
+    """
+    labile = _labile_donors(mol, donors)
+    if not labile:  # the common case (no carbanion/amine stereocentre) — skip the RWMol copy + sanitize entirely
+        return mol, []
+    rw = Chem.RWMol(mol)
+    held = []
+    for d in labile:
+        a = rw.GetAtomWithIdx(d)
+        held.append((None, d, a.GetFormalCharge()))
+        a.SetFormalCharge(0)  # neutralise: a 4th bond on an anion would be hypervalent
+        a.SetNoImplicit(True)
+        dm = rw.AddAtom(Chem.Atom(1))
+        rw.GetAtomWithIdx(dm).SetIsotope(2)  # deuterium — distinct from any real H, lowest CIP priority
+        rw.AddBond(d, dm, Chem.BondType.SINGLE)
+        add_distance(cons.distances, metal, dm, _DUMMY_M_LO, _DUMMY_M_HI)  # pin D near M -> fast, correct ETKDG place
+        held[-1] = (dm, d, held[-1][2])
+    out = rw.GetMol()
+    Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
+    for conf in out.GetConformers():  # place each D at the 4th vertex of this conformer's current hand
+        for dm, d, _q in held:
+            pd = np.array(conf.GetAtomPosition(d))
+            nbrs = [n.GetIdx() for n in out.GetAtomWithIdx(d).GetNeighbors() if n.GetIdx() != dm][:3]
+            units = [(v := np.array(conf.GetAtomPosition(i)) - pd) / (np.linalg.norm(v) or 1.0) for i in nbrs]
+            fourth = -sum(units)  # opposite the three real substituents (~ the lone-pair / M direction)
+            conf.SetAtomPosition(dm, Point3D(*(pd + fourth / (np.linalg.norm(fourth) or 1.0))))
+    return out, held
+
+
+def _release_donor_chirality(mol, held, cons):
+    """Remove the hold dummy D's + their ``(metal, D)`` cons keys, restore donor charges, keep the tag.
+
+    Dropping the cons key is critical: `cons` is the Ensemble's, reused by `minimize`/`_reembed`/`mc`, and a
+    distance to a now-removed atom would index past the mol (an IndexError in the bounds matrix).
+    """
+    if not held:
+        return mol
+    dummies = {dm for dm, _d, _q in held}
+    for key in [k for k in cons.distances if k[0] in dummies or k[1] in dummies]:
+        del cons.distances[key]
+    rw = Chem.RWMol(mol)
+    for dm in sorted(dummies, reverse=True):  # high indices first so the remaining atoms don't shift
+        rw.RemoveAtom(dm)
+    for _dm, d, q in held:
+        rw.GetAtomWithIdx(d).SetFormalCharge(q)
+    out = rw.GetMol()
+    donor_tags = {d: out.GetAtomWithIdx(d).GetChiralTag() for _dm, d, _q in held}  # sanitize drops the now-degree-3
+    Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
+    for d, t in donor_tags.items():  # carbanion/amine tag -> keep it so the NEXT hold (relax, re-embed, mc) fires
+        out.GetAtomWithIdx(d).SetChiralTag(t)
+    return out
+
+
 def prepare(mol):
     """Remove metal-donor bonds and swap the metal to a UFF surrogate. Returns (mol, metal, donors, real_Z)."""
     m = metal_index(mol)
@@ -184,14 +304,20 @@ def prepare(mol):
     em = Chem.RWMol(mol)
     for d in donors:
         em.RemoveBond(d, m)
+        _clear_labile_donor_stereo(em.GetAtomWithIdx(d))  # a donor that's a stereocentre only WHILE metal-bound
         em.GetAtomWithIdx(d).SetNoImplicit(True)  # freeze donor H count so MC (openconf) adds none
     real_z = em.GetAtomWithIdx(m).GetAtomicNum()
     a = em.GetAtomWithIdx(m)
     a.SetAtomicNum(SURROGATE)
     a.SetNoImplicit(True)
     a.SetFormalCharge(0)
-    out = em.GetMol()
-    Chem.SanitizeMol(out)
+    a.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)  # a bondless surrogate is never a stereocentre (a stray tag
+    out = em.GetMol()  # from a metal RDKit mis-flagged as tetrahedral would crash ETKDG: 'nbrs.size() >= 3')
+    donor_tags = {d: out.GetAtomWithIdx(d).GetChiralTag() for d in donors}  # sanitize drops an enumerated
+    Chem.SanitizeMol(out)  # degree-3 carbanion/amine donor's tag -> re-apply it so `_hold_donor_chirality` sees it
+    for d, t in donor_tags.items():
+        if t != Chem.ChiralType.CHI_UNSPECIFIED:
+            out.GetAtomWithIdx(d).SetChiralTag(t)
     return out, m, donors, real_z
 
 
@@ -224,12 +350,14 @@ def prepare_all(mol):
         for d in [n.GetIdx() for n in em.GetAtomWithIdx(m).GetNeighbors()]:
             if em.GetBondBetweenAtoms(d, m) is not None:
                 em.RemoveBond(d, m)
+            _clear_labile_donor_stereo(em.GetAtomWithIdx(d))  # stale tag on a now-<3-nbr donor crashes ETKDG
             em.GetAtomWithIdx(d).SetNoImplicit(True)
             donors.append(d)
         a = em.GetAtomWithIdx(m)
         a.SetAtomicNum(SURROGATE)
         a.SetNoImplicit(True)
         a.SetFormalCharge(0)
+        a.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)  # bondless surrogate — a stray metal tag crashes ETKDG
     out = em.GetMol()
     Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
     out.UpdatePropertyCache(strict=False)
@@ -287,6 +415,28 @@ def hold_shape(mol, atoms, cons, pad=0.1, cid=-1):
     add_pairwise_shape(cons, atoms, mol.GetConformer(cid).GetPositions(), pad)
 
 
+def _orient_donor(mol, metal, d, donor_set, cons, orient_protons):
+    """Hold a donor's substituent directions relative to the metal with M-D-X angles.
+
+    Two parts. (1) ALWAYS: a conjugated N/O donor's rigid **sp2 heavy** plane is held ~120° so it can't fold acute
+    into the metal — the long-standing donation hold. (2) Only when embedding **from scratch** (`orient_protons`,
+    i.e. no input geometry — a geometry / frozen-core embed already places the H's, and piling extra angles onto its
+    already-tight bounds over-constrains it): splay **any donor's protons** to the hybridisation angle (~109.5° sp3)
+    so a methyl / ammine / amine's X-H bonds point away and the lone pair points at M, and SKIP a **haptic** donor
+    (directly bonded to a co-donor = a side-on eta2 / two-sigma unit, not a lone-pair splay). Each angle is one 1,3
+    bounds entry that biases the embed, is held by the relax, and registers the atoms for mc's pose-hold.
+    """
+    a = mol.GetAtomWithIdx(d)
+    conjugated = a.GetAtomicNum() in (7, 8)
+    proton_window = _DONOR_ORIENT.get(a.GetHybridization()) if orient_protons else None
+    haptic = any(nb.GetIdx() in donor_set for nb in a.GetNeighbors())
+    for nb in a.GetNeighbors():
+        if conjugated and nb.GetAtomicNum() > 1 and nb.GetHybridization() == Chem.HybridizationType.SP2:
+            cons.angles.setdefault((metal, d, nb.GetIdx()), (_DONOR_DONATION_MIN, _DONOR_DONATION_MAX))  # (1)
+        elif proton_window and not haptic and nb.GetAtomicNum() == 1:  # (2) — from-scratch, non-haptic donor protons
+            cons.angles.setdefault((metal, d, nb.GetIdx()), proton_window)
+
+
 def coordination(mol, metal, donors, geometry, order, real_z, frozen=()):
     """Build one isomer's constraints: metal-donor distances + donor-metal-donor angles.
 
@@ -311,6 +461,7 @@ def coordination(mol, metal, donors, geometry, order, real_z, frozen=()):
     pos = mol.GetConformer().GetPositions() if mol.GetNumConformers() else None
     c = Constraints()
     od = [donors[k] for k in order]  # od[vertex] = donor atom there, or VACANT
+    real_od = {x for x in od if x != VACANT}  # the co-donors, for the haptic (side-on) check in _orient_donor
     for d in od:
         if d == VACANT:
             continue
@@ -323,17 +474,11 @@ def coordination(mol, metal, donors, geometry, order, real_z, frozen=()):
             if z_d in _SOFT_DATIVE_DONORS:  # its covalent radius implies; a halide (X-type) keeps the covalent sum
                 r_d = min(r_d, _DONOR_RCOV_CAP)
             add_distance(c.distances, metal, d, r_m + r_d - 0.05, r_m + r_d + 0.05)
-        # a conjugated heteroatom (N/O) donor donates along its sp2 lone-pair axis, so M-donor-X (X an sp2/
-        # aromatic heavy neighbour) sits near 120° and must never fold acute — otherwise the donor's own rigid
-        # unit (a carboxylate / amide / pyridine / imine plane) swings into the metal under openconf's free-rotor
-        # moves (M-O-C measured collapsing 110°→83°, dragging the carbonyl C to 2.2 Å). A wide window forbids the
-        # fold-in while leaving real variation free. Biases the embed, is held by the UFF relax, AND registers the
-        # atoms for mc's pose-hold (one struct, three uses). A carbon sigma/pi donor (carbanion/carbene/η²) is NOT
-        # held here — its aryl keeps rotating and η² is already pinned by the π-bond distance + both-donor hold.
-        if mol.GetAtomWithIdx(d).GetAtomicNum() in (7, 8):
-            for nb in mol.GetAtomWithIdx(d).GetNeighbors():
-                if nb.GetAtomicNum() > 1 and nb.GetHybridization() == Chem.HybridizationType.SP2:
-                    c.angles.setdefault((metal, d, nb.GetIdx()), (_DONOR_DONATION_MIN, _DONOR_DONATION_MAX))
+        # orient the donor's substituents away from the metal (its protons splay, lone pair / coordinate bond
+        # points at M): a conjugated N/O donor's rigid plane is held near 120° (else it folds acute, swinging a
+        # carboxylate/amide/pyridine plane into the sphere), and ANY donor's PROTONS are held so a methyl/ammine/
+        # amine's X-H bonds don't point every which way. Skipped for a side-on η² pair. See `_orient_donor`.
+        _orient_donor(mol, metal, d, real_od, c, orient_protons=pos is None)
     for i, j, a in ANGLES[geometry]:
         if od[i] == VACANT or od[j] == VACANT:  # an angle to an empty vertex is unconstrained
             continue
@@ -563,6 +708,8 @@ class Isomer:
     extra: list = field(default_factory=list)  # other surrogated metals (idx, real_z) — spectators in a
     # multi-metal complex, restored alongside `metal`
     stereo_ref: object = None  # input-geometry chirality fingerprint (for stereo='preserve')
+    stereo_label: str = ""  # LIGAND stereoisomer tag (e.g. '16R') when rx.metal enumerated an undefined ligand
+    # stereocentre — the coordination x ligand-stereo load-in; distinct from the metal-centre `chirality`
 
     def restore(self):
         """Restore this isomer's metal(s) from the surrogate back to their real elements."""
@@ -576,7 +723,8 @@ class Isomer:
         The convenient one-liner for a single isomer (the name-agnostic keys you'd ``select`` on), e.g.
         ``'square_planar | C25 C44 O27 N37 | achiral'``. Mirrors what `IsomerSet.summary` prints per row.
         """
-        return f"{self.geometry} | {arrangement(self)} | {self.chirality or 'achiral'}"
+        stereo = f" | stereo {self.stereo_label}" if self.stereo_label else ""
+        return f"{self.geometry} | {arrangement(self)} | {self.chirality or 'achiral'}{stereo}"
 
 
 def arrangement(iso):
@@ -612,28 +760,31 @@ class IsomerSet(list):
     search runs only on the `Isomer` you pick.
     """
 
-    def select(self, geometry=None, label=None, arrangement=None, chirality=None, index=None):
+    def select(self, geometry=None, label=None, arrangement=None, chirality=None, index=None, stereo=None):
         """Return the single `Isomer` matching the given keys.
 
         Key on `arrangement` (the unambiguous per-vertex slot map), `chirality` (``'Δ'``/``'Λ'``/``''``),
-        `geometry`, `index`, or the coarse `label`. **Raises** if zero or several match — the message lists
-        every isomer's ``(index, geometry, chirality, arrangement)`` so you can narrow it.
+        `geometry`, `index`, the ligand `stereo` tag (e.g. ``'16R'``), or the coarse `label`. **Raises** if
+        zero or several match — the message lists every isomer so you can narrow it.
         """
-        hits = self.filter(geometry=geometry, label=label, arrangement=arrangement, chirality=chirality, index=index)
+        hits = self.filter(
+            geometry=geometry, label=label, arrangement=arrangement, chirality=chirality, index=index, stereo=stereo
+        )
         if len(hits) != 1:
-            have = [(k, i.geometry, i.chirality or "-", arrange(i)) for k, i in enumerate(self)]
+            have = [(k, i.geometry, i.chirality or "-", i.stereo_label or "-", arrange(i)) for k, i in enumerate(self)]
             raise ValueError(
                 f"select(geometry={geometry!r}, label={label!r}, arrangement={arrangement!r}, "
-                f"chirality={chirality!r}, index={index!r}) matched {len(hits)} isomer(s) — "
+                f"chirality={chirality!r}, index={index!r}, stereo={stereo!r}) matched {len(hits)} isomer(s) — "
                 f"{'narrow it or pick by index' if hits else 'no match'}; have {have}"
             )
         return hits[0]
 
-    def filter(self, geometry=None, label=None, arrangement=None, chirality=None, index=None):
+    def filter(self, geometry=None, label=None, arrangement=None, chirality=None, index=None, stereo=None):
         """Return the subset matching the given keys, as an `IsomerSet` (keep several / pick by index).
 
         `label` matches the **base** tag (``'fac'`` also matches auto-numbered ``fac1``/``fac2``);
-        `arrangement`/`chirality`/`geometry` match exactly; `index` selects positionally.
+        `arrangement`/`chirality`/`geometry`/`stereo` (the ligand stereoisomer tag) match exactly;
+        `index` selects positionally.
         """
 
         def ok(k, i):
@@ -642,6 +793,7 @@ class IsomerSet(list):
                 and (index is None or index == k)
                 and (arrangement is None or arrange(i) == arrangement)
                 and (chirality is None or i.chirality == chirality)
+                and (stereo is None or i.stereo_label == stereo)
                 and (label is None or i.label == label or i.label.rstrip("0123456789") == label)
             )
 
@@ -655,7 +807,8 @@ class IsomerSet(list):
         select on ``arrangement=`` / ``chirality=`` / index. Returns self (chainable).
         """
         for k, i in enumerate(self):
-            print(f"  [{k}] {i.geometry:16s} {arrange(i):26s} {i.chirality or '(achiral)'}")
+            stereo = f"  stereo {i.stereo_label}" if i.stereo_label else ""
+            print(f"  [{k}] {i.geometry:16s} {arrange(i):26s} {i.chirality or '(achiral)'}{stereo}")
         return self
 
 
@@ -685,10 +838,14 @@ def _resolve_center(mol, metals, center):
     raise ValueError(f"{len(hits)} {center} centres ({hits}) — disambiguate with center=<atom index>")
 
 
-def enumerate_isomers(mol, geometry=None, center=None, fix=None):
+def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic"):
     """Enumerate all distinct coordination isomers as ready-to-embed `Isomer` objects (metal surrogated).
 
     Returns an `IsomerSet`; each `Isomer` carries `.geometry` + `.label` -- pick with ``IsomerSet.select(…)``.
+    This is the metal **load-in**: for a coordinate-free input (SMILES) `stereo='racemic'` also enumerates any
+    UNDEFINED *ligand* stereocentre (the alpha-carbon of an amino-acidate, a chiral-at-P donor, …), so the set
+    spans coordination x ligand-stereo — each such `Isomer` carries a `.stereo_label` (select on ``stereo=``).
+    `stereo='free'` opts out (one arbitrary hand). A geometry input (.xyz) has 3D-defined stereo — untouched.
 
     `mol` is a SMILES or Mol. `geometry` selects the polyhedron(a): ``None`` → the default for the donor
     count (4 → square_planar); a name (``'octahedral'``, …) → just that one; a **list** of names → each, to
@@ -710,6 +867,32 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None):
             from rxembed.embed.dispatch import parse_smiles
 
             mol = Chem.AddHs(parse_smiles(mol))  # clear error on a bad SMILES, not a cryptic AddHs(None)
+    if stereo != "free" and mol.GetNumConformers() == 0:  # coordinate-free ligand-stereo load-in: expand any
+        from rxembed import stereo as _stereo  # UNDEFINED ligand stereocentre so the set spans coordination x
+
+        variants, n_unassigned, _total, unresolved = _stereo.enumerate_unassigned(
+            mol, exclude=set(metal_indices(mol))
+        )  # exclude the metal's own centre — its Λ/Δ is enumerated below, not as RDKit point stereo
+        if n_unassigned:
+            out = IsomerSet()
+            for vmol, slabel in variants:  # each variant is stereo-DEFINED -> recurse with stereo='free' so its
+                for iso in enumerate_isomers(vmol, geometry, center, fix, stereo="free"):  # own load-in is a no-op
+                    iso.stereo_label = slabel
+                    out.append(iso)
+            logger.info(
+                "metal: %d undefined ligand stereocentre(s) -> enumerating coordination x %d ligand "
+                "stereoisomer(s) = %d candidate(s) (select stereo=)",
+                n_unassigned,
+                len(variants),
+                len(out),
+            )
+            if unresolved:
+                logger.warning(
+                    "metal: %d ligand stereo axis(es) (allene/atropisomer) cannot be enumerated from a flat "
+                    "SMILES — embedded as a single arbitrary hand; pass a geometry to fix it",
+                    unresolved,
+                )
+            return out
     metals = metal_indices(mol)
     if not metals:
         raise ValueError("no transition metal found")

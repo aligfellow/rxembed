@@ -35,7 +35,9 @@ def test_henry_bischelate_embeds_with_proper_coordination(smi):
 
     import rxembed as rx
 
-    isos = rx.metal(smi, "square_planar")
+    # a coordination/embeddability check, NOT a stereo one (that is test_stereo.py) -> stereo="free" (one hand);
+    # these amidate complexes have an alpha-C stereocentre the racemic default would enumerate, doubling every embed
+    isos = rx.metal(smi, "square_planar", stereo="free")
     embedded = 0
     for iso in isos:
         ens = rx.embed(iso, n=3).minimize()

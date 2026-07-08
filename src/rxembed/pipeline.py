@@ -123,6 +123,114 @@ class EnsembleSet(list):
             print(f"  [{k}] {ident}  ({e.n} seeds)")
         return self
 
+    #: verbs whose per-candidate output is comparable ACROSS candidates only via a REAL calculator, not the FF
+    _REAL_ENERGY_VERBS = frozenset({"score", "optimize"})
+
+    def _map(self, method, *args, **kw):
+        """Apply an `Ensemble` verb to every candidate, returning a new `EnsembleSet` (tags carried over).
+
+        The chain works the SAME on one `Ensemble` or a whole set — a racemate, metal isomers, NCI modes: each
+        stereoisomer / isomer / mode is conf-searched, pruned, scored, etc. **on its own, with its own
+        constraints** (search seeds, geometry dedup, energy windows, clustering are all WITHIN one candidate).
+        Distinct species are NEVER pooled or energy-pruned against each other — to RANK them you must use
+        `score`/`optimize` (a real calculator: enantiomers/diastereomers/coordination isomers share a formula,
+        so their g-xTB totals ARE comparable; FF surrogate energies are not) and then compare deliberately.
+        """
+        tags = ", ".join(self._slug(e.tag or {}, k) for k, e in enumerate(self)) or "?"
+        logger.info(
+            "EnsembleSet.%s: applied to %d candidate(s) [%s] independently — WITHIN each (own constraints); "
+            "distinct species are never pooled/cross-pruned%s",
+            method,
+            len(self),
+            tags,
+            " — compare across them only via these REAL energies" if method in self._REAL_ENERGY_VERBS else "",
+        )
+        out = EnsembleSet()
+        for e in self:
+            res = getattr(e, method)(*args, **kw)
+            res.tag = res.tag or dict(e.tag)  # a returned-new ensemble (score/optimize/lowest) carries the tag
+            out.append(res)
+        return out
+
+    def mc(self, *args, **kw):
+        """Monte-Carlo conformer search on each candidate (see `Ensemble.mc`)."""
+        return self._map("mc", *args, **kw)
+
+    def minimize(self, *args, **kw):
+        """FF-relax each candidate (see `Ensemble.minimize`)."""
+        return self._map("minimize", *args, **kw)
+
+    def prune(self, *args, **kw):
+        """Dedup each candidate's conformers (see `Ensemble.prune`)."""
+        return self._map("prune", *args, **kw)
+
+    def score(self, *args, **kw):
+        """Real-energy score each candidate (see `Ensemble.score`) — energies are per-species, not cross-comparable."""
+        return self._map("score", *args, **kw)
+
+    def optimize(self, *args, **kw):
+        """Geometry-optimise each candidate (see `Ensemble.optimize`)."""
+        return self._map("optimize", *args, **kw)
+
+    def lowest(self, *args, **kw):
+        """Keep the lowest-energy conformer(s) WITHIN each candidate (see `Ensemble.lowest`)."""
+        return self._map("lowest", *args, **kw)
+
+    def representatives(self, *args, **kw):
+        """Distinct representatives WITHIN each candidate (see `Ensemble.representatives`)."""
+        return self._map("representatives", *args, **kw)
+
+    def best(self, n=1):
+        """Rank the candidates by their LOWEST energy and keep the best `n` — the deliberate CROSS-species compare.
+
+        This is the ONE place species are ranked against each other, so it demands **real** energies: it raises
+        unless every candidate has been `score`d / `optimize`d (enantiomers / diastereomers / coordination
+        isomers share a molecular formula, so their g-xTB totals ARE comparable; FF surrogate energies are NOT,
+        and are refused). Returns the single winning `Ensemble` (``n==1``) or an `EnsembleSet` of the best `n`.
+        """
+        not_real = [self._slug(e.tag or {}, k) for k, e in enumerate(self) if e.energy_kind != "real"]
+        if not_real:
+            raise ValueError(
+                f"best() ranks distinct species by REAL energy, but {not_real} have none (FF surrogate energies are "
+                f"NOT comparable across species) — run .score('gxtb') or .optimize('gxtb') on the set first"
+            )
+
+        def emin(e):
+            return min(e.energies[i] for i in e.ids if i in e.energies)
+
+        ranked = sorted(self, key=emin)
+        lo = emin(ranked[0])
+        order = ", ".join(f"{self._slug(e.tag or {}, k)}(+{emin(e) - lo:.1f})" for k, e in enumerate(ranked))
+        logger.info(
+            "EnsembleSet.best: ranked %d by REAL ΔE (kcal/mol): %s -> kept %d", len(self), order, min(n, len(ranked))
+        )
+        kept = EnsembleSet(ranked[:n])
+        return kept[0] if n == 1 else kept
+
+    @staticmethod
+    def _slug(tag, k):
+        """Filename-safe identifier for a candidate from its tag (stereo / label / nci …), else its index."""
+        s = "_".join(str(tag[key]) for key in ("stereo", "label", "nci", "chirality") if tag.get(key)) or f"c{k}"
+        return "".join(ch if ch.isalnum() or ch in "-." else "_" for ch in s)
+
+    def dump(self, path, align=True):
+        """Write EACH candidate to its own multi-frame .xyz, its tag folded into the filename; return the paths.
+
+        ``rx.embed('CC(N)C(=O)O').minimize().dump('amac.xyz')`` -> ``amac_1S.xyz`` + ``amac_1R.xyz`` (the two
+        enantiomers kept apart — distinct species, never pooled). Same `align` semantics as `Ensemble.dump`.
+        """
+        from pathlib import Path
+
+        base = Path(path)
+        paths = []
+        for k, e in enumerate(self):
+            p = base.with_name(f"{base.stem}_{self._slug(e.tag or {}, k)}{base.suffix or '.xyz'}")
+            e.dump(str(p), align=align)
+            paths.append(str(p))
+        return paths
+
+    write = dump  # alias, matching Ensemble
+
 
 def embed(
     source,
@@ -137,7 +245,7 @@ def embed(
     n=None,
     seed=0xF00D,
     knowledge=True,
-    stereo="auto",
+    stereo="racemic",
     **kw,
 ):
     """Embed conformers (optionally constrained), returning an `Ensemble` or an `EnsembleSet` of candidates.
@@ -168,34 +276,55 @@ def embed(
     - **metal**:           ``rx.embed('…[Pd]…', metal='square_planar')`` → `EnsembleSet` of isomers
     - metal + substrate:   ``rx.embed('…[Pd]….O1CCCC1', metal='square_planar', coordinate='[OX2]')``
 
-    Keyword detail lives with the machinery each drives: ``contacts=`` / ``contacts='auto'`` → `nci_modes`;
-    ``metal=`` / ``coordinate=`` → `rx.metal` (they reuse ``fix``/``constrain`` for their held cores);
-    ``stereo=`` (chirality the embed can't keep — planar/axial/helical) → `Ensemble.select_stereo`.
+    **``stereo=``** governs undefined chirality (`stereo.enumerate_unassigned`). For a coordinate-free input
+    (SMILES / conformer-less Mol) with *unlabeled* stereocentres, it deliberately embeds the racemate rather
+    than one arbitrary hand — enumerating point R/S **+** double-bond E/Z (defined centres held fixed, meso
+    dropped, chiral-at-P included, the metal centre never enumerated):
+
+    - ``'racemic'`` *(default; alias ``'auto'``)*: embed every stereoisomer with EQUAL effort, folded into one
+      `EnsembleSet` (each tagged ``stereo=<config>``); a fully-defined / stereocentre-free input is untouched
+      (one `Ensemble`). The stereoisomers are **never energy-pruned against each other** — they are distinct
+      species with distinct constraint sets, so their energies are not directly comparable (a higher-energy
+      one is logged, not dropped).
+    - ``'separate'`` *(alias ``'enumerate'``)*: keep the stereoisomers apart — a ``list[EnsembleSet]``, one per
+      configuration, to drive / score each on its own.
+    - ``'free'``: opt out of enumeration — a single embed with the stereocentres left to the ETKDG seed (a mix).
+
+    For a *geometry* input (an .xyz / metal `Isomer`) stereo is already 3D-defined, so ``stereo=`` instead
+    tunes the preservation filter for chirality the embed can't keep (planar/axial/helical) — see
+    `_attach_stereo`. Other machinery: ``contacts=`` / ``contacts='auto'`` → `nci_modes`; ``metal=`` /
+    ``coordinate=`` → `rx.metal` (they reuse ``fix``/``constrain`` for their held cores).
     """
     n_alias = kw.pop("n_confs", None)
     n_alias = kw.pop("num_confs", n_alias)
     if n is None:
         n = n_alias  # accept n_confs= / num_confs= as friendly aliases of n=
+    stereo = {"auto": "racemic", "enumerate": "separate"}.get(stereo, stereo)  # accept the older mode names
     if kw:
         raise TypeError(
             f"embed() got unexpected keyword(s) {sorted(kw)} — the constraint verbs are "
             f"fix / constrain / template (+ contacts / metal / coordinate / n_confs)"
         )
-    from .embed.dispatch import _attach_stereo, _embed_dispatch  # lazy: breaks the dispatch<->pipeline cycle
+    # lazy imports: break the dispatch<->pipeline cycle
+    from .embed.dispatch import _attach_stereo, _embed_dispatch, _stereo_enumerated_embed, _stereo_expand
 
-    result = _embed_dispatch(
-        source,
-        metal=metal,
-        fix=fix,
-        constrain=constrain,
-        template=template,
-        contacts=contacts,
-        coordinate=coordinate,
-        charge=charge,
-        n=n,
-        seed=seed,
-        knowledge=knowledge,
-    )
+    dispatch_kw = {
+        "metal": metal,
+        "fix": fix,
+        "constrain": constrain,
+        "template": template,
+        "contacts": contacts,
+        "coordinate": coordinate,
+        "charge": charge,
+        "n": n,
+        "seed": seed,
+        "knowledge": knowledge,
+        "stereo": stereo,  # the metal load-in (enumerate_isomers) reads it; the organic path uses _stereo_expand
+    }
+    expanded = _stereo_expand(source, charge, stereo)  # undefined-stereocentre racemate load-in (or None)
+    if expanded is not None:
+        return _stereo_enumerated_embed(expanded, stereo, dispatch_kw)
+    result = _embed_dispatch(source, **dispatch_kw)
     _attach_stereo(result, source, charge, stereo)
     return result
 
@@ -283,6 +412,11 @@ class Ensemble:
     # (e.g. {'geometry','label'} for a metal isomer)
     _stereo: tuple | None = None  # (spec, reference signature) for the chirality filter
     # applied in minimize() — set by embed(stereo=…)
+    _donor_hand: dict = field(default_factory=dict)  # {labile-donor idx: target signed-volume hand} from the
+    # uniform initial embed — minimize() culls any conformer whose metal-bound C/N donor inverted (relax/mc stray)
+    energy_kind: str = ""  # "" none | "ff" (surrogate UFF/MMFF — NOT comparable across species) | "real" (xtb/g-xTB
+    # from score/optimize — IS comparable across enantiomers/isomers). EnsembleSet.best() ranks only "real". Kept
+    # last so the positional Ensemble(...) constructors (score/optimize/wrap) are unaffected.
 
     def mc(
         self,
@@ -451,41 +585,56 @@ class Ensemble:
         still tears at every stiffness and is dropped, so this does not resurrect a phantom. Returns the
         energies from the accepted relax (or ``None`` if UFF can't type the graph — the embed is kept).
         """
-        embed_pos = {
-            c.GetId(): [list(c.GetAtomPosition(a)) for a in range(self.mol.GetNumAtoms())]
-            for c in self.mol.GetConformers()
-        }
-        e = None
-        for step, mult in enumerate(_FC_ESCALATION):  # half-order steps: find the MINIMAL sufficient stiffness
-            if step:  # restore the embed geometry before a stiffer retry (a big jump over-stiffens the geometry)
-                for cid, pos in embed_pos.items():
-                    conf = self.mol.GetConformer(cid)
-                    for a, xyz in enumerate(pos):
-                        conf.SetAtomPosition(a, xyz)
-            fc = distance_fc * mult
-            try:
-                e = _refine.restrained_uff(self.mol, self.cons, distance_fc=fc)
-            except RuntimeError as err:  # UFF can't build a force field for this graph — keep the embed
-                logger.warning(
-                    "minimize: UFF could not relax this system (%s) — an untypable TS/hypervalent "
-                    "reacting core; keeping the embedded geometry (constraints biased, not stiffened)",
-                    err,
-                )
-                return None
-            # accept a stiffness only if it leaves a conformer that is BOTH bonded AND (for a planar
-            # polyhedron) coplanar — so escalation recovers a torn sphere but never forces a phantom through
-            # as an out-of-plane pucker. A metal keeps the looser bond tol (its plane is checked separately).
-            bt = _METAL_BOND_TOL if self._metal else 1.3
-            kept = [
-                i
-                for i in self.ids
-                if _metrics.bonding_ok(self.mol, i, bond_tol=bt, exclude=self.cons.frozen)
-                and self._coordination_ok(i, self._metal)
-            ]
-            if kept or step == len(_FC_ESCALATION) - 1:  # some survived (accept), or out of steps (caller drops)
-                if step and kept:
-                    logger.info("minimize: soft relax tore the coordination sphere; escalated distance_fc to %.0e", fc)
-                break
+        # Hold a metal-bound labile (carbanion/amine) donor's hand through stage-1: the surrogate has no M-C bond
+        # so a bare degree-3 centre inverts under UFF. Cap it with a dummy D (placed at the 4th vertex of each
+        # current conformer) and release BEFORE stage-2 — fix_donor_protons re-adds the real M-C bond, which then
+        # holds the (degree-4) donor, and a dummy would make it degree-5. Keep the ctx's mol in sync (restore +
+        # fix_donor_protons operate on it).
+        mc = self._metal
+        held = _metal._hold_donor_chirality(self.mol, mc.metal, mc.donors, self.cons) if mc else (self.mol, [])
+        self.mol, hold = held
+        if mc and hold:
+            mc.mol = self.mol
+        e, fc = None, distance_fc
+        try:
+            embed_pos = {
+                c.GetId(): [list(c.GetAtomPosition(a)) for a in range(self.mol.GetNumAtoms())]
+                for c in self.mol.GetConformers()
+            }
+            for step, mult in enumerate(_FC_ESCALATION):  # half-order steps: find the MINIMAL sufficient stiffness
+                if step:  # restore the embed geometry before a stiffer retry (a big jump over-stiffens it)
+                    for cid, pos in embed_pos.items():
+                        conf = self.mol.GetConformer(cid)
+                        for a, xyz in enumerate(pos):
+                            conf.SetAtomPosition(a, xyz)
+                fc = distance_fc * mult
+                try:
+                    e = _refine.restrained_uff(self.mol, self.cons, distance_fc=fc)
+                except RuntimeError as err:  # UFF can't build a force field for this graph — keep the embed
+                    logger.warning(
+                        "minimize: UFF could not relax this system (%s) — an untypable TS/hypervalent "
+                        "reacting core; keeping the embedded geometry (constraints biased, not stiffened)",
+                        err,
+                    )
+                    return None
+                # accept a stiffness only if it leaves a conformer that is BOTH bonded AND (for a planar
+                # polyhedron) coplanar — so escalation recovers a torn sphere but never forces a phantom through
+                # as an out-of-plane pucker. A metal keeps the looser bond tol (its plane is checked separately).
+                bt = _METAL_BOND_TOL if self._metal else 1.3
+                kept = [
+                    i
+                    for i in self.ids
+                    if _metrics.bonding_ok(self.mol, i, bond_tol=bt, exclude=self.cons.frozen)
+                    and self._coordination_ok(i, self._metal)
+                ]
+                if kept or step == len(_FC_ESCALATION) - 1:  # some survived (accept), or out of steps (caller drops)
+                    if step and kept:
+                        logger.info("minimize: relax tore the sphere; escalated distance_fc to %.0e", fc)
+                    break
+        finally:  # release the hold (even on the early UFF-failure return) BEFORE stage-2: fix_donor_protons re-adds
+            if mc and hold:  # the real M-C bond that then holds the (degree-4) donor — a dummy would make it degree-5
+                self.mol = _metal._release_donor_chirality(self.mol, hold, self.cons)
+                mc.mol = self.mol
         if self._metal:
             try:  # stage-2 donor-H relax — a best-effort nicety; an RDKit BFGS divergence must not sink minimize
                 self._metal.fix_donor_protons(self.cons, self.ids, fc)
@@ -506,10 +655,12 @@ class Ensemble:
         e = None
         if self.cons.is_constrained:
             e = self._relax_constrained(distance_fc)  # escalates stiffness if the soft relax tears every bond
+            self.mol = mc.mol if mc else self.mol  # _relax_constrained may have re-bound self.mol via the ctx
         else:
             e = _refine.ff_energies(self.mol, minimize=True)
         if e is not None:
             self.energies = {c.GetId(): float(e[k]) for k, c in enumerate(self.mol.GetConformers())}
+            self.energy_kind = "ff"  # surrogate FF — NOT comparable across species (EnsembleSet.best refuses it)
         if self._metal:
             self._metal.restore()
             self._metal = None
@@ -525,6 +676,14 @@ class Ensemble:
         ]
         if self.energies and self.ids:  # also drop failed relaxes — a non-physical energy is an un-converged
             emin = min(self.energies[i] for i in self.ids if i in self.energies)  # geometry, not a real rotamer
+            rel = sorted(self.energies[i] - emin for i in self.ids if i in self.energies)
+            over = [round(r, 1) for r in rel if r > _RELAX_ENERGY_WINDOW]
+            logger.info(  # show the FACTS — the relax-energy spread (kcal/mol above the min) and the generous window
+                "minimize: relax ΔE spread (kcal/mol above min): %s | window=%.0f%s",
+                [round(r, 1) for r in rel],
+                _RELAX_ENERGY_WINDOW,
+                f" -> dropping {len(over)} un-converged: {over}" if over else " -> all within window",
+            )
             self.ids = [i for i in self.ids if self.energies.get(i, emin) <= emin + _RELAX_ENERGY_WINDOW]
         if len(self.ids) < before:  # drop torn/clashed/puckered geometries + non-physical relaxes
             logger.info(
@@ -535,6 +694,15 @@ class Ensemble:
             )
         if template is not None:  # a metal seed the relax tore is a bad EMBED, not a bad relax — re-embed fresh
             self._reembed_until_clean(template, mc, target, distance_fc)  # seeds until N are geom.check-clean
+        for d, target_sign in self._donor_hand.items():  # cull any conformer whose labile donor inverted vs the
+            if target_sign is None:  # enumerated hand (a rare relax/re-embed/mc stray that escaped the dummy hold)
+                continue
+            keep = [i for i in self.ids if _metal.donor_chirality_sign(self.mol, i, d) == target_sign]
+            if 0 < len(keep) < len(self.ids):
+                logger.info(
+                    "minimize: culled %d conformer(s) whose donor-%d hand inverted", len(self.ids) - len(keep), d
+                )
+                self.ids = keep
         if not self.ids:  # all conformers broke a bond or puckered — the arrangement itself
             logger.warning(
                 "minimize: every embedded conformer breaks a ligand bond or puckers out of plane — this "
@@ -583,9 +751,13 @@ class Ensemble:
             seed += 1  # a distinct seed each round — the point is to regenerate the embed, not repeat it
             tmpl = Chem.Mol(template)
             tmpl.RemoveAllConformers()
+            # re-apply the labile-donor chirality hold — a fresh ETKDG seed is random-handed, so without it a
+            # carbanion/amine donor's enumerated hand would silently invert; the batch relax below re-holds it.
+            tmpl, held = _metal._hold_donor_chirality(tmpl, mc.metal, mc.donors, self.cons) if mc else (tmpl, [])
             new_ids = _bounds.embed(tmpl, self.cons, target - len(have) + _EMBED_BUFFER, seed=seed)
             if not new_ids:
                 continue
+            tmpl = _metal._release_donor_chirality(tmpl, held, self.cons)  # drop dummy + cons key; batch relax re-holds
             batch = Ensemble(tmpl, new_ids, self.cons, replace(mc, mol=tmpl)).minimize(distance_fc, _retry=False)
             for cid in batch.ids:  # merge only good ones — the fallback already holds the bonding-ok geometries
                 if not is_good(batch.mol, cid):
@@ -658,7 +830,7 @@ class Ensemble:
         if calc is None:  # 'ff'/None -> single-point force field, geometry kept
             e = _refine.ff_energies(self.mol, minimize=False)
             by = {c.GetId(): float(e[k]) for k, c in enumerate(self.mol.GetConformers())}
-            return Ensemble(
+            out = Ensemble(
                 Chem.Mol(self.mol),
                 list(self.ids),
                 self.cons,
@@ -667,6 +839,8 @@ class Ensemble:
                 True,
                 tag=dict(self.tag),
             )
+            out.energy_kind = "ff"  # a force-field single point is NOT a real energy — best() still refuses it
+            return out
         energies, kept = {}, []
         for i in self.ids:
             try:
@@ -681,7 +855,9 @@ class Ensemble:
             )  # caller
             #                                                  thinks are xTB; honest energies were the whole point
         logger.info("score: %s single point on %d conformer(s) (charge %d)", refine, len(kept), q)
-        return Ensemble(Chem.Mol(self.mol), kept, self.cons, None, energies, True, tag=dict(self.tag))
+        out = Ensemble(Chem.Mol(self.mol), kept, self.cons, None, energies, True, tag=dict(self.tag))
+        out.energy_kind = "real"  # xtb/g-xTB — comparable across species, so EnsembleSet.best() accepts it
+        return out
 
     def _calc_charge(self, charge):
         """Return the total charge for a calculator: the override, else the molecule's formal charge.
@@ -745,7 +921,9 @@ class Ensemble:
         logger.info(
             "optimize: %s --opt %s on %d conformer(s); %d core atom(s) held fixed", refine, level, len(kept), len(fix)
         )
-        return Ensemble(new_mol, kept, self.cons, None, energies, True, tag=dict(self.tag))
+        out = Ensemble(new_mol, kept, self.cons, None, energies, True, tag=dict(self.tag))
+        out.energy_kind = "real"  # geometry-optimised xtb/g-xTB energies — comparable across species
+        return out
 
     def relative(self, unit="kcal"):
         """Relative energies ``{conformer id -> E - E_min}`` -- the only physically meaningful read.

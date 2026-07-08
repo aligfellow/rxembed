@@ -19,8 +19,9 @@ ens.score("gxtb").lowest(3).optimize("gxtb")   # real energies, then optimise th
 
 `rx.embed(source, *, metal, fix, constrain, template, contacts, coordinate, charge, n, seed, knowledge,
 stereo)` returns an **`Ensemble`** (or an **`EnsembleSet`** when the input is inherently several candidates —
-metal isomers, NCI binding modes, ambiguous coordination). `rx.minimize(source, *, fix, constrain, …)` is the
-search-free companion: same verbs, relax an existing geometry *toward* the targets instead of conf-searching.
+metal isomers, NCI binding modes, ambiguous coordination, **undefined stereocentres**). `rx.minimize(source,
+*, fix, constrain, …)` is the search-free companion: same verbs, relax an existing geometry *toward* the
+targets instead of conf-searching.
 
 > **Constraint spec — three index-driven verbs** (`constraints/builders.py::resolve_core`, the clean-break
 > redesign of the old `freeze`/`distances`/`angles`/`template`/`match`/`anchor`; see **`DESIGN.md`**):
@@ -39,12 +40,22 @@ search-free companion: same verbs, relax an existing geometry *toward* the targe
 | constrained TS **from SMILES** | `rx.embed("cat.substrate", fix={(i, j): d, (i, j, k): θ})` → verify `.measure()` |
 | soft distance / angle / π-stack | `rx.embed(smi, constrain={(i, j): (lo, hi)})` |
 | metal coordination isomers | `rx.metal("…[Pd]…", "square_planar")` → cis/trans, mer/fac… |
+| the racemate (undefined centre) | `rx.embed("CC(N)C(=O)O")` → `EnsembleSet` of enantiomers (`stereo='enumerate'` keeps them separate) |
 | replace a ligand on a known core | `rx.embed(analogue, template=(parent_xyz, {target_i: ref_i}))` |
 
 **Pipeline stages** (the mutation contract is explicit): `mc`, `minimize`, `prune` build in place and chain;
-`lowest`, `representatives`, `align` return a *new* ensemble; `view`, `landscape`, `cluster` never mutate.
-Real-energy tiers via `score(refine=…)` (single point) and `optimize(refine=…, level=…)` (geometry, frozen core
-held): **`ff` → `gfnff` → `gfn2` → `gxtb`** (force field → GFN-FF NCI-aware → GFN2 → g-xTB).
+`lowest`, `representatives`, `align` return a *new* ensemble; `view`, `landscape`, `cluster` never mutate. An
+**`EnsembleSet` is chainable too** — `mc`/`minimize`/`prune`/`score`/`optimize`/`lowest`/`representatives`/`dump` map
+over its candidates (returning an `EnsembleSet`, tags carried; `dump` writes one tagged `.xyz` per candidate), so
+`rx.embed(anything).mc().prune().dump(...)` works whether the input is one molecule, a **racemate** (default
+`stereo='racemic'` → an `EnsembleSet` of enantiomers), metal isomers, or NCI modes — logged per call. Each candidate
+is searched, pruned (RMSD/MOI/energy/cluster), and scored **on its own constraints, WITHIN itself** — distinct
+species are NEVER pooled or cross-pruned. Real-energy tiers via `score(refine=…)` (single point) and
+`optimize(refine=…, level=…)` (geometry, frozen core held): **`ff` → `gfnff` → `gfn2` → `gxtb`**. An ensemble's
+`energy_kind` is **`ff`** (surrogate UFF/MMFF, from `minimize`/`score('ff')` — NOT comparable across species) or
+**`real`** (xtb/g-xTB, from `score`/`optimize` — comparable, since enantiomers/diastereomers/isomers share a
+formula). Ranking the candidates against each other is the one deliberate cross-species step — `EnsembleSet.best(n)`
+— which **refuses `ff`** energies and demands `real` ones.
 
 ## Design principles
 
@@ -110,8 +121,12 @@ has to be one the rxembed relax also reads (a distance/angle), not a pose-hold a
 
 **Metal M-donor approximations** (`constraints/metal.py::coordination`, SMILES path): M-donor distance =
 covalent-sum bond length, with the donor radius **capped at 0.85 Å for soft dative donors** (P/S/As/Se — their
-dative bond runs shorter than rcov implies; a halide keeps the covalent sum). A conjugated N/O donor's
-**M-donor-neighbour donation angle is held ~120°** so its rigid plane can't fold into the metal during search.
+dative bond runs shorter than rcov implies; a halide keeps the covalent sum). **Donor orientation** (`_orient_donor`):
+a conjugated N/O donor's rigid plane is held ~120° (no fold-in), and **any donor's protons** are held at the
+hybridisation angle (~109.5° sp3) so a methyl/ammine/amine's X–H bonds splay away and its lone pair points at the
+metal — skipped for a side-on η² (donor bonded to a co-donor). NB `N[Co]` writes a *covalent* N (→ NH₂, valence
+consumes an H); a true NH₃ ammine donor needs the dative `[NH3]->[Co]`. A metal-bound sp3 **carbanion/amine
+stereocentre** is additionally held by a charge-neutralised dummy-D through every embed/relax (`_hold_donor_chirality`).
 
 ## Where things live
 
@@ -125,7 +140,9 @@ dative bond runs shorter than rcov implies; a halide keeps the covalent sum). A 
 - `src/rxembed/refine/` — `xtb.py` (executable interface), `calculator.py` (`resolve`, `XTB`, `ASE`).
 - `src/rxembed/geometry.py` — the TS-aware geometry gate (`check`): broken conjugation, bad H positions,
   clashes, moved core; frozen/metal-aware (dative distances aren't clashes).
-- `src/rxembed/stereo.py` — chirality fingerprints + the auto-preserve gate.
+- `src/rxembed/stereo.py` — chirality fingerprints + the auto-preserve gate; **`enumerate_unassigned`** (the
+  undefined-stereocentre racemate/diastereomer load-in: point R/S + E/Z, `onlyUnassigned`, meso-deduped,
+  metal-safe, chiral-at-P). Wired in `embed/dispatch.py::_stereo_expand`/`_stereo_enumerated_embed`.
 - `examples/*.ipynb` — the 8-notebook breadth tour; `examples/structures/` — static TS `.xyz` geometries.
 
 See `plan.md` for the forward roadmap and open threads, and `DESIGN.md` for the planned `fix`/`constrain`/`template` constraint-API redesign.
