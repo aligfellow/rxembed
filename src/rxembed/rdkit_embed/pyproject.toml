@@ -1,0 +1,37 @@
+# PLACEHOLDER — inert, reference only. NOT a uv-workspace member, NOT built, NOT installed.
+#
+# The embed kernel currently ships as the in-place `rxembed.rdkit_embed` subpackage (it is part of rxembed's
+# own `src`, discovered by the root `[tool.setuptools.packages.find]`). This file records the standalone-package
+# shape the kernel is meant to graduate to once it stabilises: numpy + rdkit only, with scipy (sphere solver)
+# the one soft, guarded fallback. xyzgraph (perception) left with the source readers — they moved to the shell
+# leaf `rxembed.inputs`, so the kernel takes a Mol and no longer perceives one. Until then nothing reads it —
+# it is a design marker.
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rdkit_embed"
+version = "0.1.0"
+description = "The rxembed embedding kernel: bounds-matrix constrained conformer embedding (RDKit + numpy)."
+authors = [{name = "Alister S. Goodfellow"}]
+requires-python = ">=3.12"
+# The kernel's whole point is a light footprint OIN-SMILES can pip-install: numpy + rdkit only. scipy is the
+# one soft EXTRA the sphere solver falls back from (see optional-dependencies below); perception (xyzgraph)
+# left with the source readers, which now live shell-side in `rxembed.inputs`.
+dependencies = [
+    "numpy",
+    "rdkit",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+# Soft, guarded at its use site (never imported at module top level of the hard path):
+#   sphere  -> scipy, gated by `constraints.sphere.available()` (the coordination-sphere solver fallback)
+# perception (xyzgraph) is no longer a kernel extra — the source readers that used it moved to the shell leaf
+# `rxembed.inputs`. scikit-learn / networkx / openconf are SHELL-only (dedup / nci / mc), deliberately absent.
+[project.optional-dependencies]
+sphere = ["scipy"]

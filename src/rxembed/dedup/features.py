@@ -29,7 +29,7 @@ def _norm(m):
 
 def _first_metal(mol):
     """Index of the first transition-metal atom, or None."""
-    from rxembed.constraints.metal import TRANSITION_METALS
+    from rxembed.rdkit_embed.constraints.metal import TRANSITION_METALS
 
     return next((a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS), None)
 
@@ -175,7 +175,7 @@ def _blocks(mol, ids, nci=True):
     with detectable donors is present; ``'relpose'`` (inter-fragment relative pose) iff a multi-fragment
     non-metal complex — so distinct encounter geometries don't collapse; ``'nci'`` (binary inter-fragment
     contact fingerprint) iff ``nci`` and any inter-fragment contact is detected. Used by both
-    ``feature_matrix`` (the numbers) and ``active_blocks`` (which kinds are live).
+    ``feature_matrix`` (the numbers) and ``active_feature_kinds`` (which kinds are live).
     """
     quads = rotatable_quads(mol)
     blocks = [("dihedral", np.array([dihedrals(mol, i, quads) for i in ids]))]
@@ -207,7 +207,7 @@ _MODE_KIND = {
 }
 
 
-def active_blocks(mol, ids, nci=True):
+def active_feature_kinds(mol, ids, nci=True):
     """Names of the latent blocks live for this ensemble, e.g. ``['dihedral', 'relpose', 'nci']``.
 
     The honest answer to "what is clustering/representatives actually separating here?".
@@ -239,7 +239,7 @@ def mode_kind(mol, ids, nci=True):
     'ligand arrangement' (metal), else 'contact pattern' (NCI), else 'relative arrangement' (multi-fragment,
     no detected contact), else 'conformer family' (a single flexible molecule).
     """
-    blocks = active_blocks(mol, ids, nci)
+    blocks = active_feature_kinds(mol, ids, nci)
     for b in ("metal", "nci", "relpose"):  # most specific block wins
         if b in blocks:
             return _MODE_KIND[b]
@@ -269,7 +269,7 @@ def mode_signature(mol, ids, nci=True):
     ``Ensemble.representatives`` to recover a genuinely rare binding mode HDBSCAN flagged as noise,
     without letting torsional scatter inflate the representative set.
     """
-    blocks = active_blocks(mol, ids, nci)
+    blocks = active_feature_kinds(mol, ids, nci)
     if "nci" not in blocks and "metal" not in blocks:
         return None
     sigs = [[] for _ in ids]
@@ -282,7 +282,7 @@ def mode_signature(mol, ids, nci=True):
             contacts = _interfragment_contacts(an, mol.GetConformer(i).GetPositions(), fmap)
             sigs[k].append(("nci", frozenset((t, p) for t, _a, p in contacts)))
     if "metal" in blocks:
-        from rxembed.constraints.metal import label as metal_label
+        from rxembed.rdkit_embed.constraints.metal import label as metal_label
 
         m, donors = _metal_donors(mol, ids)
         if donors:

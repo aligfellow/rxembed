@@ -1,11 +1,11 @@
-"""Undefined-stereocentre enumeration — the deliberate racemate/diastereomer load-in on the embed front.
+"""Undefined-stereocentre enumeration — the racemate/diastereomer load-in on the embed front. RDKit, no xtb.
 
-A coordinate-free input (SMILES) with *unlabeled* stereocentres embeds every stereoisomer instead of one
-arbitrary hand: ``stereo='auto'`` folds them into one `EnsembleSet`, ``stereo='enumerate'`` keeps them
-separate, ``stereo='free'`` opts out. Point R/S + double-bond E/Z, defined centres held fixed, meso dropped,
-chiral-at-P included, and it composes with the metal coordination-isomer axis. Pure RDKit — no xtb.
+An unlabelled-stereocentre SMILES embeds every stereoisomer: ``stereo='auto'`` folds them into one EnsembleSet,
+``'enumerate'`` keeps them separate, ``'free'`` opts out. R/S + E/Z, defined centres held, meso dropped,
+chiral-at-P included, composes with the metal coordination-isomer axis.
 """
 
+import pytest
 from rdkit import Chem
 
 import rxembed as rx
@@ -21,13 +21,17 @@ def test_undefined_centre_auto_embeds_racemate_as_one_set():
     assert _configs(r) == ["1R", "1S"]  # both enantiomers, index-keyed CIP tags
 
 
-def test_defined_centre_is_untouched():
-    r = rx.embed("C[C@H](N)C(=O)O", n=2)  # a labelled centre -> the single, kept configuration
-    assert isinstance(r, rx.Ensemble)
-
-
-def test_no_stereocentre_is_a_single_ensemble():
-    assert isinstance(rx.embed("CCO", n=2), rx.Ensemble)
+@pytest.mark.parametrize(
+    ("smi", "kw"),
+    [
+        pytest.param("C[C@H](N)C(=O)O", {}, id="defined-centre-kept"),
+        pytest.param("CCO", {}, id="no-stereocentre"),
+        pytest.param("CC(N)C(=O)O", {"stereo": "free"}, id="stereo-free-opts-out"),
+    ],
+)
+def test_single_ensemble_when_nothing_to_enumerate(smi, kw):
+    """A defined centre, no centre, or stereo='free' each yields one Ensemble, not an EnsembleSet."""
+    assert isinstance(rx.embed(smi, n=2, **kw), rx.Ensemble)
 
 
 def test_enumerate_keeps_stereoisomers_separate_and_uniform():
@@ -57,8 +61,6 @@ def test_racemate_ensembleset_dumps_one_xyz_per_stereoisomer(tmp_path):
 
 def test_best_refuses_ff_energies_across_species():
     # ranking distinct species needs REAL energies; FF (minimize / score('ff')) is not cross-comparable -> refused
-    import pytest
-
     s = rx.embed("CC(N)C(=O)O", n=2).minimize()
     assert {e.energy_kind for e in s} == {"ff"}  # minimize tags FF energies
     with pytest.raises(ValueError, match="REAL energy"):
@@ -68,16 +70,42 @@ def test_best_refuses_ff_energies_across_species():
         s.score("ff").best()
 
 
-def test_free_opts_out_of_enumeration():
-    assert isinstance(rx.embed("CC(N)C(=O)O", n=2, stereo="free"), rx.Ensemble)
-
-
 def test_double_bond_ez_is_enumerated():
     r = rx.embed("CC=CC(N)O", n=2)  # one undefined C + one undefined C=C -> 4
     cfgs = _configs(r)
     assert len(cfgs) == 4
     assert any(":E" in c for c in cfgs)
     assert any(":Z" in c for c in cfgs)
+
+
+def test_coordination_locked_imine_is_not_ez_enumerated():
+    """A C=N in a ring closed through the metal is coordination-locked and must not be E/Z enumerated."""
+    from rxembed import stereo
+    from rxembed.rdkit_embed.constraints.metal import metal_indices
+
+    # FindPotentialStereo runs on the metal-disconnected graph, which opens the ring so the imine looks acyclic.
+    # an alpha-diimine-style chelate: the imine N=C sits in the 5-membered metal ring
+    smi = "O=C1[O-]->[Ni+2]2(<-[N](=C3C(=[N]->2c2cccc4ccccc24)c2cccc4cccc3c24)c2cccc3ccccc23)<-[N-](c2ccccc2)C1c1ccccc1"
+    mol = Chem.MolFromSmiles(smi)
+    metals = set(metal_indices(mol))
+    locked = stereo._coordination_locked_double_bonds(mol, metals)
+    assert locked, "the imine C=N in the metal-closed chelate ring must be detected as coordination-locked"
+    variants, _n, _total, _unres = stereo.enumerate_unassigned(mol, exclude=metals)
+    # only the one real point stereocentre (the amidate alpha-C) is enumerated -> 2 hands, not 2x2x... phantoms
+    assert len(variants) == 2, f"the locked imine(s) must not be enumerated; got {len(variants)} variants"
+
+
+def test_a_free_organic_double_bond_is_still_enumerated_with_a_metal_present():
+    """The lock is metal-ring-specific: a free pendant C=C is not coordination-locked (no over-suppression)."""
+    from rxembed import stereo
+    from rxembed.rdkit_embed.constraints.metal import metal_indices
+
+    smi = "CC=CC[NH2]->[Ni+2](<-[O-]C(=O)C)<-[NH2]CC=CC"  # pendant but-2-enyl C=C, not in any metal ring
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return
+    metals = set(metal_indices(mol))
+    assert not (stereo._coordination_locked_double_bonds(mol, metals)), "a free pendant C=C is not coordination-locked"
 
 
 def test_meso_duplicate_is_dropped():

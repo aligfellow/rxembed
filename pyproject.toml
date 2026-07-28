@@ -12,9 +12,9 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy",
     "rdkit",
-    "prism_pruner", 
+    "prism_pruner",
     "openconf",
-    "xyzgraph",
+    "xyzgraph>=1.6.14",
     "scikit-learn",
     "networkx",
 ]
@@ -26,11 +26,18 @@ classifiers = [
 
 [project.optional-dependencies]
 ase = ["ase"]
-viz = ["matplotlib", "seaborn", "xyzrender"]
-all = ["ase", "matplotlib", "seaborn", "xyzrender"]
+sphere = ["scipy"]  # the coordination-sphere solver fallback (rdkit_embed/constraints/sphere.py) — makes its
+#   "install the 'sphere' extra" message true; scipy is otherwise only transitive via scikit-learn.
+viz = ["matplotlib", "seaborn", "xyzrender>=0.3.8"]
+all = ["ase", "matplotlib", "seaborn", "xyzrender>=0.3.8"]
 
 [project.urls]
 homepage = "https://github.com/aligfellow/rxembed"
+
+# The embed kernel lives in-place as the `rxembed.rdkit_embed` subpackage (src/rxembed/rdkit_embed) — the
+# premature uv-workspace split is unwound. Its placeholder pyproject (src/rxembed/rdkit_embed/pyproject.toml)
+# is inert reference only, marking the intent to graduate the kernel to a standalone `rdkit_embed` package once
+# it stabilises. For now it ships as part of rxembed's own `src`, auto-discovered below.
 
 # openconf's transition-metal support (the `transition_metal` preset + auto metal-move budget) is on the
 # upstream main branch but not yet on a PyPI release, so pull it from git. `uv sync` resolves this for
@@ -63,7 +70,7 @@ target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-exclude = ["examples/*.ipynb", "playground/*ipynb"]
+exclude = ["examples/*.ipynb", "playground/**"]  # playground is scratch: diagnostics, not library code
 select = [
     "B",      # bugbear
     "D",      # pydocstyle
@@ -73,6 +80,7 @@ select = [
     "N",      # pep8-naming conventions
     "W",      # pycodestyle warnings
     "C4",     # comprehensions
+    "C901",   # mccabe cyclomatic complexity ceiling (see [tool.ruff.lint.mccabe])
     "PL",     # pylint
     "PT",     # flake8-pytest-style
     "PIE",    # misc lints
@@ -96,6 +104,13 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403"]
 "tests/**" = ["D", "PLR2004"]
+# The Mechanism base class documents each phase hook's contract once; restating it on every override would be
+# the duplication the project standard forbids. Each subclass carries a CLASS docstring saying what its field is.
+# (Path-globbed: mechanisms.py lives in the in-place rxembed.rdkit_embed kernel subpackage.)
+"src/rxembed/rdkit_embed/**/mechanisms.py" = ["D102"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15  # regression guard (T7): keep per-function cyclomatic complexity from creeping back
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"

@@ -1,15 +1,11 @@
 """The user-facing pipeline: one `embed()` entry returning a chainable `Ensemble`.
 
     import rxembed as rx
-    ens = rx.embed("CCO").mc().prune()                              # free, vdW-aware, sanity internal
-    ens = rx.embed("OC(=O)CCc1ccccc1", constrain={(1, 9): (2.6, 3.0)})  # soft distance window (index-driven)
-    ens = rx.embed("ts.xyz", fix=[11, 14, 15]).mc().prune()        # hold a TS core at its geometry (0.000 A graft)
-    for iso in rx.metal("CCCN[Pd](Cl)(Cl)NCCC", "square_planar"):
-        ens = rx.embed(iso).mc().prune()                           # metal surrogate handled internally
+    ens = rx.embed("CCO").mc().prune()
+    ens = rx.embed("ts.xyz", fix=[11, 14, 15]).mc().prune()   # hold a TS core (0.000 A graft)
 
-Sanity (bond-perception vs the graph), multi-fragment vdW separation, the metal carbon-surrogate
-swap/restore, and constraint validation all happen inside — the user does not manage them. Every
-stage logs (`rxembed.set_verbose()`).
+Sanity, vdW separation, the metal surrogate swap/restore and constraint validation all happen
+inside. Every stage logs (`rxembed.set_verbose()`).
 """
 
 from __future__ import annotations
@@ -22,46 +18,44 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdMolAlign, rdMolTransforms
 
+from rxembed.rdkit_embed.constraints import distance as _distance
+from rxembed.rdkit_embed.constraints import metal as _metal
+from rxembed.rdkit_embed.embed import bounds as _bounds
+from rxembed.rdkit_embed.log import logger
+
 from . import dedup as _dedup
 from . import geometry as _geometry
 from . import metrics as _metrics
 from . import refine as _refine
 from . import stereo as _stereo
 from .constraints import Constraints, match, resolve_atom
-from .constraints import metal as _metal
 from .constraints import nci as _nci
-from .embed import bounds as _bounds
 from .embed import mc as _mc
-from .log import logger
 
 if TYPE_CHECKING:
     from .embed.dispatch import _MetalCtx
 
-# The embed-dispatch machinery (source routing, metal surrogate, Kabsch graft, isomer/template/auto-NCI)
-# lives in `rxembed.embed.dispatch`; it constructs the `Ensemble` / `EnsembleSet` defined here, so this
-# module imports it lazily (inside `embed()` and `Ensemble.mc`) to keep the import cycle one-directional.
+# dispatch constructs the Ensemble/EnsembleSet defined here, so it is imported lazily (in `embed()` and
+# `Ensemble.mc`) to keep the import cycle one-directional.
 _MIN_OVERLAY_ATOMS = 3  # need >=3 atoms to define an alignment frame
-_HARTREE_KCAL = 627.5094740631  # Eh -> kcal/mol, so a calculator's energies match the FF's unit
-# restrained-UFF distance-stiffness multipliers, tried in order until a conformer survives — half-order steps
-# (not 10x jumps) so escalation lands on the MINIMAL stiffness that holds the sphere, without over-stiffening
-# the geometry. Base is minimize()'s distance_fc (default 1e4): 1e4, 3e4, 1e5, 3e5, 1e6.
+_HARTREE_KCAL = 627.5094740631  # Eh -> kcal/mol
+_DISTANCE_FC = 1e4  # restrained-UFF distance force constant every relax entry point starts from
+# half-order steps (not 10x jumps) so escalation lands on the MINIMAL stiffness that holds the sphere: 1e4..1e6
 _FC_ESCALATION = (1.0, 3.0, 10.0, 30.0, 100.0)
-# a metal complex embeds through a bond-stripped carbon surrogate whose vdW distorts bonds a little; a bond
-# stretched to ~1.5x in a coplanar coordination is a surrogate/tight-bite artifact that xtb recovers, so the
-# metal path keeps it (the coplanarity gate is the real validity check for the plane). Non-metal stays 1.3.
+# a ~1.5x-stretched bond in a coplanar coordination is a surrogate/tight-bite artifact xtb recovers, so the
+# metal path keeps it (the coplanarity gate is the real plane check). Non-metal stays 1.3.
 _METAL_BOND_TOL = 1.5
-# a relaxed conformer this far (kcal/mol) above the ensemble minimum never converged — an un-recovered
-# clash or an unsatisfied stiff restraint leaves a non-physical energy (1e3-1e11 kcal/mol), orders of
-# magnitude past any real rotamer (a flexible ensemble spans tens). Drop it: it passed the loose bond/
-# coplanarity gate but is geometrically broken (the tail the single-seed embeds never surfaced).
+# Å slack over a rigid body's pairwise windows before it counts as torn; on top of hold_shape's own 0.1 pad,
+# so a body must be a clear 0.2 Å out of shape to be rejected.
+_SHAPE_TEAR_TOL = 0.10
+# kcal/mol above the ensemble min past which a relax never converged (real is 1e3-1e11, orders past any real
+# rotamer): it passed the loose bond/coplanarity gate but is geometrically broken. Drop it.
 _RELAX_ENERGY_WINDOW = 250.0
-# embed(n=N) should hand back N *good* geometries, not N attempts. A bad ETKDG seed the relax tears is a
-# failure to RE-EMBED (a fresh seed), never to re-relax (the same seed tears the same way) — and it only shows
-# after the FF relax (the raw embed is clean; the tear is introduced by minimize). So minimize, for a metal,
-# re-embeds fresh seeds until N conformers are geom.check-clean, up to _MAX_MIN_ROUNDS; clean geometries are
-# preferred, the bonding-ok fallback kept only if clean is unreachable (an inherently-strained arrangement).
+# a torn ETKDG seed is a failure to RE-EMBED (a fresh seed), not to re-relax (same seed tears the same way),
+# and shows only after the FF relax. So minimize re-embeds a metal up to _MAX_MIN_ROUNDS until N are
+# geom.check-clean; the bonding-ok fallback is kept only if clean is unreachable.
 _MAX_MIN_ROUNDS = 5
-_EMBED_SEED = 0xF00D  # the initial-embed seed; retry rounds step off it so each is a distinct seed
+_EMBED_SEED = 0xF00D  # initial-embed seed; retry rounds step off it for a distinct seed each
 _EMBED_BUFFER = 2  # over-embed a couple extra per round to cover that round's own tear rate
 
 
@@ -74,14 +68,12 @@ def _last_line(err):
 class EnsembleSet(list):
     """Several candidate `Ensemble`s to choose from (metal isomers, or ambiguous ``coordinate=`` donors).
 
-    Each is ``.tag``ged by what makes it distinct. The same *enumerate-candidates -> select* pattern as NCI
-    binding modes:
+    Each is ``.tag``ged by what makes it distinct.
 
         cands = rx.embed('CCCN[Pd](Cl)Cl', metal='square_planar'); cands.summary()
-        ens   = cands.select(label='trans').mc().prune()        # conf-search just the one you want
+        ens   = cands.select(label='trans').mc().prune()
 
-    `select(**tag)` returns the single match (or a smaller `EnsembleSet` if several match); iterate or
-    index to keep them all.
+    `select(**tag)` returns the single match; iterate or index to keep them all.
     """
 
     def __repr__(self):
@@ -103,15 +95,22 @@ class EnsembleSet(list):
             )
         return hits[0]
 
-    def filter(self, **tag):
-        """Return the subset of candidates matching `tag`, as an `EnsembleSet` (keep several)."""
+    def filter(self, by=None, **tag):
+        """Subset the candidates by `tag`, or — with `by=` — drop reacted conformers within each candidate.
+
+        Told apart by how it is called:
+
+            set.filter(geometry='square_planar')   # keep the candidates matching this tag -> EnsembleSet
+            set.filter('connectivity')             # drop conformers whose graph changed, in every candidate
+        """
+        if by is not None:
+            return self._map("filter", by, **tag)
         return EnsembleSet(e for e in self if all(e.tag.get(k) == v for k, v in tag.items()))
 
     def summary(self):
         """Print each candidate (index, identity, #seeds) so you can pick one. Returns self (chainable).
 
-        A metal candidate shows its geometric identity — geometry, per-vertex arrangement, metal chirality
-        (the name-agnostic keys you ``select`` on); other candidates (NCI modes) show their raw tag.
+        A metal candidate shows geometry / per-vertex arrangement / chirality; other candidates show their raw tag.
         """
         for k, e in enumerate(self):
             t = e.tag or {}
@@ -129,12 +128,8 @@ class EnsembleSet(list):
     def _map(self, method, *args, **kw):
         """Apply an `Ensemble` verb to every candidate, returning a new `EnsembleSet` (tags carried over).
 
-        The chain works the SAME on one `Ensemble` or a whole set — a racemate, metal isomers, NCI modes: each
-        stereoisomer / isomer / mode is conf-searched, pruned, scored, etc. **on its own, with its own
-        constraints** (search seeds, geometry dedup, energy windows, clustering are all WITHIN one candidate).
-        Distinct species are NEVER pooled or energy-pruned against each other — to RANK them you must use
-        `score`/`optimize` (a real calculator: enantiomers/diastereomers/coordination isomers share a formula,
-        so their g-xTB totals ARE comparable; FF surrogate energies are not) and then compare deliberately.
+        Each candidate is searched/pruned/scored **on its own, with its own constraints** — distinct species
+        are NEVER pooled or cross-pruned. To rank them, use `score`/`optimize` (a real calculator) then `best`.
         """
         tags = ", ".join(self._slug(e.tag or {}, k) for k, e in enumerate(self)) or "?"
         logger.info(
@@ -183,10 +178,9 @@ class EnsembleSet(list):
     def best(self, n=1):
         """Rank the candidates by their LOWEST energy and keep the best `n` — the deliberate CROSS-species compare.
 
-        This is the ONE place species are ranked against each other, so it demands **real** energies: it raises
-        unless every candidate has been `score`d / `optimize`d (enantiomers / diastereomers / coordination
-        isomers share a molecular formula, so their g-xTB totals ARE comparable; FF surrogate energies are NOT,
-        and are refused). Returns the single winning `Ensemble` (``n==1``) or an `EnsembleSet` of the best `n`.
+        The ONE place species are ranked against each other, so it demands **real** energies (raises unless
+        every candidate was `score`d / `optimize`d; FF surrogate energies are refused). Returns the single
+        winning `Ensemble` (``n==1``) or an `EnsembleSet` of the best `n`.
         """
         not_real = [self._slug(e.tag or {}, k) for k, e in enumerate(self) if e.energy_kind != "real"]
         if not_real:
@@ -216,8 +210,8 @@ class EnsembleSet(list):
     def dump(self, path, align=True):
         """Write EACH candidate to its own multi-frame .xyz, its tag folded into the filename; return the paths.
 
-        ``rx.embed('CC(N)C(=O)O').minimize().dump('amac.xyz')`` -> ``amac_1S.xyz`` + ``amac_1R.xyz`` (the two
-        enantiomers kept apart — distinct species, never pooled). Same `align` semantics as `Ensemble.dump`.
+        ``rx.embed('CC(N)C(=O)O').dump('amac.xyz')`` -> ``amac_1S.xyz`` + ``amac_1R.xyz``. Same `align`
+        semantics as `Ensemble.dump`.
         """
         from pathlib import Path
 
@@ -248,52 +242,39 @@ def embed(
     stereo="racemic",
     **kw,
 ):
-    """Embed conformers (optionally constrained), returning an `Ensemble` or an `EnsembleSet` of candidates.
+    """Embed conformers (optionally constrained), returning an `Ensemble`, an `EnsembleSet`, or a `list`.
 
-    An `EnsembleSet` (of candidates to `.select` from) when the input is inherently several poses -- metal
-    coordination isomers, discovered NCI modes, or an ambiguous ``coordinate=``.
+    Return shape follows the input: an `Ensemble` for one molecule; an `EnsembleSet` (to `.select` from) when
+    the input is inherently several poses (metal isomers, NCI modes, ambiguous ``coordinate=``, a racemate);
+    or a bare ``list[EnsembleSet]`` for ``stereo='separate'`` (one per configuration; iterate/index, it does
+    not chain).
 
-    **Three constraint verbs** (all index-driven — 0-based atom indices in xyz/graph order; resolve any
-    SMARTS yourself first):
+    A constrained embed comes back **relaxed into its windows** (`_relax_into_windows`); only the geometry
+    moves, so the rest of the chain is unchanged.
 
-    - **``fix``** *(rigid — the atoms WILL have this geometry)*:
-      ``fix=[i, j, k]`` holds them at the source's own coords (Kabsch graft; needs a geometry);
+    **Three constraint verbs**, all index-driven (0-based, xyz/graph order; resolve any SMARTS yourself):
+
+    - **``fix``** *(rigid)*: ``fix=[i, j, k]`` at the source's own coords (Kabsch graft; needs a geometry);
       ``fix={i: (x, y, z)}`` at explicit coords; ``fix={(i, j): d, (i, j, k): θ}`` at exact numbers
-      (tight-window UFF pull — verify with ``.measure()``). A ``fix`` dict may mix coords and numbers.
-    - **``constrain``** *(soft — bias the seed, a real energy may win)*: ``constrain={(i, j): (lo, hi)}``
-      distance/angle windows, plus π-stacks ``constrain={(ring_a, ring_b): separation}``.
-    - **``template``** *(reference sugar for a coords-fix)*: ``template=(reference, {target_i: ref_i})`` —
-      ``reference`` is an .xyz path / Mol / Ensemble / (N,3) array, mapped explicitly (order-proof).
+      (tight-window UFF pull — verify with ``.measure()``). May mix coords and numbers.
+    - **``constrain``** *(soft)*: ``{(i, j): (lo, hi)}`` distance/angle windows, plus π-stacks
+      ``{(ring_a, ring_b): separation}``.
+    - **``template``** *(coords-fix sugar)*: ``(reference, {target_i: ref_i})`` — ``reference`` is an .xyz
+      path / Mol / Ensemble / (N,3) array, mapped explicitly.
 
-    The one surface for every case:
+    **``stereo=``** governs undefined chirality of a coordinate-free input (`stereo.enumerate_unassigned`):
+    point R/S + double-bond E/Z (defined centres held, meso dropped, chiral-at-P included, metal never
+    enumerated).
 
-    - free / flexible:     ``rx.embed('CCO')``
-    - a distance / angle:  ``rx.embed(smi, constrain={(i, j): (2.6, 3.0)})``
-    - NCI / vdW complex:   ``rx.embed('A.B', contacts='auto')``  (or a specific ``rx.nci_modes(mol)['HB:…']``)
-    - frozen TS core:      ``rx.embed('ts.xyz', fix=[14, 15])`` — held to 0.000 Å
-    - a TS from SMILES:    ``rx.embed(smi, fix={(f, c): 2.02, (c, cl): 2.28, (f, c, cl): 178})``
-    - a known TS onto a molecule: ``rx.embed(smi, template=('ts.xyz', {0: 5, 4: 1, 5: 6}))``
-    - **metal**:           ``rx.embed('…[Pd]…', metal='square_planar')`` → `EnsembleSet` of isomers
-    - metal + substrate:   ``rx.embed('…[Pd]….O1CCCC1', metal='square_planar', coordinate='[OX2]')``
+    - ``'racemic'`` *(default; alias ``'auto'``)*: embed every stereoisomer with equal effort, folded into one
+      `EnsembleSet` (each tagged ``stereo=<config>``); never energy-pruned against each other. A fully-defined
+      input is untouched (one `Ensemble`).
+    - ``'separate'`` *(alias ``'enumerate'``)*: keep them apart — a ``list[EnsembleSet]``, one per configuration.
+    - ``'free'``: opt out — one embed, stereocentres left to the ETKDG seed.
 
-    **``stereo=``** governs undefined chirality (`stereo.enumerate_unassigned`). For a coordinate-free input
-    (SMILES / conformer-less Mol) with *unlabeled* stereocentres, it deliberately embeds the racemate rather
-    than one arbitrary hand — enumerating point R/S **+** double-bond E/Z (defined centres held fixed, meso
-    dropped, chiral-at-P included, the metal centre never enumerated):
-
-    - ``'racemic'`` *(default; alias ``'auto'``)*: embed every stereoisomer with EQUAL effort, folded into one
-      `EnsembleSet` (each tagged ``stereo=<config>``); a fully-defined / stereocentre-free input is untouched
-      (one `Ensemble`). The stereoisomers are **never energy-pruned against each other** — they are distinct
-      species with distinct constraint sets, so their energies are not directly comparable (a higher-energy
-      one is logged, not dropped).
-    - ``'separate'`` *(alias ``'enumerate'``)*: keep the stereoisomers apart — a ``list[EnsembleSet]``, one per
-      configuration, to drive / score each on its own.
-    - ``'free'``: opt out of enumeration — a single embed with the stereocentres left to the ETKDG seed (a mix).
-
-    For a *geometry* input (an .xyz / metal `Isomer`) stereo is already 3D-defined, so ``stereo=`` instead
-    tunes the preservation filter for chirality the embed can't keep (planar/axial/helical) — see
-    `_attach_stereo`. Other machinery: ``contacts=`` / ``contacts='auto'`` → `nci_modes`; ``metal=`` /
-    ``coordinate=`` → `rx.metal` (they reuse ``fix``/``constrain`` for their held cores).
+    For a *geometry* input stereo is 3D-defined, so ``stereo=`` instead tunes the preservation filter for
+    chirality the embed can't keep (planar/axial/helical) — see `_attach_stereo`. ``contacts=`` → `nci_modes`;
+    ``metal=`` / ``coordinate=`` → `rx.metal`.
     """
     n_alias = kw.pop("n_confs", None)
     n_alias = kw.pop("num_confs", n_alias)
@@ -323,19 +304,31 @@ def embed(
     }
     expanded = _stereo_expand(source, charge, stereo)  # undefined-stereocentre racemate load-in (or None)
     if expanded is not None:
-        return _stereo_enumerated_embed(expanded, stereo, dispatch_kw)
-    result = _embed_dispatch(source, **dispatch_kw)
-    _attach_stereo(result, source, charge, stereo)
-    return result
+        result = _stereo_enumerated_embed(expanded, stereo, dispatch_kw)
+    else:
+        result = _embed_dispatch(source, **dispatch_kw)
+        _attach_stereo(result, source, charge, stereo)
+    return _relax_embedded(result)
 
 
-def minimize(source, *, fix=None, constrain=None, charge=0, distance_fc=1e4):
+def _relax_embedded(result):
+    """Relax every embedded candidate into its windows — the one seam `embed` returns through.
+
+    `EnsembleSet` subclasses `list`, so the plain-list branch must come LAST (an earlier ``isinstance(…, list)``
+    would downgrade an EnsembleSet to a bare list).
+    """
+    if isinstance(result, EnsembleSet):
+        return result._map("_relax_into_windows")
+    if isinstance(result, Ensemble):
+        return result._relax_into_windows()
+    return [r._map("_relax_into_windows") for r in result]  # stereo='separate' -> a plain list of EnsembleSet
+
+
+def minimize(source, *, fix=None, constrain=None, charge=0, distance_fc=_DISTANCE_FC):
     """Relax an existing structure **toward** ``fix``/``constrain`` targets — the search-free companion to `embed`.
 
-    Same vocabulary and resolver as `embed`, but it does not conf-search: it wraps the input geometry, grafts
-    any coordinate-``fix`` core, and runs the restrained UFF pull toward the targets (a numbers-``fix`` is
-    pulled exact, a ``constrain`` window is respected). Use it to nudge a geometry into a TS-like core or a
-    contact without re-sampling the periphery. Needs an input geometry (an .xyz / a Mol with a conformer).
+    Same vocabulary as `embed` but no conf-search: wrap the input geometry, graft any coordinate-``fix`` core,
+    run the restrained UFF pull toward the targets. Needs an input geometry (an .xyz / a Mol with a conformer).
 
         rx.minimize('mol.xyz', fix={(i, j): 2.0, (i, j, k): 178})   # pull toward a linear 3-centre core
     """
@@ -347,25 +340,38 @@ def minimize(source, *, fix=None, constrain=None, charge=0, distance_fc=1e4):
         raise ValueError(
             "minimize() relaxes an existing geometry — give an .xyz or a Mol with a conformer, not a SMILES"
         )
+    from .embed.dispatch import _MetalCtx
+
+    metal_ctx = None
+    if _metal.metal_index(mol) is not None:  # a metal gets the same treatment as in embed(): surrogated,
+        spheres = {  # its sphere held from the input geometry, and the same zero-vdW force field. Handing UFF a
+            mi: [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()]  # real metal is the worst option of
+            for mi in _metal.metal_indices(mol)  # all: it types Ti and not Ir, so the force field would depend
+        }  # on which metal you have.
+        donor_bonds = [(d, mi) for mi, dons in spheres.items() for d in dons]  # re-added DATIVE on the output mol
+        mol, metals, _ = _metal.surrogate_all_metals(mol)
+        (m, real_z, real_q), extra = metals[0], metals[1:]  # extra: [(idx, real_z, real_q), ...]
+        metal_ctx = _MetalCtx(mol, m, real_z, real_q, donors=spheres.get(m), extra=extra, donor_bonds=donor_bonds)
     cons, ref = resolve_core(mol, fix=fix, constrain=constrain, has_geometry=has_geom)
+    if metal_ctx is not None:
+        rz = {mi: z for mi, z, _q in metals}
+        for mi, dons in spheres.items():
+            _metal.hold_shape(mol, [mi, *dons], cons)  # hold the sphere at the input geometry
+        _distance.ff_terms(mol, cons, {mi: (rz[mi], dons) for mi, dons in spheres.items()})
     ids = [c.GetId() for c in mol.GetConformers()]
     if ref:
         graft = sorted(ref)
         _graft_frozen(mol, ids, graft, np.array([ref[i] for i in graft]))
-    return Ensemble(mol, ids, cons).minimize(distance_fc=distance_fc)
+    return Ensemble(mol, ids, cons, metal_ctx).minimize(distance_fc=distance_fc)
 
 
 def wrap(mol, ids=None, *, energies=None, minimized=False):
     """Wrap an existing RDKit Mol (with conformers) as an Ensemble to give it rxembed's methods.
 
-    Any conformers -- from racerts, RDKit's own EmbedMultipleConfs, an xtb optimisation, or a loaded
-    multi-frame file -- then get `align()`, `representatives()`, `cluster()`, `prune()`, `measure()`, `dump()`.
-
-    By default the wrapped geometries are treated as un-relaxed: `prune()`/`representatives()`/`lowest()`
-    will run one FF `minimize()` first (which **moves atoms** onto rxembed's force field). If your
-    conformers are **already optimised** and must not be disturbed (racerts/xtb output), pass
-    ``minimized=True`` — the relax is skipped and energies are taken from ``energies=`` (a list aligned
-    to `ids`, or a dict) or computed as **single points** (no geometry change) if omitted.
+    By default the wrapped geometries are treated as un-relaxed: `prune()`/`representatives()`/`lowest()` run
+    one FF `minimize()` first (which **moves atoms**). If your conformers are **already optimised** and must
+    not be disturbed (racerts/xtb output), pass ``minimized=True`` — the relax is skipped and energies come
+    from ``energies=`` (a list aligned to `ids`, or a dict) or as **single points** if omitted.
     """
     ids = ids if ids is not None else [c.GetId() for c in mol.GetConformers()]
     ens = Ensemble(mol, list(ids))
@@ -392,31 +398,60 @@ class Ensemble:
     `ens.mol` is that shared molecule; `ens.ids` are the conformer ids in play; `ens.energies` maps
     id -> energy.
 
-    **Mutation contract** (so nothing surprises you):
-    - The pipeline steps that *build* the ensemble — `mc`, `minimize`, `prune` — change it in place
-      and return it, so they chain: `embed(...).mc().prune()`.
-    - Everything that *derives* a smaller/aligned set — `lowest`, `representatives`, `align` — returns
-      a **new** Ensemble and leaves this one untouched.
-    - **Looking never mutates.** `view`, `compare`, `landscape`, `cluster`, `binding_modes` change
-      nothing (they relax once via `minimize` if energies are needed, which is idempotent).
+    **The `_mol` / `.mol` split (metal complexes).** The stored `_mol` is the bond-less carbon/Li **surrogate**
+    every DG/FF stage relies on (UFF cannot type a bonded transition metal). `.mol` is a **property** that
+    finalizes the user-facing connected graph on access (real element + oxidation state + M-L DATIVE bonds,
+    via `restore_metal` + `connect_metal`). Internal consumers read `_mol`; organic inputs pass through.
+
+    **Mutation contract:**
+    - Build/narrow-in-place-and-return (chainable): `mc`, `minimize`, `prune`, `filter`.
+    - Derive a NEW Ensemble (this one untouched): `lowest`, `representatives`, `align`, `score`, `optimize`,
+      `select_stereo`.
+    - Looking never mutates: `view`, `compare`, `landscape`, `cluster`, `binding_modes` (they relax once via
+      `minimize` if energies are needed, which is idempotent).
     """
 
-    mol: Chem.Mol
+    _mol: Chem.Mol  # the internal working surrogate; `.mol` finalizes the connected user-facing graph from it
     ids: list
     cons: Constraints = field(default_factory=Constraints)
     _metal: _MetalCtx | None = None
     energies: dict = field(default_factory=dict)
     _minimized: bool = False
-    discarded: list = field(default_factory=list)  # conformer ids prune merged away (still in `mol`)
+    _seeds_relaxed: bool = False  # embed already relaxed these seeds into their windows, so minimize takes a
+    # single point; cleared by mc() (its openconf geometries need a fresh relax)
+    discarded: list = field(default_factory=list)  # conformer ids a stage dropped (still in `mol`)
     tag: dict = field(default_factory=dict)  # what distinguishes this candidate in an EnsembleSet
-    # (e.g. {'geometry','label'} for a metal isomer)
-    _stereo: tuple | None = None  # (spec, reference signature) for the chirality filter
-    # applied in minimize() — set by embed(stereo=…)
+    _stereo: tuple | None = None  # (spec, reference signature) for the minimize() chirality filter (embed sets it)
     _donor_hand: dict = field(default_factory=dict)  # {labile-donor idx: target signed-volume hand} from the
-    # uniform initial embed — minimize() culls any conformer whose metal-bound C/N donor inverted (relax/mc stray)
-    energy_kind: str = ""  # "" none | "ff" (surrogate UFF/MMFF — NOT comparable across species) | "real" (xtb/g-xTB
-    # from score/optimize — IS comparable across enantiomers/isomers). EnsembleSet.best() ranks only "real". Kept
-    # last so the positional Ensemble(...) constructors (score/optimize/wrap) are unaffected.
+    # uniform initial embed — minimize() culls any conformer whose metal-bound C/N donor inverted
+    energy_kind: str = ""  # "" none | "ff" (surrogate — not cross-species) | "real" (xtb/g-xTB — is); best()
+    # ranks only "real". Last so the positional Ensemble(...) constructors are unaffected.
+    reacted: dict = field(default_factory=dict)  # {conf id: (formed, broken)} — graph changed under a stage that
+    # moved atoms (an xtb opt can return a clean low-energy geometry of a different species). Flagged, not dropped.
+    sphere: dict = field(default_factory=dict)  # {metal idx: [donor idx]} — the intended sphere, durable past
+    # `_metal`'s teardown; the only way `coordination_changed` tells a dissociated ligand from a healthy one
+    metal_bonds: list = field(default_factory=list)  # stripped M-donor bonds as (donor, metal) pairs; minimize()
+    # re-adds them DATIVE on the output. Durable past `_metal`, so a re-`minimize` after `mc` re-connects too.
+
+    @property
+    def mol(self):
+        """The user-facing molecule — ALWAYS a proper connected graph, finalized on access from `_mol`.
+
+        Returns the connected graph the input had (real element + oxidation state + M-donor **DATIVE** bonds)
+        at any stage, via `restore_metal` + `connect_metal` on a COPY (the working `_mol` is never mutated).
+        Organic / post-minimize inputs pass through unchanged.
+
+        **Uncached** — every access re-runs the finalize for a pre-minimize metal complex, so a hot loop should
+        bind it once (`m = ens.mol`).
+        """
+        mol, metal_ctx = self._mol, self._metal
+        bonds = self.metal_bonds or (list(metal_ctx.donor_bonds) if metal_ctx is not None else [])
+        if metal_ctx is not None:  # pre-minimize: `_mol` still carries the carbon surrogate + no M-L bonds. Restore
+            mol = Chem.Mol(mol)  # real element(s)/charge on a COPY (never touch the working surrogate), then
+            # connect below — the same order
+            for mi, rz, rq in [(metal_ctx.metal, metal_ctx.real_z, metal_ctx.real_q), *metal_ctx.extra]:
+                _metal.restore_metal(mol, mi, rz, rq)  # `minimize` finalizes in (restore element+charge, then bond)
+        return _metal.connect_metal(mol, bonds) if bonds else mol  # connect_metal is idempotent (no-op if bonded)
 
     def mc(
         self,
@@ -433,25 +468,20 @@ class Ensemble:
         """Openconf Monte-Carlo torsional search (rowansci), in place.
 
         `preset` effort ('rapid'|'ensemble'|'spectroscopic'|'docking'|'analogue'|'macrocycle'|
-        'transition_metal'); use **'transition_metal'** for an organometallic / coordination complex — it
-        budgets metal-ligand fragment rotations (every preset also auto-adds a metal move budget when a metal
-        is present, so the default is workable too). `seed` reproducibility; `max_out` conformer cap;
-        `low_mode` Hessian low-mode following (off under constraints); `config` a raw openconf ConformerConfig.
-        **Any other keyword** is passed straight
-        through as an openconf ``ConformerConfig`` field override (e.g. ``energy_window_kcal=``,
-        ``move_probs=``, ``parent_strategy=``, ``final_select=``) — so the full openconf API is reachable;
-        an unknown field raises. `config=` (a whole ConformerConfig) and per-field kwargs compose (kwargs win).
+        'transition_metal'); use **'transition_metal'** for a coordination complex (every preset also
+        auto-adds a metal move budget). `seed` reproducibility; `max_out` conformer cap; `low_mode` Hessian
+        low-mode following (off under constraints); `config` a raw openconf ConformerConfig. **Any other
+        keyword** is passed through as a ``ConformerConfig`` field override (unknown field raises; kwargs win
+        over `config=`).
 
-        Unconstrained: openconf drives generation and *replaces* the ETKDG seeds. Constrained / multi-
-        fragment: it searches *around* the bounds-biased seeds with the held atoms **pose-frozen** (logged,
-        rotor-only), so its output is *added* (the seeds are first settled into their windows — see
-        `_settle_seeds`). `replace=` overrides.
+        Unconstrained: openconf *replaces* the ETKDG seeds. Constrained / multi-fragment: it searches *around*
+        the pose-frozen seeds (settled into their windows first — see `_settle_seeds`), so its output is
+        *added*. `replace=` overrides.
 
-        `explore=True` (a seeded NCI complex): fire a second search with the NCI contacts *released*
-        (structural holds — frozen core, π planes, encounter bounds — kept), pool both, and swap cons to the
-        relaxed set so downstream minimize/score/optimize don't yank the released contacts back. Energy then
-        decides — best with an NCI-aware calculator (`score('gfnff')`). On the metal path only the substrate
-        contacts release; the coordination sphere stays held.
+        `explore=True` (a seeded NCI complex): fire a second search with the NCI contacts *released* (structural
+        holds kept), pool both, and swap cons to the relaxed set so downstream stages don't yank the contacts
+        back — energy then decides (best with `score('gfnff')`). On the metal path only substrate contacts
+        release; the sphere stays held.
         """
         if not _mc.available():
             logger.warning("mc: openconf not installed; skipped")
@@ -468,12 +498,14 @@ class Ensemble:
                 len(self.cons.constrained_atoms()),
             )
 
+        if self.metal_bonds:  # a prior minimize() left the output CONNECTED; the search/relax needs the bare mol
+            self._mol = _metal.disconnect_metal(self._mol)  # (UFF can't type a bonded metal) — minimize re-connects
         self._settle_seeds()  # settle seeds INTO their windows (spread across them) before openconf pose-freezes
 
         def _search(cons, label):
             try:
                 return _mc.search(
-                    self.mol,
+                    self._mol,
                     cons,
                     preset=preset,
                     seed=seed,
@@ -505,19 +537,17 @@ class Ensemble:
             logger.info(
                 "mc: +%d (openconf '%s', pose-constrained around seeds; total %d)", len(added), preset, len(self.ids)
             )
-        self._minimized = False  # openconf's geometries are its own FF's — a follow-up .minimize() re-relaxes
-        # them through rxembed's (tighter) restrained UFF and applies the energy-window / bonding gate. Kept
-        # EXPLICIT (not auto-relaxed here) so the pipeline stays legible: embed -> mc -> minimize -> prune.
+        self._minimized = self._seeds_relaxed = False  # openconf's geometries are its own FF's; a follow-up
+        # minimize() must genuinely re-relax them. Kept explicit (not auto here) so the pipeline stays legible.
 
         if explore and any(self.cons.contacts):  # second pass: contacts released, structure kept
             from .embed.dispatch import _encounter_bounds  # lazy: breaks the dispatch<->pipeline cycle
 
             relaxed = self.cons.relaxed()
-            # NB distinct from dispatch's `_float_encounter_bounds`: releasing the grip frees the fragments it
-            # linked, so explore re-bounds ALL inter-fragment pairs (setdefault: never override a surviving
-            # structural hold) — not just the "no constraint touches them" subset that path tethers at embed.
-            if len(Chem.GetMolFrags(self.mol)) > 1:  # keep the fragments together once contacts are freed
-                for k, v in _encounter_bounds(self.mol).items():
+            # releasing the grip frees the fragments it linked, so explore re-bounds ALL inter-fragment pairs
+            # (setdefault never overrides a surviving structural hold), unlike dispatch's _float_encounter_bounds.
+            if len(Chem.GetMolFrags(self._mol)) > 1:  # keep the fragments together once contacts are freed
+                for k, v in _encounter_bounds(self._mol).items():
                     relaxed.distances.setdefault(k, v)
             more = _search(relaxed, " explore")
             if more:
@@ -535,11 +565,9 @@ class Ensemble:
     def _settle_seeds(self, bins=5):
         """Pull the seeded (non-frozen) distance/angle constraints inside their windows before an MC search.
 
-        Spread across the window over the conformers (each bin targets a different fraction of every window)
-        rather than collapsed to one value, so the search keeps its breadth and does not over-dictate the
-        contact. Frozen atoms and the frozen-core shape are held exactly and untouched. A narrow (point/TS)
-        target barely spreads (stays effectively exact); a wide window keeps its full range. Fixes the raw
-        ETKDG seed sitting *outside* a tight window.
+        Spread across the window over the conformers (each bin targets a different fraction) rather than
+        collapsed to one value, so the search keeps its breadth. Frozen atoms and the frozen-core shape are
+        held exactly. Fixes the raw ETKDG seed sitting *outside* a tight window.
         """
         cons = self.cons
         seeded_d = [(k, v) for k, v in cons.distances.items() if not (k[0] in cons.frozen and k[1] in cons.frozen)]
@@ -548,7 +576,11 @@ class Ensemble:
             return
         for b, group in enumerate(g for g in np.array_split(list(self.ids), min(len(self.ids), bins)) if len(g)):
             frac = (b + 0.5) / min(len(self.ids), bins)  # this bin's fraction across every window
-            tgt = Constraints(frozen=set(cons.frozen), planes=list(cons.planes))
+            # A PARTIAL rebuild: `distances`/`angles` are re-derived below per bin, so they start empty; but
+            # everything else is carried — critically `coplanar`, without which the stiff relax loses the
+            # sp2-donor coplanarity torsion and drives the metal out of plane. `contacts`/`dg_floors` are
+            # omitted (provenance / bounds-writer only — this path relaxes, never embeds).
+            tgt = cons.copy(distances={}, angles={}, contacts=(frozenset(), frozenset()), dg_floors={})
             tgt.distances.update(shape_d)  # keep the frozen-core shape exact
             for k, (lo, hi) in seeded_d:
                 m = lo + frac * (hi - lo)
@@ -557,11 +589,31 @@ class Ensemble:
                 m = lo + frac * (hi - lo)
                 tgt.angles[k] = (max(lo, m - 2.0), min(hi, m + 2.0))
             try:  # settling is best-effort pre-conditioning; an RDKit BFGS divergence must not sink mc()
-                _refine.restrained_uff(self.mol, tgt, distance_fc=1e4, conf_ids=[int(i) for i in group])
+                _refine.restrained_uff(self._mol, tgt, distance_fc=_DISTANCE_FC, conf_ids=[int(i) for i in group])
             except RuntimeError:  # keep the raw ETKDG seeds for this group (openconf still searches around them)
                 logger.debug("mc: seed-settle relax diverged on a group; keeping the raw seeds")
 
-    def _coordination_ok(self, cid, mc):
+    def _shape_intact(self, cid, tol=_SHAPE_TEAR_TOL):
+        """Return False if a rigid body (``cons.shapes``) came out torn.
+
+        A `hold_shape` body — a retained or spectator coordination sphere — is pinned by all C(n,2) of its
+        pairwise input distances: one object whose internal geometry is the input, not a preference. Nothing
+        else in the accept gate checks those windows (`bonding_ok` skips metal pairs; `check_constraints`
+        only logs), so a torn body would otherwise survive.
+        """
+        if not self.cons.shapes:
+            return True
+        pos = self._mol.GetConformer(cid).GetPositions()
+        for body in self.cons.shapes:
+            for (i, j), (lo, hi) in self.cons.distances.items():
+                if i in body and j in body:
+                    d = float(np.linalg.norm(pos[i] - pos[j]))
+                    if d < lo - tol or d > hi + tol:
+                        logger.debug("minimize: conformer %d rejected — rigid shape torn at (%d,%d)", cid, i, j)
+                        return False
+        return True
+
+    def _coordination_ok(self, cid, metal_ctx):
         """Return False if a declared *planar* metal polyhedron came out puckered (a phantom the relax forced).
 
         A square-planar / T-shape / trigonal-planar centre **is** coplanar by definition; the escalating relax
@@ -569,47 +621,47 @@ class Ensemble:
         that `bonding_ok` doesn't catch. This rejects exactly that. No-op for non-planar geometries (octahedral
         etc.) or a metal with no declared polyhedron (a fixed TS core).
         """
-        if mc is None or mc.geometry not in _metal.COPLANAR_GEOMETRIES or not mc.donors:
+        if metal_ctx is None or not _metal.is_planar(metal_ctx.geometry) or not metal_ctx.donors:
             return True
-        return _metal.coplanar(self.mol.GetConformer(cid).GetPositions(), mc.metal, mc.donors)
+        pos = self._mol.GetConformer(cid).GetPositions()
+        # a haptic face is one vertex
+        return _metal.coplanar(pos, metal_ctx.metal, metal_ctx.donors, haptic=self.cons.haptic)
 
     def _relax_constrained(self, distance_fc):
         """Restrained-UFF relax; if the soft relax tears *every* bond, stiffen the distances and retry.
 
-        The metal surrogate's carbon vdW crowds the donors out to ~2.1 Å; a soft distance constraint (the
-        ``1e4`` default) then lets an unusual ligand (an N=N triazene, a side-on alkyne, a carbanion) tear
-        during the relax. Escalating the distance force constant (``1e5`` → ``1e6``) lets the coordination
-        distances dominate that vdW/UFF strain so the bonds survive. A well-behaved chelate keeps the softer
-        ``1e4`` (which holds it planar without over-stiffening), because escalation only fires when the softer
-        relax leaves **zero** intact conformers — a genuinely infeasible arrangement (an en forced *trans*)
-        still tears at every stiffness and is dropped, so this does not resurrect a phantom. Returns the
-        energies from the accepted relax (or ``None`` if UFF can't type the graph — the embed is kept).
+        The surrogate's carbon vdW crowds donors out to ~2.1 Å, so a soft (``1e4``) constraint lets an unusual
+        ligand tear; escalating the force constant (``1e5`` → ``1e6``) lets the coordination distances dominate
+        so the bonds survive. Escalation fires ONLY when the softer relax leaves **zero** intact conformers, so
+        a genuinely infeasible arrangement (an en forced *trans*) still tears at every stiffness and is dropped
+        — no phantom resurrected. Returns the accepted relax's energies (or ``None`` if UFF can't type the graph).
         """
-        # Hold a metal-bound labile (carbanion/amine) donor's hand through stage-1: the surrogate has no M-C bond
-        # so a bare degree-3 centre inverts under UFF. Cap it with a dummy D (placed at the 4th vertex of each
-        # current conformer) and release BEFORE stage-2 — fix_donor_protons re-adds the real M-C bond, which then
-        # holds the (degree-4) donor, and a dummy would make it degree-5. Keep the ctx's mol in sync (restore +
-        # fix_donor_protons operate on it).
-        mc = self._metal
-        held = _metal._hold_donor_chirality(self.mol, mc.metal, mc.donors, self.cons) if mc else (self.mol, [])
-        self.mol, hold = held
-        if mc and hold:
-            mc.mol = self.mol
+        # Hold a labile (carbanion/amine) donor's hand through the relax: the surrogate's bare degree-3 centre
+        # inverts under UFF. Cap it with a dummy D, release when done, keep the ctx's mol in sync.
+        metal_ctx = self._metal
+        held = (
+            _metal._hold_donor_chirality(self._mol, metal_ctx.metal, metal_ctx.donors, self.cons)
+            if metal_ctx
+            else (self._mol, [])
+        )
+        self._mol, hold = held
+        if metal_ctx and hold:
+            metal_ctx.mol = self._mol
         e, fc = None, distance_fc
         try:
             embed_pos = {
-                c.GetId(): [list(c.GetAtomPosition(a)) for a in range(self.mol.GetNumAtoms())]
-                for c in self.mol.GetConformers()
+                c.GetId(): [list(c.GetAtomPosition(a)) for a in range(self._mol.GetNumAtoms())]
+                for c in self._mol.GetConformers()
             }
             for step, mult in enumerate(_FC_ESCALATION):  # half-order steps: find the MINIMAL sufficient stiffness
                 if step:  # restore the embed geometry before a stiffer retry (a big jump over-stiffens it)
                     for cid, pos in embed_pos.items():
-                        conf = self.mol.GetConformer(cid)
+                        conf = self._mol.GetConformer(cid)
                         for a, xyz in enumerate(pos):
                             conf.SetAtomPosition(a, xyz)
                 fc = distance_fc * mult
                 try:
-                    e = _refine.restrained_uff(self.mol, self.cons, distance_fc=fc)
+                    e = _refine.restrained_uff(self._mol, self.cons, distance_fc=fc)
                 except RuntimeError as err:  # UFF can't build a force field for this graph — keep the embed
                     logger.warning(
                         "minimize: UFF could not relax this system (%s) — an untypable TS/hypervalent "
@@ -617,132 +669,265 @@ class Ensemble:
                         err,
                     )
                     return None
-                # accept a stiffness only if it leaves a conformer that is BOTH bonded AND (for a planar
-                # polyhedron) coplanar — so escalation recovers a torn sphere but never forces a phantom through
-                # as an out-of-plane pucker. A metal keeps the looser bond tol (its plane is checked separately).
+                # accept a stiffness only if a conformer is BOTH bonded AND (for a planar polyhedron) coplanar,
+                # so escalation never forces a phantom through as an out-of-plane pucker. Metal keeps a looser tol.
                 bt = _METAL_BOND_TOL if self._metal else 1.3
                 kept = [
                     i
                     for i in self.ids
-                    if _metrics.bonding_ok(self.mol, i, bond_tol=bt, exclude=self.cons.frozen)
+                    if _metrics.bonding_ok(
+                        self._mol, i, bond_tol=bt, exclude=self.cons.frozen, constrained=self.cons.distances
+                    )
                     and self._coordination_ok(i, self._metal)
                 ]
                 if kept or step == len(_FC_ESCALATION) - 1:  # some survived (accept), or out of steps (caller drops)
                     if step and kept:
                         logger.info("minimize: relax tore the sphere; escalated distance_fc to %.0e", fc)
                     break
-        finally:  # release the hold (even on the early UFF-failure return) BEFORE stage-2: fix_donor_protons re-adds
-            if mc and hold:  # the real M-C bond that then holds the (degree-4) donor — a dummy would make it degree-5
-                self.mol = _metal._release_donor_chirality(self.mol, hold, self.cons)
-                mc.mol = self.mol
-        if self._metal:
-            try:  # stage-2 donor-H relax — a best-effort nicety; an RDKit BFGS divergence must not sink minimize
-                self._metal.fix_donor_protons(self.cons, self.ids, fc)
-            except RuntimeError:
-                logger.debug("minimize: donor-proton relax diverged; leaving donor H's at their stage-1 positions")
+        finally:  # release the hold on every exit path, including the early UFF-failure return — the dummy D
+            if metal_ctx and hold:  # is scaffolding for this relax alone
+                self._mol = _metal._release_donor_chirality(self._mol, hold, self.cons)
+                metal_ctx.mol = self._mol
         return e
 
-    def minimize(self, distance_fc=1e4, _retry=True):
-        """FF relax (stiff restrained UFF if constrained, else MMFF), restore any metal, drop clashes, validate."""
+    def _relax_into_windows(self):
+        """Relax the raw ETKDG seeds into their own constraint windows, in place — what `embed` returns through.
+
+        A raw seed does **not** satisfy its constraints (measured: angle windows missed by 9.5° mean / 42.8°
+        max, an organic window by 0.21-0.43 Å, 17/20 square-planar crystals come out *tetrahedral*); this relax
+        enforces them, moving toward the crystal on every local axis (M-donor MAE 0.063 -> 0.006 Å), neutral on
+        global RMSD — `docs/findings/seed-vs-relax.md`.
+
+        Uses `_relax_constrained`, NOT `minimize`: it carries the stiffness ladder, donor-hand hold and
+        bonding/coordination acceptance WITHOUT restoring the metal / dropping the surrogate — doing that at
+        embed time would strip the rest of the chain of the coplanarity gate, donor-hand hold and re-embed
+        (measured on henry Ni: 11/11 clean falling to 4/5). So `_metal` stays live and `_minimized` unset.
+
+        Unconstrained embeds are left alone (no window, and no unbidden FF pass).
+        """
+        if not self.ids or not self.cons.is_constrained:
+            return self
+        seed_pos = {c: self._mol.GetConformer(c).GetPositions() for c in self.ids}
+        self._relax_constrained(_DISTANCE_FC)
+        self._mol = self._metal.mol if self._metal else self._mol  # _relax_constrained may have re-bound it
+        # The relax can TEAR a seed; `embed` must not spend the caller's `n` re-embedding (that is `minimize`'s
+        # job), so a torn conformer keeps its seed coordinates — output is never worse than the seed.
+        bond_tol = _METAL_BOND_TOL if self._metal else 1.3
+        self._rescue_torn(seed_pos, bond_tol)
+        self._seeds_relaxed = True
+        return self
+
+    def _rescue_torn(self, seed_pos, bond_tol):
+        """Re-relax each conformer the window relax tore at its own minimal sufficient stiffness; else keep its seed.
+
+        `_relax_constrained` escalates GLOBALLY and stops at the first rung leaving any conformer intact, so a
+        seed needing more stiffness than its siblings stays torn. Each is retried from its seed up the same
+        ladder (embed must not spend the caller's ``n`` re-embedding); one that survives no rung keeps its seed.
+
+        NB the rescue runs outside `_hold_donor_chirality`, so a labile donor could invert here; `minimize`'s
+        `_donor_hand` cull catches that.
+        """
+
+        def place(cid, pos):
+            conf = self._mol.GetConformer(cid)
+            for a, xyz in enumerate(pos):
+                conf.SetAtomPosition(a, xyz.tolist())
+
+        def intact(cid):
+            return _metrics.bonding_ok(
+                self._mol, cid, bond_tol=bond_tol, exclude=self.cons.frozen, constrained=self.cons.distances
+            )
+
+        torn = [c for c in self.ids if not intact(c)]
+        rescued = 0
+        for cid in torn:
+            for mult in _FC_ESCALATION[1:]:  # rung 0 is the pass that already tore it
+                place(cid, seed_pos[cid])
+                try:
+                    _refine.restrained_uff(self._mol, self.cons, distance_fc=_DISTANCE_FC * mult, conf_ids=[int(cid)])
+                except RuntimeError:  # UFF cannot build for this graph — the seed is the best we have
+                    break
+                if intact(cid):
+                    rescued += 1
+                    break
+            else:
+                place(cid, seed_pos[cid])
+                continue
+            if not intact(cid):
+                place(cid, seed_pos[cid])
+        if torn:
+            logger.info(
+                "embed: the window relax tore %d of %d seed(s) — %d rescued by escalating their stiffness, "
+                "%d kept their unrelaxed geometry (minimize() re-embeds those)",
+                len(torn),
+                len(self.ids),
+                rescued,
+                len(torn) - rescued,
+            )
+
+    def minimize(self, distance_fc=_DISTANCE_FC, _retry=True):
+        """FF relax (stiff restrained UFF if constrained, else MMFF), restore any metal, drop clashes, validate.
+
+        Every conformer a gate here rejects (torn bond, puckered sphere, non-physical relax energy, inverted
+        donor hand, wrong stereo) is appended to ``discarded`` — like prune's, it stays in ``mol``.
+        """
         if self._minimized:
             return self
         if not self.ids:  # nothing embedded (e.g. ETKDG could not place this graph)
             self._minimized = True
             return self
-        mc = self._metal  # capture before restore — the coordination-planarity gate needs metal + donors
+        metal_ctx = self._metal  # capture before restore — the coordination-planarity gate needs metal + donors
         target = len(self.ids)  # embed(n=N) -> N GOOD geometries; the retry re-embeds if the relax tears some
-        template = Chem.Mol(self.mol) if (_retry and mc is not None) else None  # pristine surrogate to re-embed on
-        e = None
-        if self.cons.is_constrained:
-            e = self._relax_constrained(distance_fc)  # escalates stiffness if the soft relax tears every bond
-            self.mol = mc.mol if mc else self.mol  # _relax_constrained may have re-bound self.mol via the ctx
-        else:
-            e = _refine.ff_energies(self.mol, minimize=True)
-        if e is not None:
-            self.energies = {c.GetId(): float(e[k]) for k, c in enumerate(self.mol.GetConformers())}
-            self.energy_kind = "ff"  # surrogate FF — NOT comparable across species (EnsembleSet.best refuses it)
+        # a pristine surrogate to re-embed on
+        template = Chem.Mol(self._mol) if (_retry and metal_ctx is not None) else None
+        self._relax_and_record(distance_fc, metal_ctx)
         if self._metal:
+            if self._metal.donors:  # remember the sphere: `_metal` goes, but who coordinates whom is durable
+                self.sphere.setdefault(self._metal.metal, list(self._metal.donors))
             self._metal.restore()
             self._metal = None
-        before = len(self.ids)
-        # the arbiter: drop a torn/clashed geometry, and a declared-planar polyhedron that came out puckered.
-        # A metal keeps the looser bond tol — a slightly-stretched bond in a *coplanar* coordination is a
-        # surrogate artifact xtb recovers, and the coplanarity gate already rejects the impossible (phantom) ones.
-        bt = _METAL_BOND_TOL if mc else 1.3
-        self.ids = [
-            i
-            for i in self.ids
-            if _metrics.bonding_ok(self.mol, i, bond_tol=bt, exclude=self.cons.frozen) and self._coordination_ok(i, mc)
-        ]
-        if self.energies and self.ids:  # also drop failed relaxes — a non-physical energy is an un-converged
-            emin = min(self.energies[i] for i in self.ids if i in self.energies)  # geometry, not a real rotamer
-            rel = sorted(self.energies[i] - emin for i in self.ids if i in self.energies)
-            over = [round(r, 1) for r in rel if r > _RELAX_ENERGY_WINDOW]
-            logger.info(  # show the FACTS — the relax-energy spread (kcal/mol above the min) and the generous window
-                "minimize: relax ΔE spread (kcal/mol above min): %s | window=%.0f%s",
-                [round(r, 1) for r in rel],
-                _RELAX_ENERGY_WINDOW,
-                f" -> dropping {len(over)} un-converged: {over}" if over else " -> all within window",
-            )
-            self.ids = [i for i in self.ids if self.energies.get(i, emin) <= emin + _RELAX_ENERGY_WINDOW]
-        if len(self.ids) < before:  # drop torn/clashed/puckered geometries + non-physical relaxes
-            logger.info(
-                "minimize: dropped %d conformer(s) with a broken bond, out-of-plane coordination sphere, or "
-                "non-physical relax energy -> %d kept",
-                before - len(self.ids),
+        before = list(self.ids)  # ids, not a count: what minimize drops is recorded in `discarded` like prune's
+        drops = self._drop_bad_geometries(metal_ctx)  # torn bond / puckered sphere / torn rigid body
+        self._drop_unconverged(drops)  # non-physical relax energy
+        if len(self.ids) < len(before):  # drop torn/clashed/puckered geometries + non-physical relaxes
+            logger.info(  # name the gate(s) that fired, with counts
+                "minimize: dropped %d conformer(s) (%s) -> %d kept",
+                len(before) - len(self.ids),
+                ", ".join(f"{n}x {why}" for why, n in drops.items() if n),
                 len(self.ids),
             )
         if template is not None:  # a metal seed the relax tore is a bad EMBED, not a bad relax — re-embed fresh
-            self._reembed_until_clean(template, mc, target, distance_fc)  # seeds until N are geom.check-clean
-        for d, target_sign in self._donor_hand.items():  # cull any conformer whose labile donor inverted vs the
-            if target_sign is None:  # enumerated hand (a rare relax/re-embed/mc stray that escaped the dummy hold)
+            self._reembed_until_clean(template, metal_ctx, target, distance_fc)  # seeds until N are geom.check-clean
+        self._cull_inverted_donors()  # a labile donor that inverted vs its enumerated hand
+        if not self.ids:  # every conformer failed a gate — usually the arrangement itself is impossible.
+            logger.warning(  # `embed` relaxes, so this now fires at EMBED time: state the gates, not a guess
+                "minimize: 0 of %d conformer(s) survived the relax (%s) — the ensemble is EMPTY and nothing "
+                "downstream can run. Usually the arrangement is geometrically infeasible (a chelate forced to "
+                "span a bite it can't reach); check the isomer/coordination requested, or supply a geometry "
+                "that already satisfies it.",
+                len(before),
+                ", ".join(f"{n}x {why}" for why, n in drops.items() if n) or "no gate recorded",
+            )
+        self._cull_wrong_stereo()  # embed-uncapturable handedness (metallocene planar / axial / helical)
+        self.discarded += [i for i in before if i not in set(self.ids)]
+        self._validate()
+        if metal_ctx is not None and not self.metal_bonds:  # remember the stripped M-L bonds durably (past `_metal`):
+            self.metal_bonds = list(metal_ctx.donor_bonds)  # re-minimize after mc has no `_metal` but must re-connect
+        if self.metal_bonds:  # connectivity finalize, LAST: geometry/element/charge now settled, re-add the
+            # surrogate-stripped M-donor bonds DATIVE so the output is connected (every gate/relax above saw the
+            # bond-less surrogate unchanged; coords/charge untouched).
+            self._mol = _metal.connect_metal(self._mol, self.metal_bonds)
+        self._minimized = True
+        return self
+
+    def _relax_and_record(self, distance_fc, metal_ctx):
+        """FF-relax the conformers (restrained UFF if constrained, else MMFF) and store the surrogate energies."""
+        e = None
+        if self.cons.is_constrained:
+            if self._seeds_relaxed:  # embed already relaxed these into their windows; relaxing again only rides
+                # the flat-bottomed walls further (measured: primary-phosphine M-P-H median 129.47 -> 130.00, the
+                # splay cap's exact bound). Take a single point on the same FF; the gates below are what's owed.
+                try:
+                    e = _refine.restrained_uff(self._mol, self.cons, distance_fc=distance_fc, max_iters=0)
+                except RuntimeError as err:  # the two relax entry points must degrade identically: mirror
+                    #  _relax_constrained's guard so an untypable/hypervalent core keeps its embedded geometry
+                    logger.warning(
+                        "minimize: UFF could not relax this system (%s) — an untypable TS/hypervalent "
+                        "reacting core; keeping the embedded geometry (constraints biased, not stiffened)",
+                        err,
+                    )
+            else:
+                e = self._relax_constrained(distance_fc)  # escalates stiffness if the soft relax tears every bond
+                # _relax_constrained may have re-bound self._mol via the ctx
+                self._mol = metal_ctx.mol if metal_ctx else self._mol
+        else:
+            e = _refine.ff_energies(self._mol, minimize=True)
+        if e is not None:
+            self.energies = {c.GetId(): float(e[k]) for k, c in enumerate(self._mol.GetConformers())}
+            self.energy_kind = "ff"  # surrogate FF — NOT comparable across species (EnsembleSet.best refuses it)
+
+    def _drop_bad_geometries(self, metal_ctx):
+        """Drop each conformer that broke a bond, puckered a planar sphere, or tore a rigid body; return the counts."""
+        # the arbiter: drop a torn/clashed geometry, and a declared-planar polyhedron that came out puckered.
+        # A metal keeps the looser bond tol — a slightly-stretched bond in a *coplanar* coordination is a
+        # surrogate artifact xtb recovers, and the coplanarity gate already rejects the impossible (phantom) ones.
+        bt = _METAL_BOND_TOL if metal_ctx else 1.3
+        kept, drops = [], {"broken bond": 0, "out-of-plane coordination sphere": 0, "torn rigid body": 0}
+        for i in self.ids:  # one pass; record which gate rejected each so the log can name it
+            if not _metrics.bonding_ok(
+                self._mol, i, bond_tol=bt, exclude=self.cons.frozen, constrained=self.cons.distances
+            ):
+                drops["broken bond"] += 1
+            elif not self._coordination_ok(i, metal_ctx):
+                drops["out-of-plane coordination sphere"] += 1
+            elif not self._shape_intact(i):
+                drops["torn rigid body"] += 1
+            else:
+                kept.append(i)
+        self.ids = kept
+        return drops
+
+    def _drop_unconverged(self, drops):
+        """Drop conformers whose relax energy sits above the window — a non-physical, un-converged geometry."""
+        if not (self.energies and self.ids):
+            return
+        emin = min(self.energies[i] for i in self.ids if i in self.energies)  # geometry, not a real rotamer
+        rel = sorted(self.energies[i] - emin for i in self.ids if i in self.energies)
+        over = [round(r, 1) for r in rel if r > _RELAX_ENERGY_WINDOW]
+        logger.info(  # show the FACTS — the relax-energy spread (kcal/mol above the min) and the generous window
+            "minimize: relax ΔE spread (kcal/mol above min): %s | window=%.0f%s",
+            [round(r, 1) for r in rel],
+            _RELAX_ENERGY_WINDOW,
+            f" -> dropping {len(over)} un-converged: {over}" if over else " -> all within window",
+        )
+        drops["non-physical relax energy"] = len(over)
+        self.ids = [i for i in self.ids if self.energies.get(i, emin) <= emin + _RELAX_ENERGY_WINDOW]
+
+    def _cull_inverted_donors(self):
+        """Cull any conformer whose labile metal-donor hand inverted vs the enumerated (uniform-embed) hand."""
+        for d, target_sign in self._donor_hand.items():
+            if target_sign is None:  # a rare relax/re-embed/mc stray that escaped the dummy hold
                 continue
-            keep = [i for i in self.ids if _metal.donor_chirality_sign(self.mol, i, d) == target_sign]
+            keep = [i for i in self.ids if _metal.donor_chirality_sign(self._mol, i, d) == target_sign]
             if 0 < len(keep) < len(self.ids):
                 logger.info(
                     "minimize: culled %d conformer(s) whose donor-%d hand inverted", len(self.ids) - len(keep), d
                 )
                 self.ids = keep
-        if not self.ids:  # all conformers broke a bond or puckered — the arrangement itself
-            logger.warning(
-                "minimize: every embedded conformer breaks a ligand bond or puckers out of plane — this "
-                "arrangement is geometrically infeasible (e.g. a chelate forced to span a bite it can't reach); "
-                "the ensemble is empty"
-            )  # is impossible (an unreachable chelate isomer)
-        if self._stereo and self.ids:  # keep only the requested handedness on chirality the
-            spec, ref = self._stereo  # embed can't (metallocene planar / axial / helical)
-            kept = [i for i in self.ids if _stereo.passes(_stereo.signature(self.mol, i), ref, spec)]
-            if len(kept) < len(self.ids):
-                logger.info(
-                    "minimize: stereo=%r kept %d/%d (matched the input handedness)", spec, len(kept), len(self.ids)
-                )
-            self.ids = kept
-            self._stereo = None
-        self._validate()
-        self._minimized = True
-        return self
 
-    def _reembed_until_clean(self, template, mc, target, distance_fc):
+    def _cull_wrong_stereo(self):
+        """Keep only the requested handedness on chirality the embed can't (metallocene planar / axial / helical)."""
+        if not (self._stereo and self.ids):
+            return
+        spec, ref = self._stereo
+        kept = [i for i in self.ids if _stereo.satisfies_spec(_stereo.signature(self._mol, i), ref, spec)]
+        if len(kept) < len(self.ids):
+            logger.info("minimize: stereo=%r kept %d/%d (matched the input handedness)", spec, len(kept), len(self.ids))
+        self.ids = kept
+        self._stereo = None
+
+    def _reembed_until_clean(self, template, metal_ctx, target, distance_fc):
         """Re-embed fresh seeds until `target` conformers pass acceptance, merging the good ones in.
 
-        The raw ETKDG embed is clean; the FF relax is what tears a bad seed — so the fix is a *fresh seed*
-        (a new randomSeed), never re-relaxing the torn one. Acceptance is geom.check-clean AND, if ``stereo=``
-        is set, the requested handedness — so the count the retry targets survives the later stereo cull (a
-        re-embedded metal centre is random-handed). Good geometries are preferred and placed first; the
-        bonding-ok fallback (already in ``self.ids``) is kept only where good is unreachable (an inherently-
-        strained arrangement, e.g. a bare side-on η² the two-donor model can't hold) so it is never needlessly
-        emptied. Metal-only (the tearing is a surrogate-relax artifact); scoped by the caller.
+        The raw embed is clean and the FF relax tears a bad seed, so the fix is a *fresh seed*, never
+        re-relaxing the torn one. Acceptance is geom.check-clean AND (if ``stereo=`` set) the requested
+        handedness, so the retry count survives the later stereo cull. Good geometries are preferred and placed
+        first; the bonding-ok fallback is kept only where good is unreachable. Metal-only.
+
+        The intended donors (from `sphere` + this run's `_MetalCtx`) are handed to the gate — both in-sphere
+        checks are circular without them (a collapsed ligand is perceived as coordinating and exempts itself).
         """
+        donors = sorted({int(d) for ds in self.sphere.values() for d in ds} | {int(d) for d in metal_ctx.donors or ()})
 
         def is_good(mol, cid):  # geom.check-clean, and the requested handedness when a stereo spec is active
-            if not _geometry.check(mol, cid).ok():
-                return False
+            if not _geometry.check(mol, cid, donors=donors or None).ok():  # structural gates only — a metal-donor
+                return False  # distance is an approximate surrogate target, not a hard accept bar (see _validate)
             if self._stereo:
                 spec, ref = self._stereo
-                return _stereo.passes(_stereo.signature(mol, cid), ref, spec)
+                return _stereo.satisfies_spec(_stereo.signature(mol, cid), ref, spec)
             return True
 
-        good = lambda: [i for i in self.ids if is_good(self.mol, i)]  # noqa: E731
+        good = lambda: [i for i in self.ids if is_good(self._mol, i)]  # noqa: E731
         seed = _EMBED_SEED
         for _ in range(_MAX_MIN_ROUNDS):
             have = good()
@@ -753,16 +938,20 @@ class Ensemble:
             tmpl.RemoveAllConformers()
             # re-apply the labile-donor chirality hold — a fresh ETKDG seed is random-handed, so without it a
             # carbanion/amine donor's enumerated hand would silently invert; the batch relax below re-holds it.
-            tmpl, held = _metal._hold_donor_chirality(tmpl, mc.metal, mc.donors, self.cons) if mc else (tmpl, [])
+            tmpl, held = (
+                _metal._hold_donor_chirality(tmpl, metal_ctx.metal, metal_ctx.donors, self.cons)
+                if metal_ctx
+                else (tmpl, [])
+            )
             new_ids = _bounds.embed(tmpl, self.cons, target - len(have) + _EMBED_BUFFER, seed=seed)
             if not new_ids:
                 continue
             tmpl = _metal._release_donor_chirality(tmpl, held, self.cons)  # drop dummy + cons key; batch relax re-holds
-            batch = Ensemble(tmpl, new_ids, self.cons, replace(mc, mol=tmpl)).minimize(distance_fc, _retry=False)
+            batch = Ensemble(tmpl, new_ids, self.cons, replace(metal_ctx, mol=tmpl)).minimize(distance_fc, _retry=False)
             for cid in batch.ids:  # merge only good ones — the fallback already holds the bonding-ok geometries
-                if not is_good(batch.mol, cid):
+                if not is_good(batch._mol, cid):
                     continue
-                nid = self.mol.AddConformer(Chem.Conformer(batch.mol.GetConformer(cid)), assignId=True)
+                nid = self._mol.AddConformer(Chem.Conformer(batch._mol.GetConformer(cid)), assignId=True)
                 self.ids.append(nid)
                 if cid in batch.energies:  # never fabricate a 0.0 — an absent energy (untypable graph) stays absent
                     self.energies[nid] = batch.energies[cid]
@@ -774,25 +963,24 @@ class Ensemble:
     def _validate(self, dist_slack=0.15, ang_slack=5.0):
         """Warn if a constraint the relax *can enforce* is not realised within its window (+ a small slack).
 
-        Only constraints with at least one non-frozen atom are warned — the seeded contacts / user windows
-        the restrained relax is responsible for. A constraint **between two frozen atoms** is a structural
-        hold (a frozen-core shape, a spectator metal sphere) held by the exact graft / ``AddFixedPoint`` at
-        the embedded geometry, not by the distance window — the relax cannot move a pinned atom to satisfy
-        it, so it is logged at DEBUG. (An off-window value there is the embed's approximation of a
-        *spectator* shape; the reacting core stays exact.)
+        Only constraints with a non-frozen atom are warned. A constraint between two **frozen** atoms is a
+        structural hold (frozen-core shape, spectator sphere) held by the graft / ``AddFixedPoint``, not the
+        relax, so an off-window value there is logged at DEBUG.
         """
         if not self.ids:
             return
         frozen = self.cons.frozen
-        # a metal-donor distance / L-M-L angle is an APPROXIMATE coordination bias (the surrogate target is a
-        # covalent-radius guess; the real distance/angle is set later by the calculator, and the surrogate's
-        # vdW legitimately pushes a donor out to ~2 Å) — so an off-window value there is DEBUG, not a warning.
-        metals = {a.GetIdx() for a in self.mol.GetAtoms() if a.GetAtomicNum() in _metal.TRANSITION_METALS}
+        # a metal-donor distance / L-M-L angle is an APPROXIMATE bias (covalent-radius guess; the real value is
+        # the calculator's, and the surrogate vdW legitimately pushes donors out) — off-window there is DEBUG.
+        metals = {a.GetIdx() for a in self._mol.GetAtoms() if a.GetAtomicNum() in _metal.TRANSITION_METALS}
+        n = self._mol.GetNumAtoms()  # a haptic centroid dummy is transient (index >= n); its real counterpart
 
         def realised(fn, *atoms):
-            return float(np.mean([fn(self.mol.GetConformer(c), *atoms) for c in self.ids]))
+            return float(np.mean([fn(self._mol.GetConformer(c), *atoms) for c in self.ids]))
 
         for (i, j), (lo, hi) in self.cons.distances.items():
+            if i >= n or j >= n:  # (M -> each ring atom) is a real-indexed distance validated in this same loop
+                continue
             d = realised(rdMolTransforms.GetBondLength, i, j)
             if lo - dist_slack <= d <= hi + dist_slack:
                 logger.debug("held d(%d,%d) = %.2f (target %.2f-%.2f)", i, j, d, lo, hi)
@@ -803,6 +991,8 @@ class Ensemble:
             else:
                 logger.warning("constraint NOT held: d(%d,%d) = %.2f, target %.2f-%.2f", i, j, d, lo, hi)
         for (i, j, k), (lo, hi) in self.cons.angles.items():
+            if i >= n or j >= n or k >= n:  # a constraint on a transient centroid dummy — skip (see the distance loop)
+                continue
             a = realised(rdMolTransforms.GetAngleDeg, i, j, k)
             if lo - ang_slack <= a <= hi + ang_slack:
                 continue
@@ -828,34 +1018,43 @@ class Ensemble:
         q = self._calc_charge(charge)
         calc = resolve(refine, solvent, q)
         if calc is None:  # 'ff'/None -> single-point force field, geometry kept
-            e = _refine.ff_energies(self.mol, minimize=False)
-            by = {c.GetId(): float(e[k]) for k, c in enumerate(self.mol.GetConformers())}
+            e = _refine.ff_energies(self._mol, minimize=False)
+            by = {c.GetId(): float(e[k]) for k, c in enumerate(self._mol.GetConformers())}
             out = Ensemble(
-                Chem.Mol(self.mol),
+                Chem.Mol(self._mol),
                 list(self.ids),
                 self.cons,
                 None,
                 {i: by[i] for i in self.ids if i in by},
                 True,
                 tag=dict(self.tag),
+                metal_bonds=list(self.metal_bonds),
             )
             out.energy_kind = "ff"  # a force-field single point is NOT a real energy — best() still refuses it
             return out
         energies, kept = {}, []
         for i in self.ids:
             try:
-                energies[i] = float(calc.energy(self.mol, i)) * _HARTREE_KCAL  # -> kcal/mol, unit-consistent
-                kept.append(i)  # with the FF energies (windows
+                energies[i] = float(calc.energy(self._mol, i)) * _HARTREE_KCAL  # -> kcal/mol, unit-consistent
+                kept.append(i)
             except Exception as err:  # a single conformer xtb failure shouldn't sink the run
                 logger.warning("score: %s failed on conformer %d (%s) — dropping it", refine, i, _last_line(err))
-        if not kept:  # total failure -> RAISE (don't silently hand back FF
+        if not kept:  # total failure -> RAISE, never silently hand back FF energies the caller thinks are xTB
             raise RuntimeError(
-                f"score: {refine} produced no energies — is the xtb binary on PATH "  # energies the
+                f"score: {refine} produced no energies — is the xtb binary on PATH "
                 f"($XTB_EXE, or ~/bin/xtb)? not falling back to the force field silently"
-            )  # caller
-            #                                                  thinks are xTB; honest energies were the whole point
+            )
         logger.info("score: %s single point on %d conformer(s) (charge %d)", refine, len(kept), q)
-        out = Ensemble(Chem.Mol(self.mol), kept, self.cons, None, energies, True, tag=dict(self.tag))
+        out = Ensemble(
+            Chem.Mol(self._mol),
+            kept,
+            self.cons,
+            None,
+            energies,
+            True,
+            tag=dict(self.tag),
+            metal_bonds=list(self.metal_bonds),
+        )
         out.energy_kind = "real"  # xtb/g-xTB — comparable across species, so EnsembleSet.best() accepts it
         return out
 
@@ -864,8 +1063,8 @@ class Ensemble:
 
         Warns for a metal, whose perceived formal charge is a likely bond-perception artefact.
         """
-        q = Chem.GetFormalCharge(self.mol) if charge is None else charge
-        if charge is None and q != 0 and _metal.metal_index(self.mol) is not None:
+        q = Chem.GetFormalCharge(self._mol) if charge is None else charge
+        if charge is None and q != 0 and _metal.metal_index(self._mol) is not None:
             logger.warning(
                 "a metal complex's PERCEIVED formal charge is %d — likely a bond-perception artefact; "
                 "pass charge=<true total charge> for honest energies (relative ranking of same-charge "
@@ -898,22 +1097,21 @@ class Ensemble:
                 "optimize needs a real calculator (refine='gxtb' or 'gfn2'); the force-field relaxation is minimize()"
             )
         fix = sorted(self.cons.frozen)  # the frozen TS core (reacting atoms)
-        new_mol = Chem.Mol(self.mol)  # opt MOVES atoms -> work on a copy, never clobber self
+        new_mol = Chem.Mol(self._mol)  # opt MOVES atoms -> work on a copy, never clobber self
         energies, kept = {}, []
         for i in self.ids:
             try:
-                coords, e = calc.optimize(self.mol, i, level, fix)
+                coords, e = calc.optimize(self._mol, i, level, fix)
                 conf = new_mol.GetConformer(i)
                 for a, xyz in enumerate(coords):
                     conf.SetAtomPosition(a, [float(v) for v in xyz])
                 energies[i] = e * _HARTREE_KCAL
                 kept.append(i)
-            except (RuntimeError, OSError) as err:  # an xtb RUN failure -> drop this conformer; a
+            except (RuntimeError, OSError) as err:  # an xtb RUN failure -> drop this conformer (a config error
+                # — bad level/solvent — is a ValueError and propagates, not a per-conformer failure)
                 logger.warning(
                     "optimize: %s --opt failed on conformer %d (%s) — dropping it", refine, i, _last_line(err)
                 )
-                #                                              config error (bad level/solvent) is a ValueError
-                #                                              and propagates (it's not a per-conformer failure)
         if not kept:
             raise RuntimeError(
                 f"optimize: {refine} --opt produced nothing — is the xtb binary on PATH ($XTB_EXE, or ~/bin/xtb)?"
@@ -921,8 +1119,22 @@ class Ensemble:
         logger.info(
             "optimize: %s --opt %s on %d conformer(s); %d core atom(s) held fixed", refine, level, len(kept), len(fix)
         )
-        out = Ensemble(new_mol, kept, self.cons, None, energies, True, tag=dict(self.tag))
+        # The opt moved every free atom, so it may have returned a different molecule; check here since the
+        # output's _minimized=True makes every downstream minimize() (incl. prune's) a no-op.
+        changed = self._flag_connectivity(new_mol, kept, f"optimize[{refine}]", charge)
+        out = Ensemble(
+            new_mol,
+            kept,
+            self.cons,
+            None,
+            energies,
+            True,
+            tag=dict(self.tag),
+            sphere=dict(self.sphere),
+            metal_bonds=list(self.metal_bonds),
+        )
         out.energy_kind = "real"  # geometry-optimised xtb/g-xTB energies — comparable across species
+        out.reacted = changed  # flagged, not dropped: .filter('connectivity') drops them
         return out
 
     def relative(self, unit="kcal"):
@@ -938,20 +1150,97 @@ class Ensemble:
         scale = 1.0 if unit == "kcal" else 1.0 / _HARTREE_KCAL
         return {i: (e - emin) * scale for i, e in have.items()}
 
+    def _scan_connectivity(self, mol=None, ids=None, charge=None):
+        """``{conf id: (formed, broken)}`` for every conformer whose graph no longer matches the intended one.
+
+        The metal is handed to the perceiver as its real element (the pipeline may still be carrying the
+        carbon surrogate), and its dative pairs are judged by coordination, not covalent radii.
+        """
+        mol = self._mol if mol is None else mol
+        ids = self.ids if ids is None else ids
+        metal_ctx = self._metal
+        metals, elements, spheres = frozenset(), None, dict(self.sphere)
+        if metal_ctx is not None:  # pre-minimize: the mol still carries the surrogate, so name the real elements
+            metals = {metal_ctx.metal, *(mi for mi, _rz, _rq in metal_ctx.extra)}
+            elements = {metal_ctx.metal: metal_ctx.real_z, **{mi: rz for mi, rz, _rq in metal_ctx.extra}}
+            if metal_ctx.donors:
+                spheres.setdefault(metal_ctx.metal, list(metal_ctx.donors))
+        else:  # post-minimize: the real elements are back, and `sphere` is what remembers the coordination
+            metals = _metrics._metal_indices(mol)
+        # Not _calc_charge: it warns about a metal's perceived charge and this runs on every stage. Perception
+        # here is connectivity-only (no bond orders), which the total charge barely moves.
+        q = Chem.GetFormalCharge(self._mol) if charge is None else charge
+        out = {}
+        for i in ids:
+            formed, broken = _metrics.connectivity(
+                mol, i, exclude=self.cons.frozen, metals=metals, charge=q, elements=elements
+            )
+            for m, donors in spheres.items():  # the metal's own check: a dative bond has no covalent yardstick,
+                if not donors:  # so the coordination sphere is compared as a set instead
+                    continue
+                left, joined = _metrics.coordination_changed(mol, i, m, donors, elements=elements)
+                formed = formed + [(m, a) for a in joined]
+                broken = broken + [(m, d) for d in left]
+            if formed or broken:
+                out[i] = (formed, broken)
+        return out
+
+    def _flag_connectivity(self, mol, ids, stage, charge=None):
+        """Warn, in chemistry, for every conformer a stage just turned into a different molecule."""
+        changed = self._scan_connectivity(mol, ids, charge)
+        for i, (formed, broken) in changed.items():
+            logger.warning(
+                "%s: conformer %d CHANGED CONNECTIVITY — %s. The geometry (and any energy) is for a "
+                "DIFFERENT species than the one you asked for; drop these with .filter('connectivity').",
+                stage,
+                i,
+                _metrics.describe(mol, formed, broken),
+            )
+        return changed
+
+    def filter(self, by="connectivity", *, charge=None):
+        """Drop conformers that are no longer the molecule you asked for, in place.
+
+        ``by='connectivity'`` re-perceives each graph and drops any whose bonds differ from the intended ones
+        (a transferred proton, a formed/broken bond, a ligand that left the metal) — the gate that drops what
+        ``optimize()`` only flags. A frozen TS core is exempt (partial bonds held to the reference). Dropping
+        every conformer raises rather than returning a silent empty ensemble.
+        """
+        if by != "connectivity":
+            raise ValueError(f"filter(by={by!r}): the only filter is 'connectivity' (geometric dedup is prune())")
+        changed = self._scan_connectivity(charge=charge)
+        if not changed:
+            logger.info("filter[connectivity]: %d conformer(s), all intact", len(self.ids))
+            return self
+        kept = [i for i in self.ids if i not in changed]
+        if not kept:
+            raise RuntimeError(
+                f"filter[connectivity]: all {len(self.ids)} conformer(s) changed connectivity — every one is a "
+                "different species than the input. That is a result, not a filter failure: the geometry or the "
+                "level of theory is reacting your molecule."
+            )
+        for i, (formed, broken) in changed.items():
+            logger.info("filter[connectivity]: dropping #%d — %s", i, _metrics.describe(self._mol, formed, broken))
+        logger.info("filter[connectivity]: %d -> %d (dropped %d reacted)", len(self.ids), len(kept), len(changed))
+        self.discarded += list(changed)
+        self.ids = kept
+        self.reacted = {**self.reacted, **changed}
+        return self
+
     def prune(self, by="auto", **kw):
         """Deduplicate by geometry, in place.
 
-        `by` (alias `method`) is **'auto'** (default) -- the rigorous, rotation-invariant **'rmsd'**, safe
-        for any system -- or pick explicitly: 'rmsd' | 'moi' | 'descriptor' | 'energy', or a cheap-first
-        cascade list, e.g. ['moi', 'rmsd'] (moi is a fast coarse pre-filter worth it only for *large
-        single-molecule* ensembles; it can over-merge, so it is not the default). Avoid **'moi' on a
-        multi-fragment system**: principal moments of inertia are nearly blind to a light or symmetric
-        fragment's *relative pose*, so moi would silently merge distinct encounter geometries -- rxembed
-        warns if you do. For a binding-mode *summary* use `representatives()`.
+        Relaxes once via `minimize()` first (idempotent if already minimized) — which **moves atoms** — then
+        dedups, so a raw embed is FF-settled before comparison.
 
-        Tuning knobs (keyword): `max_rmsd` (rmsd cutoff Å), `moi_dev`, `max_dist` (descriptor), `energy_tol`
-        (energy), `energy_window` (kcal/mol gate). Nothing is lost: discarded conformers stay in `ens.mol`;
-        `ens.discarded` lists their ids and `ens.duplicates()` says which kept conformer each duplicates.
+        `by` (alias `method`) is **'auto'** (default → rotation-invariant **'rmsd'**, safe anywhere), or pick:
+        'rmsd' | 'moi' | 'descriptor' | 'energy', or a cheap-first cascade e.g. ['moi', 'rmsd']. **'moi' on a
+        multi-fragment system** silently merges distinct encounter geometries (nearly blind to a light/symmetric
+        fragment's relative pose) — rxembed warns. For a binding-mode summary use `representatives()`.
+
+        Tuning knobs (keyword): `max_rmsd` (Å), `moi_dev`, `max_dist` (descriptor), `energy_tol`,
+        `energy_window` (kcal/mol gate). Nothing is lost: discarded conformers stay in `ens.mol`; see
+        `ens.discarded` / `ens.duplicates()`.
         """
         by = kw.pop("method", by)  # 'method=' is the intuitive name; accept it as an alias of by=
         allowed = {"energy_window", "max_dist", "moi_dev", "max_rmsd", "energy_tol"}
@@ -967,7 +1256,7 @@ class Ensemble:
 
         # a metal complex looks multi-fragment only because the surrogate stripped its coordinate bonds;
         # those "fragments" are one molecule, so moi is a fine choice there — don't count them.
-        n_frag = 1 if _metal_present(self.mol) else len(Chem.GetMolFrags(self.mol))
+        n_frag = 1 if _metal_present(self._mol) else len(Chem.GetMolFrags(self._mol))
         if by == "auto":
             by = "rmsd"  # rigorous everywhere; moi/cascade are opt-in for speed
         methods = [by] if isinstance(by, str) else list(by)
@@ -979,10 +1268,13 @@ class Ensemble:
                 n_frag,
             )
         for method in methods:
+            if method == "connectivity":  # a validity filter, not a dedup — but it composes in the cascade
+                self.filter("connectivity")  # (e.g. prune(by=['connectivity', 'rmsd']): drop reacted, then dedup)
+                continue
             before = list(self.ids)
             energies = [self.energies.get(i, float("inf")) for i in self.ids]  # no energy -> outside any window,
             # never merged into a phantom 0.0-kcal band nor kept over a real-energy duplicate (untypable core)
-            self.ids, _ = _dedup.apply(self.mol, self.ids, energies, method=method, **kw)
+            self.ids, _ = _dedup.apply(self._mol, self.ids, energies, method=method, **kw)
             kept = set(self.ids)
             dropped = [i for i in before if i not in kept]
             self.discarded += dropped
@@ -1000,36 +1292,33 @@ class Ensemble:
 
     def _group_duplicates(self, kept, dropped):
         groups = {}
-        for d, (k, r) in _dedup.nearest_kept(self.mol, kept, dropped).items():
+        for d, (k, r) in _dedup.nearest_kept(self._mol, kept, dropped).items():
             groups.setdefault(k, []).append((d, r))
         return {k: sorted(v) for k, v in sorted(groups.items())}
 
     def duplicates(self):
-        """Explain what prune discarded: ``{kept_id: [(discarded_id, RMSD_Angstrom), ...]}``.
+        """Explain what was discarded: ``{kept_id: [(discarded_id, RMSD_Angstrom), ...]}``.
 
-        Each discarded conformer is grouped under the kept one it most resembles, with their heavy-atom
-        RMSD. The discarded geometries still live in `ens.mol`, so dump any with
-        `rxembed.wrap(ens.mol, [discarded_id]).dump('dropped.xyz')`. (At `set_verbose('DEBUG')` prune
-        logs this as it runs.)
+        Each discarded conformer is grouped under the kept one it most resembles. The geometries still live in
+        `ens.mol` (dump any via `rxembed.wrap(ens.mol, [discarded_id]).dump(...)`).
         """
         return self._group_duplicates(self.ids, self.discarded) if self.discarded else {}
 
     def binding_modes(self):
         """Count the inter-fragment NCI binding-mode signatures sampled across the conformers.
 
-        Uses the same inter-fragment scope as the latent / ``representatives`` -- intramolecular NCIs are
-        conformational detail, not binding modes -- so the two views agree. Empty signature ``()`` means no
-        inter-fragment contact in that pose.
+        Same inter-fragment scope as ``representatives`` (intramolecular NCIs are conformational detail), so
+        the two views agree. Empty signature ``()`` = no inter-fragment contact in that pose.
         """
         from collections import Counter
 
         from .dedup.features import _frag_map, _interfragment_contacts
 
-        an = _nci.analyzer(self.mol)
-        fmap = _frag_map(self.mol)
+        an = _nci.analyzer(self._mol)
+        fmap = _frag_map(self._mol)
 
         def sig(c):
-            contacts = _interfragment_contacts(an, self.mol.GetConformer(c).GetPositions(), fmap)
+            contacts = _interfragment_contacts(an, self._mol.GetConformer(c).GetPositions(), fmap)
             return tuple(sorted({t for t, _a, _p in contacts}))
 
         return Counter(sig(c) for c in self.ids)
@@ -1037,12 +1326,13 @@ class Ensemble:
     def cluster(self, *, min_cluster=3, reduce=None, nci=True):
         """Binding-mode cluster label per conformer (HDBSCAN on the shared latent; -1 = rare/noise).
 
-        On the dihedral [+NCI] [+metal] latent that ``landscape()`` also projects.
+        On the dihedral [+NCI] [+metal] latent that ``landscape()`` also projects. Relaxes once via
+        `minimize()` first (idempotent if already minimized) — which **moves atoms** — before clustering.
         """
         self.minimize()
         if not self.ids:
             return np.array([], dtype=int)
-        return _dedup.cluster_labels(self.mol, self.ids, min_cluster=min_cluster, reduce=reduce, nci=nci)
+        return _dedup.cluster_labels(self._mol, self.ids, min_cluster=min_cluster, reduce=reduce, nci=nci)
 
     def landscape(self, method="pca", color="cluster", *, reduce=None, min_cluster=3, nci=True):
         """2D ensemble map (method='pca'|'tsne'), coloured by 'cluster' or 'energy'."""
@@ -1054,7 +1344,7 @@ class Ensemble:
     # -- deriving a smaller / aligned ensemble (returns a NEW Ensemble) --------
 
     def _derive(self, ids, mol=None):
-        mol = mol if mol is not None else Chem.Mol(self.mol)  # own the Mol: a derived ensemble must not
+        mol = mol if mol is not None else Chem.Mol(self._mol)  # own the Mol: a derived ensemble must not
         metal = replace(self._metal, mol=mol) if self._metal is not None else None  # else mutate the parent.
         return Ensemble(
             mol,
@@ -1064,28 +1354,27 @@ class Ensemble:
             {i: self.energies[i] for i in ids if i in self.energies},  # ensemble (align/lowest); a later
             self._minimized,  # minimize() then relaxes this copy, never the parent's shared context.
             tag=dict(self.tag),
+            sphere=dict(self.sphere),  # a derived ensemble is still the same complex — keep its coordination
+            metal_bonds=list(self.metal_bonds),  # and its M-L connectivity record (so it stays connected too)
         )  # Keep provenance.
 
     def select_stereo(self, like, spec="preserve"):
         """Keep only conformers whose chirality matches `spec` against a reference `like`.
 
-        `like` is a Mol carrying the wanted handedness (usually the input geometry). This is for the
-        chirality the **embed cannot keep** -- a metallocene's **planar** chirality, **axial**/**helical**
-        atropisomerism -- sampled at random by a distance-geometry embed and selected here, *general* over
-        all element kinds via xyzgraph.
+        `like` is a Mol carrying the wanted handedness (usually the input geometry). For the chirality the
+        **embed cannot keep** — a metallocene's **planar** chirality, **axial**/**helical** atropisomerism —
+        sampled at random by the embed and selected here (general over all elements via xyzgraph).
 
-        `spec`: ``'preserve'`` (default — keep the non-graph chirality, i.e. planar/axial/helical; leave
-        **point R/S and E/Z free**, since those are the embed's own job or a labile centre you would not
-        want to lock — e.g. a protic amine); ``'free'`` (sample every handedness); ``'invert'`` (the
-        enantiomeric series); or a dict ``{kind|'default': mode}`` to **keep some and scramble others**
-        (e.g. ``{'planar':'preserve','default':'free'}`` — hold a ferrocene, explore the metal centre).
-        Returns a new Ensemble (a no-op if no managed chirality element is present).
+        `spec`: ``'preserve'`` (default — keep non-graph chirality, leave point R/S and E/Z free);
+        ``'free'`` (sample every handedness); ``'invert'`` (the enantiomeric series); or a dict
+        ``{kind|'default': mode}`` to keep some and scramble others (e.g. ``{'planar':'preserve','default':'free'}``).
+        Returns a new Ensemble (no-op if no managed chirality element is present).
         """
         if not self._minimized:
             self._stereo = None  # an EXPLICIT select_stereo overrides the embed default,
         self.minimize()  # so e.g. select_stereo(..,'free') still sees every pose
         ref = _stereo.signature(like) if isinstance(like, Chem.Mol) else _stereo.signature(*like)
-        keep = [i for i in self.ids if _stereo.passes(_stereo.signature(self.mol, i), ref, spec)]
+        keep = [i for i in self.ids if _stereo.satisfies_spec(_stereo.signature(self._mol, i), ref, spec)]
         logger.info("select_stereo[%s]: %d -> %d (chirality-matched)", spec, len(self.ids), len(keep))
         return self._derive(keep)
 
@@ -1104,20 +1393,19 @@ class Ensemble:
     def representatives(self, *, min_cluster=3, nci=True, recover_noise="auto", noise_window=10.0):
         """Return one lowest-energy conformer per **mode** as a new Ensemble (the distinct-shapes summary).
 
-        A "mode" is whatever the latent distinguishes (`dedup.active_blocks`): a conformer family (organic),
-        a contact pattern (NCI), or a ligand arrangement (metal). Sorted by energy; folded conformers stay
-        in `ens.ids`.
+        A "mode" is whatever the latent distinguishes (`dedup.active_feature_kinds`): a conformer family, a
+        contact pattern, or a ligand arrangement. Sorted by energy; folded conformers stay in `ens.ids`.
+        Relaxes once via `minimize()` first (**moves atoms**).
 
-        `recover_noise` handles HDBSCAN noise (label -1): ``"auto"`` (default) recovers a noise conformer
-        only if its discrete `mode_signature` is a genuinely new binding mode (all noise folded for a plain
-        organic); ``True`` keeps every noise conformer; ``False`` drops them. A recovered mode must sit
-        within `noise_window` kcal/mol of the minimum.
+        `recover_noise` handles HDBSCAN noise (label -1): ``"auto"`` (default) recovers a noise conformer only
+        if its `mode_signature` is a genuinely new binding mode; ``True`` keeps every noise conformer; ``False``
+        drops them. A recovered mode must sit within `noise_window` kcal/mol of the minimum.
         """
         self.minimize()
         if not self.ids:  # infeasible isomer / nothing embedded -> empty summary
             return self._derive([])
-        kind = _dedup.mode_kind(self.mol, self.ids, nci=nci)
-        labels = _dedup.cluster_labels(self.mol, self.ids, min_cluster=min_cluster, nci=nci).tolist()
+        kind = _dedup.mode_kind(self._mol, self.ids, nci=nci)
+        labels = _dedup.cluster_labels(self._mol, self.ids, min_cluster=min_cluster, nci=nci).tolist()
 
         def by_e(i):
             return self.energies.get(i, float("inf"))  # no energy (untypable core) -> sorts last, never "lowest"
@@ -1130,7 +1418,7 @@ class Ensemble:
         noise_k = [k for k in range(len(labels)) if labels[k] == -1]
         recovered, skipped_e = [], 0
         if noise_k and recover_noise is not False:
-            sigs = None if recover_noise is True else _dedup.mode_signature(self.mol, self.ids, nci=nci)
+            sigs = None if recover_noise is True else _dedup.mode_signature(self._mol, self.ids, nci=nci)
             if recover_noise is True:
                 recovered = [self.ids[k] for k in noise_k]
             elif sigs is not None:  # one rep per noise signature not already clustered
@@ -1171,12 +1459,12 @@ class Ensemble:
                 "measure() on an empty ensemble — no conformers to measure (embed/minimize "
                 "may have produced none; check the log)"
             )
-        idx = [resolve_atom(self.mol, a) for a in atoms]
+        idx = [resolve_atom(self._mol, a) for a in atoms]
         fns = {2: rdMolTransforms.GetBondLength, 3: rdMolTransforms.GetAngleDeg, 4: rdMolTransforms.GetDihedralDeg}
         if len(idx) not in fns:
             raise ValueError("measure() takes 2 (distance), 3 (angle) or 4 (dihedral) atoms")
         f = fns[len(idx)]
-        v = [f(self.mol.GetConformer(c), *idx) for c in self.ids]
+        v = [f(self._mol.GetConformer(c), *idx) for c in self.ids]
         return {"mean": float(np.mean(v)), "min": float(np.min(v)), "max": float(np.max(v)), "n": len(v)}
 
     def _align_atoms(self, on):
@@ -1186,14 +1474,14 @@ class Ensemble:
                 return core
             from .dedup.features import _metal_donors, _metal_present
 
-            if _metal_present(self.mol):  # a metal's natural overlay core is M + its donors (even when
-                m, donors = _metal_donors(self.mol, self.ids)  # cons is empty, e.g. a wrapped metal mol)
+            if _metal_present(self._mol):  # a metal's natural overlay core is M + its donors (even when
+                m, donors = _metal_donors(self._mol, self.ids)  # cons is empty, e.g. a wrapped metal mol)
                 if donors:
                     return [m, *donors]
-            return [a.GetIdx() for a in self.mol.GetAtoms() if a.GetAtomicNum() > 1]
+            return [a.GetIdx() for a in self._mol.GetAtoms() if a.GetAtomicNum() > 1]
         if isinstance(on, str):
-            return list(match(self.mol, on))
-        return [resolve_atom(self.mol, a) for a in on]
+            return list(match(self._mol, on))
+        return [resolve_atom(self._mol, a) for a in on]
 
     def align(self, on=None):
         """Return a new Ensemble with every conformer Kabsch-superposed for a readable overlay.
@@ -1202,15 +1490,14 @@ class Ensemble:
         default (a TS's frozen atoms sit still, the rest shows its variation); pass `on=` atom
         indices/SMARTS to align on something else.
         """
-        m = Chem.Mol(self.mol)
+        m = Chem.Mol(self._mol)
         if len(self.ids) > 1:
             rdMolAlign.AlignMolConformers(m, atomIds=self._align_atoms(on), confIds=list(self.ids))
         return self._derive(self.ids, mol=m)
 
     # -- looking (returns an artifact, never mutates) -------------------------
-    # 3D structure rendering is notebook-level: align()/dump() give you the geometry, then a couple of
-    # lines of py3Dmol (interactive) or xyzrender (publication SVG) in the notebook. Only `landscape` (the
-    # ensemble map — diversity, kept/dropped) lives here, because the dim-reduction is real reusable work.
+    # 3D rendering is notebook-level (align()/dump() + a few lines of py3Dmol/xyzrender). Only `landscape`
+    # lives here, because the dim-reduction is real reusable work.
 
     @property
     def n(self):
@@ -1220,9 +1507,8 @@ class Ensemble:
     def __getitem__(self, key):
         """Pick conformer(s) by position as a new Ensemble: ``reps[1]`` the 2nd, ``ens[:3]`` the first three.
 
-        A user-centric way to isolate one representative / conformer for a single view or dump
-        (``reps[1].dump('mode2.xyz')``) — ranked as tracked (``representatives``/``lowest`` order). Returns a
-        new Ensemble, so it carries the metal restoration and never mutates this one.
+        Isolates one representative / conformer for a view or dump, ranked as tracked
+        (``representatives``/``lowest`` order). Returns a new Ensemble (never mutates this one).
         """
         sel = self.ids[key]
         return self._derive(sel if isinstance(sel, list) else [sel])
@@ -1230,24 +1516,25 @@ class Ensemble:
     def dump(self, path, align=True):
         """Write the current conformers as a multi-frame **.xyz** (one frame per tracked id).
 
-        Dump at any pipeline stage (``embed(...).dump('seeds.xyz')``, ``.mc().dump('mc.xyz')``,
-        ``.prune().dump(...)``) or from any derived / filtered ensemble (``representatives()``, ``lowest()``,
-        ``align()``, or ``wrap(ens.mol, ens.discarded)`` for the pruned-away ones). Real element symbols are
-        written even before ``minimize()`` restores a metal surrogate.
+        Dump at any pipeline stage or from any derived ensemble. Real element symbols are written even before
+        ``minimize()`` restores a metal surrogate.
 
-        By default the frames are **aligned** (Kabsch-superposed on the rigid core — the constrained atoms,
-        else a metal's coordination sphere, else all heavy atoms — via the same selector as ``align()``) so
-        they overlay for viewing; pass ``align=False`` for raw embed-frame coordinates. Works on a **copy**,
-        so the live ensemble's geometry is never moved. Returns the path.
+        By default the frames are **aligned** (Kabsch-superposed on the rigid core, same selector as
+        ``align()``); pass ``align=False`` for raw embed-frame coordinates. Works on a **copy**, so the live
+        geometry is never moved. Returns the path.
         """
-        mc = self._metal
-        real = [(mc.metal, mc.real_z), *mc.extra] if mc is not None else []
-        mol = Chem.Mol(self.mol)  # a copy — dump never moves the live ensemble
-        for mi, rz in real:  # show the real metal(s), not the C surrogate
+        metal_ctx = self._metal
+        real = []
+        if metal_ctx is not None:
+            real = [(metal_ctx.metal, metal_ctx.real_z, metal_ctx.real_q), *metal_ctx.extra]
+        mol = Chem.Mol(self._mol)  # the ensemble mol is already real (no haptic centroid dummy); work on a copy
+        for mi, rz, rq in real:  # show the real metal(s) with their oxidation state, not the C surrogate
             mol.GetAtomWithIdx(mi).SetAtomicNum(rz)
+            mol.GetAtomWithIdx(mi).SetFormalCharge(rq)
         if align and len(self.ids) > 1:  # overlay frames on the rigid core
             try:
-                rdMolAlign.AlignMolConformers(mol, atomIds=self._align_atoms(None), confIds=list(self.ids))
+                aln = self._align_atoms(None)
+                rdMolAlign.AlignMolConformers(mol, atomIds=aln, confIds=list(self.ids))
             except Exception as e:
                 logger.debug("dump: alignment skipped (%s)", e)
         with open(path, "w") as f:

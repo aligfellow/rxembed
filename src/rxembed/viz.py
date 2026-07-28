@@ -53,7 +53,7 @@ def landscape(ens, color="cluster", method="pca", nci=True, reduce=None, min_clu
     xk, xd = xy[: len(kept)], xy[len(kept) :]
     fig, ax = plt.subplots()
     if dropped:  # the whole ensemble: pruned-away conformers as faint, small points behind the kept
-        ax.scatter(*xd.T, s=16, color="0.75", alpha=0.45, lw=0, zorder=1, label=f"dropped ({len(dropped)})")
+        ax.scatter(*xd.T, s=50, color="0.75", alpha=0.45, lw=0, zorder=1, label=f"dropped ({len(dropped)})")
     if color == "energy":
         e = [ens.energies.get(i, float("nan")) for i in kept]
         sc = ax.scatter(*xk.T, c=e, cmap="viridis", s=70, edgecolor="k", lw=0.4, zorder=2)

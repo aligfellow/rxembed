@@ -2,12 +2,13 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from rxembed.rdkit_embed.log import set_verbose
+
 from . import geometry
-from .constraints.metal import enumerate_isomers as metal
 from .constraints.nci import Contact
 from .constraints.nci import auto_binding_modes as nci_modes
 from .constraints.nci import candidate_contacts as nci_candidates
-from .log import set_verbose
+from .isomers import enumerate_isomers as metal
 from .pipeline import Ensemble, EnsembleSet, embed, minimize, wrap
 
 __all__ = [

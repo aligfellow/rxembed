@@ -14,6 +14,8 @@ from __future__ import annotations
 import os
 import tempfile
 
+from rxembed.rdkit_embed import io as _io
+
 _KEYS = [("point", "atom"), ("ez", "bond"), ("axial", "atoms"), ("planar", "ring"), ("helical", "atoms")]
 
 
@@ -84,7 +86,7 @@ def signature(mol, conf_id=-1, charge=0):
     return sig
 
 
-def passes(sig, ref, spec="preserve"):
+def satisfies_spec(sig, ref, spec="preserve"):
     """Return whether fingerprint ``sig`` satisfies the chirality ``spec`` against reference ``ref``.
 
     Judged on **handedness, not count** — xyzgraph's per-conformer perception is count-unstable (a
@@ -105,24 +107,6 @@ def passes(sig, ref, spec="preserve"):
         if mode == "invert" and present & ref_labels:
             return False  # an un-flipped (original) element is present
     return True
-
-
-def kinds(sig):
-    """Return the chirality element kinds present in ``sig`` (``'planar'``, ``'point'``, ...).
-
-    Lets a caller decide if chirality control is even relevant (no planar/axial/helical and SMILES-defined
-    point -> the embed handles it).
-    """
-    return set(sig)
-
-
-def relevant(ref):
-    """Return whether ``ref`` carries chirality the embed would drop (planar/axial/helical).
-
-    That is whether the auto-default should engage; a molecule with only point/EZ stereo needs no filtering
-    (RDKit keeps it).
-    """
-    return bool(_NONGRAPH & set(ref))
 
 
 def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
@@ -172,6 +156,116 @@ def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
     return ",".join(parts)
 
 
+def _coordination_locked_double_bonds(mol, metals):
+    """Double bonds whose E/Z is fixed by the coordination — endocyclic in a ring closed through the metal.
+
+    Such a bond has one buildable geometry (decided by the coordination isomer, the polyhedron path's job), so
+    enumerating both E and Z is a phantom: the wrong hand forces a bite the chelate can't span and the pipeline
+    burns seeds relaxing it into broken bonds. An alpha-diimine (N=C-C=N chelate) is the type case — both C=N
+    sit in the 5-membered metal ring and were enumerated 2x2.
+
+    RDKit ignores dative M-donor bonds in ring perception, so the metal-closed ring is invisible natively;
+    upgrade the datives to single to reveal it. A double bond still in a ring once the metal is removed is a
+    genuine organic ring bond (RDKit already handles its E/Z) and left alone — only a bond cyclic because of the
+    metal is locked here.
+    """
+    from rdkit import Chem
+
+    metals = set(metals)
+    if not metals:
+        return set()
+    up = Chem.RWMol(mol)  # dative -> single so RDKit sees the metal ring; FastFindRings avoids a valence sanitize
+    for b in up.GetBonds():
+        if b.GetBondType() == Chem.BondType.DATIVE:
+            b.SetBondType(Chem.BondType.SINGLE)
+    up = up.GetMol()
+    Chem.FastFindRings(up)
+    metal_rings = [set(r) for r in up.GetRingInfo().AtomRings() if metals & set(r)]
+    free = Chem.RWMol(mol)  # the metal-free graph: which double bonds are still cyclic without the metal?
+    for m in sorted(metals, reverse=True):
+        for nb in [n.GetIdx() for n in free.GetAtomWithIdx(m).GetNeighbors()]:
+            free.RemoveBond(m, nb)
+    free = free.GetMol()
+    Chem.FastFindRings(free)
+    locked = set()
+    for b in mol.GetBonds():
+        if b.GetBondType() != Chem.BondType.DOUBLE:
+            continue
+        a, c = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
+        in_metal_ring = any({a, c} <= r for r in metal_rings)
+        fb = free.GetBondBetweenAtoms(a, c)
+        if in_metal_ring and not (fb is not None and fb.IsInRing()):  # cyclic only because of the metal
+            locked.add(frozenset((a, c)))
+    return locked
+
+
+def _lock_double_bond(work, fb):
+    """Pin a coordination-locked double bond to an arbitrary definite stereo on ``work``; return True on success.
+
+    Stops ``onlyUnassigned`` from enumerating it. The value is never grafted onto the full mol (``graft`` skips
+    locked bonds), so the metal embed builds the one ring-feasible hand.
+
+    ``SetStereoAtoms`` requires the two reference atoms in the bond's own begin/end order (each a neighbour of
+    the corresponding end), so read the order off the bond, not off the unordered ``fb``.
+    """
+    from rdkit import Chem
+
+    a, c = tuple(fb)
+    wb = work.GetBondBetweenAtoms(a, c)
+    if wb is None:
+        return False
+    bi, ei = wb.GetBeginAtomIdx(), wb.GetEndAtomIdx()
+    nb_b = next((n.GetIdx() for n in work.GetAtomWithIdx(bi).GetNeighbors() if n.GetIdx() != ei), None)
+    nb_e = next((n.GetIdx() for n in work.GetAtomWithIdx(ei).GetNeighbors() if n.GetIdx() != bi), None)
+    if nb_b is None or nb_e is None:
+        return False
+    try:
+        wb.SetStereoAtoms(nb_b, nb_e)
+        wb.SetStereo(Chem.BondStereo.STEREOCIS)
+    except (RuntimeError, ValueError):  # degrade to "not locked" rather than crash; the phantom just enumerates
+        return False
+    return True
+
+
+def _build_enumeration_graph(mol, exclude):
+    """Disconnect each metal and D-cap each freed sp3 donor so RDKit enumerates only ligand stereo.
+
+    Returns ``(work, cap_to_metal)`` — the cap index → its metal's atomic number. With no `exclude` there is
+    nothing to disconnect, so `mol` is returned unchanged.
+    """
+    from rdkit import Chem
+
+    if not exclude:
+        return mol, {}
+    # Build the enumeration graph by DISCONNECTING each metal (bonds removed -> an isolated atom, never a false
+    # stereocentre) and capping each metal-bound sp3 DONOR's freed valence with a DEUTERIUM. A dative metal bond
+    # doesn't count toward a donor's valence, so RDKit sees a degree-3 phosphine and refuses the stereocentre; a
+    # real single bond to D restores it. D (not a plain H, which would clobber a donor already carrying an H into
+    # two identical substituents; not the metal, whose priority dominates) is distinct AND lowest-priority, so the
+    # donor's R/S is the lone-pair convention. The D's are APPENDED, so every real atom index is preserved. The
+    # embed carries the same cap (`metal._hold_donor_chirality`). A planar sp2 donor is left uncapped (non-stereo);
+    # a backbone centre needs no cap — it is a normal stereocentre on the metal-free graph.
+    cap_to_metal = {}  # D-cap atom index -> its metal's atomic number (for the coordinated-complex CIP label)
+    work = Chem.RWMol(mol)
+    for mi in exclude:
+        z_metal = mol.GetAtomWithIdx(mi).GetAtomicNum()
+        for nb in [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()]:
+            work.RemoveBond(mi, nb)
+            if mol.GetAtomWithIdx(nb).GetHybridization() == Chem.HybridizationType.SP3:
+                d = work.AddAtom(Chem.Atom(1))
+                work.GetAtomWithIdx(d).SetIsotope(2)  # deuterium
+                work.AddBond(nb, d, Chem.BondType.SINGLE)
+                work.GetAtomWithIdx(nb).SetNoImplicit(True)
+                cap_to_metal[d] = z_metal
+    work = work.GetMol()
+    Chem.SanitizeMol(work, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
+    # The strip above can orphan a C=N whose stereo reference atom WAS the metal, and a flagged bond with no
+    # references makes `FindPotentialStereo` below raise ("only can support 2 stereo neighbors"). The
+    # tolerant sanitize happens to scrub most of them, but that is luck, not a contract — see `io`.
+    _io.repair_bond_stereo(work)
+    return work, cap_to_metal
+
+
 def enumerate_unassigned(mol, cap=32, exclude=()):
     """Enumerate stereoisomers over ONLY the *unspecified* stereo elements (point R/S + double-bond E/Z).
 
@@ -199,43 +293,25 @@ def enumerate_unassigned(mol, cap=32, exclude=()):
 
     exclude = set(exclude)
     n_real = mol.GetNumAtoms()
-    # Build the enumeration graph by DISCONNECTING each metal (its bonds removed -> an isolated atom, never a
-    # false stereocentre) and capping each metal-bound DONOR stereocentre's freed valence with a DEUTERIUM. This
-    # is the fix for OIN-SMILES's zone-A problem: a DATIVE metal bond doesn't count toward a donor's valence, so
-    # RDKit sees a degree-3 phosphine and refuses the stereocentre; a real single bond (to D) restores it. D (not
-    # a plain H, which would clobber a donor already carrying an H into two identical substituents; not the metal,
-    # whose priority would dominate) is distinct AND lowest-priority — so the donor's R/S is the lone-pair
-    # convention. The D's are APPENDED, so every real atom index is preserved.
-    #
-    # Every PYRAMIDAL (sp3) donor is capped; the embed carries the same D-cap (`metal._hold_donor_chirality`) so
-    # a donor ETKDG would not otherwise hold as a degree-3 centre (a carbanion-C, an amine-N) still embeds its two
-    # hands distinctly. A planar sp2 donor (a conjugated amidate/thiourea N) is left uncapped and stays non-stereo.
-    # A backbone (non-donor) centre needs no cap — it is a normal stereocentre on the metal-free graph.
-    cap_to_metal = {}  # D-cap atom index -> its metal's atomic number (for the coordinated-complex CIP label)
-    if exclude:
-        work = Chem.RWMol(mol)
-        for mi in exclude:
-            z_metal = mol.GetAtomWithIdx(mi).GetAtomicNum()
-            for nb in [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()]:
-                work.RemoveBond(mi, nb)
-                if mol.GetAtomWithIdx(nb).GetHybridization() == Chem.HybridizationType.SP3:
-                    d = work.AddAtom(Chem.Atom(1))
-                    work.GetAtomWithIdx(d).SetIsotope(2)  # deuterium
-                    work.AddBond(nb, d, Chem.BondType.SINGLE)
-                    work.GetAtomWithIdx(nb).SetNoImplicit(True)
-                    cap_to_metal[d] = z_metal
-        work = work.GetMol()
-        Chem.SanitizeMol(
-            work, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True
-        )
-    else:
-        work = mol
+    work, cap_to_metal = _build_enumeration_graph(mol, exclude)
+
+    # A C=N / C=C whose E/Z is fixed by the coordination must not be enumerated. `FindPotentialStereo` runs on
+    # `work` (metal disconnected), which opens any ring the metal closed, so a coordination-locked imine looks
+    # like a free acyclic double bond and gets a phantom E and Z (an alpha-diimine chelate enumerates 2x2, most
+    # of it unbuildable). A double bond endocyclic in a ring closed through the metal has one buildable geometry,
+    # decided by the coordination isomer, not two hands.
+    locked = _coordination_locked_double_bonds(mol, exclude)
+    locked = {fb for fb in locked if _lock_double_bond(work, fb)}  # keep only the ones we could actually pin
 
     def enumerable(e):  # genuine organic point (R/S) + double-bond (E/Z); the isolated metal is never a centre
-        return e.specified == Chem.StereoSpecified.Unspecified and e.type in (
-            Chem.StereoType.Atom_Tetrahedral,
-            Chem.StereoType.Bond_Double,
-        )
+        if e.specified != Chem.StereoSpecified.Unspecified:
+            return False
+        if e.type == Chem.StereoType.Atom_Tetrahedral:
+            return True
+        if e.type == Chem.StereoType.Bond_Double:  # skip a double bond the coordination has already locked
+            wb = work.GetBondWithIdx(e.centeredOn)
+            return frozenset((wb.GetBeginAtomIdx(), wb.GetEndAtomIdx())) not in locked
+        return False
 
     unassigned = [e for e in Chem.FindPotentialStereo(work) if enumerable(e)]
     if not unassigned:
@@ -253,6 +329,10 @@ def enumerate_unassigned(mol, cap=32, exclude=()):
                 full.GetAtomWithIdx(a.GetIdx()).SetChiralTag(a.GetChiralTag())
         for b in wv.GetBonds():
             i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
+            # skip a coordination-locked bond: its `work` stereo is the arbitrary lock value, not a real hand;
+            # the full mol keeps it unspecified so the metal embed builds the ring-feasible geometry.
+            if frozenset((i, j)) in locked:
+                continue
             if b.GetStereo() != Chem.BondStereo.STEREONONE and i < n_real and j < n_real:
                 fb = full.GetBondBetweenAtoms(i, j)
                 if fb is not None:

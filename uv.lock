@@ -912,7 +912,7 @@ name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ptyprocess", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "ptyprocess" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz", hash = "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f", size = 166450, upload-time = "2023-11-25T09:07:26.339Z" }
 wheels = [
@@ -1407,6 +1407,9 @@ all = [
 ase = [
     { name = "ase" },
 ]
+sphere = [
+    { name = "scipy" },
+]
 viz = [
     { name = "matplotlib" },
     { name = "seaborn" },
@@ -1439,13 +1442,14 @@ requires-dist = [
     { name = "prism-pruner" },
     { name = "rdkit" },
     { name = "scikit-learn" },
+    { name = "scipy", marker = "extra == 'sphere'" },
     { name = "seaborn", marker = "extra == 'all'" },
     { name = "seaborn", marker = "extra == 'viz'" },
-    { name = "xyzgraph" },
-    { name = "xyzrender", marker = "extra == 'all'" },
-    { name = "xyzrender", marker = "extra == 'viz'" },
+    { name = "xyzgraph", specifier = ">=1.6.14" },
+    { name = "xyzrender", marker = "extra == 'all'", specifier = ">=0.3.8" },
+    { name = "xyzrender", marker = "extra == 'viz'", specifier = ">=0.3.8" },
 ]
-provides-extras = ["ase", "viz", "all"]
+provides-extras = ["ase", "sphere", "viz", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1725,21 +1729,21 @@ wheels = [
 
 [[package]]
 name = "xyzgraph"
-version = "1.6.12"
+version = "1.6.14"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "networkx" },
     { name = "numpy" },
     { name = "rdkit" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5d/52/6fa7545e7336b3953bdeec88aa68cf18f89e6b38d51d776380e5bd462ec8/xyzgraph-1.6.12.tar.gz", hash = "sha256:7f4dfe30538d18ccba38c23c3741e10fe8e1089e058f0db753e798240c36de7f", size = 175875, upload-time = "2026-06-08T07:15:44.808Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0d/90/93e5da04ef7efed8d8737aff24171886dd2738060295cd3b881b3a0d6919/xyzgraph-1.6.14.tar.gz", hash = "sha256:360cbee22172c0823dbc2c43ca109a3a1212bd7bdb029fd8998da676b3fe99a3", size = 181173, upload-time = "2026-07-20T14:48:22.813Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/61/f9/bf414dc8e352eba65699ffe42406dc8d55adcb3ba757e02463e6d2cfca5b/xyzgraph-1.6.12-py3-none-any.whl", hash = "sha256:5327f1cb99511493905939fb3990eaa8436ce45b55ce924b34ac1f3a4d42c63c", size = 129221, upload-time = "2026-06-08T07:15:43.145Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/e7/35f138e79a0ba3fae37f23af80a55cbdf3a616b635799579bb3fd87e29d2/xyzgraph-1.6.14-py3-none-any.whl", hash = "sha256:1aecb1c07f4b32364cd21e1d52e2f657a93b15504225c2cddb672d24b783aea7", size = 131082, upload-time = "2026-07-20T14:48:20.53Z" },
 ]
 
 [[package]]
 name = "xyzrender"
-version = "0.3.1"
+version = "0.3.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cairosvg" },
@@ -1751,7 +1755,7 @@ dependencies = [
     { name = "resvg-py" },
     { name = "xyzgraph" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8d/06/0cec054ada3a9763a513e4b9614485091a5a493379bd32ab85e67ba8c014/xyzrender-0.3.1.tar.gz", hash = "sha256:a2db1c977770037fb6d2eb0836f011e694b3357288d29ddf75805b9c16ecd644", size = 301968, upload-time = "2026-05-31T19:02:08.257Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/cc/c9/ba0c4ff1ac10844627993ad7770596cc9168fa9dad774201dcf34ad0d8bf/xyzrender-0.3.8.tar.gz", hash = "sha256:ce97535ae19636e04a2fd9ea9ffa7945678ea6757a0da1e7d1833b32166fcbd9", size = 312614, upload-time = "2026-07-21T07:25:24.189Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/87/45/8edbde2bf05b02b43c18e557455447d885b0074aeca637a6276fd0838b14/xyzrender-0.3.1-py3-none-any.whl", hash = "sha256:3106bfc1e11744999631791ecef0fb7d658e9942e325044a32b1d39d05cc2d69", size = 248973, upload-time = "2026-05-31T19:02:06.167Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/97/030225e028dbc18e5d0e81aba7c72bdb6c97919fbaa41589b48b3a0da08f/xyzrender-0.3.8-py3-none-any.whl", hash = "sha256:a83923463df278b66906cd5e81d22f9ba8d7f5ff782e38008f75a91ba322cf53", size = 255178, upload-time = "2026-07-21T07:25:21.486Z" },
 ]

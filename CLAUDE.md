@@ -23,8 +23,8 @@ metal isomers, NCI binding modes, ambiguous coordination, **undefined stereocent
 *, fix, constrain, …)` is the search-free companion: same verbs, relax an existing geometry *toward* the
 targets instead of conf-searching.
 
-> **Constraint spec — three index-driven verbs** (`constraints/builders.py::resolve_core`, the clean-break
-> redesign of the old `freeze`/`distances`/`angles`/`template`/`match`/`anchor`; see **`DESIGN.md`**):
+> **Constraint spec — three index-driven verbs** (`rdkit_embed/constraints/builders.py::resolve_core`, the
+> clean-break replacement of the old `freeze`/`distances`/`angles`/`template`/`match`/`anchor`):
 > **`fix`** (rigid — own-coords list / explicit-coords dict / exact-number dict, grafted or UFF-pulled),
 > **`constrain`** (soft windows + π-stack planes, releasable by `mc(explore=)`), **`template`**
 > (`(reference, {target_i: ref_i})` sugar for a coords-`fix`). Keys are **0-based atom indices** (xyz/graph
@@ -62,8 +62,8 @@ formula). Ranking the candidates against each other is the one deliberate cross-
 - **KISS / no over-engineering.** Adding a capability should be a *registry row or one argument*, not a
   branch. NCI contact types live in one `KINDS` registry (`constraints/nci.py`); the enumerator is generic
   over it. Dead machinery gets deleted.
-- **One struct in, one struct out.** `Constraints` (`constraints/base.py`) is the single thing every *builder*
-  fills and every *stage* reads. Nothing reaches into the pipeline sideways.
+- **One struct in, one struct out.** `Constraints` (`rdkit_embed/constraints/base.py`) is the single thing every
+  *builder* fills and every *stage* reads. Nothing reaches into the pipeline sideways.
 - **Edit, don't replace.** The ETKDG bounds matrix is *edited* from RDKit's knowledge-derived bounds, so
   experimental-torsion / basic-knowledge seeding survives even under a tight custom core.
 - **Bias the seed, let energy decide.** Constraints bias the *starting* geometry; they are not truth.
@@ -119,30 +119,85 @@ sync` resolves + locks it; `just setup-openconf-dev` swaps in a local editable c
 openconf's pose-freeze is *soft* (held atoms drift ~0.1 Å), so a constraint that must truly hold across `mc`
 has to be one the rxembed relax also reads (a distance/angle), not a pose-hold alone.
 
-**Metal M-donor approximations** (`constraints/metal.py::coordination`, SMILES path): M-donor distance =
-covalent-sum bond length, with the donor radius **capped at 0.85 Å for soft dative donors** (P/S/As/Se — their
-dative bond runs shorter than rcov implies; a halide keeps the covalent sum). **Donor orientation** (`_orient_donor`):
-a conjugated N/O donor's rigid plane is held ~120° (no fold-in), and **any donor's protons** are held at the
-hybridisation angle (~109.5° sp3) so a methyl/ammine/amine's X–H bonds splay away and its lone pair points at the
-metal — skipped for a side-on η² (donor bonded to a co-donor). NB `N[Co]` writes a *covalent* N (→ NH₂, valence
-consumes an H); a true NH₃ ammine donor needs the dative `[NH3]->[Co]`. A metal-bound sp3 **carbanion/amine
-stereocentre** is additionally held by a charge-neutralised dummy-D through every embed/relax (`_hold_donor_chirality`).
+**Metal surrogate — two atoms, one index.** The metal is a bond-less **carbon** in the distance geometry (its
+excluded volume stops a ligand folding into the centre) and a bond-less **lithium** in the force field
+(`rdkit_embed/refine/ff.py::_ff_surrogate`): Li's small vdW is a soft excluded-volume sphere that keeps every non-donor — heavy *and*
+hydrogen — off the metal, which no per-atom floor did. The M-donor bonds stay stripped, so `prepare`/`restore`
+must hand the metal's **oxidation state** back (not just its element), or every `score`/`optimize` runs at the
+wrong total charge. M-donor distance is the fitted periodic model (`ml_distance`, element/group/**delocalised**
+charge/hapticity — never the raw formal charge, a Kekulé artefact) with a P/As/Se dative cap.
+
+**Donor orientation** (`rdkit_embed/constraints/donor_orient.py`): the stripped bond removes UFF's own terms, so
+the ones that matter are put back, softly. `_orient_donor` holds an **sp** donor end-on (nitrile/CO) and a slow-inverting
+**pnictogen** donor's protons splayed (P/As/Sb — their inversion barrier is one a local optimiser can't cross);
+`_coplanar_donor` keeps a **conjugated sp2** donor's metal in the donor's own π-plane (a soft dihedral cap, plus
+a wide M-O-C angle wall for a one-neighbour O so the plane bound gets a fix). All are caps/walls, not points —
+the real energy decides where inside them to sit. NB `N[Co]` writes a *covalent* N (→ NH₂); a true ammine needs
+the dative `[NH3]->[Co]`. A metal-bound sp3 **carbanion/amine stereocentre** is held by a charge-neutralised
+dummy-D through every embed/relax (`_hold_donor_chirality`).
+
+**Connectivity is truth.** An optimiser can hand back a *different species* with a plausible energy;
+`.filter('connectivity')` (and `prune(by=['connectivity',…])`) re-perceives the graph and drops a conformer
+whose bonding changed — flagged loudly, never silent. A double bond whose E/Z the coordination locks (an
+α-diimine C=N in a ring closed *through* the metal) is not enumerated as a phantom pair (`stereo.py`). The
+geometry gate additionally reports a **folded donor** — a ligand pointing the wrong way off its donor —
+which every distance-based check is blind to (`geometry.donor_fold`/`donor_orientation`).
 
 ## Where things live
 
-- `src/rxembed/pipeline.py` — `embed`, `wrap`, `Ensemble` (mc/minimize/prune/score/optimize/representatives),
+The tree is a **kernel/shell split**: the pure DG/FF engine is the in-place subpackage `rxembed.rdkit_embed.*`
+(numpy + rdkit only — no pipeline, no calculators, no perception-heavy deps), and the user-facing pipeline +
+QA gate + NCI + isomers + real-energy calculators are the shell `rxembed.*`. You import as `rx` and call the
+shell; the shell drives the kernel — you rarely open a kernel file. The boundary is import-closed and locked by
+`tests/test_import_hygiene.py` (no kernel module reaches up into the shell). The kernel is intended to graduate
+to a standalone `rdkit_embed` package once it stabilises (its `pyproject.toml` there is an inert placeholder).
+
+**Shell — `src/rxembed/` (the pipeline you drive):**
+
+- `pipeline.py` — `embed`, `minimize`, `wrap`, `Ensemble` (mc/minimize/prune/score/optimize/representatives),
   `EnsembleSet`.
-- `src/rxembed/embed/` — `dispatch.py` (the embed machinery: `_xyz_to_mol`, metal path, template path,
-  `_embed_dispatch`), `bounds.py` (edited-bounds ETKDG embed + seed-count scaling), `mc.py`.
-- `src/rxembed/constraints/` — `base.py` (`Constraints`, `relaxed()`), `nci.py` (KINDS registry, binding
-  modes, acceptor quality, reciprocal split), `metal.py`, `builders.py` (`resolve_core` — the fix/constrain/template resolver).
-- `src/rxembed/dedup/` — `prism` moi/rmsd/descriptor prunes + the distinct energy-aware `energy_prune`.
-- `src/rxembed/refine/` — `xtb.py` (executable interface), `calculator.py` (`resolve`, `XTB`, `ASE`).
-- `src/rxembed/geometry.py` — the TS-aware geometry gate (`check`): broken conjugation, bad H positions,
-  clashes, moved core; frozen/metal-aware (dative distances aren't clashes).
-- `src/rxembed/stereo.py` — chirality fingerprints + the auto-preserve gate; **`enumerate_unassigned`** (the
-  undefined-stereocentre racemate/diastereomer load-in: point R/S + E/Z, `onlyUnassigned`, meso-deduped,
-  metal-safe, chiral-at-P). Wired in `embed/dispatch.py::_stereo_expand`/`_stereo_enumerated_embed`.
+- `inputs.py` — `_xyz_to_mol` (path→Mol, xyzgraph perception) + `parse_smiles` (str→Mol); the shell leaf that
+  adapts a user source before the kernel `embed(mol, …)` engine sees it (imports nothing from `rxembed`, so it
+  forms no cycle).
+- `isomers.py` — the `rx.metal` entry point: `enumerate_isomers` + the `Isomer`/`IsomerSet` data model
+  (name-agnostic arrangement + Λ/Δ chirality, `select()`/`filter()`).
+- `embed/` — `dispatch.py` (the embed machinery: source normalisation, metal path, template path,
+  `_embed_dispatch`, `_stereo_expand`/`_stereo_enumerated_embed`), `mc.py` (openconf Monte-Carlo). *(The
+  edited-bounds ETKDG embed is kernel-side, `rdkit_embed/embed/bounds.py`.)*
+- `constraints/` — `nci.py` only (KINDS registry, binding modes, acceptor quality, reciprocal split). *(The
+  `Constraints` struct + `builders`/`metal`/etc. are kernel-side, `rdkit_embed/constraints/`.)*
+- `dedup/` — `prism` moi/rmsd/descriptor prunes + the distinct energy-aware `energy_prune` (`select.py`).
+- `refine/` — `xtb.py` (executable interface), `calculator.py` (`resolve`, `XTB`, `ASE`). *(The
+  constraint-enforcing restrained UFF + FF energies are kernel-side, `rdkit_embed/refine/ff.py`.)*
+- `geometry.py` — the TS-aware geometry gate (`check`): broken conjugation, bad H positions, clashes, moved
+  core, metal over-bond, **folded donor** (`donor_orientation`/`donor_fold`, census-calibrated); frozen/metal-
+  aware (dative distances aren't clashes). Shell — it reads the kernel's `coordination` perception, never the
+  reverse.
+- `metrics.py` — `bonding_ok`, `connectivity` (graph diff), `coordination_changed` (a donor that left / a
+  non-donor that joined the metal) — behind `.filter('connectivity')`.
+- `stereo.py` — chirality fingerprints + the auto-preserve gate; **`enumerate_unassigned`** (the undefined-
+  stereocentre racemate/diastereomer load-in: point R/S + E/Z, `onlyUnassigned`, meso-deduped, metal-safe,
+  chiral-at-P; a coordination-locked C=N is not enumerated). Wired in `embed/dispatch.py`.
+- `viz.py` — landscape / cluster / render helpers (matplotlib/seaborn, the `viz` extra).
+
+**Kernel — `src/rxembed/rdkit_embed/` (the pure embed engine, `numpy + rdkit`):**
+
+- `embed/bounds.py` — the edited-bounds ETKDG embed (RDKit knowledge-derived bounds *edited* from the
+  constraints) + seed-count scaling.
+- `refine/ff.py` — `restrained_uff` (the constraint-enforcing minimiser), `ff_energies`, `_ff_surrogate` (the
+  bond-less Li force-field surrogate).
+- `constraints/` — `base.py` (`Constraints`, `copy`/`compose`, `relaxed()`), `builders.py` (`resolve_core` —
+  the fix/constrain/template resolver), `metal.py` (the polyhedron per isomer: `surrogate_metal`, `coordination`,
+  `restore_metal`/`connect_metal`, `n_sites`, `geometry_for`), `distance.py` (`ml_distance` — the fitted M–L
+  periodic model), `donor_orient.py` (`_orient_donor`/`_coplanar_donor`), `mechanisms.py` (each field's
+  co-located DG + FF writer), `polyhedron.py` (slot/parity descriptor), `solver.py`/`sphere.py` (the
+  scipy-gated coordination-sphere solver, effectively a rare fallback).
+- `coordination.py` — the coordination-sphere perception ruler (which atoms coordinate which metal; the fold /
+  overbond gates the shell `geometry` reads).
+- `io.py` (`repair_bond_stereo` — the bottom of the stack, imports nothing), `log.py`, `report.py`,
+  `vecmath.py` — the kernel leaves.
+
 - `examples/*.ipynb` — the 8-notebook breadth tour; `examples/structures/` — static TS `.xyz` geometries.
 
-See `plan.md` for the forward roadmap and open threads, and `DESIGN.md` for the planned `fix`/`constrain`/`template` constraint-API redesign.
+See `plan.md` (a local, un-checked-in roadmap file) for forward threads; the tracked reasoning lives in
+`docs/findings/`.

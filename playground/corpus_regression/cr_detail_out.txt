@@ -1,0 +1,49 @@
+==========================================================================================
+ZERO-CONFORMER RETURNS (silent embed failures) — by tree, any seed
+==========================================================================================
+  HEAD    : 2 structures — TUXRUZ[tmQM]['0xf00d', '0xbeef', '0x1234'], ticat3_generated_broken[fixtures]['0xf00d', '0xbeef', '0x1234']
+  +T3     : 1 structures — ticat3_generated_broken[fixtures]['0xf00d', '0xbeef', '0x1234']
+  +T3+T4  : 1 structures — ticat3_generated_broken[fixtures]['0xf00d', '0xbeef', '0x1234']
+
+==========================================================================================
+BOUND CROSSOVER (smoothing tol > 0 at embed) — by tree
+==========================================================================================
+  HEAD    : 1 structures — TiCat2[fixtures][('0xf00d', 0.07279999999999999), ('0xbeef', 0.07279999999999999), ('0x1234', 0.07279999999999999)]
+  +T3     : 1 structures — TiCat2[fixtures][('0xf00d', 0.07279999999999999), ('0xbeef', 0.07279999999999999), ('0x1234', 0.07279999999999999)]
+  +T3+T4  : 1 structures — TiCat2[fixtures][('0xf00d', 0.07279999999999999), ('0xbeef', 0.07279999999999999), ('0x1234', 0.07279999999999999)]
+
+==========================================================================================
+dg_floors emitted per structure (the T4 substrate — non-zero means dg_floors were WRITTEN)
+==========================================================================================
+  structures with any dg_floors: 136 / 142
+  (these are all from nondonor_floors, the single-source producer — collisions need TWO sources,
+   which only the coordinate= path creates; see cr_t4_fires.json: 0 collisions corpus-wide)
+
+==========================================================================================
+POST-MINIMIZE CLASH conformers — where the census jump 28->126 comes from
+==========================================================================================
+  HEAD    : 8 clash-conformers across 3 structures: ZAHZUD[tmQM]x4, WUVJAB[tmQM]x3, WELROW[tmQM]x1
+  +T3     : 28 clash-conformers across 3 structures: ZAHZUD[tmQM]x19, WUVJAB[tmQM]x5, WELROW[tmQM]x4
+
+==========================================================================================
+KEY POST REGRESSIONS — HEAD vs +T3, mean over seeds
+==========================================================================================
+  WUVJAB          [tmQM]  ml_mae: 0.001->0.026 (+0.025) | fold: 14.540->22.204 (+7.664) | rmsd: 1.614->1.515 (-0.099) | bond_mae: 0.024->0.017 (-0.007)
+  SOHMEJ          [tmQM]  ml_mae: 0.001->0.001 (+0.000) | fold: 28.558->26.548 (-2.010) | rmsd: 3.277->3.665 (+0.388) | bond_mae: 0.018->0.018 (+0.000)
+  YIXSIJ          [tmQM]  ml_mae: 0.002->0.002 (+0.000) | fold: 17.812->17.226 (-0.586) | rmsd: 2.166->2.228 (+0.062) | bond_mae: 0.015->0.015 (-0.000)
+  PdCl2-RR-BDNN   [fixtures]  ml_mae: 0.006->0.006 (-0.000) | fold: 30.423->30.594 (+0.171) | rmsd: 2.979->3.026 (+0.047) | bond_mae: 0.012->0.012 (+0.000)
+  WELROW          [tmQM]  ml_mae: 0.000->0.000 (-0.000) | fold: 26.822->38.582 (+11.760) | rmsd: 2.605->1.357 (-1.248) | bond_mae: 0.027->0.024 (-0.003)
+  HOXLAK          [tmQM]  ml_mae: 0.005->0.005 (+0.000) | fold: 5.341->9.629 (+4.288) | rmsd: 1.272->1.137 (-0.135) | bond_mae: 0.013->0.013 (+0.000)
+  QUZKAZ          [tmQM]  ml_mae: 0.006->0.006 (-0.000) | fold: 26.746->29.550 (+2.803) | rmsd: 1.927->1.782 (-0.145) | bond_mae: 0.021->0.021 (-0.000)
+  KEGFOU          [tmQM]  ml_mae: 0.009->0.009 (-0.000) | fold: 74.891->66.682 (-8.210) | rmsd: 4.206->3.757 (-0.449) | bond_mae: 0.015->0.015 (-0.000)
+
+==========================================================================================
+CONFORMER YIELD — embedded vs kept-through-minimize, pooled by tree
+==========================================================================================
+  HEAD    : embedded=2986 kept=2168 (72.6%) scored_runs=420
+  +T3     : embedded=3406 kept=2667 (78.3%) scored_runs=423
+  +T3+T4  : embedded=3406 kept=2667 (78.3%) scored_runs=423
+
+  runs that embedded but minimize emptied (kept==0):
+    HEAD    : 13 — ['AGUFEN', 'Ferrocene', 'Ferrocene-halide-face', 'HgI3', 'IYIJAE', 'JIWHOQ', 'LASFOB', 'PdCl2PhenPhosMe', 'RERHEB', 'WEGBOZ', 'WELROW', 'ZAHZUD', 'Zeises_salt']
+    +T3     : 9 — ['AGUFEN', 'Ferrocene', 'Ferrocene-halide-face', 'IYIJAE', 'JIWHOQ', 'LASFOB', 'PdCl2PhenPhosMe', 'WEGBOZ', 'Zeises_salt']

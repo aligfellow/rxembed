@@ -1,0 +1,102 @@
+
+=== per case: which violation fires (counts over all conformers x seeds) ===
+acetic-pyridine          seed {'conjugation': 7}                             relax {}
+acid-angle               seed {'conjugation': 9}                             relax {}
+acid-dist                seed {'conjugation': 2}                             relax {'planarity': 2}
+acid-dist-tight          seed {'conjugation': 5}                             relax {'planarity': 2}
+bimp                     seed {'planarity': 2}                               relax {'conjugation': 14}
+bimp-smiles-auto         seed {'conjugation': 511}                           relax {'conjugation': 591, 'planarity': 216, 'hydrogen': 22, 'bond_length': 19, 'clash': 4}
+chb-tetramisole          seed {}                                             relax {'planarity': 40}
+cpa                      seed {'planarity': 3}                               relax {'planarity': 20}
+jacob_ts4                seed {'planarity': 10}                              relax {}
+schreiner-acetone        seed {}                                             relax {'conjugation': 11}
+sn2-smiles               seed {'clash': 18, 'bond_length': 17}               relax {'clash': 18}
+takemoto-acetone         seed {}                                             relax {'conjugation': 19, 'planarity': 1}
+thia-ma                  seed {'conjugation': 17}                            relax {'conjugation': 18}
+
+=== cases with a REAL reference geometry: seed / relax / reference ===
+
+  bimp
+    conjugation twist, max (deg)           seed   1.6450  relax  42.3209  REF  12.7599
+    conjugation twist, mean (deg)          seed   1.2292  relax  25.3812  REF   9.4877
+    conjugation quartets > 30 deg (count)  seed   0.0000  relax   0.7000  REF   0.0000
+    sp2 out-of-plane, max (A)              seed   0.2955  relax   0.1578  REF   0.1509
+    distance-window violation, max (A)     seed   0.1805  relax   0.0010  REF   8.9688
+    angle-window violation, max (deg)      seed   0.0000  relax   0.0000  REF   0.0000
+    bond-length MAE vs reference (A)       seed   0.0272  relax   0.0153  REF   0.0000
+    bond-length max vs reference (A)       seed   0.3780  relax   0.0903  REF   0.0000
+    frozen-core drift vs reference (A)     seed   0.0000  relax   0.0000  REF   0.0000
+    reference passes geometry.check: False  (reference gate kinds ['planarity'])
+
+  cpa
+    conjugation twist, max (deg)           seed   0.0000  relax   0.0000  REF   0.0000
+    conjugation twist, mean (deg)          seed   0.0000  relax   0.0000  REF   0.0000
+    conjugation quartets > 30 deg (count)  seed   0.0000  relax   0.0000  REF   0.0000
+    sp2 out-of-plane, max (A)              seed   0.2833  relax   0.2096  REF   0.1563
+    distance-window violation, max (A)     seed   0.0000  relax   0.0000  REF   0.0000
+    angle-window violation, max (deg)      seed   0.0000  relax   0.0000  REF   0.0000
+    bond-length MAE vs reference (A)       seed   0.0261  relax   0.0147  REF   0.0000
+    bond-length max vs reference (A)       seed   0.2249  relax   0.1800  REF   0.0000
+    frozen-core drift vs reference (A)     seed   0.0000  relax   0.0000  REF   0.0000
+    reference passes geometry.check: True  (reference gate kinds [])
+
+  jacob_ts4
+    conjugation twist, max (deg)           seed   0.0000  relax   0.0000  REF   0.0000
+    conjugation twist, mean (deg)          seed   0.0000  relax   0.0000  REF   0.0000
+    conjugation quartets > 30 deg (count)  seed   0.0000  relax   0.0000  REF   0.0000
+    sp2 out-of-plane, max (A)              seed   0.1625  relax   0.0775  REF   0.0122
+    distance-window violation, max (A)     seed   0.0000  relax   0.0000  REF   0.0000
+    angle-window violation, max (deg)      seed   0.0000  relax   0.0000  REF   0.0000
+    bond-length MAE vs reference (A)       seed   0.0426  relax   0.0292  REF   0.0000
+    bond-length max vs reference (A)       seed   0.4333  relax   0.3540  REF   0.0000
+    frozen-core drift vs reference (A)     seed   0.0000  relax   0.0000  REF   0.0000
+    reference passes geometry.check: True  (reference gate kinds [])
+
+  spiro-ts1
+    conjugation twist, max (deg)           seed   0.0000  relax   0.0000  REF   0.0000
+    conjugation twist, mean (deg)          seed   0.0000  relax   0.0000  REF   0.0000
+    conjugation quartets > 30 deg (count)  seed   0.0000  relax   0.0000  REF   0.0000
+    sp2 out-of-plane, max (A)              seed   0.0050  relax   0.0822  REF   0.0191
+    distance-window violation, max (A)     seed   0.0000  relax   0.0000  REF   0.0000
+    angle-window violation, max (deg)      seed   0.0000  relax   0.0000  REF   0.0000
+    bond-length MAE vs reference (A)       seed   0.0251  relax   0.0150  REF   0.0000
+    bond-length max vs reference (A)       seed   0.1196  relax   0.1929  REF   0.0000
+    frozen-core drift vs reference (A)     seed   0.0000  relax   0.0000  REF   0.0000
+    reference passes geometry.check: True  (reference gate kinds [])
+
+  thia-ma
+    conjugation twist, max (deg)           seed  63.5176  relax  56.4253  REF  16.5772
+    conjugation twist, mean (deg)          seed  29.0284  relax  35.4137  REF   8.0733
+    conjugation quartets > 30 deg (count)  seed   0.9000  relax   1.5500  REF   0.0000
+    sp2 out-of-plane, max (A)              seed   0.0956  relax   0.2212  REF   0.2791
+    distance-window violation, max (A)     seed   0.0000  relax   0.0000  REF   0.0000
+    angle-window violation, max (deg)      seed   0.0000  relax   0.0000  REF   0.0000
+    bond-length MAE vs reference (A)       seed   0.0320  relax   0.0239  REF   0.0000
+    bond-length max vs reference (A)       seed   0.1996  relax   0.1658  REF   0.0000
+    frozen-core drift vs reference (A)     seed   0.0000  relax   0.0000  REF   0.0000
+    reference passes geometry.check: True  (reference gate kinds [])
+
+=== drift: how far the relax moved each conformer (heavy-atom RMSD, A) ===
+  thia-ma                  mean  2.373  max  3.701
+  chb-tetramisole          mean  2.372  max  3.507
+  bimp                     mean  1.976  max  3.329
+  schreiner-acetone        mean  1.642  max  2.413
+  xb-i-n                   mean  1.592  max  2.127
+  takemoto-acetone         mean  1.414  max  2.029
+  cpa                      mean  1.391  max  2.392
+  acetic-pyridine          mean  1.324  max  1.813
+  bimp-smiles-auto         mean  1.198  max  2.710
+  chalcogen-benzothiazole  mean  1.052  max  1.557
+  salt-bridge              mean  0.996  max  1.547
+  jacob_ts4                mean  0.823  max  2.639
+  spiro-ts1                mean  0.708  max  0.926
+  sn2-smiles               mean  0.573  max  0.877
+  acid-dist-tight          mean  0.416  max  0.774
+  acid-dist                mean  0.397  max  0.712
+  tmpl-ptBu                mean  0.392  max  0.461
+  tmpl-anilide             mean  0.391  max  0.437
+  acid-angle               mean  0.388  max  0.648
+  tmpl-pMe                 mean  0.376  max  0.437
+  catpi                    mean  0.252  max  0.364
+  pi-stack                 mean  0.229  max  0.324
+  nh-stretch               mean  0.008  max  0.012

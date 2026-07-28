@@ -207,7 +207,7 @@ just check   # lint + type-check + tests
 
 The development discipline — every non-trivial change runs `assess → plan → implement → adversarial review →
 regress` with the test suite as the gate and the `examples/` notebooks as the proof of breadth — is in
-[`CLAUDE.md`](CLAUDE.md); the constraint-API design is in [`DESIGN.md`](DESIGN.md).
+[`CLAUDE.md`](CLAUDE.md).
 
 ### CI
 

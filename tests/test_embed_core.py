@@ -137,3 +137,73 @@ def test_unknown_kwarg_is_rejected():
 
     with pytest.raises(TypeError, match="fix / constrain / template"):
         rx.embed("CCO", freeze=[0, 1, 2])  # the old kwarg is gone — fail loudly, don't silently ignore
+
+
+# --- minimize records its drops, exactly as prune does -----------------------
+
+
+def test_minimize_records_its_energy_window_drops(monkeypatch):
+    """A conformer minimize() drops on its relax-energy window must land in `discarded`, not vanish silently.
+
+    prune promises "Nothing is lost" — every conformer it merges away is recorded in `discarded`. minimize
+    drops conformers too (energy window, torn bond, out-of-plane sphere, inverted donor hand, wrong stereo) and
+    once did so *silently*, so that promise was false for any ensemble that saw a minimize first. Spike ONE
+    conformer's FF energy far past the window: the real relax still runs (the geometry gates upstream see a
+    normal structure and pass it through to the window), so the drop is the window's, and it must be recorded.
+    """
+    import numpy as np
+
+    import rxembed as rx
+    from rxembed import refine as _refine
+
+    ens = rx.embed("CCCCO", n=8)  # unconstrained -> not yet minimized; `n` is a request, so read the real ids
+    assert len(ens.ids) >= 2, "need >=2 conformers so dropping one still leaves a non-empty ensemble"
+    victim = ens.ids[0]
+
+    real = _refine.ff_energies  # what minimize() calls for an UNCONSTRAINED ensemble (pipeline.minimize, ~line 838)
+
+    def spiked(mol, *args, **kwargs):
+        e = np.asarray(real(mol, *args, **kwargs), dtype=float)  # the relax runs for real; only the number is faked
+        for k, conf in enumerate(mol.GetConformers()):  # e is in conformer-enumeration order, mapped by GetId()
+            if conf.GetId() == victim:
+                e[k] = 1e4  # a non-physical energy for the victim alone -> its ΔE >> the 250 kcal/mol window
+        return e
+
+    monkeypatch.setattr(_refine, "ff_energies", spiked)  # the binding pipeline.minimize resolves at call time
+    ens.minimize()
+
+    assert victim not in ens.ids, "the energy window never fired — the test would be a null measurement"
+    assert victim in ens.discarded, "minimize dropped the conformer but did not record it in `discarded`"
+
+
+# --- minimize degrades on an untypable graph in BOTH relax entry points ------
+
+
+def test_minimize_single_point_branch_degrades_on_untypable_graph(monkeypatch, caplog):
+    """minimize()'s single-point relax must degrade like its sibling `_relax_constrained`, not crash.
+
+    `_relax_constrained` wraps `restrained_uff` in try/except RuntimeError so an untypable / hypervalent
+    reacting core keeps its embedded geometry. The single-point branch taken once `embed` has relaxed the
+    seeds (`_seeds_relaxed=True`) called `restrained_uff` WITHOUT that guard, so it propagated the error
+    where the sibling degraded — and `_relax_into_windows` sets `_seeds_relaxed` even when its own relax
+    build failed, so a later `.minimize()` re-hits the same graph. RDKit's UFF builds even for actinides, so
+    the natural trigger is rare; fault-inject the RuntimeError to prove both entry points now degrade alike.
+    """
+    import rxembed as rx
+    from rxembed import refine as _refine
+
+    ens = rx.embed("OC(=O)CCCCc1ccccc1", constrain={(1, 9): (2.6, 3.0)}, n=2, seed=1)
+    assert ens.ids, "embed produced no conformers"
+    assert ens._seeds_relaxed, "embed did not mark the seeds relaxed -> minimize won't take the single-point branch"
+    assert not ens._minimized, "minimize must still run"
+    kept = list(ens.ids)
+
+    def raiser(*a, **kw):  # UFFGetMoleculeForceField raises at build time on an untypable graph
+        raise RuntimeError("UFF: could not type atom")
+
+    monkeypatch.setattr(_refine, "restrained_uff", raiser)  # pipeline.minimize resolves the binding at call time
+    with caplog.at_level("WARNING", logger="rxembed"):
+        ens.minimize()  # single-point branch -> must NOT propagate the RuntimeError
+
+    assert any("UFF could not relax" in r.message for r in caplog.records), "the guard never fired (null test)"
+    assert ens.ids == kept, "the embedded geometry must be kept when the single point cannot be typed"

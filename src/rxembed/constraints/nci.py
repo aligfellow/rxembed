@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 import networkx as nx
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom
 from xyzgraph.nci import NCIAnalyzer
 
 
@@ -110,19 +109,14 @@ KINDS = {
 class Contact:
     """A seeded non-covalent contact: a distance window, plus an orientation angle for a directional one.
 
-    A held distance *alone* gives a bent, weakly-detected contact (a real H-bond is D-H···A ~ 150-180°,
-    not ~115°), so a directional contact (H-bond, sigma-hole halogen/chalcogen/pnictogen bond) also carries
-    an **orientation angle** window.
+    A held distance alone gives a bent, weakly-detected contact, so a directional contact (H-bond, sigma-hole)
+    also carries an **orientation angle** window.
 
     - ``distances``: ``{(i, j): (lo, hi)}`` — the contact separation(s).
-    - ``angles``: ``{(i, j, k): (lo, hi)}`` — the orientation (e.g. donor-heavy, H, acceptor), in degrees.
+    - ``angles``: ``{(i, j, k): (lo, hi)}`` — the orientation (donor-heavy, H, acceptor), in degrees.
 
-    Plugs into ``rx.embed(contacts=...)`` (applies both), or merge several. ``Contact`` with only
-    ``distances`` is equivalent to the old distance-only seeding.
-
-    ``near``/``far`` record the contact's two ends — ``near`` the donor/anchor atom, ``far`` the acceptor
-    atom (or a ring tuple) — so contacts can be grouped into compatible binding modes (all donors reaching
-    one acceptor = a multidentate clamp). They carry no constraint themselves; ignore them for manual use.
+    Plugs into ``rx.embed(contacts=...)``. ``near``/``far`` record the two ends (donor/anchor, acceptor atom or
+    ring tuple) so contacts group into compatible binding modes; they carry no constraint themselves.
     """
 
     distances: dict = field(default_factory=dict)
@@ -171,22 +165,18 @@ def _atom_over_ring(pos, atom, ring, d_centroid):
 def candidate_contacts(mol, kinds=tuple(KINDS), inter_fragment=True, seed=0xC0FFEE):
     """Candidate NCI contacts ENUMERATED from topology (xyzgraph `_pairs`), not a random geometry.
 
-    xyzgraph type-matches donors/acceptors/rings from the molecular graph, so this finds the real
-    H-bond / halogen-bond / cation-pi / CH-pi candidates (e.g. every thiourea N-H to every substrate
-    O) independent of the embedded pose, plus terminal metal hydrides (M-H) as H-bond donors. Each entry
-    is a binding mode to constrain; ring contacts become per-ring-atom distances placing the atom over the
-    centroid. Returns ``{label: Contact}`` — each carries a distance window and, for a **directional**
-    contact (H-bond, sigma-hole, M-H), the orientation angle that makes it geometrically real; plug straight
-    into ``embed(contacts=...)``. Every contact *kind* is one row of the ``KINDS`` registry. A rough
-    conformer is embedded (deterministically, `seed`) only when the input has none — its geometry decides
-    the sigma-hole apex, the metal-hydride's nearest acceptor, and ring radii, so a fixed seed keeps the
-    discovered contacts reproducible.
+    Finds the real H-bond / halogen-bond / cation-pi / CH-pi candidates (every thiourea N-H to every substrate
+    O) independent of the pose, plus terminal metal hydrides (M-H). Returns ``{label: Contact}`` — each a
+    distance window and, for a **directional** contact, the orientation angle that makes it geometrically real;
+    plug into ``embed(contacts=...)``. Every kind is one ``KINDS`` row. A rough conformer is embedded
+    (deterministically, `seed`) only when the input has none (its geometry decides the sigma-hole apex, the M-H
+    nearest acceptor, and ring radii).
     """
     work = Chem.Mol(mol)
-    if work.GetNumConformers() == 0:
-        ps = rdDistGeom.ETKDGv3()
-        ps.randomSeed = int(seed)
-        rdDistGeom.EmbedMolecule(work, ps)
+    if work.GetNumConformers() == 0:  # `seed` differs from the embed default deliberately — it is this
+        from rxembed.rdkit_embed.embed.bounds import probe_conformer  # function's own documented default, and moving it
+
+        work = probe_conformer(mol, seed) or work  # would move every discovered contact
     pos = work.GetConformer().GetPositions()
     an = analyzer(work)
     frag = {a: fi for fi, f in enumerate(Chem.GetMolFrags(work)) for a in f}
@@ -344,20 +334,37 @@ def _maximal_assignments(by_near, cap, hard_cap=256):
     return out
 
 
+def _augment_with_aux(combo, aux, cap):
+    """Ride every geometrically-compatible auxiliary sigma-hole (XB/ChB/PnB) onto an anchor grip.
+
+    An aux rides along only where its donor is still free and the acceptor has spare capacity, so a weak
+    halogen bond strengthens a real clamp but never stands alone. Mutates and returns `combo`.
+    """
+    from collections import defaultdict
+
+    used = {c.near for c in combo}
+    count = defaultdict(lambda: [0, 0])
+    for c in combo:
+        _seat(c, count, +1)
+    for c in aux:
+        if c.near not in used and _accepts(c, count, cap):
+            combo.append(c)
+            used.add(c.near)
+            _seat(c, count, +1)
+    return combo
+
+
 def auto_binding_modes(mol, kinds=_AUTO_KINDS, inter_fragment=True, acceptor_cap=2, max_modes=8, seed=0xC0FFEE):
     """Enumerate cooperative, geometrically-compatible binding modes (each a *combination* of contacts).
 
     Multipoint binding, not any single weak contact, is what stabilises these complexes. Returns
-    ``{mode_label: Contact}`` (merged); drive them all with ``embed(contacts='auto')`` (-> an `EnsembleSet`)
-    or pass one to ``embed(contacts=...)``.
+    ``{mode_label: Contact}`` (merged); drive with ``embed(contacts='auto')`` or pass one to ``embed(contacts=)``.
 
-    **Anchors** (H-bond / ionic / cation-lone-pair / metal-hydride) define a mode and are assigned to
-    acceptors maximally (`acceptor_cap`, default 2 → bifurcated clamps, so a (thio)urea's two N-H land on
-    one carbonyl in the *same* mode); compatible auxiliary sigma-holes (XB/ChB/PnB) then ride along a strong
-    grip without ever standing alone. Modes are ranked (most contacts → strongest → acceptor quality →
-    bifurcation) and the top `max_modes` returned; ring/π faces off by default (see ``kinds``). With no
-    anchor (a pure halogen-bonded pair) each auxiliary becomes its own weak mode. The assignment/ranking
-    logic is commented at the code (`_maximal_assignments`, `_resolve_reciprocal`, `score`).
+    **Anchors** (H-bond / ionic / cation-lone-pair / metal-hydride) define a mode and are assigned to acceptors
+    maximally (`acceptor_cap`, default 2 → bifurcated clamps); compatible auxiliary sigma-holes (XB/ChB/PnB) then
+    ride a strong grip without standing alone. Modes are ranked (most contacts → strongest → acceptor quality →
+    bifurcation) and the top `max_modes` returned; ring/π off by default. With no anchor each auxiliary is its own
+    weak mode.
     """
     from collections import OrderedDict, defaultdict
 
@@ -412,17 +419,7 @@ def auto_binding_modes(mol, kinds=_AUTO_KINDS, inter_fragment=True, acceptor_cap
 
     modes = OrderedDict()
     for sk in ranked[:max_modes]:
-        combo = list(sk)
-        if augment:
-            used = {c.near for c in combo}
-            count = defaultdict(lambda: [0, 0])
-            for c in combo:
-                _seat(c, count, +1)
-            for c in aux:  # ride compatible sigma-holes onto the grip
-                if c.near not in used and _accepts(c, count, acceptor_cap):
-                    combo.append(c)
-                    used.add(c.near)
-                    _seat(c, count, +1)
+        combo = _augment_with_aux(list(sk), aux, acceptor_cap) if augment else list(sk)
         m = Contact()
         for c in combo:
             m.distances.update(c.distances)
@@ -443,12 +440,9 @@ def _atom_contacts(work, an, pos, frag, sym, seen, inter_fragment, kind):
         if not (isinstance(a, int) and isinstance(b, int)) or (inter_fragment and frag[a] == frag[b]):
             continue
         eff = kind
-        if kind.name == "IONIC":  # a salt bridge whose ion bears an H is a
-            #                                                      charge-assisted (anion) H-bond — describe it as
-            #                                                      the directional HB, not a non-directional clamp
-            #                                                      (collapses onto the real HB pair if xyzgraph
-            #                                                      also typed it, so no double count). Bare ion
-            #                                                      pairs (no polar donor H either side) stay IONIC.
+        if kind.name == "IONIC":  # a salt bridge whose ion bears an H is a charge-assisted (anion) H-bond —
+            # describe it as the directional HB (collapses onto the real HB pair if xyzgraph typed it, so no double
+            # count). Bare ion pairs (no polar donor H either side) stay IONIC.
             if work.GetAtomWithIdx(a).GetAtomicNum() in _HB_DONOR_Z and _donor_h(work, a) is not None:
                 eff = KINDS["HB"]
             elif work.GetAtomWithIdx(b).GetAtomicNum() in _HB_DONOR_Z and _donor_h(work, b) is not None:
@@ -508,7 +502,7 @@ def _metal_hydride_contacts(work, an, pos, frag, sym, seen, inter_fragment, kind
     heavy', orientation M-H...A linear); the di-hydrogen-bond and S/Cl-acceptor cases are left for later.
     xyzgraph does not type these, so they are *seeded* but not *re-detected* by binding_modes().
     """
-    from .metal import TRANSITION_METALS
+    from rxembed.rdkit_embed.constraints.metal import TRANSITION_METALS
 
     out = {}
     metals = [a.GetIdx() for a in work.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS]

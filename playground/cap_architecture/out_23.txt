@@ -1,0 +1,15 @@
+
+===== case2 =====  (median/max metal-out-of-donor-plane, deg)
+              donor |        BASE |    SELF-off |     ALL-off | verdict
+   D= 15(N)        |  17.3/ 41.0 |  21.7/ 44.4 |  31.3/ 46.9 | Δself= +4.4  REDUNDANT
+   D= 34(N)        |   8.1/ 30.3 |   3.4/ 43.9 |  12.8/ 21.0 | Δself= -4.7  REDUNDANT
+   D= 17(O)        |   7.6/ 38.2 |  23.7/ 52.4 |  20.0/ 35.9 | Δself=+16.1  load-bearing
+   D= 27(N)        |  12.7/ 37.2 |  20.7/ 42.3 |  40.9/ 48.8 | Δself= +8.0  partial
+
+===== case3 =====  (median/max metal-out-of-donor-plane, deg)
+              donor |        BASE |    SELF-off |     ALL-off | verdict
+   D= 15(N)        |  23.7/ 33.0 |  36.8/ 56.7 |  28.2/ 39.4 | Δself=+13.1  load-bearing
+   D= 34(N)        |   4.6/ 40.6 |  10.0/ 29.8 |   4.5/ 21.3 | Δself= +5.4  partial
+   D= 17(O)        |  20.2/ 41.5 |  14.7/ 32.0 |   6.8/ 27.0 | Δself= -5.5  REDUNDANT
+
+[guard] total FF torsion terms written across all runs: 2440 (>0 confirms path live)

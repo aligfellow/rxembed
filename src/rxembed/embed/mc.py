@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from rdkit import Chem
 
-from rxembed.log import logger
+from rxembed.rdkit_embed.log import logger
 
 
 def available() -> bool:

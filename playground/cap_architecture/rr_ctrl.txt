@@ -1,0 +1,17 @@
+
+===== HENRY =====  (median/max metal-out-of-donor-plane, deg)
+              donor |        BASE |    SELF-off |     ALL-off | verdict
+   D= 13(O)        |   7.2/ 39.5 |  23.7/ 73.2 |  28.0/ 68.2 | Δself=+16.5  load-bearing
+   D= 23(N)        |   8.7/ 42.3 |  16.2/ 53.2 |  14.4/ 41.4 | Δself= +7.5  partial
+
+===== KETONE =====  (median/max metal-out-of-donor-plane, deg)
+              donor |        BASE |    SELF-off |     ALL-off | verdict
+   D=  3(O)        |  22.0/ 35.3 |  46.9/ 55.2 |  29.1/ 53.4 | Δself=+24.9  load-bearing
+   D=  7(N)        |   0.3/ 42.3 |  50.0/ 50.7 |  40.4/ 50.2 | Δself=+49.7  load-bearing
+
+===== PICO =====  (median/max metal-out-of-donor-plane, deg)
+              donor |        BASE |    SELF-off |     ALL-off | verdict
+   D=  2(O)        |   1.4/ 19.6 |   2.3/ 27.4 |   2.4/  7.5 | Δself= +0.9  REDUNDANT
+   D=  8(N)        |   0.7/ 15.4 |   0.6/  6.3 |   0.8/  4.3 | Δself= -0.0  REDUNDANT
+
+[guard] total FF torsion terms written across all runs: 1071 (>0 confirms path live)

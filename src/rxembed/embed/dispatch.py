@@ -8,97 +8,31 @@ Kabsch frozen-core graft, and the isomer / template / auto-NCI routing. The user
 
 from __future__ import annotations
 
-import copy
 import os
 from dataclasses import dataclass, field
 
 import numpy as np
-from rdkit import Chem, rdBase
-from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
+from rdkit import Chem
 
-from rxembed import refine as _refine
+from rxembed import isomers as _isomers
 from rxembed import stereo as _stereo
 from rxembed.constraints import add_distance, resolve_atom, resolve_core
-from rxembed.constraints import metal as _metal
 from rxembed.constraints import nci as _nci
-from rxembed.log import logger
+from rxembed.inputs import _xyz_to_mol, parse_smiles
 from rxembed.pipeline import Ensemble, EnsembleSet
-
-from . import bounds as _embed
+from rxembed.rdkit_embed.constraints import coordination_builders as _cbuild
+from rxembed.rdkit_embed.constraints import distance as _distance
+from rxembed.rdkit_embed.constraints import metal as _metal
+from rxembed.rdkit_embed.constraints.base import compose
+from rxembed.rdkit_embed.embed import bounds as _embed
+from rxembed.rdkit_embed.log import logger
 
 _PT = Chem.GetPeriodicTable()
 _EPS = 1e-6  # near-zero norm floor for the graft axis
-_AROMATIC_BO_TOL = 0.25  # |bond_order - 1.5| within this reads as aromatic
 _BOND_ATOMS = 2  # a two-atom frozen core is a bond: fix its length, not an orientation
 _XYZ_DIM = 3  # an (x, y, z) coordinate
 _TEMPLATE_LEN = 2  # template= is (reference, mapping)
 _MIN_FRAGS = 2  # below this there is no inter-fragment separation to enforce
-
-
-def _xyz_to_mol(path, charge=0):
-    """Read an ``.xyz`` into an RDKit Mol with **perceived bonds and a conformer** (robust for metals/TS).
-
-    Bonds come from **xyzgraph** (transition-metal-aware perception + bond-order optimiser), not RDKit's
-    organic-only ``rdDetermineBonds`` (which raises on a metal). The graph is converted to an RWMol and
-    only *leniently* sanitised (ring perception, but no valence/property checks that choke on a metal),
-    so a metal complex or a TS from xyz Just Works. Index addressing always works; SMARTS works too for the
-    organic part. Pass `charge` for a charged species. Falls back to ``rdDetermineBonds`` only if xyzgraph
-    is unavailable. (Do **not** pass ``quick=True`` to ``build_graph`` here — it skips bond-order/charge
-    perception and would return all-single bonds.)
-    """
-    try:
-        import xyzgraph
-    except ImportError:
-        from rdkit.Chem import rdDetermineBonds
-
-        mol = Chem.MolFromXYZFile(path)
-        if mol is None:
-            raise ValueError(f"could not read {path} as an .xyz") from None
-        rdDetermineBonds.DetermineBonds(mol, charge=charge)
-        return mol
-    from rdkit.Chem import BondType, Conformer
-    from rdkit.Geometry import Point3D
-
-    g = xyzgraph.build_graph(path, charge=charge, kekule=True)  # integer bond orders (no 1.5)
-    order = {1: BondType.SINGLE, 2: BondType.DOUBLE, 3: BondType.TRIPLE}
-    rw = Chem.RWMol()
-    idx = {}
-    for n, d in sorted(g.nodes(data=True)):
-        a = Chem.Atom(int(d["atomic_number"]))
-        a.SetFormalCharge(round(d.get("formal_charge", 0) or 0))
-        a.SetNoImplicit(True)  # xyz is fully explicit (incl. H)
-        idx[n] = rw.AddAtom(a)
-    for u, v, d in g.edges(data=True):
-        bo = d.get("bond_order", 1.0)
-        if abs(bo - 1.5) < _AROMATIC_BO_TOL:  # aromatic (only if kekule fell through)
-            b = rw.AddBond(idx[u], idx[v], BondType.AROMATIC) - 1
-            rw.GetBondWithIdx(b).SetIsAromatic(True)
-            rw.GetAtomWithIdx(idx[u]).SetIsAromatic(True)
-            rw.GetAtomWithIdx(idx[v]).SetIsAromatic(True)
-        else:
-            rw.AddBond(idx[u], idx[v], order.get(round(bo), BondType.SINGLE))
-    mol = rw.GetMol()
-    conf = Conformer(mol.GetNumAtoms())
-    for n, d in g.nodes(data=True):
-        x, y, z = d["position"]
-        conf.SetAtomPosition(idx[n], Point3D(float(x), float(y), float(z)))
-    mol.AddConformer(conf, assignId=True)
-    Chem.SanitizeMol(
-        mol, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True
-    )  # rings yes, valence checks no
-    try:
-        Chem.AssignStereochemistryFrom3D(mol)  # point R/S + E/Z from the geometry -> graph tags,
-    except Exception:  # so the embed preserves them exactly as it would
-        pass  # for a SMILES @/@@ (an .xyz behaves like SMILES)
-    return mol
-
-
-def parse_smiles(smi):
-    """Parse a SMILES to a Mol, raising a clear error instead of returning ``None`` (which crashes downstream)."""
-    mol = Chem.MolFromSmiles(smi)
-    if mol is None:
-        raise ValueError(f"could not parse SMILES: {smi!r}")
-    return mol
 
 
 def _normalize(source, charge=0):
@@ -120,14 +54,16 @@ def _normalize(source, charge=0):
     return Chem.AddHs(mol, addCoords=has_geom), has_geom
 
 
-def _encounter_bounds(mol, slack=1.5):
+def _encounter_bounds(mol, slack=1.5, seed=_embed.DEFAULT_SEED):
     """vdW-aware inter-fragment bounds so a multi-fragment SMILES does not embed on top of itself.
 
     For every pair of fragments, bound their closest heavy-atom pair to roughly van-der-Waals contact
-    (sum of vdW radii .. + slack), giving the embedder a separated but touching encounter geometry.
+    (sum of vdW radii .. + slack), giving the embedder a separated but touching encounter geometry. The
+    probe conformer that decides *which* pair is closest comes from `bounds.probe_conformer` — see there
+    for why its seed is fixed.
     """
-    tmp = Chem.Mol(mol)
-    if rdDistGeom.EmbedMolecule(tmp, rdDistGeom.ETKDGv3()) != 0:
+    tmp = _embed.probe_conformer(mol, seed)
+    if tmp is None:
         return {}
     pt = Chem.GetPeriodicTable()
     pos = tmp.GetConformer().GetPositions()
@@ -153,69 +89,21 @@ class _MetalCtx:
     mol: Chem.Mol
     metal: int
     real_z: int
-    donors: list | None = None  # the metal's real donor atoms (for the donor-proton relax); None = skip it
-    geometry: str | None = None  # the coordination polyhedron name (only named polyhedra get the proton relax)
-    extra: list = field(default_factory=list)  # other surrogated metals (idx, real_z) in a multi-metal complex
+    real_q: int = 0  # the metal's real formal charge; the surrogate is neutral, restored below
+    donors: list | None = None  # the metal's real donor atoms; None = unknown
+    geometry: str | None = None  # the coordination polyhedron name (a planar one is checked for pucker)
+    extra: list = field(default_factory=list)  # other surrogated metals (idx, real_z, real_q) in a multi-metal complex
+    donor_bonds: list = field(default_factory=list)  # the stripped M-donor bonds as (donor, metal) pairs, EVERY metal's
+    # — `minimize` re-adds them (`metal.connect_metal`) once element+charge are settled, so the output mol is connected
 
     def restore(self):
+        # element and charge: restoring only Z leaves an M(0) among anionic ligands, so `_calc_charge`
+        # hands xtb a total charge wrong by the oxidation state.
         self.mol.GetAtomWithIdx(self.metal).SetAtomicNum(self.real_z)
-        for mi, rz in self.extra:  # restore the rest of a bimetallic complex
+        self.mol.GetAtomWithIdx(self.metal).SetFormalCharge(self.real_q)
+        for mi, rz, rq in self.extra:  # restore the rest of a bimetallic complex
             self.mol.GetAtomWithIdx(mi).SetAtomicNum(rz)
-
-    def fix_donor_protons(self, cons, ids, distance_fc):
-        """Stage-2 of the metal relax: settle the donor **hydrogens** with the coordination bonds restored.
-
-        The main relax (stage-1) runs with the metal-donor bonds *removed* (the surrogate is a bondless
-        anchor), which leaves a bonded donor under-coordinated, so UFF mis-hybridises it and its protons
-        splay (M-D-H ~127° instead of ~109°). Here we re-add the metal-donor bonds, swap to a phosphorus
-        surrogate (which UFF-types the *bonded* metal through CN6, unlike carbon), and relax with **every
-        atom pinned except the donor hydrogens**. The donor regains correct hybridisation so the protons
-        fall to ~109°, while the polyhedron and metal-donor distances from stage-1 are held exactly.
-
-        No-op (nothing lost) when there are no donor H's, the geometry is not a named polyhedron (an
-        arbitrary/retained or high-CN centre — ferrocene's η⁵ carbons have no donor protons), or the
-        bonded metal still won't UFF-type.
-        """
-        if not self.donors or self.geometry not in _metal.ANGLES:
-            return
-        donor_h = [
-            x.GetIdx() for d in self.donors for x in self.mol.GetAtomWithIdx(d).GetNeighbors() if x.GetAtomicNum() == 1
-        ]
-        if not donor_h:
-            return
-        em = Chem.RWMol(self.mol)
-        for d in self.donors:
-            if em.GetBondBetweenAtoms(d, self.metal) is None:
-                em.AddBond(d, self.metal, Chem.BondType.SINGLE)
-        a = em.GetAtomWithIdx(self.metal)
-        a.SetAtomicNum(_metal.RELAX_SURROGATE)
-        a.SetNoImplicit(True)
-        a.SetFormalCharge(0)
-        relax = em.GetMol()
-        Chem.SanitizeMol(
-            relax, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True
-        )
-        relax.UpdatePropertyCache(strict=False)
-        with rdBase.BlockLogs():  # the P surrogate trips a benign per-atom UFF
-            if not rdForceFieldHelpers.UFFHasAllMoleculeParams(relax):  # "unrecognized charge state" log — mute it
-                logger.debug(
-                    "metal: bonded surrogate won't UFF-type (CN%d) — skipping donor-proton relax", len(self.donors)
-                )
-                return
-            guided = copy.deepcopy(cons)  # guide each donor H toward a tetrahedral angle
-            for d in self.donors:  # so a conformer whose stage-1 protons splayed
-                for h in (x.GetIdx() for x in self.mol.GetAtomWithIdx(d).GetNeighbors() if x.GetAtomicNum() == 1):
-                    guided.angles[(self.metal, d, h)] = (100.0, 118.0)  # away from the metal can't stick there.
-            # NB the window is tuned for the dominant sp3 N/O donors (amine/water/alcohol/phosphine), where
-            # ~109° is right; a rare sp2 or sulfur donor proton may land a few degrees off (an sp3-vs-sp2
-            # split isn't worth the per-element complexity for how seldom those coordinate via an X-H).
-            frozen = [i for i in range(relax.GetNumAtoms()) if i not in set(donor_h)]
-            _refine.restrained_uff(relax, guided, distance_fc=distance_fc, extra_frozen=frozen)
-        for c in ids:  # copy ONLY the donor-H positions back
-            src, dst = relax.GetConformer(c), self.mol.GetConformer(c)
-            for h in donor_h:
-                dst.SetAtomPosition(h, src.GetAtomPosition(h))
-        logger.debug("metal: settled %d donor proton(s) with coordination bonds restored", len(donor_h))
+            self.mol.GetAtomWithIdx(mi).SetFormalCharge(rq)
 
 
 def _nci_windows(contacts):
@@ -312,33 +200,35 @@ def _graft_frozen(mol, conf_ids, frozen, ref):
             conf.SetAtomPosition(i, p.tolist())
 
 
-def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowledge, keep_input=False):
-    """Embed a metal `Isomer`, optionally binding a substrate; yield one `Ensemble` per binding candidate.
+def _bind_substrate(iso, base, contacts, fix, constrain):
+    """Fold a substrate's fix/constrain/NCI grip onto the isomer coordination `base`; return ``(base, graft_ref)``.
 
-    Usually one, but several when ``coordinate=`` is a SMARTS matching several donor atoms (one candidate
-    per donor, so the user can `select` the binding they want or keep them all). Each carries a ``.tag``;
-    `keep_input` adds the Mol's input conformer to the ensemble (the retain-input-arrangement path).
+    Provenance is subtractive, NOT the union `compose` would give: a user grip that lands on a sphere hold stays
+    STRUCTURAL (never releasable), or mc(explore=) could dissociate the coordination sphere.
     """
-    base = copy.deepcopy(iso.cons)
-    graft_ref: dict = {}  # explicit/own coords the resolver wants Kabsch-grafted (a substrate fix on the metal)
-    if contacts is not None or fix or constrain:  # a substrate bound via fix / constrain / NCI contacts
-        has_geom = iso.mol.GetNumConformers() > 0
-        sub, graft_ref = resolve_core(iso.mol, fix=fix, constrain=constrain, has_geometry=has_geom)
-        _add_soft(sub, *_nci_windows(contacts))
-        sphere_d, sphere_a = set(base.distances), set(base.angles)  # the coordination sphere already in base —
-        soft_d, soft_a = sub.contacts  # never release it, so provenance records ONLY genuinely-new
-        base.distances.update(sub.distances)  # substrate contacts: a spec landing ON a sphere hold is a user
-        base.angles.update(sub.angles)  # override of that hold, not a releasable grip. mc(explore=) then frees
-        base.frozen |= sub.frozen  # only the substrate; the sphere + any coordinate= dative bond stay held.
-        base.contacts = (
-            frozenset(k for k in soft_d if k not in sphere_d),
+    if not (contacts is not None or fix or constrain):  # a substrate bound via fix / constrain / NCI contacts
+        return base, {}
+    has_geom = iso.mol.GetNumConformers() > 0
+    sub, graft_ref = resolve_core(iso.mol, fix=fix, constrain=constrain, has_geometry=has_geom)
+    _add_soft(sub, *_nci_windows(contacts))
+    sphere_d, sphere_a = set(base.distances), set(base.angles)  # the coordination sphere already in base —
+    soft_d, soft_a = sub.contacts  # never release the sphere, so provenance records ONLY genuinely-new grips.
+    # Field-driven via `compose` so no spec field is silently dropped (a hand-listed merge lost a `constrain=`
+    # pi-stack in `sub.planes`); last-wins, so a spec landing on a sphere hold overrides it, not demoted to soft.
+    base = compose(base, sub).copy(
+        contacts=(  # subtractive: a user grip that lands on a sphere hold must not become releasable, or
+            frozenset(k for k in soft_d if k not in sphere_d),  # mc(explore=) could dissociate the sphere
             frozenset(k for k in soft_a if k not in sphere_a),
         )
+    )
+    return base, graft_ref
 
-    nvac = iso.vertices.count(_metal.VACANT)
+
+def _coordination_choices(iso, coordinate, nvac):
+    """Resolve ``coordinate=`` to the donor set(s) to seat: one choice, or several for an ambiguous SMARTS."""
     if coordinate is None:
-        choices = [None]
-    elif coordinate == "auto":
+        return [None]
+    if coordinate == "auto":
         atoms = _metal.lone_pair_donors(iso.mol, iso.metal, exclude=iso.donors)
         if len(atoms) > nvac:
             logger.info(
@@ -348,16 +238,16 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
                 nvac,
                 nvac,
             )
-        choices = [atoms[:nvac]]
-    elif isinstance(coordinate, (list, tuple)):  # explicit: one spec per vacancy
-        choices = [[resolve_atom(iso.mol, s) for s in coordinate]]
-    elif isinstance(coordinate, str):  # a SMARTS — may match several atoms
+        return [atoms[:nvac]]
+    if isinstance(coordinate, (list, tuple)):  # explicit: one spec per vacancy
+        return [[resolve_atom(iso.mol, s) for s in coordinate]]
+    if isinstance(coordinate, str):  # a SMARTS — may match several atoms
         ms = [m[0] for m in iso.mol.GetSubstructMatches(Chem.MolFromSmarts(coordinate))]
         if not ms:
             raise ValueError(f"coordinate={coordinate!r} matched no atoms")
         if len(ms) == 1:
-            choices = [[ms[0]]]
-        elif nvac == 1:  # ambiguous + 1 pocket -> one mode per donor
+            return [[ms[0]]]
+        if nvac == 1:  # ambiguous + 1 pocket -> one mode per donor
             logger.info(
                 "coordinate=%r matched %d atoms; embedding %d coordination modes (one per donor) — "
                 ".select(coordinate=<idx>) one or keep all",
@@ -365,19 +255,40 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
                 len(ms),
                 len(ms),
             )
-            choices = [[a] for a in ms]
-        else:  # ambiguous + several pockets -> can't map
-            raise ValueError(
-                f"coordinate={coordinate!r} matched {len(ms)} atoms for {nvac} vacant site(s); "
-                f"name them explicitly as a list, e.g. ['[OX1]', '[OX2]']"
-            )
-    else:  # an int index
-        choices = [[resolve_atom(iso.mol, coordinate)]]
+            return [[a] for a in ms]
+        raise ValueError(  # ambiguous + several pockets -> can't map
+            f"coordinate={coordinate!r} matched {len(ms)} atoms for {nvac} vacant site(s); "
+            f"name them explicitly as a list, e.g. ['[OX1]', '[OX2]']"
+        )
+    return [[resolve_atom(iso.mol, coordinate)]]  # an int index
+
+
+def _frozen_core_ref(mol, frozen_atoms, graft_ref):
+    """Return ``(frozen, ref_core)`` — atoms to Kabsch-graft and their exact target coords (``None`` if none)."""
+    frozen = sorted(frozen_atoms)  # capture the input TS core BEFORE the embed
+    if frozen and mol.GetNumConformers():  # graft each frozen atom to its explicit-fix coord, else own coord
+        own = mol.GetConformer().GetPositions()
+        return frozen, np.array([graft_ref.get(i, own[i]) for i in frozen])
+    if graft_ref:  # SMILES metal + explicit-coords fix: no conformer, graft only the named atoms
+        frozen = sorted(graft_ref)
+        return frozen, np.array([graft_ref[i] for i in frozen])
+    return frozen, None
+
+
+def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowledge, keep_input=False):
+    """Embed a metal `Isomer`, optionally binding a substrate; yield one `Ensemble` per binding candidate.
+
+    Usually one, but several when ``coordinate=`` is a SMARTS matching several donor atoms (one candidate per
+    donor). Each carries a ``.tag``; `keep_input` adds the Mol's input conformer as a seed (the retain-input path
+    — the embed seam then relaxes it into its windows; not returned pristine).
+    """
+    base, graft_ref = _bind_substrate(iso, iso.cons.copy(), contacts, fix, constrain)
+    choices = _coordination_choices(iso, coordinate, iso.vertices.count(_metal.VACANT))
 
     for atoms in choices:
         mol = Chem.Mol(iso.mol)  # own copy so candidates don't share conformers
         input_conf = Chem.Conformer(mol.GetConformer()) if (keep_input and mol.GetNumConformers()) else None
-        cons = copy.deepcopy(base)
+        cons = base.copy()
         # identity is geometric: arrangement (slot map) + metal chirality. `label` (cis/trans/mer/fac) is
         # kept only as a coarse, sometimes-wrong convenience tag — never the thing you select on.
         tag = {
@@ -389,25 +300,16 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
         if iso.stereo_label:  # a ligand stereoisomer from the rx.metal coordination x stereo load-in
             tag["stereo"] = iso.stereo_label
         if atoms is not None:
-            extra = _metal.coordinate(iso, atoms)
-            for (i, j), (lo, hi) in extra.distances.items():
-                add_distance(cons.distances, i, j, lo, hi)
-            cons.angles.update(extra.angles)
+            # `compose`, never a field-by-field pick: the seated donor's constraints are its window AND the DG
+            # relief of the surrogate floor its neighbours inherit, and a cherry-pick silently drops the latter.
+            cons = compose(cons, _cbuild.coordinate(iso, atoms))
             if len(choices) > 1:
                 tag["coordinate"] = atoms[0]
         # tether any free fragment (a co-crystallised solvent / an un-bonded ligand the SMILES wrote as a
         # separate `.` fragment) at vdW contact, so it embeds as a vdW complex rather than drifting to
         # infinity — the same encounter-bounds the non-metal multi-fragment path applies.
         cons.distances.update(_float_encounter_bounds(mol, cons))
-        frozen = sorted(cons.frozen)  # capture the input TS core BEFORE the embed
-        if frozen and mol.GetNumConformers():  # graft each frozen atom to its explicit-fix coord, else own coord
-            own = mol.GetConformer().GetPositions()
-            ref_core = np.array([graft_ref.get(i, own[i]) for i in frozen])
-        elif graft_ref:  # SMILES metal + explicit-coords fix: no conformer, graft only the named atoms
-            frozen = sorted(graft_ref)
-            ref_core = np.array([graft_ref[i] for i in frozen])
-        else:
-            ref_core = None
+        frozen, ref_core = _frozen_core_ref(mol, cons.frozen, graft_ref)
         mol, held = _metal._hold_donor_chirality(mol, iso.metal, iso.donors, cons)  # hold a carbanion/amine donor's
         try:  # hand (a degree-3 centre with no M-C bond that ETKDG would otherwise let invert -> both hands identical)
             ids = _embed.embed(mol, cons, n or _embed.n_confs(mol, constrained=True), seed=seed, knowledge=knowledge)
@@ -433,7 +335,17 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
             len(ids),
             " (incl. input geometry)" if input_conf else "",
         )
-        ens = Ensemble(mol, ids, cons, _MetalCtx(mol, iso.metal, iso.real_z, iso.donors, iso.geometry, extra=iso.extra))
+        ctx = _MetalCtx(
+            mol,
+            iso.metal,
+            iso.real_z,
+            iso.real_q,
+            iso.donors,
+            iso.geometry,
+            extra=iso.extra,
+            donor_bonds=iso.donor_bonds,
+        )
+        ens = Ensemble(mol, ids, cons, ctx)
         if ids:  # the labile-donor hand at the uniform initial embed — minimize() culls any later inverted conformer
             ens._donor_hand = {
                 d: _metal.donor_chirality_sign(mol, ids[0], d) for d in _metal._labile_donors(mol, iso.donors)
@@ -506,13 +418,10 @@ def _attach_stereo(result, source, charge, stereo):
             ref = None
     if not ref:
         return
-    if stereo in ("racemic", "separate", "auto"):  # for a geometry input these enumeration modes are the auto-
-        #   preserve default. Auto-preserve ONLY a metallocene's PLANAR
-        #   chirality — the handedness the embed genuinely cannot keep. xyzgraph's AXIAL/HELICAL perception is
-        #   geometry-dependent and over-fires on labile, freely-rotating bonds (an aryl-N or P=N-C reads a
-        #   different Rₐ/Sₐ every rotamer, not a real atropisomer), so auto-preserving it rejects perfectly
-        #   valid conformers (the BImP TS embed kept 0/4). Point R/S is the embed's own job (ETKDG enforces the
-        #   3D-assigned tags). A genuine organic atropisomer: opt in with stereo={'axial': 'preserve'}.
+    if stereo in ("racemic", "separate", "auto"):  # for a geometry input, auto-preserve ONLY a metallocene's
+        #   PLANAR chirality (what the embed genuinely can't keep). xyzgraph's AXIAL/HELICAL perception over-fires
+        #   on labile bonds (an aryl-N reads a different Rₐ/Sₐ every rotamer), rejecting valid conformers (BImP
+        #   kept 0/4); point R/S is the embed's own job. A genuine atropisomer: opt in with stereo={'axial':'preserve'}.
         spec = {"planar": "preserve", "default": "free"} if "planar" in set(ref) else None
     else:
         spec = stereo
@@ -561,11 +470,9 @@ def _stereo_expand(source, charge, stereo, cap=_STEREO_CAP):
 def _stereo_enumerated_embed(expanded, stereo, dispatch_kw):
     """Embed each stereoisomer variant and assemble per `stereo` mode — the racemate/diastereomer load-in stage.
 
-    ``'racemic'`` folds every variant's candidate(s) into ONE flat `EnsembleSet` (the racemate as one set of
-    candidates); ``'separate'`` keeps them apart as a ``list[EnsembleSet]`` (one per stereoisomer, uniform type
-    — a lone organic variant is an `EnsembleSet`-of-one, consistent with the metal path). Each variant is
-    embedded with the SAME effort; each ensemble is tagged ``stereo=<label>`` (composing with any metal
-    ``label``/``nci`` tag). The stereoisomers are never pruned against each other — they are distinct species.
+    ``'racemic'`` folds every variant's candidate(s) into ONE flat `EnsembleSet`; ``'separate'`` keeps them apart
+    as a ``list[EnsembleSet]`` (one per stereoisomer, uniform type across metal & organic). Each variant is
+    embedded with the SAME effort and tagged ``stereo=<label>``; never pruned against each other (distinct species).
     """
     variants, n_unassigned, total, unresolved = expanded
     labels = ", ".join(lbl or "achiral" for _, lbl in variants)
@@ -682,6 +589,39 @@ def _float_encounter_bounds(mol, cons):
     }
 
 
+def _dispatch_metal_source(
+    source, *, metal, template, coordinate, contacts, fix, constrain, n, seed, knowledge, charge, stereo
+):
+    """Route a ``metal=<geometry>`` / metal `Isomer` source: enumerate isomers, or embed the one chosen isomer."""
+    if template is not None:
+        raise ValueError("template= pins a core by graft; it does not compose with metal=/an Isomer source")
+    _iso_kw = {
+        "coordinate": coordinate,
+        "contacts": contacts,
+        "fix": fix,
+        "constrain": constrain,
+        "n": n,
+        "seed": seed,
+        "knowledge": knowledge,
+    }
+    if metal is None:
+        results = list(_embed_isomer(source, **_iso_kw))  # a single chosen isomer
+        return results[0] if len(results) == 1 else EnsembleSet(results)
+    if isinstance(source, _metal.Isomer):
+        raise ValueError("pass either a metal Isomer source OR metal=<geometry>, not both")
+    if isinstance(source, str) and source.lower().endswith(".xyz"):
+        source = _normalize(source, charge)[0]  # xyz -> perceived Mol (enumerate wants a Mol/SMILES)
+    isos = _isomers.enumerate_isomers(source, metal, stereo=stereo)
+    out = EnsembleSet(e for iso in isos for e in _embed_isomer(iso, **_iso_kw))
+    logger.info(
+        "metal: ENUMERATING isomers of %s -> %d distinct candidate(s) (each a separate "
+        "ensemble; .summary() / .select() one to conf-search)",
+        metal,
+        len(out),
+    )
+    return out
+
+
 def _embed_dispatch(
     source,
     *,
@@ -718,33 +658,20 @@ def _embed_dispatch(
             knowledge=knowledge,
         )
     if metal is not None or isinstance(source, _metal.Isomer):  # the metal enumerate / isomer paths
-        if template is not None:
-            raise ValueError("template= pins a core by graft; it does not compose with metal=/an Isomer source")
-        _iso_kw = {
-            "coordinate": coordinate,
-            "contacts": contacts,
-            "fix": fix,
-            "constrain": constrain,
-            "n": n,
-            "seed": seed,
-            "knowledge": knowledge,
-        }
-        if metal is not None:
-            if isinstance(source, _metal.Isomer):
-                raise ValueError("pass either a metal Isomer source OR metal=<geometry>, not both")
-            if isinstance(source, str) and source.lower().endswith(".xyz"):
-                source = _normalize(source, charge)[0]  # xyz -> perceived Mol (enumerate wants a Mol/SMILES)
-            isos = _metal.enumerate_isomers(source, metal, stereo=stereo)
-            out = EnsembleSet(e for iso in isos for e in _embed_isomer(iso, **_iso_kw))
-            logger.info(
-                "metal: ENUMERATING isomers of %s -> %d distinct candidate(s) (each a separate "
-                "ensemble; .summary() / .select() one to conf-search)",
-                metal,
-                len(out),
-            )
-            return out
-        results = list(_embed_isomer(source, **_iso_kw))  # a single chosen isomer
-        return results[0] if len(results) == 1 else EnsembleSet(results)
+        return _dispatch_metal_source(
+            source,
+            metal=metal,
+            template=template,
+            coordinate=coordinate,
+            contacts=contacts,
+            fix=fix,
+            constrain=constrain,
+            n=n,
+            seed=seed,
+            knowledge=knowledge,
+            charge=charge,
+            stereo=stereo,
+        )
 
     mol, has_geom = _normalize(source, charge)
     if (
@@ -752,12 +679,18 @@ def _embed_dispatch(
         and _metal.metal_index(mol) is not None
         and not (fix or constrain or contacts or coordinate or template)
     ):  # retain the input arrangement
-        iso = _metal.from_geometry(mol)
+        iso = _cbuild.from_geometry(mol)
         logger.info(
             "metal: source carries a geometry and no metal= -> RETAINING the input ligand "
             "arrangement (%s: %s); pass metal=<geometry> to enumerate isomers instead",
             iso.geometry,
             _metal.arrangement(iso),
+        )
+        # the embed seam then RELAXES this retained geometry (arrangement kept, M-donor sphere held <0.01 A), so
+        # the input is NOT returned pristine — say so, or the RETAINING line reads as "returned as-is".
+        logger.info(
+            "metal: the retained input geometry is RELAXED into its constraint windows by the embed seam "
+            "(arrangement kept, coordination sphere held) — it is not returned as-is/pristine"
         )
         return next(
             _embed_isomer(
@@ -777,6 +710,10 @@ def _embed_dispatch(
     metals_donors = {}
     hydrides = []
     if _metal.metal_index(mol) is not None and (fix or constrain or contacts or template):
+        # every M-donor bond, read BEFORE the strip — re-added as DATIVE on the pipeline output (`connect_metal`)
+        donor_bonds = [
+            (n.GetIdx(), mi) for mi in _metal.metal_indices(mol) for n in mol.GetAtomWithIdx(mi).GetNeighbors()
+        ]
         if has_geom:  # capture each metal's donors BEFORE the bonds
             metals_donors = {
                 mi: [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()] for mi in _metal.metal_indices(mol)
@@ -788,9 +725,9 @@ def _embed_dispatch(
                 for nb in mol.GetAtomWithIdx(mi).GetNeighbors()  # to an acceptor) survives the
                 if nb.GetAtomicNum() == 1 and nb.GetDegree() == 1
             ]  # surrogate's bond strip
-        mol, metals, core_donors = _metal.prepare_all(mol)  # surrogate EVERY metal (bimetallic-safe)
-        (m, real_z), extra = metals[0], metals[1:]
-        metal_ctx = _MetalCtx(mol, m, real_z, extra=extra)
+        mol, metals, core_donors = _metal.surrogate_all_metals(mol)  # surrogate EVERY metal (bimetallic-safe)
+        (m, real_z, real_q), extra = metals[0], metals[1:]  # extra: [(idx, real_z, real_q), ...]
+        metal_ctx = _MetalCtx(mol, m, real_z, real_q, extra=extra, donor_bonds=donor_bonds)
         _metal_core_donors = core_donors  # deferred: only pin the sphere if a core is actually grafted (below)
         logger.debug("metal complex: %d metal(s) swapped to carbon surrogate for the FF", len(metals))
     else:
@@ -798,9 +735,8 @@ def _embed_dispatch(
 
     tmpl = _resolve_template_spec(template, charge) if template is not None else None
     cons, ref = resolve_core(mol, fix=fix, constrain=constrain, template=tmpl, has_geometry=has_geom)
-    _add_soft(cons, *_nci_windows(contacts))  # NCI grips: soft, releasable by mc(explore=)
-    #   fix numbers + the frozen-core SHAPE + the metal-sphere / M-H / encounter holds are all structural and
-    #   stay OUT of `contacts` (resolve_core recorded only constrain=; _add_soft only the NCI grips), so
+    _add_soft(cons, *_nci_windows(contacts))  # NCI grips: soft, releasable by mc(explore=). fix numbers, the
+    #   frozen-core shape and the sphere/M-H/encounter holds are structural and stay OUT of `contacts`, so
     #   mc(explore=) releases exactly the soft grips and never the structure.
     user_graft = dict(ref)  # atoms to Kabsch-graft onto their exact coords (own / explicit / template)
     if user_graft and _metal.metal_index(mol) is not None:  # a grafted core -> pin the metal coordination
@@ -809,6 +745,13 @@ def _embed_dispatch(
     for mi, dons in metals_donors.items():  # a spectator metal is held intact-but-achiral by
         _metal.hold_shape(mol, [mi, *dons], cons)  # hold_shape (NOT grafted — its handedness must
         #                                          stay free for the stereo filter), then pinned at the embed
+    if metals_donors and metal_ctx is not None:
+        # A frozen metal has no DOF, but its bond-less carbon still fires fictitious LJ at every ligand atom.
+        # hold_shape above pinned each sphere as an all-pairs body, so ff_terms gives these metals the zero-vdW
+        # type + floors but no pulls (pulling a rigid shape's M-donor members tears a spectator ferrocene).
+        # hold_shape must run first: ff_terms reads the `cons.shapes` record it leaves.
+        real_z = {metal_ctx.metal: metal_ctx.real_z, **{mi: rz for mi, rz, _rq in metal_ctx.extra}}
+        _distance.ff_terms(mol, cons, {mi: (real_z[mi], list(dons)) for mi, dons in metals_donors.items()})
     for mi, rz, h in hydrides:  # covalent M-H window (no input geometry to read)
         d = _PT.GetRcovalent(rz) + _PT.GetRcovalent(1)
         add_distance(cons.distances, mi, h, d - 0.1, d + 0.15)

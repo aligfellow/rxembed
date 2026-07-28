@@ -85,6 +85,68 @@ def test_clash_is_caught(embed):
     assert any(v.kind == "clash" for v in rep.violations)
 
 
+def test_collapsed_ester_1_3_fusion_is_caught(embed):
+    """An ester O-C-O folded until its two oxygens fuse (~1.27 Å) is caught — the silent 1-3 gate hole.
+
+    The two oxygens are a 1-3 pair across the carbonyl carbon, and every prior gate is blind to it *for that
+    structural reason*: `clashes` excludes 1-3 pairs, `metrics.bonding_ok`'s fusion floor (~0.9 Å) sits below the
+    fused distance, and `metrics.connectivity`'s `_MIN_TOPO` skips a topo-2 pair. So a phantom O-C-O ring shipped
+    silently until `over_compression`. This asserts both directions: the fusion IS flagged, and (red-first) the
+    three prior gates stay silent on that O...O pair.
+    """
+    from rdkit.Chem import rdMolTransforms
+
+    from rxembed import metrics as met
+
+    mol = embed("CC(=O)OC")  # methyl acetate — the case-4 coordinated-ester motif, metal-free
+    cc = next(
+        a.GetIdx()
+        for a in mol.GetAtoms()
+        if a.GetAtomicNum() == 6 and sum(nb.GetAtomicNum() == 8 for nb in a.GetNeighbors()) == 2
+    )
+    onb = [nb.GetIdx() for nb in mol.GetAtomWithIdx(cc).GetNeighbors() if nb.GetAtomicNum() == 8]
+    o_term = next(o for o in onb if mol.GetAtomWithIdx(o).GetDegree() == 1)  # swing the terminal =O, not the methyl
+    o_est = next(o for o in onb if o != o_term)
+    rdMolTransforms.SetAngleDeg(mol.GetConformer(0), o_est, cc, o_term, 56.0)  # fold O-C-O toward fusion
+    pos = mol.GetConformer(0).GetPositions()
+    assert float(np.linalg.norm(pos[o_term] - pos[o_est])) < 1.4, "the two oxygens must have fused to set the test"
+
+    fused = [v for v in geom.check(mol, 0).violations if v.kind == "fusion"]
+    assert fused, "the collapsed ester O...O fusion must be flagged"
+    assert set(fused[0].atoms) >= {o_term, o_est}, "the flagged pair must be the two fused oxygens"
+
+    # red-first: the three gates that were the only ones looking here all stay silent on the O...O pair
+    assert not [v for v in geom.clashes(mol, pos) if set(v.atoms) >= {o_term, o_est}], "clashes excludes the 1-3 pair"
+    assert met.bonding_ok(mol, 0), "bonding_ok's fusion floor sits below the fused O...O distance"
+    formed, _ = met.connectivity(mol, 0)
+    assert {o_term, o_est} not in [set(p) for p in formed], "connectivity skips the topo-2 O...O pair"
+
+
+@pytest.mark.parametrize("smiles", ["C1CO1", "C1CC1", "C1CN1"])  # epoxide, cyclopropane, aziridine
+def test_genuine_three_membered_ring_is_not_a_fusion(embed, smiles):
+    """A REAL strained 3-ring (real ~60° angle, real A-C bond) is never read as a 1-3 fusion — the FP guard.
+
+    The discriminator is the graph, not the angle: the ring's two terminal atoms ARE bonded, so the pair never
+    enters the over-compression test. A check that flagged real epoxides would be worse than the hole it closes.
+    """
+    mol = embed(smiles)
+    rep = geom.check(mol, 0)
+    assert not [v for v in rep.violations if v.kind == "fusion"], rep.summary()
+    assert rep.ok(), rep.summary()  # a clean strained ring passes the whole gate
+
+
+@pytest.mark.parametrize("smiles", ["CC(=O)OC", "CC(=O)O", "C[N+](=O)[O-]", "CC(=O)C", "O=CN(C)C"])
+def test_real_tight_1_3_pairs_are_not_flagged(embed, smiles):
+    """Real ester / carboxylate / nitro / ketone / amide 1-3 pairs (~2.1-2.5 Å) sit far above bonding — clean.
+
+    These are the tight-1-3 ligand motifs the fusion check must never false-positive on: their O...O / C...O 1-3
+    separations are ~1.6x the covalent sum, well clear of the `d < r_cov sum` fusion floor.
+    """
+    mol = embed(smiles)
+    rep = geom.check(mol, 0)
+    assert not [v for v in rep.violations if v.kind == "fusion"], rep.summary()
+
+
 def test_bad_hydrogen_is_caught(embed):
     mol = embed("CO")
     h = next(a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 1)

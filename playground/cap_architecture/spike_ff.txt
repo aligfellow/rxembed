@@ -1,0 +1,16 @@
+##### mode=ff #####
+  case1    flag_rate= 0.0%  n=128  kinds={}
+  case2    flag_rate=21.9%  n= 64  kinds={'planarity': 16, 'conjugation': 12}
+  case3    flag_rate=39.6%  n= 53  kinds={'conjugation': 22, 'planarity': 10}
+  case4    flag_rate= 0.0%  n=102  kinds={}
+  HENRY    flag_rate= 0.0%  n= 64  kinds={}
+  KETONE   flag_rate= 0.0%  n= 64  kinds={}
+  PICO     flag_rate= 0.0%  n= 27  kinds={}
+  -- control in-plane hold (median/max metal-out-of-plane, deg, vs baseline planes) --
+     HENRY D=13(O) median=0.6 max=39.5
+     HENRY D=23(N) median=6.1 max=42.3
+     KETONE D=3(O) median=25.2 max=35.3
+     KETONE D=7(N) median=0.3 max=42.3
+     PICO D=2(O) median=2.4 max=21.6
+     PICO D=8(N) median=1.1 max=16.9
+  skip stats: {'capped': 3664, 'skipped': 2736}

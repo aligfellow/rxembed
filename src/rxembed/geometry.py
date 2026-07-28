@@ -1,119 +1,58 @@
 """Geometry gate -- validate that an embedded conformer is chemically sound.
 
-The point of freezing a core (or grafting a reacting TS back by Kabsch) is that the *free periphery*
-still has to come out right. A perfect frozen core and perfect constraint distances can coexist with a
-puckered aromatic ring, a twisted amide (broken conjugation), an out-of-plane N-H, a stretched X-H, or
-two atoms embedded on top of each other. Distance-window checks miss all of that.
+A perfect frozen core and perfect constraint distances can still coexist with a puckered aromatic ring, a
+twisted amide, an out-of-plane N-H, a stretched X-H, or two atoms on top of each other — the *free periphery*
+that distance-window checks miss.
 
 ``check()`` runs the physical checks and returns a ``GeometryReport``: truthy when clean, printable, with
-``.assert_ok()`` for tests. Pure ``rdkit`` + ``numpy`` — no optional deps, usable on any conformer.
+``.assert_ok()`` for tests. Pure ``rdkit`` + ``numpy``.
 
     rep = rxembed.geometry.check(mol, conf_id, frozen=core, reference=ts_mol,
                                    constraints={"distances": {(1, 9): (2.6, 3.0)}})
     rep.assert_ok()          # raises with a readable summary if any check fails
+
+The two metal coordination-sphere gates it calls (``metal_overbond`` / ``donor_orientation``) live in
+``rxembed.rdkit_embed.coordination``; result types in ``.report``; the vector math in ``.vecmath``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import numpy as np
 from rdkit import Chem
 
-_PT = Chem.GetPeriodicTable()
-# transition / lanthanide / actinide metals — their coordination distances are dative, not vdW clashes,
-# and their "bonds" aren't covalent (same set metrics.bonding_ok uses); check() excludes them so a metal
-# centre isn't read as clashing with its own ligands (ligand-ligand geometry is still fully checked).
-_METAL_Z = frozenset(range(21, 31)) | frozenset(range(39, 49)) | frozenset(range(57, 81)) | frozenset(range(89, 113))
-_CARBON_Z = 6  # sp2-planarity is checked on carbons only (N is physically pyramidal — see planarity())
-_SP2_DEGREE = 3  # a planar sp2 centre has exactly three neighbours
-_EPS = 1e-9  # numerical floor for a degenerate cross-product / near-zero norm
-_COORD_FACTOR = 1.3  # a heavy atom within this x covalent-sum of a metal is a coordinating donor
+# metals excluded from every ground-state check (dative, not vdW):
+from rxembed.rdkit_embed.constraints.metal import _METAL_Z
+from rxembed.rdkit_embed.coordination import (
+    _SP2_DEGREE,
+    _coordinating_carbons,
+    _coordination_pairs,
+    _eta2_pi_atoms,
+    conjugated_quartets,
+    donor_orientation,
+    metal_overbond,
+)
+from rxembed.rdkit_embed.report import GeometryReport, Violation
+from rxembed.rdkit_embed.vecmath import (
+    _CARBON_Z,
+    _PT,
+    _angle,
+    _dihedral,
+    _kabsch_rmsd,
+    _plane_offset,
+    _positions,
+    _rcov,
+    _rvdw,
+)
+
 _FLEX_CONJ = 60.0  # deg: the wider conjugation-dihedral window a metal-coordinated / side-on π atom gets (vs 30)
 _XH_TOL = 0.2  # Å slack over an X-H covalent-radius sum (P-H/Si-H/S-H run longer than the flat C-H ceiling)
-_SIDEON_SYM = 0.5  # Å: max |d(M,a) - d(M,b)| for a pi pair to count as symmetric side-on (else donor + backbone)
-_SIDEON_MAX = 2.6  # Å: both eta-2 atoms must bind within this — beyond it a pi atom is a backbone atom, not a donor
-
-
-@dataclass(frozen=True)
-class Violation:
-    """One failed check. ``value`` breached ``limit`` for the atoms named."""
-
-    kind: str
-    atoms: tuple[int, ...]
-    value: float
-    limit: float
-    detail: str = ""
-
-    def __str__(self) -> str:
-        """Format the violation as a readable one-liner."""
-        a = "-".join(map(str, self.atoms))
-        return f"[{self.kind}] atoms {a}: {self.value:.3f} vs {self.limit:.3f} {self.detail}".rstrip()
-
-
-@dataclass
-class GeometryReport:
-    """Result of ``check()``. Falsy/``ok()`` when there are no violations."""
-
-    violations: list[Violation] = field(default_factory=list)
-
-    def ok(self) -> bool:
-        """Return True when the conformer passed every check."""
-        return not self.violations
-
-    def __bool__(self) -> bool:
-        """Truthy when there are no violations."""
-        return self.ok()
-
-    def summary(self) -> str:
-        """Format the violations one per line (or an all-clear message)."""
-        if self.ok():
-            return "geometry OK (no violations)"
-        lines = [f"{len(self.violations)} geometry violation(s):"]
-        lines += [f"  - {v}" for v in self.violations]
-        return "\n".join(lines)
-
-    def assert_ok(self) -> None:
-        """Raise ``AssertionError`` with the summary if any check failed (for tests)."""
-        if not self.ok():
-            raise AssertionError(self.summary())
-
-
-# --- geometry helpers --------------------------------------------------------
-
-
-def _positions(mol_or_pos, conf_id: int = -1) -> np.ndarray:
-    """(N, 3) coordinates from a Mol conformer or a pass-through array."""
-    if isinstance(mol_or_pos, np.ndarray):
-        return mol_or_pos
-    return mol_or_pos.GetConformer(conf_id).GetPositions()
-
-
-def _rcov(z: int) -> float:
-    return _PT.GetRcovalent(z)
-
-
-def _rvdw(z: int) -> float:
-    return _PT.GetRvdw(z)
-
-
-def _kabsch_rmsd(a: np.ndarray, b: np.ndarray) -> float:
-    """RMSD of ``a`` onto ``b`` after optimal rigid superposition (Kabsch)."""
-    a = a - a.mean(0)
-    b = b - b.mean(0)
-    u, _, vt = np.linalg.svd(a.T @ b)
-    d = np.sign(np.linalg.det(vt.T @ u.T))
-    r = vt.T @ np.diag([1, 1, d]) @ u.T
-    return float(np.sqrt(((a @ r.T - b) ** 2).sum(1).mean()))
-
-
-def _plane_offset(center: np.ndarray, neighbors: np.ndarray) -> float:
-    """Distance of ``center`` from the best-fit plane of its 3 ``neighbors`` (0 = planar sp2)."""
-    n = np.cross(neighbors[1] - neighbors[0], neighbors[2] - neighbors[0])
-    norm = np.linalg.norm(n)
-    if norm < _EPS:
-        return 0.0
-    return float(abs(np.dot(center - neighbors[0], n / norm)))
+_FUSE_RATIO = 1.0  # a NON-bonded 1-3 pair has FUSED when its separation drops below this x their covalent-radius
+# sum — CLOSER than a bond the graph does not have. Catches the phantom bond `metrics.connectivity` cannot (its
+# `_MIN_TOPO=3` skips a 1-3 pair, assuming an angle holds it apart). Calibrated on the REAL karoline case-4 collapse
+# (docs/findings/karoline-metal-embed.md): an ester's O-C-O folds to 55.6°, fusing its O to ratio 0.96 (all 13/40
+# collapses land there — discrete, not a mild in-between). The gap to real structure is clean: the tightest real 1-3
+# heavy pair (a nitro/ester O...O) sits at ~1.6; a genuine 3-ring never enters (its terminals ARE bonded); a carborane
+# cage B...B sits at ~1.06 (AT a bond length, above the sum), so 1.2 would false-flag it; 1.0 is the physical edge.
 
 
 # --- the checks --------------------------------------------------------------
@@ -139,12 +78,15 @@ def bond_lengths(mol, pos, lo: float = 0.7, hi: float = 1.3, exclude=frozenset()
     return out
 
 
-def hydrogens(mol, pos, lo: float = 0.8, hi: float = 1.3, exclude=frozenset()) -> list[Violation]:
+def hydrogens(mol, pos, lo: float = 0.8, hi: float = 1.3, exclude=frozenset(), donors=frozenset()) -> list[Violation]:
     """Each H bonded to exactly one heavy atom at a sane X-H length (bad-H-position detector).
 
-    The upper limit is element-aware: a P-H (~1.42 A), Si-H (~1.48), or S-H (~1.34) bond is genuinely
-    longer than a C/N/O-H, so the heavy atom's covalent radius sets its own ceiling (else a correct P-H
-    false-flags). C/N/O-H keep the tight default `hi`.
+    The upper limit is element-aware: a P-H/Si-H/S-H bond is genuinely longer than a C/N/O-H, so the heavy
+    atom's covalent radius sets its own ceiling (else a correct P-H false-flags); C/N/O-H keep the tight `hi`.
+
+    A **metal-held H is not judged here** (a dative M-H is not a covalent X-H). It is metal-held if it is a
+    ``donors`` declaration (a terminal hydride is left bond-less by the strip) or its bonds reach a metal; its
+    M-H distance is judged by `metal_overbond`'s dative floor.
     """
     out = []
     for atom in mol.GetAtoms():
@@ -152,7 +94,9 @@ def hydrogens(mol, pos, lo: float = 0.8, hi: float = 1.3, exclude=frozenset()) -
             continue
         nbrs = atom.GetNeighbors()
         h = atom.GetIdx()
-        if h in exclude or (nbrs and nbrs[0].GetIdx() in exclude):
+        # `any`, not `nbrs[0]`: an eta2-H2 donor's neighbours are the metal *and* its H partner, in whatever
+        # order RDKit stored them — order must not decide whether this H is judged.
+        if h in exclude or h in donors or any(nb.GetIdx() in exclude for nb in nbrs):
             continue
         if len(nbrs) != 1:
             out.append(Violation("hydrogen", (h,), float(len(nbrs)), 1.0, "H not bonded to exactly one atom"))
@@ -170,15 +114,13 @@ def clashes(
 ) -> list[Violation]:
     """No non-bonded pair (excluding 1-3 angle pairs) in steric overlap.
 
-    Thresholds differ by kind so real non-covalent contacts (H-bonds, halogen/π) are not flagged:
-    heavy-heavy overlap at `heavy_vdw` x sum-of-vdW (a genuine steric clash sits well inside vdW); H...H
-    below `hh_floor` Å; and an H buried inside a non-bonded heavy atom at `xh_cov` x sum-of-covalent
-    (small enough that a 1.8 Å H-bond H...acceptor passes, large enough to catch a buried H).
-    ``exclude`` atoms (a frozen/reacting core) are skipped — a forming/breaking bond reads as a clash.
+    Thresholds differ by kind so real non-covalent contacts (H-bonds, halogen/π) are not flagged: heavy-heavy
+    at `heavy_vdw` x sum-of-vdW; H...H below `hh_floor` Å; an H buried in a heavy atom at `xh_cov` x
+    sum-of-covalent (a 1.8 Å H-bond passes, a buried H caught). ``exclude`` atoms (a frozen/reacting core) are
+    skipped.
 
-    Two donors of the same metal are a **1-3 pair through the metal** — cis coordination partners sit at the
-    bite distance (~2 Å), which is not a clash. The metal-donor bonds are stripped on the surrogate, so
-    these are detected by distance (`_coordination_pairs`) and excluded like any angle pair.
+    Two donors of the same metal are a **1-3 pair through the metal** (cis partners at the bite distance ~2 Å,
+    not a clash); the surrogate strips the M-donor bonds, so these are found by distance and excluded.
     """
     excluded = set()
     for b in mol.GetBonds():
@@ -208,6 +150,50 @@ def clashes(
                 limit, why = heavy_vdw * (_rvdw(z[i]) + _rvdw(z[j])), "heavy-atom steric overlap"
             if d < limit:
                 out.append(Violation("clash", (i, j), d, limit, why))
+    return out
+
+
+def over_compression(mol, pos, exclude=frozenset(), ratio: float = _FUSE_RATIO) -> list[Violation]:
+    """Non-bonded 1-3 pairs crushed to bonding distance — a phantom ring no other gate catches.
+
+    A 1-3 pair is normally held apart by its bridging angle, so ``clashes`` excludes it and
+    ``metrics.connectivity`` (``_MIN_TOPO``) never reports it. But a hard relax CAN fold that angle until the
+    terminals fuse: a coordinated ester's O-C-O collapsing ~122->56° fuses its O to 1.27 Å and a perceiver reads
+    a 3-ring the molecule never had (below ``bonding_ok``'s ~0.9 Å fusion floor).
+
+    The discriminator against a GENUINE small ring (epoxide/cyclopropane) is the graph, not the angle — there the
+    terminals are BONDED so the pair never enters this test. Only a NOT-bonded pair below ``ratio`` x covalent sum
+    is a fusion. Frozen-core / metal atoms come in via ``exclude``.
+    """
+    out: list[Violation] = []
+    for mid_atom in mol.GetAtoms():
+        mid = mid_atom.GetIdx()
+        if mid in exclude or mid_atom.GetAtomicNum() == 1:  # a frozen/metal bridge, or an H (no bridging angle to
+            continue  # fold — an H bonded to two heavies is itself only a broken/3-center graph, not a fusion)
+        nbrs = [n.GetIdx() for n in mid_atom.GetNeighbors() if n.GetAtomicNum() > 1 and n.GetIdx() not in exclude]
+        for u in range(len(nbrs)):
+            for w in range(u + 1, len(nbrs)):
+                a, c = nbrs[u], nbrs[w]
+                if mol.GetBondBetweenAtoms(a, c) is not None:  # a genuine small ring: the two terminals ARE bonded
+                    continue
+                r_sum = _rcov(mol.GetAtomWithIdx(a).GetAtomicNum()) + _rcov(mol.GetAtomWithIdx(c).GetAtomicNum())
+                floor = ratio * r_sum
+                d = float(np.linalg.norm(pos[a] - pos[c]))
+                if d < floor:
+                    ang = _angle(pos[a], pos[mid], pos[c])
+                    a_s = f"{mol.GetAtomWithIdx(a).GetSymbol()}{a}"
+                    c_s = f"{mol.GetAtomWithIdx(c).GetSymbol()}{c}"
+                    m_s = f"{mol.GetAtomWithIdx(mid).GetSymbol()}{mid}"
+                    out.append(
+                        Violation(
+                            "fusion",
+                            (a, mid, c),
+                            d,
+                            floor,
+                            f"{a_s}...{c_s} fused to {d:.2f} A across {m_s} (angle {ang:.0f}°) — "
+                            "a bond the graph does not have",
+                        )
+                    )
     return out
 
 
@@ -252,28 +238,12 @@ def conjugation(mol, pos, tol_deg: float = 30.0, exclude=frozenset(), flex=froze
     side-on η² π atom) gets the wider ``_FLEX_CONJ`` window.
     """
     out = []
-    for b in mol.GetBonds():
-        if b.GetBondType() != Chem.BondType.SINGLE or b.IsInRing():
-            continue
-        for x_atom, c_atom in ((b.GetBeginAtom(), b.GetEndAtom()), (b.GetEndAtom(), b.GetBeginAtom())):
-            if x_atom.GetAtomicNum() not in (7, 8) or c_atom.GetAtomicNum() != _CARBON_Z:
-                continue
-            if x_atom.GetIdx() in exclude or c_atom.GetIdx() in exclude:
-                continue
-            dbl = [
-                n
-                for n in c_atom.GetNeighbors()
-                if mol.GetBondBetweenAtoms(c_atom.GetIdx(), n.GetIdx()).GetBondType() == Chem.BondType.DOUBLE
-            ]
-            subs = [n for n in x_atom.GetNeighbors() if n.GetIdx() != c_atom.GetIdx()]
-            if not dbl or not subs:
-                continue
-            a, x, c, s = dbl[0].GetIdx(), x_atom.GetIdx(), c_atom.GetIdx(), subs[0].GetIdx()
-            limit = _FLEX_CONJ if (c in flex or x in flex or a in flex) else tol_deg  # side-on η² twists further
-            dih = abs(_dihedral(pos[a], pos[c], pos[x], pos[s]))
-            dev = min(dih, abs(180.0 - dih))
-            if dev > limit:
-                out.append(Violation("conjugation", (a, c, x, s), dev, limit, "twisted out of plane"))
+    for a, c, x, s in conjugated_quartets(mol, exclude):
+        limit = _FLEX_CONJ if (c in flex or x in flex or a in flex) else tol_deg  # side-on η² twists further
+        dih = abs(_dihedral(pos[a], pos[c], pos[x], pos[s]))
+        dev = min(dih, abs(180.0 - dih))
+        if dev > limit:
+            out.append(Violation("conjugation", (a, c, x, s), dev, limit, "twisted out of plane"))
     return out
 
 
@@ -294,20 +264,25 @@ def check_constraints(mol, pos, spec, dist_slack: float = 0.15, ang_slack: float
     """
     dists = _attr(spec, "distances", {})
     angles = _attr(spec, "angles", {})
-    out = []
+    n = len(pos)  # a constraint on a transient (a haptic centroid dummy) has no counterpart in the real geometry:
+    out = []  # its index is >= n, so skip it. The equivalent real check (M -> each ring atom) has real indices.
     for (i, j), win in dists.items():
+        if i >= n or j >= n:
+            continue
         lo, hi = win if isinstance(win, tuple) else (win, win)
         d = float(np.linalg.norm(pos[i] - pos[j]))
         if not (lo - dist_slack <= d <= hi + dist_slack):
             out.append(Violation("constraint", (i, j), d, hi + dist_slack, f"distance window [{lo}, {hi}]"))
     for (i, j, k), (lo, hi) in angles.items():
+        if i >= n or j >= n or k >= n:
+            continue
         a = _angle(pos[i], pos[j], pos[k])
         if not (lo - ang_slack <= a <= hi + ang_slack):
             out.append(Violation("constraint", (i, j, k), a, hi + ang_slack, f"angle window [{lo}, {hi}]"))
     return out
 
 
-def stereo(mol, pos, reference, conf_id: int = -1) -> list[Violation]:
+def stereo_violations(mol, pos, reference, conf_id: int = -1) -> list[Violation]:
     """No stereocentre inverted vs ``reference`` (CIP tags from 3D)."""
     got = _cip(mol, conf_id)
     want = _cip(reference)
@@ -321,7 +296,7 @@ def stereo(mol, pos, reference, conf_id: int = -1) -> list[Violation]:
 # --- top-level entry ---------------------------------------------------------
 
 
-def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=None) -> GeometryReport:
+def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=None, donors=None) -> GeometryReport:
     """Run the full physical gate on one conformer and collect all violations.
 
     Parameters
@@ -345,23 +320,28 @@ def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=No
     exclude = set(frozen) if frozen is not None else set()
     exclude |= {a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _METAL_Z}  # dative, not vdW
     exclude = frozenset(exclude)
-    # a metal-coordinated carbon (carbanion / carbene / side-on η² carbon) is NOT held to sp2 planarity — the
-    # coordination sets its geometry (it can be sp3-pyramidal or bent; gfn2 keeps a coordinating [CH-] ~0.3 A
-    # out of plane), so it's EXEMPT from the flat-sp2 check. A gross error still shows in bond/clash, and the
-    # metal SQUARE PLANE is the separate coplanarity gate — this is only the atom's own local sp2.
+    # A metal-coordinated carbon (carbanion / carbene / side-on η² C) is NOT held to sp2 planarity — the
+    # coordination sets its geometry (gfn2 keeps a coordinating [CH-] ~0.3 A out of plane), so it is EXEMPT from
+    # the flat-sp2 check (a gross error still shows in bond/clash; the metal square plane is a separate gate).
+    # (A haptic centroid dummy never reaches here — the mol is real, its ring atoms ARE the donors.)
     coord_c = _coordinating_carbons(mol, pos)
     v: list[Violation] = []
     v += bond_lengths(mol, pos, exclude=exclude)
-    v += hydrogens(mol, pos, exclude=exclude)
+    v += hydrogens(mol, pos, exclude=exclude, donors=frozenset(donors or ()))
     v += clashes(mol, pos, exclude=exclude)
+    v += over_compression(mol, pos, exclude=exclude)  # a 1-3 pair fused across a collapsed bridging angle — the
+    #     phantom ring `clashes` (1-3 excluded) and `metrics.connectivity` (`_MIN_TOPO`) are both blind to
     v += planarity(mol, pos, exclude=exclude | coord_c)
     v += conjugation(mol, pos, exclude=exclude, flex=_eta2_pi_atoms(mol, pos) | coord_c)
+    v += metal_overbond(mol, pos, donors)  # the two gates that look INTO the sphere (every other check excludes
+    v += donor_orientation(mol, pos, donors, frozen or frozenset())  # metals): has an atom reached bonding distance,
+    #     and does a ligand still point the right way (a short D-X can go side-on under the floor). Pass `donors`.
     if frozen is not None and reference is not None:
         v += frozen_core(mol, pos, frozen, reference)
     if constraints is not None:
         v += check_constraints(mol, pos, constraints)
     if reference is not None:
-        v += stereo(mol, pos, reference, conf_id)
+        v += stereo_violations(mol, pos, reference, conf_id)
     return GeometryReport(v)
 
 
@@ -374,91 +354,6 @@ def _attr(obj, name, default):
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
-
-
-def _eta2_pi_atoms(mol, pos) -> set[int]:
-    """Return atoms in a genuine side-on **η²** unit — a π-bonded pair binding one metal *symmetrically*.
-
-    A side-on π ligand (alkene / alkyne / imine / phosphaalkene) binds *through* its π bond, so the metal
-    sits above the bond and legitimately pulls the sp2 atoms a little out of plane. That out-of-plane is a
-    real feature of the (angle/distance-restricted) side-on coordination, not a broken geometry, so these
-    atoms get a wider planarity/conjugation window.
-
-    The signal is a pi-bonded (double/triple) pair BOTH near the metal AND at **~equal** metal distance —
-    side-on binding is symmetric. Equal-distance is what rejects a false positive the flat 1.3x donor shell
-    lets through: an alpha-diimine's imine *carbon* drifts just inside the shell behind its sigma-donor N,
-    but that N (~2.0 A) / C (~2.8 A) pair is lopsided, not side-on, so its backbone stays strictly planar.
-    """
-    metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _METAL_Z]
-    out: set[int] = set()
-    for a, b in _coordination_pairs(mol, pos):
-        bond = mol.GetBondBetweenAtoms(a, b)
-        if bond is None or bond.GetBondTypeAsDouble() < 2:  # noqa: PLR2004 — need double/triple for side-on pi
-            continue
-        for m in metals:  # symmetric binding: both atoms at ~equal distance from the SAME metal
-            da, db = float(np.linalg.norm(pos[m] - pos[a])), float(np.linalg.norm(pos[m] - pos[b]))
-            if abs(da - db) <= _SIDEON_SYM and max(da, db) <= _SIDEON_MAX:
-                out.update((a, b))
-                break
-    return out
-
-
-def _coordinating_carbons(mol, pos) -> set[int]:
-    """Return carbons bound to a metal — a carbanion / carbene / eta-2 carbon is sp3-ish, not sp2-planar.
-
-    A carbon that coordinates a metal (within the ``_COORD_FACTOR`` donor shell) legitimately pyramidalises
-    out of the flat sp2 plane RDKit assigns it — gfn2 confirms a coordinating ``[CH-]`` amidate carbanion
-    stays ~0.3 A out of plane — so it gets the wider planarity window, not the strict flat-sp2 one.
-    """
-    metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _METAL_Z]
-    out: set[int] = set()
-    for m in metals:
-        rm = _rcov(mol.GetAtomWithIdx(m).GetAtomicNum())
-        for a in mol.GetAtoms():
-            if a.GetAtomicNum() == _CARBON_Z and (
-                float(np.linalg.norm(pos[m] - pos[a.GetIdx()])) <= _COORD_FACTOR * (rm + _rcov(_CARBON_Z))
-            ):
-                out.add(a.GetIdx())
-    return out
-
-
-def _coordination_pairs(mol, pos) -> set[tuple[int, int]]:
-    """Return donor-donor index pairs of each metal (a heavy atom within ``_COORD_FACTOR`` x covalent-sum).
-
-    These are 1-3 pairs *through* the metal — cis coordination partners at the bite distance, not a steric
-    clash. The metal-donor bonds are stripped on the rxembed surrogate, so donors are found geometrically.
-    """
-    metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _METAL_Z]
-    out: set[tuple[int, int]] = set()
-    for m in metals:
-        rm = _rcov(mol.GetAtomWithIdx(m).GetAtomicNum())
-        donors = [
-            a.GetIdx()
-            for a in mol.GetAtoms()
-            if a.GetAtomicNum() > 1
-            and a.GetIdx() != m
-            and a.GetAtomicNum() not in _METAL_Z
-            and float(np.linalg.norm(pos[m] - pos[a.GetIdx()])) <= _COORD_FACTOR * (rm + _rcov(a.GetAtomicNum()))
-        ]
-        for x in range(len(donors)):
-            for y in range(x + 1, len(donors)):
-                out.add((min(donors[x], donors[y]), max(donors[x], donors[y])))
-    return out
-
-
-def _angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-    u, w = a - b, c - b
-    cos = np.dot(u, w) / (np.linalg.norm(u) * np.linalg.norm(w))
-    return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
-
-
-def _dihedral(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
-    """Signed dihedral p0-p1-p2-p3 in degrees."""
-    b0, b1, b2 = p0 - p1, p2 - p1, p3 - p2
-    b1 /= np.linalg.norm(b1)
-    v = b0 - np.dot(b0, b1) * b1
-    w = b2 - np.dot(b2, b1) * b1
-    return float(np.degrees(np.arctan2(np.dot(np.cross(b1, v), w), np.dot(v, w))))
 
 
 def _cip(mol, conf_id: int = -1) -> dict[int, str]:

@@ -1,0 +1,1422 @@
+[
+ {
+  "name": "ABEZAJ",
+  "half": "tmQM",
+  "n_dist_windows": 5,
+  "exempt_pairs": 5,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "ADUDAG",
+  "half": "tmQM",
+  "n_dist_windows": 9,
+  "exempt_pairs": 9,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "AKILAJ",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "ASIPAW",
+  "half": "tmQM",
+  "n_dist_windows": 9,
+  "exempt_pairs": 9,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "BESJUE",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "BUWXIC",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "CBZYTA",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "COJKAO",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "CSBRHB",
+  "half": "tmQM",
+  "n_dist_windows": 7,
+  "exempt_pairs": 7,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "DADXAK",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "DAJXOD",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "DASSUL",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "DEYMIE",
+  "half": "tmQM",
+  "n_dist_windows": 7,
+  "exempt_pairs": 7,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "DUGVUX",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "DUKPII",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "DUNSEN",
+  "half": "tmQM",
+  "n_dist_windows": 2,
+  "exempt_pairs": 2,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "ENCYSM",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "EPEJOZ",
+  "half": "tmQM",
+  "n_dist_windows": 9,
+  "exempt_pairs": 9,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "ESOVIU",
+  "half": "tmQM",
+  "n_dist_windows": 2,
+  "exempt_pairs": 2,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "FIHTIZ",
+  "half": "tmQM",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "FIJTOH",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "GODNOD",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "GUVVID",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "HESNOL",
+  "half": "tmQM",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "HEXCEU",
+  "half": "tmQM",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "HIBPAK",
+  "half": "tmQM",
+  "n_dist_windows": 2,
+  "exempt_pairs": 2,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "HOXLAK",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "HURVOI",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "IHUBUJ",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "IHUKAA",
+  "half": "tmQM",
+  "n_dist_windows": 5,
+  "exempt_pairs": 5,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "ILONON",
+  "half": "tmQM",
+  "n_dist_windows": 12,
+  "exempt_pairs": 12,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "IXOMIR",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "IYIJAE",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "JIWHOQ",
+  "half": "tmQM",
+  "n_dist_windows": 9,
+  "exempt_pairs": 9,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "JUQGUZ",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "KASFIU",
+  "half": "tmQM",
+  "n_dist_windows": 7,
+  "exempt_pairs": 7,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "KEGFOU",
+  "half": "tmQM",
+  "n_dist_windows": 2,
+  "exempt_pairs": 2,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "KISZAR",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "KUNBUS",
+  "half": "tmQM",
+  "n_dist_windows": 2,
+  "exempt_pairs": 2,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "LASFOB",
+  "half": "tmQM",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "LISVIW",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "LOSCEE",
+  "half": "tmQM",
+  "n_dist_windows": 5,
+  "exempt_pairs": 5,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "MEBLAI",
+  "half": "tmQM",
+  "n_dist_windows": 9,
+  "exempt_pairs": 9,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "MOCHUH",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "MUTBUY",
+  "half": "tmQM",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "NEWVOB",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "NITCAW",
+  "half": "tmQM",
+  "n_dist_windows": 9,
+  "exempt_pairs": 9,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "NOBKIA",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "NUDXOC",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "NUKHEG",
+  "half": "tmQM",
+  "n_dist_windows": 7,
+  "exempt_pairs": 7,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 3,
+  "tear_masked": 0
+ },
+ {
+  "name": "NUMLUF",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "OFULEJ",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "OWAHEC",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "PAPMEZ",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "PESHUT",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "PIWPUJ",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "POFFOG",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "QIKNIJ",
+  "half": "tmQM",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "QISROZ",
+  "half": "tmQM",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "QIXJOW",
+  "half": "tmQM",
+  "n_dist_windows": 2,
+  "exempt_pairs": 2,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "QUZKAZ",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "RERHEB",
+  "half": "tmQM",
+  "n_dist_windows": 13,
+  "exempt_pairs": 13,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "REVWAU",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "ROLWAR",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "RUSZUA",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "RUTQUS",
+  "half": "tmQM",
+  "n_dist_windows": 5,
+  "exempt_pairs": 5,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "SACJEO",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "SAYJEJ",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "SIFJUO",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "SIKQIO",
+  "half": "tmQM",
+  "n_dist_windows": 7,
+  "exempt_pairs": 7,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "SOHMEJ",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "SOMJIN",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "TARJON",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "TIQGUY",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 3,
+  "tear_masked": 0
+ },
+ {
+  "name": "TUDGUU",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "TUXRUZ",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 1,
+  "tear_masked": 0
+ },
+ {
+  "name": "UDITUW",
+  "half": "tmQM",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "UGUYUT",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "URIFUZ",
+  "half": "tmQM",
+  "n_dist_windows": 5,
+  "exempt_pairs": 5,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "UTANUA",
+  "half": "tmQM",
+  "n_dist_windows": 9,
+  "exempt_pairs": 9,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "VUPCIT",
+  "half": "tmQM",
+  "n_dist_windows": 2,
+  "exempt_pairs": 2,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "VUYWIX",
+  "half": "tmQM",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "WACJET",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "WAVBUS",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "WAVGAC",
+  "half": "tmQM",
+  "n_dist_windows": 2,
+  "exempt_pairs": 2,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "WEGBOZ",
+  "half": "tmQM",
+  "n_dist_windows": 9,
+  "exempt_pairs": 9,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "WELROW",
+  "half": "tmQM",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "WUSXIT",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "WUVJAB",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "XAWQUH",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "XAYVUP",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "XEGGEY",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "XEYNIA",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "YAPZAS",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "YEYSOK",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "YIXSIJ",
+  "half": "tmQM",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "ZAHZUD",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "ZEJZOF",
+  "half": "tmQM",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "ZONHOB",
+  "half": "tmQM",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "ZOPJOG",
+  "half": "tmQM",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "ZOPNOH",
+  "half": "tmQM",
+  "n_dist_windows": 5,
+  "exempt_pairs": 5,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "ABUVUP",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "AGUFEN",
+  "half": "fixtures",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "BEGLUU",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 2,
+  "tear_masked": 0
+ },
+ {
+  "name": "Cis-PtCl2(en)",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "CisPlatin",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "CuCN2",
+  "half": "fixtures",
+  "n_dist_windows": 2,
+  "exempt_pairs": 2,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "DIXHOK",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "FeCO5",
+  "half": "fixtures",
+  "n_dist_windows": 5,
+  "exempt_pairs": 5,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "FeH2(CO)4",
+  "half": "fixtures",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "Ferrocene-halide-face",
+  "half": "fixtures",
+  "n_dist_windows": 10,
+  "exempt_pairs": 10,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "Ferrocene",
+  "half": "fixtures",
+  "n_dist_windows": 10,
+  "exempt_pairs": 10,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "HgI3",
+  "half": "fixtures",
+  "n_dist_windows": 3,
+  "exempt_pairs": 3,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 2,
+  "tear_masked": 0
+ },
+ {
+  "name": "IROXET_comp_0",
+  "half": "fixtures",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "JOTJEK_comp_0",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "NAXDOI",
+  "half": "fixtures",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "PdCl2-R-BINAP",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "PdCl2-RR-BDNN",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "PdCl2-RR-BDPP",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "PdCl2-RR-DPDME",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "PdCl2PhenPhosMe",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "PtMeNH3ClBr-Cis",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 3,
+  "tear_masked": 0
+ },
+ {
+  "name": "PtMeNH3ClBr-Trans",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "ReF7",
+  "half": "fixtures",
+  "n_dist_windows": 7,
+  "exempt_pairs": 7,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "Rh-RR-DIPAMP-Cl2",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "Rh-RR-DIPAMP-Ph-Cl2",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "Rh-Single-Chiral-Phosphine",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "RhF7",
+  "half": "fixtures",
+  "n_dist_windows": 7,
+  "exempt_pairs": 7,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 3,
+  "tear_masked": 0
+ },
+ {
+  "name": "TiCat1",
+  "half": "fixtures",
+  "n_dist_windows": 12,
+  "exempt_pairs": 12,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 3,
+  "tear_masked": 0
+ },
+ {
+  "name": "TiCat2",
+  "half": "fixtures",
+  "n_dist_windows": 8,
+  "exempt_pairs": 8,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "TiCat3",
+  "half": "fixtures",
+  "n_dist_windows": 12,
+  "exempt_pairs": 12,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "TiCat4",
+  "half": "fixtures",
+  "n_dist_windows": 12,
+  "exempt_pairs": 12,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 3,
+  "tear_masked": 0
+ },
+ {
+  "name": "TiCat5",
+  "half": "fixtures",
+  "n_dist_windows": 12,
+  "exempt_pairs": 12,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "TiCat6",
+  "half": "fixtures",
+  "n_dist_windows": 12,
+  "exempt_pairs": 12,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 3,
+  "tear_masked": 0
+ },
+ {
+  "name": "TiCl4",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 3,
+  "tear_masked": 0
+ },
+ {
+  "name": "TiCp2Me2",
+  "half": "fixtures",
+  "n_dist_windows": 12,
+  "exempt_pairs": 12,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 4,
+  "tear_masked": 0
+ },
+ {
+  "name": "TransPlatin",
+  "half": "fixtures",
+  "n_dist_windows": 4,
+  "exempt_pairs": 4,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 3,
+  "tear_masked": 0
+ },
+ {
+  "name": "VOacac2",
+  "half": "fixtures",
+  "n_dist_windows": 5,
+  "exempt_pairs": 5,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "Zeises_salt",
+  "half": "fixtures",
+  "n_dist_windows": 5,
+  "exempt_pairs": 5,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 2,
+  "tear_masked": 0
+ },
+ {
+  "name": "fac-Ir(ppy)3",
+  "half": "fixtures",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 3,
+  "tear_masked": 0
+ },
+ {
+  "name": "mer-Ir(ppy)3",
+  "half": "fixtures",
+  "n_dist_windows": 6,
+  "exempt_pairs": 6,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 5,
+  "tear_masked": 0
+ },
+ {
+  "name": "ticat3_generated_broken",
+  "half": "fixtures",
+  "n_dist_windows": 14,
+  "exempt_pairs": 14,
+  "exempt_bonded": 0,
+  "exempt_bonded_examples": [],
+  "n_conf": 1,
+  "tear_masked": 0
+ }
+]

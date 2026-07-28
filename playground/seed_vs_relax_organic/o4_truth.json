@@ -1,0 +1,305 @@
+[
+ {
+  "id": "thia-ma",
+  "n_quartets": 3,
+  "confs": [
+   {
+    "cid": 0,
+    "seed_conj": 88.95970116488198,
+    "relax_conj": 27.69987483268962,
+    "seed_E": -10100.98037428424,
+    "seed_conj_after_opt": 24.799207592067035,
+    "seed_opt_rmsd": 2.5540037089888648,
+    "relax_E": -10154.573515205633,
+    "relax_conj_after_opt": 41.436265313614285,
+    "relax_opt_rmsd": 1.7210304416906346
+   },
+   {
+    "cid": 1,
+    "seed_conj": 86.09822548770181,
+    "relax_conj": 86.61793938263115,
+    "seed_E": -10052.868083803052,
+    "seed_conj_after_opt": 71.34784286902945,
+    "seed_opt_rmsd": 2.071925584758959,
+    "relax_E": -10158.842356103563,
+    "relax_conj_after_opt": 43.03434325919392,
+    "relax_opt_rmsd": 1.5390916572742015
+   },
+   {
+    "cid": 2,
+    "seed_conj": 17.19812849985574,
+    "relax_conj": 50.17397347448798,
+    "seed_E": -10101.292109259039,
+    "seed_conj_after_opt": 11.818468802576518,
+    "seed_opt_rmsd": 2.2152531863795324,
+    "relax_E": -10154.854214996958,
+    "relax_conj_after_opt": 8.870377113727756,
+    "relax_opt_rmsd": 2.8629192670402306
+   },
+   {
+    "cid": 3,
+    "seed_conj": 52.643651613646426,
+    "relax_conj": 30.55729955444575,
+    "seed_E": -10111.352666156965,
+    "seed_conj_after_opt": 26.99669576702222,
+    "seed_opt_rmsd": 1.2745752923448996,
+    "relax_E": -10159.358804271567,
+    "relax_conj_after_opt": 26.754249126511382,
+    "relax_opt_rmsd": 0.9705519697265723
+   }
+  ],
+  "ref_conj_max": 16.577198068358655
+ },
+ {
+  "id": "schreiner-acetone",
+  "n_quartets": 2,
+  "confs": [
+   {
+    "cid": 0,
+    "seed_conj": 0.5924810706880053,
+    "relax_conj": 36.14753289272043,
+    "seed_E": -5523.089274044358,
+    "seed_conj_after_opt": 1.0640975752234392,
+    "seed_opt_rmsd": 1.912190381285379,
+    "relax_E": -5527.665481543767,
+    "relax_conj_after_opt": 0.5405922051509313,
+    "relax_opt_rmsd": 0.9768272449564811
+   },
+   {
+    "cid": 1,
+    "seed_conj": 0.7780401375925714,
+    "relax_conj": 23.852428311853185,
+    "seed_E": -5517.09966757153,
+    "seed_conj_after_opt": 0.9915718158615395,
+    "seed_opt_rmsd": 1.9667324122902856,
+    "relax_E": -5530.160450667218,
+    "relax_conj_after_opt": 1.2787133992812014,
+    "relax_opt_rmsd": 2.156755135428102
+   },
+   {
+    "cid": 2,
+    "seed_conj": 0.19315600177607128,
+    "relax_conj": 30.216869071290667,
+    "seed_E": -5526.745361667262,
+    "seed_conj_after_opt": 0.7896208400680867,
+    "seed_opt_rmsd": 2.1155893397464562,
+    "relax_E": -5528.53193911552,
+    "relax_conj_after_opt": 1.0968661334482575,
+    "relax_opt_rmsd": 0.9304662228965432
+   },
+   {
+    "cid": 3,
+    "seed_conj": 0.16315245518987054,
+    "relax_conj": 23.43821716060708,
+    "seed_E": -5521.57061171334,
+    "seed_conj_after_opt": 0.6530974407028387,
+    "seed_opt_rmsd": 1.7944611537971968,
+    "relax_E": -5530.191592932672,
+    "relax_conj_after_opt": 0.9203233715179383,
+    "relax_opt_rmsd": 2.0110210442343748
+   }
+  ]
+ },
+ {
+  "id": "bimp",
+  "n_quartets": 2,
+  "confs": [
+   {
+    "cid": 0,
+    "seed_conj": 4.288251421434609,
+    "relax_conj": 47.41408798496806,
+    "seed_E": -20759.682689905294,
+    "seed_conj_after_opt": 13.027006445884695,
+    "seed_opt_rmsd": 3.1456593859835,
+    "relax_E": -20896.269263816317,
+    "relax_conj_after_opt": 11.419009263922419,
+    "relax_opt_rmsd": 2.5766706632514866
+   },
+   {
+    "cid": 1,
+    "seed_conj": 1.769481778329606,
+    "relax_conj": 46.674087404487665,
+    "seed_E": -20805.17021008934,
+    "seed_conj_after_opt": 19.265199059293906,
+    "seed_opt_rmsd": 3.331388102447956,
+    "relax_E": -20905.822794247073,
+    "relax_conj_after_opt": 9.950485123178936,
+    "relax_opt_rmsd": 2.424493735574718
+   },
+   {
+    "cid": 2,
+    "seed_conj": 0.9337154379392985,
+    "relax_conj": 18.848536173040912,
+    "seed_E": -20760.25770271173,
+    "seed_conj_after_opt": 8.815879356591722,
+    "seed_opt_rmsd": 1.715126051572233,
+    "relax_E": -20917.253524288317,
+    "relax_conj_after_opt": 10.018084531475097,
+    "relax_opt_rmsd": 1.4507480451181902
+   },
+   {
+    "cid": 3,
+    "seed_conj": 0.99281964538653,
+    "relax_conj": 68.2223165878595,
+    "seed_E": -20700.33673442848,
+    "seed_conj_after_opt": 14.92738017664236,
+    "seed_opt_rmsd": 2.2195860871386883,
+    "relax_E": -20906.758574194795,
+    "relax_conj_after_opt": 20.095676234113427,
+    "relax_opt_rmsd": 2.219084726094013
+   }
+  ],
+  "ref_conj_max": 12.759926184484016
+ },
+ {
+  "id": "takemoto-acetone",
+  "n_quartets": 2,
+  "confs": [
+   {
+    "cid": 0,
+    "seed_conj": 1.055964322198742,
+    "relax_conj": 46.673871230903,
+    "seed_E": -5960.950287757501,
+    "seed_conj_after_opt": 12.806567316933384,
+    "seed_opt_rmsd": 1.7552138674272566,
+    "relax_E": -5982.352913467039,
+    "relax_conj_after_opt": 50.27912019171047,
+    "relax_opt_rmsd": 1.5564553786969226
+   },
+   {
+    "cid": 1,
+    "seed_conj": 0.23599377922974824,
+    "relax_conj": 35.221534034082026,
+    "seed_E": -5956.878449506271,
+    "seed_conj_after_opt": 10.819618436690961,
+    "seed_opt_rmsd": 1.0108703523666123,
+    "relax_E": -5975.8447108681785,
+    "relax_conj_after_opt": 12.268328710024223,
+    "relax_opt_rmsd": 1.0651435881151485
+   },
+   {
+    "cid": 2,
+    "seed_conj": 0.08915761673410501,
+    "relax_conj": 46.6735295062599,
+    "seed_E": -5954.948481391061,
+    "seed_conj_after_opt": 4.586739254482393,
+    "seed_opt_rmsd": 1.5572115742020254,
+    "relax_E": -5977.751721512885,
+    "relax_conj_after_opt": 48.97600334554356,
+    "relax_opt_rmsd": 1.480205917425368
+   },
+   {
+    "cid": 3,
+    "seed_conj": 0.5806358607275391,
+    "relax_conj": 38.9468040893009,
+    "seed_E": -5955.504460576365,
+    "seed_conj_after_opt": 13.058706780703668,
+    "seed_opt_rmsd": 0.7282452505239729,
+    "relax_E": -5977.139350837916,
+    "relax_conj_after_opt": 14.742348215726645,
+    "relax_opt_rmsd": 1.3987727313333422
+   }
+  ]
+ },
+ {
+  "id": "cpa",
+  "n_quartets": 0,
+  "confs": [
+   {
+    "cid": 0,
+    "seed_conj": 0.0,
+    "relax_conj": 0.0,
+    "seed_E": -13149.61952830585,
+    "seed_conj_after_opt": 0.0,
+    "seed_opt_rmsd": 1.3539478574933235,
+    "relax_E": -13227.711291755973,
+    "relax_conj_after_opt": 0.0,
+    "relax_opt_rmsd": 1.665197745051947
+   },
+   {
+    "cid": 1,
+    "seed_conj": 0.0,
+    "relax_conj": 0.0,
+    "seed_E": -12981.174217153619,
+    "seed_conj_after_opt": 0.0,
+    "seed_opt_rmsd": 2.4776790653724365,
+    "relax_E": -13222.045446007007,
+    "relax_conj_after_opt": 0.0,
+    "relax_opt_rmsd": 3.2591039319318185
+   },
+   {
+    "cid": 2,
+    "seed_conj": 0.0,
+    "relax_conj": 0.0,
+    "seed_E": -13078.99121018658,
+    "seed_conj_after_opt": 0.0,
+    "seed_opt_rmsd": 1.6662981299902426,
+    "relax_E": -13228.590478733913,
+    "relax_conj_after_opt": 0.0,
+    "relax_opt_rmsd": 0.6460497982954623
+   },
+   {
+    "cid": 3,
+    "seed_conj": 0.0,
+    "relax_conj": 0.0,
+    "seed_E": -13099.221813592494,
+    "seed_conj_after_opt": 0.0,
+    "seed_opt_rmsd": 2.1299204194397747,
+    "relax_E": -13226.24365406517,
+    "relax_conj_after_opt": 0.0,
+    "relax_opt_rmsd": 1.554232005485923
+   }
+  ],
+  "ref_conj_max": 0.0
+ },
+ {
+  "id": "chb-tetramisole",
+  "n_quartets": 2,
+  "confs": [
+   {
+    "cid": 0,
+    "seed_conj": 0.0003167195597486354,
+    "relax_conj": 7.743661047844603,
+    "seed_E": -4380.0711891937735,
+    "seed_conj_after_opt": 11.65110482821853,
+    "seed_opt_rmsd": 1.3396516789320188,
+    "relax_E": -4390.3193279888665,
+    "relax_conj_after_opt": 15.63924204751784,
+    "relax_opt_rmsd": 1.6605719257898752
+   },
+   {
+    "cid": 1,
+    "seed_conj": 0.002083674580068148,
+    "relax_conj": 1.3722283719296247,
+    "seed_E": -4369.720844226451,
+    "seed_conj_after_opt": 2.001375234242919,
+    "seed_opt_rmsd": 1.1051656007048927,
+    "relax_E": -4392.824832907909,
+    "relax_conj_after_opt": 13.511688436333266,
+    "relax_opt_rmsd": 1.223918989750399
+   },
+   {
+    "cid": 2,
+    "seed_conj": 0.00024291822439477789,
+    "relax_conj": 4.298845568040845,
+    "seed_E": -4376.737535045679,
+    "seed_conj_after_opt": 2.72267356928342,
+    "seed_opt_rmsd": 1.7595391589436786,
+    "relax_E": -4391.183763720074,
+    "relax_conj_after_opt": 12.340735456259372,
+    "relax_opt_rmsd": 1.343829169352943
+   },
+   {
+    "cid": 3,
+    "seed_conj": 0.00022976213346620619,
+    "relax_conj": 2.4375724909828924,
+    "seed_E": -4374.896285400257,
+    "seed_conj_after_opt": 10.511972478490227,
+    "seed_opt_rmsd": 1.4008005948435533,
+    "relax_E": -4392.593875365887,
+    "relax_conj_after_opt": 4.129238114766011,
+    "relax_opt_rmsd": 1.0170206152713772
+   }
+  ]
+ }
+]

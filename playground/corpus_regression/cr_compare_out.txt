@@ -1,0 +1,286 @@
+[matched keys: 426; unmatched dropped: 0]
+
+====================================================================================================
+STAGE: embed
+====================================================================================================
+
+----- tmQM -----
+metric                        1:HEAD         2:+T3      3:+T3+T4
+n_runs                           303           303           303
+n_scored                         300           303           303
+n_zero_conf                        3             0             0
+n_error                            0             0             0
+conf_total                      2288          2588          2588
+kept_total                      1731          2138          2138
+runs_with_crossover                0             0             0
+charge_bad                         0             0             0
+gate_pass                     0.2509        0.6403        0.6403
+ml_mae                        0.0677        0.0127        0.0127
+fold                         26.5693       23.5259       23.5259
+bond_mae                      0.0236        0.0212        0.0212
+rmsd                          2.4583        2.2159        2.2159
+dwin_max                      0.0566        0.0091        0.0091
+awin_max                     17.5724        3.5973        3.5973
+  gate_kinds[1:HEAD]: {'constraint': 7033, 'donor_orientation': 1448, 'metal_overbond': 83, 'conjugation': 65, 'metal_collapse': 33, 'clash': 31, 'bond_length': 5, 'hydrogen': 2, 'planarity': 1}
+  gate_kinds[2:+T3]: {'constraint': 2201, 'donor_orientation': 1148, 'clash': 151, 'planarity': 149, 'bond_length': 102, 'conjugation': 73, 'hydrogen': 58, 'metal_overbond': 16, 'metal_collapse': 10}
+  gate_kinds[3:+T3+T4]: {'constraint': 2201, 'donor_orientation': 1148, 'clash': 151, 'planarity': 149, 'bond_length': 102, 'conjugation': 73, 'hydrogen': 58, 'metal_overbond': 16, 'metal_collapse': 10}
+
+----- fixtures -----
+metric                        1:HEAD         2:+T3      3:+T3+T4
+n_runs                           123           123           123
+n_scored                         120           120           120
+n_zero_conf                        3             3             3
+n_error                            0             0             0
+conf_total                       698           818           818
+kept_total                       437           529           529
+runs_with_crossover                3             3             3
+charge_bad                         0             0             0
+gate_pass                     0.3380        0.7915        0.7915
+ml_mae                        0.0549        0.0134        0.0134
+fold                         15.3069       11.7721       11.7721
+bond_mae                      0.0348        0.0338        0.0338
+rmsd                          1.6752        1.4179        1.4179
+dwin_max                      0.0385        0.0129        0.0129
+awin_max                     13.8419        3.9499        3.9499
+  gate_kinds[1:HEAD]: {'constraint': 2170, 'donor_orientation': 394, 'conjugation': 89, 'metal_collapse': 16, 'metal_overbond': 3}
+  gate_kinds[2:+T3]: {'constraint': 1197, 'donor_orientation': 175, 'conjugation': 70, 'bond_length': 48, 'hydrogen': 47, 'planarity': 22, 'clash': 9, 'metal_collapse': 3, 'metal_overbond': 1}
+  gate_kinds[3:+T3+T4]: {'constraint': 1197, 'donor_orientation': 175, 'conjugation': 70, 'bond_length': 48, 'hydrogen': 47, 'planarity': 22, 'clash': 9, 'metal_collapse': 3, 'metal_overbond': 1}
+
+----- POOLED -----
+metric                        1:HEAD         2:+T3      3:+T3+T4
+n_runs                           426           426           426
+n_scored                         420           423           423
+n_zero_conf                        6             3             3
+n_error                            0             0             0
+conf_total                      2986          3406          3406
+kept_total                      2168          2667          2667
+runs_with_crossover                3             3             3
+charge_bad                         0             0             0
+gate_pass                     0.2758        0.6832        0.6832
+ml_mae                        0.0641        0.0129        0.0129
+fold                         23.3515       20.1915       20.1915
+bond_mae                      0.0265        0.0245        0.0245
+rmsd                          2.2346        1.9895        1.9895
+dwin_max                      0.0514        0.0102        0.0102
+awin_max                     16.5066        3.6973        3.6973
+  gate_kinds[1:HEAD]: {'constraint': 9203, 'donor_orientation': 1842, 'conjugation': 154, 'metal_overbond': 86, 'metal_collapse': 49, 'clash': 31, 'bond_length': 5, 'hydrogen': 2, 'planarity': 1}
+  gate_kinds[2:+T3]: {'constraint': 3398, 'donor_orientation': 1323, 'planarity': 171, 'clash': 160, 'bond_length': 150, 'conjugation': 143, 'hydrogen': 105, 'metal_overbond': 17, 'metal_collapse': 13}
+  gate_kinds[3:+T3+T4]: {'constraint': 3398, 'donor_orientation': 1323, 'planarity': 171, 'clash': 160, 'bond_length': 150, 'conjugation': 143, 'hydrogen': 105, 'metal_overbond': 17, 'metal_collapse': 13}
+
+----- seed sensitivity (embed) -----
+  ml_mae     1:HEAD     {'n_structs': 140, 'mean_spread': 0.011871967477661548, 'median_spread': 0.00746787528550083, 'p90_spread': 0.025828119356702126, 'max_spread': 0.09314736392154896}
+  ml_mae     2:+T3      {'n_structs': 141, 'mean_spread': 0.008833759601955286, 'median_spread': 0.0003773190578392205, 'p90_spread': 0.02697439638342363, 'max_spread': 0.09054808280979831}
+  ml_mae     3:+T3+T4   {'n_structs': 141, 'mean_spread': 0.008833759601955286, 'median_spread': 0.0003773190578392205, 'p90_spread': 0.02697439638342363, 'max_spread': 0.09054808280979831}
+  rmsd       1:HEAD     {'n_structs': 140, 'mean_spread': 0.3820771465453537, 'median_spread': 0.3146505619954656, 'p90_spread': 0.7352420173013237, 'max_spread': 1.5101117841382177}
+  rmsd       2:+T3      {'n_structs': 141, 'mean_spread': 0.3348205801926071, 'median_spread': 0.2740076711886643, 'p90_spread': 0.670753088859473, 'max_spread': 1.3693478363277969}
+  rmsd       3:+T3+T4   {'n_structs': 141, 'mean_spread': 0.3348205801926071, 'median_spread': 0.2740076711886643, 'p90_spread': 0.670753088859473, 'max_spread': 1.3693478363277969}
+  awin_max   1:HEAD     {'n_structs': 140, 'mean_spread': 7.253041542801139, 'median_spread': 4.802572160208125, 'p90_spread': 18.43494263143606, 'max_spread': 38.223275565513234}
+  awin_max   2:+T3      {'n_structs': 141, 'mean_spread': 3.724155938199815, 'median_spread': 0.00021187337554964516, 'p90_spread': 12.243257218330708, 'max_spread': 30.598260989123652}
+  awin_max   3:+T3+T4   {'n_structs': 141, 'mean_spread': 3.724155938199815, 'median_spread': 0.00021187337554964516, 'p90_spread': 12.243257218330708, 'max_spread': 30.598260989123652}
+
+====================================================================================================
+MOVERS: T3 alone (tree1 -> tree2)  [embed]
+====================================================================================================
+
+  ml_mae (tol 0.005): improved 139, regressed 0, flat 1
+    best : WAVBUS -0.167, QIXJOW -0.158, PdCl2-RR-BDNN -0.156, KUNBUS -0.138, XAWQUH -0.121, DUKPII -0.116
+
+  fold (tol 1.0): improved 59, regressed 26, flat 55
+    best : CuCN2 -50.147, FeCO5 -28.483, NITCAW -23.429, HOXLAK -22.264, QUZKAZ -21.215, IROXET_comp_0 -20.738
+    WORST: URIFUZ +12.843, WAVGAC +12.400, YEYSOK +12.003, SAYJEJ +11.195, PESHUT +8.190, ROLWAR +6.412, NUDXOC +5.347, AKILAJ +4.913, LISVIW +4.467, LASFOB +4.267
+
+  bond_mae (tol 0.005): improved 29, regressed 7, flat 100
+    best : REVWAU -0.029, QIXJOW -0.022, WACJET -0.017, FIJTOH -0.014, OFULEJ -0.014, NITCAW -0.014
+    WORST: TiCat1 +0.037, TiCat2 +0.017, TARJON +0.011, NOBKIA +0.009, mer-Ir(ppy)3 +0.008, LASFOB +0.007, AGUFEN +0.005
+
+  rmsd (tol 0.02): improved 128, regressed 10, flat 2
+    best : NUMLUF -1.549, ABUVUP -1.142, OWAHEC -1.076, FeH2(CO)4 -0.665, GODNOD -0.531, AGUFEN -0.528
+    WORST: KEGFOU +1.781, YIXSIJ +0.605, DASSUL +0.314, SOHMEJ +0.215, VOacac2 +0.100, HgI3 +0.041, DAJXOD +0.031, WUVJAB +0.019, REVWAU -0.019, HIBPAK -0.044
+
+  dwin_max (tol 0.005): improved 93, regressed 2, flat 45
+    best : WAVBUS -0.230, PdCl2-RR-BDNN -0.213, UDITUW -0.180, KUNBUS -0.176, CSBRHB -0.174, QIXJOW -0.147
+    WORST: TiCat1 +0.035, NOBKIA +0.032
+
+  awin_max (tol 0.5): improved 132, regressed 0, flat 8
+    best : NUMLUF -65.245, QUZKAZ -45.288, BESJUE -40.644, MEBLAI -39.931, CSBRHB -30.093, TARJON -30.077
+
+====================================================================================================
+MOVERS: T4 alone (tree2 -> tree3)  [embed]
+====================================================================================================
+
+  ml_mae (tol 0.005): improved 0, regressed 0, flat 141
+
+  fold (tol 1.0): improved 0, regressed 0, flat 141
+
+  bond_mae (tol 0.005): improved 0, regressed 0, flat 137
+
+  rmsd (tol 0.02): improved 0, regressed 0, flat 141
+
+  dwin_max (tol 0.005): improved 0, regressed 0, flat 141
+
+  awin_max (tol 0.5): improved 0, regressed 0, flat 141
+
+====================================================================================================
+MOVERS: both (tree1 -> tree3)  [embed]
+====================================================================================================
+
+  ml_mae (tol 0.005): improved 139, regressed 0, flat 1
+    best : WAVBUS -0.167, QIXJOW -0.158, PdCl2-RR-BDNN -0.156, KUNBUS -0.138, XAWQUH -0.121, DUKPII -0.116
+
+  fold (tol 1.0): improved 59, regressed 26, flat 55
+    best : CuCN2 -50.147, FeCO5 -28.483, NITCAW -23.429, HOXLAK -22.264, QUZKAZ -21.215, IROXET_comp_0 -20.738
+    WORST: URIFUZ +12.843, WAVGAC +12.400, YEYSOK +12.003, SAYJEJ +11.195, PESHUT +8.190, ROLWAR +6.412, NUDXOC +5.347, AKILAJ +4.913, LISVIW +4.467, LASFOB +4.267
+
+  bond_mae (tol 0.005): improved 29, regressed 7, flat 100
+    best : REVWAU -0.029, QIXJOW -0.022, WACJET -0.017, FIJTOH -0.014, OFULEJ -0.014, NITCAW -0.014
+    WORST: TiCat1 +0.037, TiCat2 +0.017, TARJON +0.011, NOBKIA +0.009, mer-Ir(ppy)3 +0.008, LASFOB +0.007, AGUFEN +0.005
+
+  rmsd (tol 0.02): improved 128, regressed 10, flat 2
+    best : NUMLUF -1.549, ABUVUP -1.142, OWAHEC -1.076, FeH2(CO)4 -0.665, GODNOD -0.531, AGUFEN -0.528
+    WORST: KEGFOU +1.781, YIXSIJ +0.605, DASSUL +0.314, SOHMEJ +0.215, VOacac2 +0.100, HgI3 +0.041, DAJXOD +0.031, WUVJAB +0.019, REVWAU -0.019, HIBPAK -0.044
+
+  dwin_max (tol 0.005): improved 93, regressed 2, flat 45
+    best : WAVBUS -0.230, PdCl2-RR-BDNN -0.213, UDITUW -0.180, KUNBUS -0.176, CSBRHB -0.174, QIXJOW -0.147
+    WORST: TiCat1 +0.035, NOBKIA +0.032
+
+  awin_max (tol 0.5): improved 132, regressed 0, flat 8
+    best : NUMLUF -65.245, QUZKAZ -45.288, BESJUE -40.644, MEBLAI -39.931, CSBRHB -30.093, TARJON -30.077
+[matched keys: 426; unmatched dropped: 0]
+
+====================================================================================================
+STAGE: post
+====================================================================================================
+
+----- tmQM -----
+metric                        1:HEAD         2:+T3      3:+T3+T4
+n_runs                           303           303           303
+n_scored                         284           291           291
+n_zero_conf                        3             0             0
+n_error                            0             0             0
+conf_total                      2288          2588          2588
+kept_total                      1731          2138          2138
+runs_with_crossover                0             0             0
+charge_bad                         0             0             0
+gate_pass                     0.6771        0.6894        0.6894
+ml_mae                        0.0056        0.0058        0.0058
+fold                         22.6449       22.4941       22.4941
+bond_mae                      0.0194        0.0194        0.0194
+rmsd                          2.3994        2.1435        2.1435
+dwin_max                      0.0001        0.0001        0.0001
+awin_max                      0.0002        0.0006        0.0006
+  gate_kinds[1:HEAD]: {'donor_orientation': 654, 'conjugation': 45, 'planarity': 41, 'clash': 28, 'bond_length': 6}
+  gate_kinds[2:+T3]: {'donor_orientation': 800, 'clash': 126, 'conjugation': 55, 'planarity': 49, 'bond_length': 19}
+  gate_kinds[3:+T3+T4]: {'donor_orientation': 800, 'clash': 126, 'conjugation': 55, 'planarity': 49, 'bond_length': 19}
+
+----- fixtures -----
+metric                        1:HEAD         2:+T3      3:+T3+T4
+n_runs                           123           123           123
+n_scored                         102           105           105
+n_zero_conf                        3             3             3
+n_error                            0             0             0
+conf_total                       698           818           818
+kept_total                       437           529           529
+runs_with_crossover                3             3             3
+charge_bad                         0             0             0
+gate_pass                     0.8787        0.8886        0.8886
+ml_mae                        0.0054        0.0052        0.0052
+fold                         13.5067       12.8579       12.8579
+bond_mae                      0.0286        0.0286        0.0286
+rmsd                          1.5935        1.3357        1.3357
+dwin_max                      0.0000        0.0000        0.0000
+awin_max                      0.0001        0.0001        0.0001
+  gate_kinds[1:HEAD]: {'donor_orientation': 77, 'conjugation': 64}
+  gate_kinds[2:+T3]: {'donor_orientation': 84, 'conjugation': 70}
+  gate_kinds[3:+T3+T4]: {'donor_orientation': 84, 'conjugation': 70}
+
+----- POOLED -----
+metric                        1:HEAD         2:+T3      3:+T3+T4
+n_runs                           426           426           426
+n_scored                         386           396           396
+n_zero_conf                        6             3             3
+n_error                            0             0             0
+conf_total                      2986          3406          3406
+kept_total                      2168          2667          2667
+runs_with_crossover                3             3             3
+charge_bad                         0             0             0
+gate_pass                     0.7304        0.7422        0.7422
+ml_mae                        0.0055        0.0056        0.0056
+fold                         20.2301       19.9391       19.9391
+bond_mae                      0.0217        0.0216        0.0216
+rmsd                          2.1864        1.9293        1.9293
+dwin_max                      0.0001        0.0001        0.0001
+awin_max                      0.0002        0.0005        0.0005
+  gate_kinds[1:HEAD]: {'donor_orientation': 731, 'conjugation': 109, 'planarity': 41, 'clash': 28, 'bond_length': 6}
+  gate_kinds[2:+T3]: {'donor_orientation': 884, 'clash': 126, 'conjugation': 125, 'planarity': 49, 'bond_length': 19}
+  gate_kinds[3:+T3+T4]: {'donor_orientation': 884, 'clash': 126, 'conjugation': 125, 'planarity': 49, 'bond_length': 19}
+
+----- seed sensitivity (post) -----
+  ml_mae     1:HEAD     {'n_structs': 129, 'mean_spread': 0.00023489685862976837, 'median_spread': 9.701018905962366e-05, 'p90_spread': 0.0005049814865260284, 'max_spread': 0.003762417235674517}
+  ml_mae     2:+T3      {'n_structs': 132, 'mean_spread': 0.00028222769913658876, 'median_spread': 8.968784043741126e-05, 'p90_spread': 0.0005700555575298253, 'max_spread': 0.008315399673928588}
+  ml_mae     3:+T3+T4   {'n_structs': 132, 'mean_spread': 0.00028222769913658876, 'median_spread': 8.968784043741126e-05, 'p90_spread': 0.0005700555575298253, 'max_spread': 0.008315399673928588}
+  rmsd       1:HEAD     {'n_structs': 129, 'mean_spread': 0.45970103977446863, 'median_spread': 0.36407402465308825, 'p90_spread': 0.8571984619826684, 'max_spread': 1.9649317663015085}
+  rmsd       2:+T3      {'n_structs': 132, 'mean_spread': 0.38745506323645074, 'median_spread': 0.30311088648764506, 'p90_spread': 0.7463530198027282, 'max_spread': 3.0825932359093984}
+  rmsd       3:+T3+T4   {'n_structs': 132, 'mean_spread': 0.38745506323645074, 'median_spread': 0.30311088648764506, 'p90_spread': 0.7463530198027282, 'max_spread': 3.0825932359093984}
+  awin_max   1:HEAD     {'n_structs': 129, 'mean_spread': 0.00017170274057601775, 'median_spread': 6.4330266932681e-05, 'p90_spread': 0.00048583445889352326, 'max_spread': 0.0018025155754865332}
+  awin_max   2:+T3      {'n_structs': 132, 'mean_spread': 0.0006378964588167123, 'median_spread': 6.784521597246062e-05, 'p90_spread': 0.0003926466618775494, 'max_spread': 0.06529365950350534}
+  awin_max   3:+T3+T4   {'n_structs': 132, 'mean_spread': 0.0006378964588167123, 'median_spread': 6.784521597246062e-05, 'p90_spread': 0.0003926466618775494, 'max_spread': 0.06529365950350534}
+
+====================================================================================================
+MOVERS: T3 alone (tree1 -> tree2)  [post]
+====================================================================================================
+
+  ml_mae (tol 0.005): improved 0, regressed 1, flat 129
+    WORST: WUVJAB +0.025
+
+  fold (tol 1.0): improved 14, regressed 9, flat 107
+    best : KEGFOU -8.210, Rh-RR-DIPAMP-Ph-Cl2 -5.018, CuCN2 -3.934, NUMLUF -2.024, SOHMEJ -2.010, ROLWAR -1.477
+    WORST: WUVJAB +7.664, WELROW +7.056, HOXLAK +4.288, QUZKAZ +2.803, FeH2(CO)4 +2.152, OWAHEC +2.026, PESHUT +1.507, REVWAU +1.042, IROXET_comp_0 +0.995
+
+  bond_mae (tol 0.005): improved 1, regressed 0, flat 126
+    best : WUVJAB -0.007
+
+  rmsd (tol 0.02): improved 110, regressed 3, flat 17
+    best : RERHEB -1.172, Rh-RR-DIPAMP-Ph-Cl2 -1.080, NAXDOI -0.853, NUMLUF -0.794, UTANUA -0.792, WELROW -0.749
+    WORST: SOHMEJ +0.388, YIXSIJ +0.062, PdCl2-RR-BDNN +0.047
+
+  dwin_max (tol 0.005): improved 0, regressed 0, flat 130
+
+  awin_max (tol 0.5): improved 0, regressed 0, flat 130
+
+====================================================================================================
+MOVERS: T4 alone (tree2 -> tree3)  [post]
+====================================================================================================
+
+  ml_mae (tol 0.005): improved 0, regressed 0, flat 132
+
+  fold (tol 1.0): improved 0, regressed 0, flat 132
+
+  bond_mae (tol 0.005): improved 0, regressed 0, flat 128
+
+  rmsd (tol 0.02): improved 0, regressed 0, flat 132
+
+  dwin_max (tol 0.005): improved 0, regressed 0, flat 132
+
+  awin_max (tol 0.5): improved 0, regressed 0, flat 132
+
+====================================================================================================
+MOVERS: both (tree1 -> tree3)  [post]
+====================================================================================================
+
+  ml_mae (tol 0.005): improved 0, regressed 1, flat 129
+    WORST: WUVJAB +0.025
+
+  fold (tol 1.0): improved 14, regressed 9, flat 107
+    best : KEGFOU -8.210, Rh-RR-DIPAMP-Ph-Cl2 -5.018, CuCN2 -3.934, NUMLUF -2.024, SOHMEJ -2.010, ROLWAR -1.477
+    WORST: WUVJAB +7.664, WELROW +7.056, HOXLAK +4.288, QUZKAZ +2.803, FeH2(CO)4 +2.152, OWAHEC +2.026, PESHUT +1.507, REVWAU +1.042, IROXET_comp_0 +0.995
+
+  bond_mae (tol 0.005): improved 1, regressed 0, flat 126
+    best : WUVJAB -0.007
+
+  rmsd (tol 0.02): improved 110, regressed 3, flat 17
+    best : RERHEB -1.172, Rh-RR-DIPAMP-Ph-Cl2 -1.080, NAXDOI -0.853, NUMLUF -0.794, UTANUA -0.792, WELROW -0.749
+    WORST: SOHMEJ +0.388, YIXSIJ +0.062, PdCl2-RR-BDNN +0.047
+
+  dwin_max (tol 0.005): improved 0, regressed 0, flat 130
+
+  awin_max (tol 0.5): improved 0, regressed 0, flat 130
