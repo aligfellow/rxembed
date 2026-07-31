@@ -1,7 +1,0 @@
-{"label": "crowd>=3 fc1.0", "fc": 1.0, "case2_rates": [0.4, 0.4, 0.4], "case2_kinds": {"conjugation": 21, "planarity": 22}, "case3_rates": [0.579, 0.5, 0.471], "case3_kinds": {"conjugation": 29, "planarity": 22}, "rdp_pin": [6, 6]}
-{"label": "crowd>=3 fc2.0", "fc": 2.0, "case2_rates": [0.5, 0.45, 0.5], "case2_kinds": {"conjugation": 27, "planarity": 21}, "case3_rates": [0.824, 0.75, 0.812], "case3_kinds": {"conjugation": 38, "planarity": 53}, "rdp_pin": [6, 6]}
-{"label": "crowd>=3 fc3.0", "fc": 3.0, "case2_rates": [0.5, 0.6, 0.55], "case2_kinds": {"planarity": 30, "conjugation": 26}, "case3_rates": [0.667, 0.579, 0.6], "case3_kinds": {"conjugation": 23, "planarity": 35}, "rdp_pin": [6, 6]}
-{"label": "baseline", "case2_rates": [0.55, 0.55, 0.55], "case2_kinds": {"planarity": 24, "conjugation": 28}, "case3_rates": [0.667, 0.667, 0.643], "case3_kinds": {"conjugation": 27, "planarity": 32}, "rdp_pin": [6, 6]}
-{"label": "CONTROL baseline", "HENRY": {"13": [1.0, 39.5, "O"], "23": [8.6, 42.3, "N"]}, "KETONE": {"3": [25.0, 35.3, "O"], "7": [0.3, 42.3, "N"]}, "PICO": {"2": [2.5, 19.6, "O"], "8": [0.6, 15.4, "N"]}}
-{"label": "CONTROL crowd>=3 fc2", "HENRY": {"13": [1.0, 39.5, "O"], "23": [8.6, 42.3, "N"]}, "KETONE": {"3": [25.0, 35.3, "O"], "7": [0.3, 42.3, "N"]}, "PICO": {"2": [2.5, 19.6, "O"], "8": [0.6, 15.4, "N"]}}
-{"label": "EPOXIDE", "crowd_fc2": [0, 40, 121.83788731517815], "baseline": [12, 40, 121.82718940156462]}

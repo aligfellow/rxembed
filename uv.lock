@@ -1388,81 +1388,91 @@ name = "rxembed"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "networkx" },
     { name = "numpy" },
-    { name = "openconf" },
-    { name = "prism-pruner" },
     { name = "rdkit" },
-    { name = "scikit-learn" },
-    { name = "xyzgraph" },
 ]
 
 [package.optional-dependencies]
 all = [
     { name = "ase" },
     { name = "matplotlib" },
+    { name = "networkx" },
+    { name = "openconf" },
+    { name = "prism-pruner" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
     { name = "seaborn" },
+    { name = "xyzgraph" },
     { name = "xyzrender" },
 ]
-ase = [
+nci = [
+    { name = "networkx" },
+    { name = "xyzgraph" },
+]
+perceive = [
+    { name = "xyzgraph" },
+]
+score = [
     { name = "ase" },
+]
+search = [
+    { name = "openconf" },
+]
+select = [
+    { name = "prism-pruner" },
+    { name = "scikit-learn" },
 ]
 sphere = [
     { name = "scipy" },
 ]
 viz = [
     { name = "matplotlib" },
+    { name = "prism-pruner" },
+    { name = "scikit-learn" },
     { name = "seaborn" },
     { name = "xyzrender" },
 ]
 
 [package.dev-dependencies]
 dev = [
-    { name = "ase" },
     { name = "ipykernel" },
-    { name = "matplotlib" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
-    { name = "seaborn" },
+    { name = "rxembed", extra = ["all"] },
     { name = "ty" },
-    { name = "xyzrender" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "ase", marker = "extra == 'all'" },
-    { name = "ase", marker = "extra == 'ase'" },
-    { name = "matplotlib", marker = "extra == 'all'" },
+    { name = "ase", marker = "extra == 'score'" },
     { name = "matplotlib", marker = "extra == 'viz'" },
-    { name = "networkx" },
+    { name = "networkx", marker = "extra == 'nci'" },
     { name = "numpy" },
-    { name = "openconf", git = "https://github.com/rowansci/openconf" },
-    { name = "prism-pruner" },
+    { name = "openconf", marker = "extra == 'search'", git = "https://github.com/rowansci/openconf" },
+    { name = "prism-pruner", marker = "extra == 'select'" },
     { name = "rdkit" },
-    { name = "scikit-learn" },
+    { name = "rxembed", extras = ["search", "select", "score", "perceive", "nci", "viz", "sphere"], marker = "extra == 'all'" },
+    { name = "rxembed", extras = ["select"], marker = "extra == 'viz'" },
+    { name = "scikit-learn", marker = "extra == 'select'" },
     { name = "scipy", marker = "extra == 'sphere'" },
-    { name = "seaborn", marker = "extra == 'all'" },
     { name = "seaborn", marker = "extra == 'viz'" },
-    { name = "xyzgraph", specifier = ">=1.6.14" },
-    { name = "xyzrender", marker = "extra == 'all'", specifier = ">=0.3.8" },
+    { name = "xyzgraph", marker = "extra == 'nci'", specifier = ">=1.6.14" },
+    { name = "xyzgraph", marker = "extra == 'perceive'", specifier = ">=1.6.14" },
     { name = "xyzrender", marker = "extra == 'viz'", specifier = ">=0.3.8" },
 ]
-provides-extras = ["ase", "sphere", "viz", "all"]
+provides-extras = ["search", "select", "score", "perceive", "nci", "viz", "sphere", "all"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "ase" },
     { name = "ipykernel" },
-    { name = "matplotlib" },
     { name = "pre-commit", specifier = ">=3.5.0" },
     { name = "pytest", specifier = ">=8.3.5" },
     { name = "pytest-cov", specifier = ">=5.0.0" },
     { name = "ruff", specifier = ">=0.14.14" },
-    { name = "seaborn" },
+    { name = "rxembed", extras = ["all"] },
     { name = "ty", specifier = ">=0.0.14" },
-    { name = "xyzrender" },
 ]
 
 [[package]]

@@ -1,196 +1,151 @@
-"""Undefined-stereocentre enumeration — the racemate/diastereomer load-in on the embed front. RDKit, no xtb.
+"""`stereo.py`; expand a `Mol`'s undefined stereocentres into the distinct species to embed.
 
-An unlabelled-stereocentre SMILES embeds every stereoisomer: ``stereo='auto'`` folds them into one EnsembleSet,
-``'enumerate'`` keeps them separate, ``'free'`` opts out. R/S + E/Z, defined centres held, meso dropped,
-chiral-at-P included, composes with the metal coordination-isomer axis.
+The embed-side half of stereochemistry: graph-only, RDKit's `EnumerateStereoisomers` over the *unspecified*
+elements alone, so a defined centre is held. Metal-safe: the metal's own handedness is the coordination-isomer
+path's job, and a double bond the coordination locks is not enumerated as a phantom pair.
+
+The conformer-side half (the coordinate-derived chirality fingerprint that filters embedded conformers) is
+perception-driven and lives in `pipeline/stereo_check.py`; the `stereo=` argument that drives this module from
+the pipeline is `pipeline/dispatch.py`.
 """
 
-import pytest
+from __future__ import annotations
+
 from rdkit import Chem
 
-import rxembed as rx
+from rxembed import stereo
+from rxembed.metal_core import metal_indices
 
-
-def _configs(es):
-    return sorted(e.tag.get("stereo") for e in es)
-
-
-def test_undefined_centre_auto_embeds_racemate_as_one_set():
-    r = rx.embed("CC(N)C(=O)O", n=2)  # undefined alpha-carbon
-    assert isinstance(r, rx.EnsembleSet)
-    assert _configs(r) == ["1R", "1S"]  # both enantiomers, index-keyed CIP tags
-
-
-@pytest.mark.parametrize(
-    ("smi", "kw"),
-    [
-        pytest.param("C[C@H](N)C(=O)O", {}, id="defined-centre-kept"),
-        pytest.param("CCO", {}, id="no-stereocentre"),
-        pytest.param("CC(N)C(=O)O", {"stereo": "free"}, id="stereo-free-opts-out"),
-    ],
+_CHIRAL_P_PD = "C[P](CC)(c1ccccc1)[Pd](Cl)(Cl)Cl"
+# an alpha-diimine-style chelate: both imine C=N sit in the 5-membered ring the metal closes
+_ALPHA_DIIMINE_NI = (
+    "O=C1[O-]->[Ni+2]2(<-[N](=C3C(=[N]->2c2cccc4ccccc24)c2cccc4cccc3c24)c2cccc3ccccc23)<-[N-](c2ccccc2)C1c1ccccc1"
 )
-def test_single_ensemble_when_nothing_to_enumerate(smi, kw):
-    """A defined centre, no centre, or stereo='free' each yields one Ensemble, not an EnsembleSet."""
-    assert isinstance(rx.embed(smi, n=2, **kw), rx.Ensemble)
 
 
-def test_enumerate_keeps_stereoisomers_separate_and_uniform():
-    r = rx.embed("CC(N)C(=O)O", n=2, stereo="enumerate")
-    assert isinstance(r, list)
-    assert len(r) == 2
-    assert all(isinstance(g, rx.EnsembleSet) for g in r)  # uniform type, even for a lone organic variant
-    assert sorted(g[0].tag["stereo"] for g in r) == ["1R", "1S"]
+def _mol(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    assert mol is not None, f"fixture SMILES did not parse: {smiles}"
+    return mol
 
 
-def test_racemate_ensembleset_is_chainable():
-    # the headline chain must work on a racemate EnsembleSet, mapping over each stereoisomer (tags carried)
-    r = rx.embed("CC(N)C(=O)O", n=3).minimize().prune()
-    assert isinstance(r, rx.EnsembleSet)
-    assert {e.tag["stereo"] for e in r} == {"1R", "1S"}  # both enantiomers survive the mapped chain
-    for e in r:
-        assert e.n >= 1
-    assert isinstance(rx.embed("CCO", n=2).minimize().prune(), rx.Ensemble)  # a stereo-free SMILES stays single
+def _with_metals(smiles):
+    """Return ``(mol, metal indices)``: what a coordination caller passes as ``exclude``."""
+    mol = _mol(smiles)
+    return mol, set(metal_indices(mol))
 
 
-def test_racemate_ensembleset_dumps_one_xyz_per_stereoisomer(tmp_path):
-    paths = rx.embed("CC(N)C(=O)O", n=2).minimize().dump(str(tmp_path / "amac.xyz"))
-    assert sorted(p.rsplit("_", 1)[1] for p in paths) == ["1R.xyz", "1S.xyz"]  # tag folded into each filename
-    for p in paths:
-        assert int(open(p).readline().strip()) == 13  # a valid .xyz (atom count header)
+def _labels(mol, **kw):
+    return sorted(label for _variant, label in stereo.enumerate_unassigned(mol, **kw)[0])
 
 
-def test_best_refuses_ff_energies_across_species():
-    # ranking distinct species needs REAL energies; FF (minimize / score('ff')) is not cross-comparable -> refused
-    s = rx.embed("CC(N)C(=O)O", n=2).minimize()
-    assert {e.energy_kind for e in s} == {"ff"}  # minimize tags FF energies
-    with pytest.raises(ValueError, match="REAL energy"):
-        s.best()
-    assert {e.energy_kind for e in s.score("ff")} == {"ff"}  # an FF single point is still not "real"
-    with pytest.raises(ValueError, match="REAL energy"):
-        s.score("ff").best()
+# ---------------------------------------------------------------------------------------------------------
+# nothing to enumerate: the pass-through, which must be exact
+# ---------------------------------------------------------------------------------------------------------
 
 
-def test_double_bond_ez_is_enumerated():
-    r = rx.embed("CC=CC(N)O", n=2)  # one undefined C + one undefined C=C -> 4
-    cfgs = _configs(r)
-    assert len(cfgs) == 4
-    assert any(":E" in c for c in cfgs)
-    assert any(":Z" in c for c in cfgs)
+def test_a_molecule_with_no_stereocentre_passes_straight_through():
+    """`([(mol, '')], 0, 1, 0)` and the same object: a caller branches on `n_unassigned == 0`."""
+    mol = _mol("CCO")
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(mol)
+    assert (n_unassigned, total, unresolved) == (0, 1, 0)
+    assert variants == [(mol, "")]
 
 
-def test_coordination_locked_imine_is_not_ez_enumerated():
-    """A C=N in a ring closed through the metal is coordination-locked and must not be E/Z enumerated."""
-    from rxembed import stereo
-    from rxembed.rdkit_embed.constraints.metal import metal_indices
-
-    # FindPotentialStereo runs on the metal-disconnected graph, which opens the ring so the imine looks acyclic.
-    # an alpha-diimine-style chelate: the imine N=C sits in the 5-membered metal ring
-    smi = "O=C1[O-]->[Ni+2]2(<-[N](=C3C(=[N]->2c2cccc4ccccc24)c2cccc4cccc3c24)c2cccc3ccccc23)<-[N-](c2ccccc2)C1c1ccccc1"
-    mol = Chem.MolFromSmiles(smi)
-    metals = set(metal_indices(mol))
-    locked = stereo._coordination_locked_double_bonds(mol, metals)
-    assert locked, "the imine C=N in the metal-closed chelate ring must be detected as coordination-locked"
-    variants, _n, _total, _unres = stereo.enumerate_unassigned(mol, exclude=metals)
-    # only the one real point stereocentre (the amidate alpha-C) is enumerated -> 2 hands, not 2x2x... phantoms
-    assert len(variants) == 2, f"the locked imine(s) must not be enumerated; got {len(variants)} variants"
+def test_a_defined_centre_is_held_not_re_enumerated():
+    """`onlyUnassigned`: a labelled centre is the user's stated species, never expanded into its enantiomer."""
+    mol = _mol("C[C@H](N)C(=O)O")
+    assert stereo.unassigned_centres(mol) == []
+    assert stereo.enumerate_unassigned(mol)[1] == 0
 
 
-def test_a_free_organic_double_bond_is_still_enumerated_with_a_metal_present():
-    """The lock is metal-ring-specific: a free pendant C=C is not coordination-locked (no over-suppression)."""
-    from rxembed import stereo
-    from rxembed.rdkit_embed.constraints.metal import metal_indices
-
-    smi = "CC=CC[NH2]->[Ni+2](<-[O-]C(=O)C)<-[NH2]CC=CC"  # pendant but-2-enyl C=C, not in any metal ring
-    mol = Chem.MolFromSmiles(smi)
-    if mol is None:
-        return
-    metals = set(metal_indices(mol))
-    assert not (stereo._coordination_locked_double_bonds(mol, metals)), "a free pendant C=C is not coordination-locked"
+# ---------------------------------------------------------------------------------------------------------
+# the expansion
+# ---------------------------------------------------------------------------------------------------------
 
 
-def test_meso_duplicate_is_dropped():
-    r = rx.embed("CC(O)C(O)C", n=2)  # 2 centres, but the meso pair collapses -> 3, not 4
-    assert isinstance(r, rx.EnsembleSet)
-    assert len(r) == 3
+def test_an_undefined_point_centre_expands_to_both_hands_with_index_keyed_cip_labels():
+    """The label keys on the enumerated atom index, so distinct variants get distinct, stable names."""
+    assert _labels(_mol("CC(N)C(=O)O")) == ["1R", "1S"]
 
 
-def test_embedded_3d_handedness_matches_the_tag():
-    r = rx.embed("CC(N)C(=O)O", n=3)
-    for e in r:
-        em = e.minimize()  # the raw ETKDG seed can carry a conjugation twist; minimise, then read the hand
-        Chem.AssignStereochemistryFrom3D(em.mol, confId=em.ids[0])
-        ((idx, code),) = Chem.FindMolChiralCenters(em.mol, useLegacyImplementation=False)
-        assert e.tag["stereo"] == f"{idx}{code}"  # the label is the geometry's actual configuration
+def test_an_undefined_double_bond_expands_e_and_z_alongside_the_point_centres():
+    """One undefined C plus one undefined C=C is 2 x 2, and each label names both axes."""
+    labels = _labels(_mol("CC=CC(N)O"))
+    assert len(labels) == 4
+    assert sum(":E" in x for x in labels) == 2
+    assert sum(":Z" in x for x in labels) == 2
 
 
-def test_composes_with_metal_coordination_isomers():
-    # an aminoacidate on Pd: 2 ligand enantiomers x the square-planar coordination isomers
-    r = rx.embed("CC(N)C(=O)[O-]->[Pd]([Cl])[Cl]", metal="square_planar", n=2)
-    assert isinstance(r, rx.EnsembleSet)
-    assert {"1R", "1S"} == {e.tag["stereo"] for e in r}  # both enantiomers present
-    assert {"cis", "trans"} <= {e.tag["label"] for e in r}  # each coordination isomer too
-    for e in r:  # every candidate carries BOTH axes
-        assert e.tag.get("stereo")
-        assert e.tag.get("label")
+def test_a_meso_duplicate_is_dropped():
+    """Two centres give four configurations but only three species; `unique=True` collapses the meso pair."""
+    variants, n_unassigned, total, _unresolved = stereo.enumerate_unassigned(_mol("CC(O)C(O)C"))
+    assert (n_unassigned, total) == (2, 4)
+    assert len(variants) == 3
 
 
-def test_chiral_at_metal_bound_phosphorus_is_enumerated():
-    r = rx.embed("C[P](CC)(c1ccccc1)[Pd](Cl)(Cl)Cl", metal="square_planar", n=2)
-    assert isinstance(r, rx.EnsembleSet)
-    assert len({e.tag["stereo"] for e in r}) == 2  # the two P-epimers, distinct after the sphere strip
+def test_atom_order_is_preserved_so_index_based_specs_stay_valid():
+    """`fix`/`constrain` key on the caller's atom indices, which a reordered variant would silently move."""
+    mol = _mol("CC=CC(N)O")
+    original = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    for variant, _label in stereo.enumerate_unassigned(mol)[0]:
+        assert [a.GetAtomicNum() for a in variant.GetAtoms()] == original
 
 
-def _chirality_volume(mol, cid, centre):
-    import numpy as np
-
-    conf = mol.GetConformer(cid)
-    nbrs = [n.GetIdx() for n in mol.GetAtomWithIdx(centre).GetNeighbors()][:3]
-    p = np.array([list(conf.GetAtomPosition(i)) for i in [centre, *nbrs]])
-    return float(np.dot(np.cross(p[1] - p[0], p[2] - p[0]), p[3] - p[0]))
+def test_the_cap_truncates_the_variants_but_reports_the_true_total():
+    """A caller warns off `total`, so it must be the real count and not the truncated one."""
+    variants, n_unassigned, total, _unresolved = stereo.enumerate_unassigned(_mol("CC(N)C(=O)O"), cap=1)
+    assert (n_unassigned, total) == (1, 2)
+    assert len(variants) == 1
 
 
-def test_metal_bound_carbanion_donor_embeds_distinct_hands():
-    # a carbanion-C donor is a stereocentre only WHILE metal-bound; the embed holds it (neutralise + dummy-D)
-    # so the two enumerated hands relax to OPPOSITE geometries, not the same one.
-    import numpy as np
-
-    smi = "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)N(c1ccccc1)[CH-]->2c1ccccc1"
-    en = rx.metal(smi, "square_planar")
-    assert {i.stereo_label for i in en} == {"23R", "23S"}  # metal-priority CIP labels
-    hands = []
-    for iso in en:
-        e = rx.embed(iso, n=4).minimize()
-        assert e.n >= 1
-        assert e.mol.GetNumAtoms() == 65  # the hold's dummy deuterium is removed after embed + relax
-        assert not any(a.GetIsotope() == 2 for a in e.mol.GetAtoms())  # no leaked D
-        assert any(a.GetSymbol() == "Ni" for a in e.mol.GetAtoms())  # the surrogate is switched back to the metal
-        signs = {np.sign(_chirality_volume(e.mol, i, 23)) for i in e.ids}
-        assert len(signs) == 1  # EVERY conformer of this isomer has the SAME donor hand (held through the relax)
-        hands.append(signs.pop())
-    assert len(set(hands)) == 2  # and the two isomers are opposite enantiomers of the carbanion donor
+# ---------------------------------------------------------------------------------------------------------
+# axial chirality: RDKit cannot encode it, so it is REPORTED rather than faked
+# ---------------------------------------------------------------------------------------------------------
 
 
-def test_donor_charge_is_restored_after_the_hold():
-    # the hold NEUTRALISES the carbanion during the embed (a -1 C can't take a 4th bond) then RESTORES it —
-    # a leaked neutralisation would corrupt the donor charge (and the xtb charge downstream).
-    smi = "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)N(c1ccccc1)[CH-]->2c1ccccc1"
-    for iso in rx.metal(smi, "square_planar"):
-        e = rx.embed(iso, n=1)
-        assert e.mol.GetAtomWithIdx(23).GetFormalCharge() == -1  # the carbanion is back to -1 after the hold
+def test_an_allene_axis_is_counted_as_unresolved_and_never_gets_a_question_mark_label():
+    """`EnumerateStereoisomers` cannot set an allene axis, so one arbitrary hand comes back and the caller warns."""
+    variants, n_unassigned, _total, unresolved = stereo.enumerate_unassigned(_mol("CC(F)=C=C(F)C"))
+    assert n_unassigned == 2
+    assert unresolved == 2
+    assert [label for _v, label in variants] == [""], "an unresolved centre must be dropped from the label"
 
 
-def test_allene_axis_stays_a_bare_chainable_ensemble():
-    # RDKit can't enumerate allene/cumulene axial chirality from a flat SMILES -> one arbitrary hand, NOT an
-    # EnsembleSet-of-1 (that would break the documented rx.embed(smi).mc().prune() chain), and no '?' tag.
-    r = rx.embed("CC(F)=C=C(F)C", n=2)
-    assert isinstance(r, rx.Ensemble)
-    assert hasattr(r, "mc")
-    assert "?" not in (r.tag.get("stereo") or "")
+# ---------------------------------------------------------------------------------------------------------
+# metal safety
+# ---------------------------------------------------------------------------------------------------------
 
 
-def test_infeasible_or_dead_stereoisomer_is_skipped_not_kept():
-    # trans-cyclooctene is too strained for ETKDG (0 conformers); only the embeddable Z survives, and no
-    # dead 0-conformer candidate is kept in the result.
-    r = rx.embed("C1CCC=CCCC1", n=6)
-    for e in [r] if isinstance(r, rx.Ensemble) else r:
-        assert e.n >= 1
+def test_a_metal_bound_chiral_phosphorus_survives_the_sphere_strip():
+    """The D-cap restores the valence the dative bond does not count, so both P-epimers are still enumerated."""
+    mol, metals = _with_metals(_CHIRAL_P_PD)
+    labels = _labels(mol, exclude=metals)
+    assert len(labels) == 2
+    assert len(set(labels)) == 2, "the two P-epimers must get distinct labels"
+
+
+def test_a_double_bond_the_coordination_locks_is_not_enumerated():
+    """A C=N endocyclic in a ring the metal closes has one buildable geometry: the other hand is a phantom.
+
+    `FindPotentialStereo` runs on the metal-disconnected graph, which opens that ring, so the imine looks like
+    a free acyclic double bond. An alpha-diimine enumerated 2x2, most of it unbuildable.
+    """
+    mol, metals = _with_metals(_ALPHA_DIIMINE_NI)
+    assert stereo._coordination_locked_double_bonds(mol, metals), "the metal-closed imine was not detected"
+    variants, _n, _total, _unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
+    assert len(variants) == 2, "only the real point stereocentre should expand, not the locked imines"
+
+
+def test_a_pendant_double_bond_is_not_locked_just_because_a_metal_is_present():
+    """The lock is metal-RING-specific: over-suppressing would drop real organic E/Z from every complex."""
+    mol, metals = _with_metals("CC=CC[NH2]->[Ni+2](<-[O-]C(=O)C)<-[NH2]CC=CC")
+    assert stereo._coordination_locked_double_bonds(mol, metals) == set()
+
+
+def test_with_no_metal_to_exclude_the_enumeration_graph_is_the_molecule_itself():
+    """Nothing to disconnect means nothing to cap, so the metal path never copies or re-sanitises an organic input."""
+    mol = _mol("CC(N)C(=O)O")
+    work, caps = stereo._build_enumeration_graph(mol, exclude=set())
+    assert work is mol
+    assert caps == {}

@@ -9,15 +9,7 @@ description = "Fast, flexible molecular embedding for reactive chemistry."
 authors = [{name = "Alister S. Goodfellow"}]
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-    "numpy",
-    "rdkit",
-    "prism_pruner",
-    "openconf",
-    "xyzgraph>=1.6.14",
-    "scikit-learn",
-    "networkx",
-]
+dependencies = ["numpy", "rdkit"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -25,42 +17,36 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-ase = ["ase"]
-sphere = ["scipy"]  # the coordination-sphere solver fallback (rdkit_embed/constraints/sphere.py) — makes its
-#   "install the 'sphere' extra" message true; scipy is otherwise only transitive via scikit-learn.
-viz = ["matplotlib", "seaborn", "xyzrender>=0.3.8"]
-all = ["ase", "matplotlib", "seaborn", "xyzrender>=0.3.8"]
+search = ["openconf"]
+select = ["prism_pruner", "scikit-learn"]
+score = ["ase"]
+perceive = ["xyzgraph>=1.6.14"]
+nci = ["xyzgraph>=1.6.14", "networkx"]
+viz = ["rxembed[select]", "matplotlib", "seaborn", "xyzrender>=0.3.8"]
+sphere = ["scipy"]
+all = ["rxembed[search,select,score,perceive,nci,viz,sphere]"]
 
 [project.urls]
 homepage = "https://github.com/aligfellow/rxembed"
 
-# The embed kernel lives in-place as the `rxembed.rdkit_embed` subpackage (src/rxembed/rdkit_embed) — the
-# premature uv-workspace split is unwound. Its placeholder pyproject (src/rxembed/rdkit_embed/pyproject.toml)
-# is inert reference only, marking the intent to graduate the kernel to a standalone `rdkit_embed` package once
-# it stabilises. For now it ships as part of rxembed's own `src`, auto-discovered below.
-
-# openconf's transition-metal support (the `transition_metal` preset + auto metal-move budget) is on the
-# upstream main branch but not yet on a PyPI release, so pull it from git. `uv sync` resolves this for
-# everyone (CI included) and pins the exact commit in uv.lock. To co-develop openconf, clone it as a sibling
-# and override with an editable install: `uv pip install -e ../openconf` (see the README dev section).
+# openconf's transition-metal preset is not yet on PyPI, so pull it from git.
 [tool.uv.sources]
 openconf = { git = "https://github.com/rowansci/openconf" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The self-reference is what makes a bare `uv sync` a full dev environment: uv installs this group by
+# default but never an extra.
 [dependency-groups]
 dev = [
+    "rxembed[all]",
     "pre-commit>=3.5.0",
     "pytest>=8.3.5",
     "pytest-cov>=5.0.0",
     "ruff>=0.14.14",
     "ty>=0.0.14",
-    "ipykernel", 
-    "seaborn",
-    "matplotlib",
-    "ase",
-    "xyzrender", 
+    "ipykernel",
 ]
 
 # ===== Ruff =====
@@ -70,7 +56,7 @@ target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-exclude = ["examples/*.ipynb", "playground/**"]  # playground is scratch: diagnostics, not library code
+exclude = ["examples/*.ipynb"]
 select = [
     "B",      # bugbear
     "D",      # pydocstyle
@@ -104,13 +90,10 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403"]
 "tests/**" = ["D", "PLR2004"]
-# The Mechanism base class documents each phase hook's contract once; restating it on every override would be
-# the duplication the project standard forbids. Each subclass carries a CLASS docstring saying what its field is.
-# (Path-globbed: mechanisms.py lives in the in-place rxembed.rdkit_embed kernel subpackage.)
-"src/rxembed/rdkit_embed/**/mechanisms.py" = ["D102"]
+"src/rxembed/mechanisms.py" = ["D102"]  # hook contracts live on the Mechanism base class, not each override
 
 [tool.ruff.lint.mccabe]
-max-complexity = 15  # regression guard (T7): keep per-function cyclomatic complexity from creeping back
+max-complexity = 15
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
@@ -122,7 +105,7 @@ docstring-code-format = true
 [tool.ty]
 
 [tool.ty.src]
-exclude = ["examples", "playground", ".venv"]
+exclude = ["examples", ".venv"]
 
 # ===== Pytest =====
 [tool.pytest.ini_options]

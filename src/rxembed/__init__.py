@@ -1,31 +1,46 @@
-"""Fast, flexible molecular embedding for reactive chemistry."""
+"""rxembed. Fast, flexible molecular embedding for reactive chemistry."""
 
+import logging
 from importlib.metadata import PackageNotFoundError, version
 
-from rxembed.rdkit_embed.log import set_verbose
+from .constraints import Constraints, compose, match, resolve_core
+from .embed import Conformers, embed, minimize
+from .metal_core import Ligand, dative_smiles, ligands
+from .metal_isomers import Isomer, IsomerSet, enumerate_isomers
+from .relax import ff_energies, restrained_uff
 
-from . import geometry
-from .constraints.nci import Contact
-from .constraints.nci import auto_binding_modes as nci_modes
-from .constraints.nci import candidate_contacts as nci_candidates
-from .isomers import enumerate_isomers as metal
-from .pipeline import Ensemble, EnsembleSet, embed, minimize, wrap
+logger = logging.getLogger("rxembed")
+
+
+def set_verbose(level: int | str = "INFO") -> None:
+    """Turn on console logging at `level` (e.g. 'INFO', 'DEBUG', logging.DEBUG)."""
+    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter("%(name)s | %(message)s"))
+        logger.addHandler(h)
+    logger.setLevel(level)
+
 
 __all__ = [
-    "Contact",
-    "Ensemble",
-    "EnsembleSet",
+    "Conformers",
+    "Constraints",
+    "Isomer",
+    "IsomerSet",
+    "Ligand",
+    "compose",
+    "dative_smiles",
     "embed",
-    "geometry",
-    "metal",
+    "enumerate_isomers",
+    "ff_energies",
+    "ligands",
+    "match",
     "minimize",
-    "nci_candidates",
-    "nci_modes",
+    "resolve_core",
+    "restrained_uff",
     "set_verbose",
-    "wrap",
 ]
 
 try:
     __version__ = version("rxembed")
-except PackageNotFoundError:  # not installed (e.g. a source checkout without an install)
+except PackageNotFoundError:
     __version__ = "0+unknown"

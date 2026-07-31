@@ -57,9 +57,4 @@ coverage.xml
 # Ignore temporary local notebooks/output
 output/
 
-# generated overnight measurement artefacts (geometries + metric dumps); regenerate with the night harness
-/overnight/
-/foldwall_dump/
-
-# agent worktrees
-.claude/worktrees/
+benchmark/

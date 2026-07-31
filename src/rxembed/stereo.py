@@ -1,112 +1,21 @@
-"""Stereochemistry fingerprints for chirality-aware conformer selection (xyzgraph ``--stereo``).
+"""Ligand-stereo load-in: expand a `Mol`'s UNDEFINED stereocentres into the distinct species to embed.
 
-A conformer's chirality is a *fingerprint* of every stereo element xyzgraph detects — point (R/S), E/Z,
-axial (Rₐ/Sₐ), **planar (a metallocene's planar chirality)**, and helical. Comparing fingerprints lets us
-keep / drop / invert conformers by handedness on any one element (or all), which is how we sample a metal
-centre's geometry while holding a spectator ferrocene's planar chirality fixed.
-
-Bonds are re-perceived from the **coordinates** (not the Mol graph), so a metallocene is recognised even on
-a surrogate Mol whose metal-donor bonds were stripped — the only requirement is real element symbols.
+The embed-side half of stereochemistry: graph-only (RDKit's `EnumerateStereoisomers` over the
+unspecified elements), metal-safe (the centre's handedness is the coordination-isomer path's job). The
+conformer-side half, the coordinate-derived chirality fingerprint that filters embedded conformers,
+is perception-driven and stays with the consumer (`rxembed.stereo`).
 """
 
 from __future__ import annotations
 
-import os
-import tempfile
+from rdkit import Chem
+from rdkit.Chem.EnumerateStereoisomers import (
+    EnumerateStereoisomers,
+    GetStereoisomerCount,
+    StereoEnumerationOptions,
+)
 
-from rxembed.rdkit_embed import io as _io
-
-_KEYS = [("point", "atom"), ("ez", "bond"), ("axial", "atoms"), ("planar", "ring"), ("helical", "atoms")]
-
-
-def _xyz_block(mol, conf_id):
-    conf = mol.GetConformer(conf_id)
-    out = [str(mol.GetNumAtoms()), ""]
-    for a in mol.GetAtoms():
-        p = conf.GetAtomPosition(a.GetIdx())
-        out.append(f"{a.GetSymbol()} {p.x:.6f} {p.y:.6f} {p.z:.6f}")
-    return "\n".join(out) + "\n"
-
-
-_INVERT = {"R": "S", "S": "R", "Rₐ": "Sₐ", "Sₐ": "Rₐ", "Rₚ": "Sₚ", "Sₚ": "Rₚ", "M": "P", "P": "M", "E": "Z", "Z": "E"}
-# the chirality RDKit's embed cannot keep — what this filter is *for*. Point R/S and E/Z are the embed's
-# own job (defined SMILES stereocentres) or labile (a protic-amine centre we do NOT want to lock), so
-# 'preserve' leaves them free by default; opt in with {'point': 'preserve'}.
-_NONGRAPH = {"planar", "axial", "helical"}
-
-
-def _mode(kind, spec):
-    """Resolve the per-kind chirality mode from ``spec``.
-
-    A global string: ``'free'`` -> free all; ``'preserve'`` -> preserve only the non-graph kinds
-    (planar/axial/helical), free point/ez; ``'all'`` -> preserve every kind; ``'invert'`` -> invert the
-    non-graph kinds. A dict overrides per kind, falling back to its ``'default'`` or the same 'preserve' rule.
-    """
-    if isinstance(spec, str):
-        if spec == "free":
-            return "free"
-        if spec == "all":
-            return "preserve"
-        if spec == "invert":
-            return "invert" if kind in _NONGRAPH else "free"
-        return "preserve" if kind in _NONGRAPH else "free"  # 'preserve' = non-graph only
-    if kind in spec:
-        return spec[kind]
-    if "default" in spec:
-        return spec["default"]
-    return "preserve" if kind in _NONGRAPH else "free"
-
-
-def signature(mol, conf_id=-1, charge=0):
-    """Compute a conformer's chirality fingerprint: a multiset of handedness labels per element kind.
-
-    ``{kind: Counter({label: count})}`` over ``point`` (R/S), ``ez``, ``axial`` (Rₐ/Sₐ), ``planar`` (a
-    metallocene's Rₚ/Sₚ), ``helical`` (M/P) — via xyzgraph (bonds re-perceived from the geometry, so a
-    metallocene is seen even on a bond-stripped surrogate). We key by *kind*, not atom indices, because
-    xyzgraph picks different representative atoms per re-perception — the handedness label is the stable,
-    physical quantity, the atom set is not.
-    """
-    from collections import Counter
-
-    import xyzgraph
-    from xyzgraph.stereo import annotate_stereo
-
-    fd, path = tempfile.mkstemp(suffix=".xyz")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(_xyz_block(mol, conf_id))
-        summary = annotate_stereo(xyzgraph.build_graph(path, charge=charge, kekule=True))
-    finally:
-        os.unlink(path)
-    sig = {}
-    for kind, _key in _KEYS:
-        labels = [e.get("label") for e in (summary.get(kind) or []) if e.get("label")]
-        if labels:
-            sig[kind] = Counter(labels)
-    return sig
-
-
-def satisfies_spec(sig, ref, spec="preserve"):
-    """Return whether fingerprint ``sig`` satisfies the chirality ``spec`` against reference ``ref``.
-
-    Judged on **handedness, not count** — xyzgraph's per-conformer perception is count-unstable (a
-    metallocene may surface as ``{}``, ``{Sₚ:1}`` or ``{Sₚ:2}`` for the *same* configuration), but the
-    *label* is stable. So per kind: ``'preserve'`` rejects only if the conformer carries the **flipped**
-    label of a reference element (an actual inversion); ``'invert'`` rejects if it carries any reference
-    label **unchanged**; ``'free'`` is unconstrained. `spec` is a global string or a dict
-    ``{kind: mode, 'default': mode}``. A conformer passes only if every reference kind is satisfied.
-    """
-    for kind, refcount in ref.items():
-        mode = _mode(kind, spec)
-        if mode == "free":
-            continue
-        present = set(sig.get(kind, ()))  # distinct handedness labels in the conformer
-        ref_labels = set(refcount)
-        if mode == "preserve" and present & {_INVERT.get(lbl, lbl) for lbl in ref_labels}:
-            return False  # a flipped element is present -> rejected
-        if mode == "invert" and present & ref_labels:
-            return False  # an un-flipped (original) element is present
-    return True
+from .utils import repair_bond_stereo
 
 
 def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
@@ -116,11 +25,9 @@ def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
     P), plus E/Z for each enumerated double bond. Keyed only on the *enumerated* atoms/bonds so distinct
     variants always get distinct, stable labels. ``cap_to_metal`` maps each donor's D-cap atom index to its
     metal's atomic number: the CIP is then computed with the METAL (highest priority) in the cap position, not
-    the D (lowest) — so a metal-bound donor's R/S names the coordinated centre correctly (the D->M priority
-    flip is NOT a fixed R<->S swap; it depends on the donor's other substituents, e.g. whether it carries an H).
+    the D (lowest), so a metal-bound donor's R/S names the coordinated centre correctly (the D->M priority
+    flip is not a fixed R<->S swap; it depends on the donor's other substituents, e.g. whether it carries an H).
     """
-    from rdkit import Chem
-
     if cap_to_metal:  # temporarily give each D-cap the metal's atomic number for a coordinated-complex CIP
         rw = Chem.RWMol(mol)
         for d_idx, z in cap_to_metal.items():
@@ -141,7 +48,7 @@ def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
             Chem.ChiralType.CHI_TETRAHEDRAL_CW: "CW",
             Chem.ChiralType.CHI_TETRAHEDRAL_CCW: "CCW",
         }.get(a.GetChiralTag())
-        if code:  # an UNRESOLVED centre (e.g. an allene axis RDKit can't set) is dropped — never a '?' tag
+        if code:  # an unresolved centre (an allene axis RDKit can't set) is dropped, never given a '?' tag
             parts.append(f"{idx}{code}")
     for bidx in bond_centers:
         b = mol.GetBondWithIdx(bidx)
@@ -157,20 +64,18 @@ def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
 
 
 def _coordination_locked_double_bonds(mol, metals):
-    """Double bonds whose E/Z is fixed by the coordination — endocyclic in a ring closed through the metal.
+    """Double bonds whose E/Z is fixed by the coordination: endocyclic in a ring closed through the metal.
 
     Such a bond has one buildable geometry (decided by the coordination isomer, the polyhedron path's job), so
     enumerating both E and Z is a phantom: the wrong hand forces a bite the chelate can't span and the pipeline
-    burns seeds relaxing it into broken bonds. An alpha-diimine (N=C-C=N chelate) is the type case — both C=N
+    burns seeds relaxing it into broken bonds. An alpha-diimine (N=C-C=N chelate) is the type case: both C=N
     sit in the 5-membered metal ring and were enumerated 2x2.
 
     RDKit ignores dative M-donor bonds in ring perception, so the metal-closed ring is invisible natively;
     upgrade the datives to single to reveal it. A double bond still in a ring once the metal is removed is a
-    genuine organic ring bond (RDKit already handles its E/Z) and left alone — only a bond cyclic because of the
+    genuine organic ring bond (RDKit already handles its E/Z) and left alone; only a bond cyclic because of the
     metal is locked here.
     """
-    from rdkit import Chem
-
     metals = set(metals)
     if not metals:
         return set()
@@ -208,8 +113,6 @@ def _lock_double_bond(work, fb):
     ``SetStereoAtoms`` requires the two reference atoms in the bond's own begin/end order (each a neighbour of
     the corresponding end), so read the order off the bond, not off the unordered ``fb``.
     """
-    from rdkit import Chem
-
     a, c = tuple(fb)
     wb = work.GetBondBetweenAtoms(a, c)
     if wb is None:
@@ -230,21 +133,13 @@ def _lock_double_bond(work, fb):
 def _build_enumeration_graph(mol, exclude):
     """Disconnect each metal and D-cap each freed sp3 donor so RDKit enumerates only ligand stereo.
 
-    Returns ``(work, cap_to_metal)`` — the cap index → its metal's atomic number. With no `exclude` there is
+    Returns ``(work, cap_to_metal)``: the cap index -> its metal's atomic number. With no `exclude` there is
     nothing to disconnect, so `mol` is returned unchanged.
     """
-    from rdkit import Chem
-
     if not exclude:
         return mol, {}
-    # Build the enumeration graph by DISCONNECTING each metal (bonds removed -> an isolated atom, never a false
-    # stereocentre) and capping each metal-bound sp3 DONOR's freed valence with a DEUTERIUM. A dative metal bond
-    # doesn't count toward a donor's valence, so RDKit sees a degree-3 phosphine and refuses the stereocentre; a
-    # real single bond to D restores it. D (not a plain H, which would clobber a donor already carrying an H into
-    # two identical substituents; not the metal, whose priority dominates) is distinct AND lowest-priority, so the
-    # donor's R/S is the lone-pair convention. The D's are APPENDED, so every real atom index is preserved. The
-    # embed carries the same cap (`metal._hold_donor_chirality`). A planar sp2 donor is left uncapped (non-stereo);
-    # a backbone centre needs no cap — it is a normal stereocentre on the metal-free graph.
+    # Disconnect each metal first: a metal-bound donor is a stereocentre only while bound, so RDKit would
+    # enumerate hands the surrogate cannot hold.
     cap_to_metal = {}  # D-cap atom index -> its metal's atomic number (for the coordinated-complex CIP label)
     work = Chem.RWMol(mol)
     for mi in exclude:
@@ -261,45 +156,18 @@ def _build_enumeration_graph(mol, exclude):
     Chem.SanitizeMol(work, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
     # The strip above can orphan a C=N whose stereo reference atom WAS the metal, and a flagged bond with no
     # references makes `FindPotentialStereo` below raise ("only can support 2 stereo neighbors"). The
-    # tolerant sanitize happens to scrub most of them, but that is luck, not a contract — see `io`.
-    _io.repair_bond_stereo(work)
+    # tolerant sanitize happens to scrub most of them, but that is luck rather than a contract.
+    repair_bond_stereo(work)
     return work, cap_to_metal
 
 
-def enumerate_unassigned(mol, cap=32, exclude=()):
-    """Enumerate stereoisomers over ONLY the *unspecified* stereo elements (point R/S + double-bond E/Z).
-
-    Returns ``(variants, n_unassigned, total, unresolved)``: ``variants`` a list of ``(variant_mol, label)``
-    with the unlabeled centres expanded and every *defined* centre held fixed (`onlyUnassigned`), meso/duplicate
-    configurations dropped (`unique`), truncated to ``cap`` of ``total`` possible; ``n_unassigned`` the count
-    of unspecified elements (0, with ``variants == [(mol, '')]``, when the input is already fully defined);
-    ``unresolved`` how many of those elements RDKit could NOT enumerate (an allene/cumulene axis or a flat
-    biaryl atropisomer — `EnumerateStereoisomers` cannot encode axial chirality, so it stays one arbitrary hand
-    and the caller must warn). Atom order is preserved, so index-based ``fix``/``constrain`` stay valid.
-
-    A metal complex is safe: only genuine organic **point (tetrahedral) + double-bond** stereo is taken — the
-    METAL atom (which `FindPotentialStereo` flags as `Atom_Octahedral`/`Atom_SquarePlanar`, or even a spurious
-    `Atom_Tetrahedral`) is EXCLUDED, since its Λ/Δ is the coordination-isomer path's job (`constraints.polyhedron`)
-    and RDKit's dative-metal stereo is not order-canonical. A *ligand* stereocentre — including a chiral-at-P or
-    carbanion donor bonded to the metal (a genuine degree-4 → degree-3-after-strip tetrahedral centre) — IS
-    enumerated. `exclude` is atom indices to never treat as a point centre (the metal indices).
-    """
-    from rdkit import Chem
-    from rdkit.Chem.EnumerateStereoisomers import (
-        EnumerateStereoisomers,
-        GetStereoisomerCount,
-        StereoEnumerationOptions,
-    )
-
+def _unassigned_elements(mol, exclude=()):
+    """Return ``(work, cap_to_metal, locked, elements)``: the enumeration graph and its unspecified elements."""
     exclude = set(exclude)
-    n_real = mol.GetNumAtoms()
     work, cap_to_metal = _build_enumeration_graph(mol, exclude)
 
-    # A C=N / C=C whose E/Z is fixed by the coordination must not be enumerated. `FindPotentialStereo` runs on
-    # `work` (metal disconnected), which opens any ring the metal closed, so a coordination-locked imine looks
-    # like a free acyclic double bond and gets a phantom E and Z (an alpha-diimine chelate enumerates 2x2, most
-    # of it unbuildable). A double bond endocyclic in a ring closed through the metal has one buildable geometry,
-    # decided by the coordination isomer, not two hands.
+    # A C=N / C=C whose E/Z the coordination fixes must not be enumerated: the metal closes the ring, so only
+    # one geometry exists and the other embeds as a strained impossibility.
     locked = _coordination_locked_double_bonds(mol, exclude)
     locked = {fb for fb in locked if _lock_double_bond(work, fb)}  # keep only the ones we could actually pin
 
@@ -313,7 +181,41 @@ def enumerate_unassigned(mol, cap=32, exclude=()):
             return frozenset((wb.GetBeginAtomIdx(), wb.GetEndAtomIdx())) not in locked
         return False
 
-    unassigned = [e for e in Chem.FindPotentialStereo(work) if enumerable(e)]
+    return work, cap_to_metal, locked, [e for e in Chem.FindPotentialStereo(work) if enumerable(e)]
+
+
+def unassigned_centres(mol, exclude=()):
+    """Return the unspecified stereo elements as atom-index tuples: ``(atom,)``, or ``(i, j)`` for a double bond.
+
+    The cheap predicate behind `enumerate_unassigned`: what WOULD be expanded, without expanding it. A caller
+    that embeds one species (`Isomer`) uses it to refuse to pool two enantiomers silently.
+    """
+    work, _caps, _locked, elements = _unassigned_elements(mol, exclude)
+    out = []
+    for e in elements:  # `work` only APPENDS D-caps, so every index here is a real atom of `mol`
+        if e.type == Chem.StereoType.Atom_Tetrahedral:
+            out.append((e.centeredOn,))
+        else:
+            b = work.GetBondWithIdx(e.centeredOn)
+            out.append((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))
+    return out
+
+
+def enumerate_unassigned(mol, cap=32, exclude=()):
+    """Enumerate stereoisomers over only the *unspecified* stereo elements (point R/S + double-bond E/Z).
+
+    Returns ``(variants, n_unassigned, total, unresolved)``: ``variants`` a list of ``(variant_mol, label)``
+    with defined centres held (`onlyUnassigned`), meso/duplicates dropped (`unique`), truncated to ``cap`` of
+    ``total``; ``unresolved`` counts elements RDKit could not enumerate -- an allene axis or a biaryl
+    atropisomer, which stay one arbitrary hand for the caller to warn about. Atom order is preserved, so
+    index-based ``fix``/``constrain`` stay valid.
+
+    A metal complex is safe: the metal is excluded, its handedness being the coordination-isomer path's job
+    and RDKit's dative-metal stereo not order-canonical. A ligand stereocentre is still enumerated, including
+    a chiral-at-P or carbanion donor that drops to degree 3 after the strip. `exclude` is the metal indices.
+    """
+    n_real = mol.GetNumAtoms()
+    work, cap_to_metal, locked, unassigned = _unassigned_elements(mol, exclude)
     if not unassigned:
         return [(mol, "")], 0, 1, 0
     atom_centers = [e.centeredOn for e in unassigned if e.type == Chem.StereoType.Atom_Tetrahedral]
