@@ -31,6 +31,7 @@ from rxembed import metal_core as _metal
 from rxembed.metal_core import classify_geometry, geometry_for, repair_bond_stereo
 from rxembed.metal_polyhedron import POLYHEDRA, describe
 from rxembed.pipeline.perceive import _xyz_to_mol
+from rxembed.utils import assign_stereo_from_3d
 
 _MN_H2 = "examples/structures/mn-h2.xyz"  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
 _MN_H2_RC = [1, 5, 63, 64, 65, 66]  # its reacting core
@@ -331,6 +332,178 @@ def test_a_metal_bound_carbanion_donor_embeds_two_distinct_hands():
         assert len(signs) == 1  # every conformer of this isomer has the same donor hand
         hands.append(signs.pop())
     assert len(set(hands)) == 2  # and the two isomers are opposite
+
+
+# --- the donor's hand across the strip: a tag is a parity over the DONOR's bond order, not a symbol to copy -
+
+# The M-L bond written FIRST at the P is the odd slot the surrogate strip mirrors; written LAST is the
+# even control. `<-` is the dative arrow the README's complexes use; a bare bond is the covalent alternative.
+_CHIRAL_P = {
+    "dative_first": "Cl[Pt](Cl)(Cl)<-[P@](C)(CC)c1ccccc1",
+    "dative_last": "[P@](C)(CC)(c1ccccc1)->[Pt](Cl)(Cl)Cl",
+    "covalent_first": "Cl[Pt](Cl)(Cl)[P@](C)(CC)c1ccccc1",
+}
+
+
+_TETRAHEDRAL = (Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+
+
+def _hand(mol, centre, order, cid=-1):
+    """The tag naming this conformer's hand at `centre`, read in the fixed bond `order` given.
+
+    RDKit's convention, pinned against RDKit itself by the first test below: negative volume is CW.
+    """
+    p = mol.GetConformer(cid).GetPositions()
+    v = float(np.dot(np.cross(p[order[0]] - p[centre], p[order[1]] - p[centre]), p[order[2]] - p[centre]))
+    return _TETRAHEDRAL[0] if v < 0 else _TETRAHEDRAL[1]
+
+
+def _phosphorus(mol):
+    return next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "P")
+
+
+def test_the_geometric_hand_convention_is_rdkits_own():
+    """`donor_chirality_sign` is negative for exactly the centres RDKit itself calls CW, wherever it answers.
+
+    It has to be pinned from outside, because where the sign is USED is a stripped degree-3 donor, and there
+    `AssignStereochemistryFrom3D` assigns nothing at all and so cannot be asked. `ensemble` compares these
+    signs between conformers to cull an inverted labile donor, so the convention is load-bearing.
+    """
+    for smiles in ("C[C@H](N)C(=O)O", "C[C@@H](N)C(=O)O", "F[C@](Cl)(Br)I", "O[C@H]1CC[C@@H](N)CC1"):
+        mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+        assert rdDistGeom.EmbedMolecule(mol, randomSeed=7) == 0
+        Chem.AssignStereochemistryFrom3D(mol)
+        tagged = [a.GetIdx() for a in mol.GetAtoms() if a.GetChiralTag() in _TETRAHEDRAL]
+        assert tagged, f"{smiles} carries no tag, so this cell asserts nothing"
+        for idx in tagged:
+            cw = mol.GetAtomWithIdx(idx).GetChiralTag() == Chem.ChiralType.CHI_TETRAHEDRAL_CW
+            assert (_metal.donor_chirality_sign(mol, -1, idx) < 0) is cw
+
+
+@pytest.mark.parametrize("case", sorted(_CHIRAL_P))
+def test_a_stripped_donor_names_the_hand_of_the_conformer_it_is_handed_with(case):
+    """THE CONTRACT. `surrogate_metal` must never hand the embedder a tag that contradicts its own coordinates.
+
+    A tag is a parity over the atom's own bond order, so deleting the M bond at an odd slot makes the same
+    symbol name the mirror image; copying it across returned the wrong enantiomer in 8 of 8 conformers on
+    every chiral-at-P donor whose metal sat at an odd slot (`Rh-RR-DIPAMP-Cl2` P2 and four more in 262
+    structures). Where a conformer survives the surgery the hand is MEASURED from it, which also settles the
+    case the graph cannot answer: RDKit's 3D writer omits a dative bond leaving the centre while its SMILES
+    parser counts it, so the same symbol on the same graph means opposite hands from the two writers.
+    """
+    mol = Chem.AddHs(Chem.MolFromSmiles(_CHIRAL_P[case]))
+    donor = _phosphorus(mol)
+    assert rdDistGeom.EmbedMolecule(mol, randomSeed=0xF00D) == 0  # ETKDG builds the declared hand
+    stripped, _m, _donors, _z, _q = _metal.surrogate_metal(mol)
+    order = [b.GetOtherAtomIdx(donor) for b in stripped.GetAtomWithIdx(donor).GetBonds()]
+    assert stripped.GetAtomWithIdx(donor).GetChiralTag() in _TETRAHEDRAL, "the donor lost its tag"
+    assert stripped.GetAtomWithIdx(donor).GetChiralTag() == _hand(stripped, donor, order)
+
+
+@pytest.mark.parametrize("case", sorted(_CHIRAL_P))
+@pytest.mark.parametrize("tag", ["[P@]", "[P@@]"])
+def test_a_chiral_at_p_donor_comes_back_with_the_hand_its_smiles_declared(case, tag):
+    """End to end and label-free: no CIP, no metal priority, only the sign the input's own bond order names.
+
+    The mirror came back for both hands at the odd slot and neither at the even one, which is the signature of
+    a basis error rather than a chemistry one. No `.xyz` fixture reaches this route at all.
+    """
+    mol = Chem.AddHs(Chem.MolFromSmiles(_CHIRAL_P[case].replace("[P@]", tag)))
+    donor = _phosphorus(mol)
+    order = [b.GetOtherAtomIdx(donor) for b in mol.GetAtomWithIdx(donor).GetBonds()]  # the INPUT's own basis
+    declared = mol.GetAtomWithIdx(donor).GetChiralTag()
+    confs = rx.embed(rx.enumerate_isomers(mol, stereo="free")[0], n=2, seed=0xF00D).minimize()
+    assert len(confs)
+    for cid in confs.ids:
+        assert _hand(confs.mol, donor, order, int(cid)) == declared, f"{case}/{tag}: came back as the mirror"
+
+
+@pytest.mark.parametrize("tag", ["[S@]", "[S@@]"])
+def test_a_dative_donor_tagged_by_a_writer_that_is_not_ours_still_survives_the_strip(tag):
+    """THE PROVENANCE-FREE CONTRACT, and the one case a graph rule cannot reach.
+
+    `utils.assign_stereo_from_3d` settles the basis for every tag rxembed writes, but RDKit's own molblock
+    reader calls `assignChiralTypesFrom3D` internally, so `rx.embed(Chem.MolFromMolFile(...))` hands the strip
+    a tag in the writer's dative-omitted basis with no rxembed call anywhere in its history. Nothing in the
+    graph distinguishes it from a parsed one. The strip therefore consults the geometry at exactly this shape,
+    a DATIVE M-L bond leaving the donor at a slot the removal would mirror; deleting that returned the
+    enantiomer here, silently, while every other test in this file still passed.
+    """
+    mol = Chem.AddHs(Chem.MolFromSmiles(f"Cl[Pd](Cl)(Cl)<-{tag}(=O)(C)CC"))
+    assert rdDistGeom.EmbedMolecule(mol, randomSeed=0xF00D) == 0
+    # sanitize=False because a strict sanitize rejects the Pd complex; the reader writes the tag either way
+    back = Chem.MolFromMolBlock(Chem.MolToV3KMolBlock(mol), sanitize=False, removeHs=False)
+    back.UpdatePropertyCache(strict=False)
+    Chem.SanitizeMol(back, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
+    donor = next(a.GetIdx() for a in back.GetAtoms() if a.GetSymbol() == "S")
+    bond = next(
+        b
+        for b in back.GetAtomWithIdx(donor).GetBonds()
+        if back.GetAtomWithIdx(b.GetOtherAtomIdx(donor)).GetSymbol() == "Pd"
+    )
+    assert bond.GetBondType() == Chem.BondType.DATIVE, "the round trip did not keep the coordination bond"
+    assert bond.GetBeginAtomIdx() == donor, "the dative bond does not leave the donor, so this asserts nothing"
+
+    stripped, _m, _donors, _z, _q = _metal.surrogate_metal(back)
+    order = [b.GetOtherAtomIdx(donor) for b in stripped.GetAtomWithIdx(donor).GetBonds()]
+    assert stripped.GetAtomWithIdx(donor).GetChiralTag() == _hand(stripped, donor, order)
+
+
+@pytest.mark.parametrize(
+    "smiles",
+    [
+        "Cl[Pd](Cl)(Cl)<-[S@](=O)(C)CC",  # the M-L bond FIRST at the S: the odd slot, where the bases differ
+        "[S@](=O)(C)(CC)->[Pd](Cl)(Cl)Cl",  # and LAST: the even control, where they agree
+    ],
+)
+def test_a_dative_donors_perceived_hand_survives_the_strip(smiles):
+    """A perceived sulfoxide donor, the case where the strip's parity and RDKit's 3D writer collide.
+
+    The writer omits a dative bond leaving the centre and the strip's parity counts it, so on `.xyz` input
+    the two corrections used to compose into a mirror at `LISVIW`'s S, the one donor of 262 where it decides
+    the answer. They compose correctly only because `utils.assign_stereo_from_3d` re-bases at the writer;
+    that is what this asserts, from the same two slots the corpus offers (odd, then the even control).
+    """
+    mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    donor = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "S")
+    assert rdDistGeom.EmbedMolecule(mol, randomSeed=0xF00D) == 0
+    assign_stereo_from_3d(mol)  # the perception writer, through the door, on this very conformer
+    assert mol.GetAtomWithIdx(donor).GetChiralTag() in _TETRAHEDRAL, "nothing was written"
+
+    stripped, _m, _donors, _z, _q = _metal.surrogate_metal(mol)
+    order = [b.GetOtherAtomIdx(donor) for b in stripped.GetAtomWithIdx(donor).GetBonds()]
+    assert stripped.GetAtomWithIdx(donor).GetChiralTag() == _hand(stripped, donor, order)
+
+
+def test_surrogate_all_metals_keeps_the_hand_its_single_metal_twin_keeps():
+    """The two strips are one operation, so a donor's hand cannot depend on which of them ran.
+
+    The multi-metal copy had no tag handling at all and silently dropped a donor tag the single-metal path
+    keeps, on 2 of the 14 tagged-donor structures in the corpora.
+    """
+    mol = Chem.AddHs(Chem.MolFromSmiles(_CHIRAL_P["dative_first"]))
+    donor = _phosphorus(mol)
+    assert rdDistGeom.EmbedMolecule(mol, randomSeed=0xF00D) == 0
+    one, _m, _donors, _z, _q = _metal.surrogate_metal(mol)
+    every, _metals = _metal.surrogate_all_metals(mol)
+    assert every.GetAtomWithIdx(donor).GetChiralTag() == one.GetAtomWithIdx(donor).GetChiralTag()
+
+
+def test_the_d_capped_donor_path_is_not_double_corrected():
+    """A capped sp3 donor's built hand must be the one its own tag names, with no second correction applied.
+
+    `_hold_donor_chirality` replaces the stripped M bond with a deuterium APPENDED LAST, and appending is
+    parity-free, so the strip's correction is the whole of it. A flip here as well would invert both
+    enumerated hands together, which the existing two-distinct-hands test cannot see.
+    """
+    for iso in rx.metal(_CARBANION_NI, "square_planar"):
+        order = [b.GetOtherAtomIdx(_CARBANION_C) for b in iso.mol.GetAtomWithIdx(_CARBANION_C).GetBonds()]
+        assert len(order) == _metal._MIN_STEREO_NEIGHBOURS, "the donor is not the capped degree-3 case"
+        tag = iso.mol.GetAtomWithIdx(_CARBANION_C).GetChiralTag()
+        assert tag in _TETRAHEDRAL, "the carbanion lost its tag, so this asserts nothing"
+        e = rx.embed(iso, n=2, seed=0xF00D).minimize()
+        for cid in e.ids:
+            assert _hand(e.mol, _CARBANION_C, order, int(cid)) == tag
 
 
 def test_the_donor_charge_is_restored_after_the_hold():

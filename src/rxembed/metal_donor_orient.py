@@ -12,6 +12,7 @@ from rdkit import Chem
 
 from .metal_core import _METAL_Z
 from .metal_distance import _APEX_DONORS, APEX, overbond_tier
+from .utils import remove_bond
 
 # --- the sp2-donor coplanarity cap (`_coplanar_donor`, `cons.coplanar`) -------------------------------
 # An sp2 donor binds from an in-plane sigma lone pair, so the metal sits in its sp2 framework. The surrogate
@@ -124,7 +125,7 @@ def _stripped_hybridisation(mol) -> dict[int, Chem.HybridizationType]:
     for a in mol.GetAtoms():
         if a.GetAtomicNum() in _METAL_Z:
             for nb in [n.GetIdx() for n in a.GetNeighbors()]:
-                rw.RemoveBond(a.GetIdx(), nb)  # index-stable: RemoveBond never renumbers atoms
+                remove_bond(rw, a.GetIdx(), nb)  # index-stable: removing a bond never renumbers atoms
     stripped = rw.GetMol()
     Chem.SanitizeMol(  # properties (valence) are not enforced: a stripped donor is a bare anion/lone pair
         stripped, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True

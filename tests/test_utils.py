@@ -15,7 +15,16 @@ import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 
-from rxembed.utils import Violation, _angle, _dihedral, conjugated_quartets, repair_bond_stereo
+from rxembed.utils import (
+    Violation,
+    _angle,
+    _dihedral,
+    assign_stereo_from_3d,
+    bond_removal_mirrors,
+    conjugated_quartets,
+    remove_bond,
+    repair_bond_stereo,
+)
 
 _SOURCE = pathlib.Path(__file__).resolve().parent.parent / "src/rxembed/utils.py"
 
@@ -128,6 +137,151 @@ def test_a_geometry_re_references_an_orphaned_flag_rather_than_discarding_the_e_
     assert bond.GetStereo() != Chem.BondStereo.STEREONONE, "the E/Z was discarded, not re-referenced"
     assert len(bond.GetStereoAtoms()) == 2
     assert 3 not in list(bond.GetStereoAtoms())
+
+
+# ---------------------------------------------------------------------------------------------------------
+# the chiral tag is a parity over the atom's own bond order (`bond_removal_mirrors` / `remove_bond`)
+# ---------------------------------------------------------------------------------------------------------
+
+_HALIDE_C = "F[C@](Cl)(Br)I"  # one tagged degree-4 centre whose four bonds are all distinguishable
+
+
+def _names_the_hand(mol, centre):
+    """Whether the tag at `centre` names its conformer's hand, in whatever bond order it has now.
+
+    RDKit's own definition: the signed volume of the FIRST THREE bonds about the centre, negative for CW. It
+    holds at degree 3 as at degree 4, the fourth reference (implicit H, lone pair, the centre itself) sitting
+    last either way. Calibrated against `AssignStereochemistryFrom3D` by the first test below, not assumed.
+    """
+    atom = mol.GetAtomWithIdx(centre)
+    nbrs = [b.GetOtherAtomIdx(centre) for b in atom.GetBonds()][:3]
+    p = mol.GetConformer().GetPositions()
+    vol = float(np.dot(np.cross(p[nbrs[0]] - p[centre], p[nbrs[1]] - p[centre]), p[nbrs[2]] - p[centre]))
+    cw = Chem.ChiralType.CHI_TETRAHEDRAL_CW
+    return atom.GetChiralTag() == (cw if vol < 0 else Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+
+
+@pytest.mark.parametrize("slot", [0, 1, 2, 3])
+def test_a_bond_removal_leaves_the_tag_naming_the_same_geometry(slot):
+    """THE RULE, measured: taking the bond at slot `p` of four out of the order mirrors the tag when 3-p is odd.
+
+    Nothing in RDKit does this: `RWMol.RemoveBond` leaves the tag verbatim in a basis that has changed. A
+    chiral-at-P donor whose M-L bond sat at an odd slot therefore came back as its own mirror image, in 8 of 8
+    conformers, silently. Refereed by the geometry rather than by CIP, so no label convention enters.
+    """
+    mol = _mol(_HALIDE_C, seed=11)
+    Chem.AssignStereochemistryFrom3D(mol)  # calibrate: RDKit's own writer, on this very conformer
+    assert _names_the_hand(mol, 1), "the sign convention this test refereeds by is wrong"
+    rw = Chem.RWMol(mol)
+    remove_bond(rw, 1, [b.GetOtherAtomIdx(1) for b in mol.GetAtomWithIdx(1).GetBonds()][slot])
+    assert _names_the_hand(rw.GetMol(), 1), f"slot {slot}: the tag now names the mirror of its own geometry"
+
+
+def test_adding_a_bond_back_needs_no_counterpart():
+    """`RWMol.AddBond` appends LAST, which is the slot the missing reference already occupied.
+
+    This is why `connect_metal`, the D-cap and every `AddHs` are free of the rule, and why one correction at
+    the removal is the whole of it rather than half of a pair.
+    """
+    mol = _mol(_HALIDE_C, seed=11)
+    Chem.AssignStereochemistryFrom3D(mol)
+    partner = next(b.GetOtherAtomIdx(1) for b in mol.GetAtomWithIdx(1).GetBonds())  # slot 0: an odd one
+    rw = Chem.RWMol(mol)
+    remove_bond(rw, 1, partner)
+    rw.AddBond(1, partner, Chem.BondType.SINGLE)
+    assert _names_the_hand(rw.GetMol(), 1), "the re-added bond needed a second correction, so it is not last"
+
+
+@pytest.mark.parametrize(
+    ("smiles", "slot", "mirrors"),
+    [
+        ("F[C@](Cl)(Br)I", 0, True),  # degree 4: 3 - 0 is odd
+        ("F[C@](Cl)(Br)I", 1, False),  # degree 4: 3 - 1 is even
+        ("F[P@](Cl)(Br)(I)F", 1, False),  # degree 5: the arithmetic would say odd, and is refuted there
+        ("F[C@](Cl)Br", 1, False),  # degree 3: no representable tag survives, so the caller clears it
+    ],
+)
+def test_the_parity_rule_is_bounded_to_degree_four(smiles, slot, mirrors):
+    """Off degree four the symbol is kept: four directions summing to zero is what makes ``n - 1 - p`` work.
+
+    Measured refuted at degree 5 (13/35 and anti-correlated on the eight hypervalent tags in the corpora), so
+    the bound is part of the rule rather than a caution around it. The two `False` rows below are the ones
+    that bite: the unbounded arithmetic calls both of them odd.
+    """
+    mol = Chem.MolFromSmiles(smiles, sanitize=False)
+    mol.UpdatePropertyCache(strict=False)
+    centre = mol.GetAtomWithIdx(1)
+    partner = [b.GetOtherAtomIdx(1) for b in centre.GetBonds()][slot]
+    assert bond_removal_mirrors(centre, partner) is mirrors
+
+
+# ---------------------------------------------------------------------------------------------------------
+# assign_stereo_from_3d: the writer half of the same rule
+# ---------------------------------------------------------------------------------------------------------
+
+# A sulfoxide S donating through a dative arrow: the one shape where RDKit's 3D writer both assigns a tag and
+# reads a different bond order from every one of its readers. `->` puts the same bond LAST, the even control.
+_DATIVE_S = "Cl[Pd](Cl)(Cl)<-[S@](=O)(C)CC"
+_DATIVE_S_LAST = "[S@](=O)(C)(CC)->[Pd](Cl)(Cl)Cl"
+_COVALENT_S = "Cl[Pd](Cl)(Cl)[S@](=O)(C)CC"
+
+
+def _sulfur(mol):
+    return next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "S")
+
+
+def test_rdkits_3d_writer_reads_a_bond_order_none_of_its_readers_read():
+    """THE PREMISE, pinned against RDKit itself, because the whole re-base is worthless if it ever stops holding.
+
+    `assignChiralTypesFrom3D` skips a DATIVE bond whose BEGIN atom is the centre; the DG embedder, both CIP
+    labellers and the SMILES writer count it. So the raw writer hands back the symbol for the mirror of the
+    geometry it was just shown, and nothing complains. If RDKit reconciles the two, this cell fails and the
+    re-base should be deleted rather than kept working around a bug that is gone.
+    """
+    mol = _mol(_DATIVE_S, seed=0xF00D)
+    centre = _sulfur(mol)
+    Chem.AssignStereochemistryFrom3D(mol)  # deliberately the RAW call: this test is about what it does
+    assert mol.GetAtomWithIdx(centre).GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED, "nothing was written"
+    assert not _names_the_hand(mol, centre), "the writer already agrees with its readers; the premise is gone"
+
+
+@pytest.mark.parametrize("smiles", [_DATIVE_S, _DATIVE_S_LAST, _COVALENT_S])
+def test_a_tag_written_from_3d_names_its_own_geometry_in_the_readers_bond_order(smiles):
+    """THE CONTRACT. Whatever the bond types, the tag left behind names the hand of the conformer it was read from.
+
+    This is what lets one parity rule hold for every tag in the graph without asking where a tag came from:
+    provenance is not recoverable (the SMILES parser leaves no positive marker), and a rule betting either way
+    on a dative bond loses somewhere. Fixing it at the writer means nothing downstream has to bet.
+    """
+    mol = _mol(smiles, seed=0xF00D)
+    centre = _sulfur(mol)
+    assign_stereo_from_3d(mol)
+    assert mol.GetAtomWithIdx(centre).GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED, "nothing was written"
+    assert _names_the_hand(mol, centre), "the tag names the mirror of the geometry it was written from"
+
+
+def test_the_re_base_leaves_a_hypervalent_perception_alone():
+    """It carries the degree-four bound, so a carborane cage vertex keeps whatever symbol the writer gave it.
+
+    The writer reaches those (it drops the dative and tags the remaining four), but the parity arithmetic is
+    refuted above degree four and the embedder truncates such an atom to its first four bonds anyway, so
+    re-basing there would be guessing. Asserted against the door itself, on a mol with a conformer, because
+    the bound only means something if the door is what honours it.
+    """
+    mol = Chem.MolFromSmiles("F[C@](Cl)(Br)(I)->[Pd]", sanitize=False)
+    mol.UpdatePropertyCache(strict=False)
+    Chem.SanitizeMol(mol, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
+    assert rdDistGeom.EmbedMolecule(mol, randomSeed=0xF00D) == 0
+    centre = mol.GetAtomWithIdx(1)
+    assert centre.GetDegree() == 5, "the fixture is not the hypervalent case, so this asserts nothing"
+    assert bond_removal_mirrors(centre, 5) is False, "the predicate itself lost the degree bound"
+
+    raw = Chem.Mol(mol)
+    Chem.AssignStereochemistryFrom3D(raw)
+    assign_stereo_from_3d(mol)
+    written = raw.GetAtomWithIdx(1).GetChiralTag()
+    assert written != Chem.ChiralType.CHI_UNSPECIFIED, "the writer tagged nothing here, so this asserts nothing"
+    assert mol.GetAtomWithIdx(1).GetChiralTag() == written, "the door re-based a hypervalent tag"
 
 
 # ---------------------------------------------------------------------------------------------------------

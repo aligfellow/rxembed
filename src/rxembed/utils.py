@@ -18,6 +18,11 @@ _CARBON_Z = 6
 _SP2_DEGREE = 3  # a planar sp2 centre has exactly three neighbours
 _STEREO_REFS = 2  # a double bond's stereo needs exactly two reference atoms; fewer means surgery orphaned it
 _DISCONNECTED = 1e6  # RDKit's topological distance for atoms in different fragments (it returns ~1e8)
+_TETRAHEDRAL_DEGREE = 4  # the only degree at which a CW/CCW tag has a bond-order parity: see `bond_removal_mirrors`
+_MIRRORED = {  # the two tetrahedral tags; no other ChiralType is a parity over the bond order
+    Chem.ChiralType.CHI_TETRAHEDRAL_CW: Chem.ChiralType.CHI_TETRAHEDRAL_CCW,
+    Chem.ChiralType.CHI_TETRAHEDRAL_CCW: Chem.ChiralType.CHI_TETRAHEDRAL_CW,
+}
 
 
 @dataclass(frozen=True)
@@ -88,6 +93,91 @@ def _dihedral(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) ->
     return float(np.degrees(np.arctan2(np.dot(np.cross(b1, v), w), np.dot(v, w))))
 
 
+def mirror_tag(tag):
+    """Return the tetrahedral tag naming the mirror image of `tag`; anything else passes through unchanged."""
+    return _MIRRORED.get(tag, tag)
+
+
+def bond_removal_mirrors(atom, partner) -> bool:
+    """Whether taking `atom`'s bond to `partner` out of its bond list makes a tag there name the MIRROR.
+
+    A CW/CCW tag is a parity over the atom's OWN bond order (insertion order, ``atom.GetBonds()``), with the
+    fourth reference it does not bond to -- an implicit H, a lone pair, the centre itself -- pinned LAST.
+    Detaching `partner` from slot ``p`` permutes that basis by ``n - 1 - p`` transpositions, so the same symbol
+    names the opposite hand whenever that count is odd. Nothing in RDKit does this for you: neither
+    `RWMol.RemoveBond` nor `RemoveAtom` touches a tag, and `SanitizeMol` only ever drops one.
+
+    Read it on whichever graph still HAS the bond, and it answers both directions: the correction is its own
+    inverse, so it serves a removal (`remove_bond`) and a tag written back across a bond the source graph did
+    not have (`stereo.graft`). An ADDITION needs no counterpart, since `RWMol.AddBond` always appends last,
+    which is the slot the missing reference already occupied.
+
+    Deliberately independent of whether a tag is present, so a centre tagged only later still gets the right
+    basis. Degree four only: four directions from one centre sum to zero, which is what makes the signed
+    volumes alternate and ``n - 1 - p`` predict the hand. A perceived hypervalent centre has no such closure
+    and the arithmetic is refuted there (13/35, anti-correlated, on the eight degree-5 tags in the corpora),
+    so those keep their symbol. Below four the removal leaves no representable tag and the caller clears it.
+    """
+    partners = [b.GetOtherAtomIdx(atom.GetIdx()) for b in atom.GetBonds()]
+    if len(partners) != _TETRAHEDRAL_DEGREE or partner not in partners:
+        return False
+    return (len(partners) - 1 - partners.index(partner)) % 2 == 1
+
+
+def remove_bond(rw, i, j) -> None:
+    """`RWMol.RemoveBond`, with each end's chiral tag left naming the geometry it already named.
+
+    The single door for bond removal in the core, so the `bond_removal_mirrors` rule cannot be forgotten at a
+    new surgery site (`tests/test_init.py` walks the AST to keep it that way). The metal-donor strip is the
+    case that bit: a chiral-at-P donor whose M-L bond sat at an odd slot came back as its own mirror image,
+    silently, with no CIP or valence complaint anywhere. Four centres over three structures, read as a
+    perceived R/S descriptor rather than an RMSD, which cannot tell an inversion from two equivalent donors
+    swapping.
+    """
+    for a, other in ((int(i), int(j)), (int(j), int(i))):
+        atom = rw.GetAtomWithIdx(a)
+        if bond_removal_mirrors(atom, other):
+            atom.SetChiralTag(mirror_tag(atom.GetChiralTag()))
+    rw.RemoveBond(int(i), int(j))
+
+
+def assign_stereo_from_3d(mol, conf_id: int = -1) -> None:
+    """`Chem.AssignStereochemistryFrom3D`, leaving every tag it writes in the basis its readers use.
+
+    The one door for writing stereo from a geometry, because RDKit's 3D writer is the only thing in the
+    toolkit that reads an atom's neighbours differently from everything else: it drops a DATIVE bond whose
+    BEGIN atom is the centre (`Chirality.cpp` `bondAffectsAtomChirality`). The DG embedder, both CIP
+    labellers and the SMILES writer all count that bond. So at a dative-bonded donor the writer produces a
+    parity over a basis nothing downstream reads, and one symbol names opposite hands depending on who is
+    asking: on `Cl[Pd](Cl)(Cl)<-[S@](=O)(C)CC` the SAME geometry gets CIP R from the parsed tag and CIP S
+    from the written one.
+
+    Re-basing here, at the one place the writer is known, is what lets `bond_removal_mirrors` hold for every
+    tag in the graph without asking where a tag came from. Inferring it later cannot work: the parser leaves
+    no positive marker, and a rule betting either way loses (betting "the dative is never in the basis"
+    mirrors the README's dative-SMILES idiom; betting "always" mirrors `LISVIW`'s sulfoxide S).
+
+    It carries `bond_removal_mirrors`' degree-four bound, deliberately: the writer reaches a hypervalent
+    perception too (a carborane cage vertex, where it drops the dative and tags the remaining four), but the
+    parity arithmetic is refuted there and the embedder truncates such an atom to its first four bonds
+    anyway, so those tags are left exactly as they were.
+    """
+    Chem.AssignStereochemistryFrom3D(mol, confId=conf_id)
+    rebased = False
+    for atom in mol.GetAtoms():
+        for bond in atom.GetBonds():
+            if bond.GetBondType() == Chem.BondType.DATIVE and bond.GetBeginAtomIdx() == atom.GetIdx():
+                if bond_removal_mirrors(atom, bond.GetOtherAtomIdx(atom.GetIdx())):
+                    atom.SetChiralTag(mirror_tag(atom.GetChiralTag()))
+                    rebased = True
+    if rebased:
+        # `AssignStereochemistryFrom3D` stamps `_CIPCode` inside itself, from the tag it wrote, so a
+        # re-based atom is left carrying the label of its own mirror until the CIP pass is re-run. Leaving
+        # the mol self-contradictory is worse than the mis-based tag was: `geom_check._cip` reads the
+        # property, not the tag, and reported the mirrored R/S at every dative-bonded donor either way.
+        Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
+
+
 def repair_bond_stereo(mol) -> int:
     """Re-derive (or drop) any bond stereo whose reference atoms were lost to bond surgery; return how many.
 
@@ -113,7 +203,7 @@ def repair_bond_stereo(mol) -> int:
     if not orphaned:
         return 0
     if mol.GetNumConformers():  # re-perceive from the geometry: keeps the E/Z, re-referenced
-        Chem.AssignStereochemistryFrom3D(mol)
+        assign_stereo_from_3d(mol)
     for b in orphaned:  # whatever re-perception could not re-reference carries no information, so drop it
         if len(b.GetStereoAtoms()) != _STEREO_REFS:
             b.SetStereo(Chem.BondStereo.STEREONONE)

@@ -142,11 +142,15 @@ def test_core_reaches_no_further_than_numpy_rdkit_and_its_own_siblings():
     assert not bad, "the tier rule (AGENTS.md) is broken:\n  " + "\n  ".join(bad)
 
 
-def test_the_perception_leaf_imports_nothing_from_rxembed():
+def test_the_perception_leaf_reaches_no_further_than_the_shared_leaf():
     """`pipeline/perceive.py` is the bottom of the stack: importing back up re-forms the cycle it broke.
 
     It was split out precisely to break metal -> dispatch -> metal, and an import in this direction is how
-    that would come back; silently, since the dev environment imports both halves anyway.
+    that would come back; silently, since the dev environment imports both halves anyway. `rxembed.utils` is
+    the one exemption and cannot re-form it, being the numpy + rdkit leaf that imports no sibling of its own.
+    It is exempt because perception WRITES stereo tags, and the rule for writing one (a tag is a parity over
+    a bond order, and RDKit's 3D writer uses a different one from every reader) has to live in a single
+    place or it drifts; that is the same reason `utils.remove_bond` is the only bond removal in the core.
     """
     leaf = _SRC / "pipeline" / "perceive.py"
     reaches = []
@@ -155,7 +159,9 @@ def test_the_perception_leaf_imports_nothing_from_rxembed():
             reaches += [a.name for a in node.names if a.name.split(".")[0] == "rxembed"]
         elif isinstance(node, ast.ImportFrom) and (node.level or (node.module or "").startswith("rxembed")):
             reaches.append("." * node.level + (node.module or ""))  # a relative import here IS an rxembed one
-    assert not reaches, f"pipeline/perceive.py must import nothing from rxembed -> {sorted(reaches)}"
+    assert not set(reaches) - {"rxembed.utils"}, (
+        f"pipeline/perceive.py may import rxembed.utils and nothing else -> {sorted(reaches)}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -171,6 +177,75 @@ def test_the_perception_leaf_imports_nothing_from_rxembed():
 def test_the_rule_bites(escape, why):
     """A gate nobody has seen fail is enforcing nothing, so check it against each escape it exists to stop."""
     assert _tier_violations(pathlib.Path("relax.py"), escape), why
+
+
+# ---------------------------------------------------------------------------------------------------------
+# One door for bond removal, so the chiral-tag parity rule cannot be forgotten at a new surgery site
+# ---------------------------------------------------------------------------------------------------------
+
+
+def _direct_bond_removals(rel, src):
+    """Report every raw ``RWMol.RemoveBond`` call in `src`, which `utils.remove_bond` is there to replace."""
+    return [
+        f"{rel}:{n.lineno}"
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "RemoveBond"
+    ]
+
+
+def test_utils_remove_bond_is_the_only_bond_removal_in_core():
+    """A chiral tag is a parity over the atom's bond order, and `RWMol.RemoveBond` does not know that.
+
+    The defect's real shape is "someone adds a bond removal and does not know a tag is a parity", and it is
+    invisible to every test that does not measure a hand: no CIP complaint, no valence complaint, a
+    plausible-looking geometry that is the mirror image. Making `utils.remove_bond` the only door turns that
+    from vigilance into a failing build.
+    """
+    bad = [
+        v
+        for p in _core_modules()
+        if p.name != "utils.py"  # the door itself is the one RemoveBond, and it re-bases both ends first
+        for v in _direct_bond_removals(p.relative_to(_SRC), p.read_text())
+    ]
+    assert not bad, "these bond removals bypass the chiral-tag rule (use utils.remove_bond):\n  " + "\n  ".join(bad)
+
+
+def test_the_bond_removal_rule_bites():
+    """A gate nobody has seen fail is enforcing nothing."""
+    assert _direct_bond_removals(pathlib.Path("relax.py"), "def f(rw):\n    rw.RemoveBond(1, 2)")
+
+
+def _direct_stereo_writes(rel, src):
+    """Report every raw ``AssignStereochemistryFrom3D`` call, which `utils.assign_stereo_from_3d` replaces."""
+    return [
+        f"{rel}:{n.lineno}"
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "AssignStereochemistryFrom3D"
+    ]
+
+
+def test_utils_assign_stereo_from_3d_is_the_only_stereo_writer():
+    """The other half of the same rule: RDKit's 3D writer uses a bond order none of its readers use.
+
+    It drops a dative bond leaving the centre; the embedder, both CIP labellers and the SMILES writer count
+    it. So a raw call writes a tag that means the mirror to everything downstream, at every dative-bonded
+    donor, with no complaint from anything. The door re-bases it at the writer, where the provenance is known
+    and nothing has to guess it later. Covers `pipeline/` too, since two of the three writers live there.
+    """
+    bad = [
+        v
+        for p in sorted(_SRC.rglob("*.py"))
+        if p.name != "utils.py"  # the door itself is the one raw call
+        for v in _direct_stereo_writes(p.relative_to(_SRC), p.read_text())
+    ]
+    assert not bad, "these stereo writes bypass the re-base (use utils.assign_stereo_from_3d):\n  " + "\n  ".join(bad)
+
+
+def test_the_stereo_writer_rule_bites():
+    """A gate nobody has seen fail is enforcing nothing."""
+    assert _direct_stereo_writes(pathlib.Path("relax.py"), "def f(m):\n    Chem.AssignStereochemistryFrom3D(m)")
 
 
 def test_every_module_has_exactly_one_test_file_named_for_it():

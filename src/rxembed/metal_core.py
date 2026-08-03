@@ -27,7 +27,7 @@ from .metal_polyhedron import (
     vertex_dirs,
 )
 from .metal_polyhedron import describe as _describe
-from .utils import repair_bond_stereo
+from .utils import bond_removal_mirrors, remove_bond, repair_bond_stereo
 
 logger = logging.getLogger("rxembed.metal")  # spelled out, not __name__ ("rxembed.metal_core"): this is
 #   the name `set_verbose` configures and every caplog filter in the suite matches.
@@ -128,6 +128,9 @@ def donor_chirality_sign(mol, cid, donor):
 
     Neighbour order is stable for a fixed mol, so the sign is comparable across that mol's conformers. Used
     to cull a conformer whose labile donor inverted, via a relax, re-embed or mc stray, off its enumerated hand.
+
+    The sign is RDKit's own convention, negative for `CHI_TETRAHEDRAL_CW`, and holds at degree 3 as at degree
+    4 (the fourth reference is then the centre itself, which leaves the triple product unchanged).
     """
     nbrs = [n.GetIdx() for n in mol.GetAtomWithIdx(donor).GetNeighbors()]
     if len(nbrs) < _MIN_STEREO_NEIGHBOURS:
@@ -136,6 +139,51 @@ def donor_chirality_sign(mol, cid, donor):
     p = np.array([list(conf.GetAtomPosition(i)) for i in [donor, nbrs[0], nbrs[1], nbrs[2]]])
     v = float(np.dot(np.cross(p[1] - p[0], p[2] - p[0]), p[3] - p[0]))
     return int(np.sign(v)) if abs(v) > 1e-6 else None  # noqa: PLR2004  a near-planar centre has no hand
+
+
+_HAND_TAG = {  # `donor_chirality_sign` -> the tag naming that hand in the atom's current bond order
+    -1: Chem.ChiralType.CHI_TETRAHEDRAL_CW,
+    +1: Chem.ChiralType.CHI_TETRAHEDRAL_CCW,
+}
+
+
+def _retag(mol, hands, ambiguous):
+    """Re-apply each stripped donor's tetrahedral tag, in the bond order the strip left behind.
+
+    `ambiguous` names the donors whose carried symbol does not determine a hand; there the geometry decides.
+    """
+    # Needed at all because the lenient sanitize drops a tag off any donor it types non-SP3, and
+    # `repair_bond_stereo`'s AssignStereochemistryFrom3D wipes one it then refuses to re-derive below degree
+    # 4. So the caller runs this last.
+    #
+    # `remove_bond` re-based every tag in `hands` as it took the M-L bond out, which is the whole answer
+    # wherever the incoming basis was known. It is not known for a DATIVE M-L bond at an odd slot, and only
+    # there: RDKit's 3D writer leaves that bond out of the basis and its SMILES parser counts it, so the two
+    # bases name opposite hands and the graph does not record which was used. `utils.assign_stereo_from_3d`
+    # settles it for every tag rxembed writes, but RDKit's own molblock reader writes tags too, so a Mol can
+    # arrive already mis-based and no predicate over the graph can tell. A conformer can. Consulting it HERE
+    # and only here costs the caller a declared hand at that one shape instead of at every donor, which is
+    # what the previous unconditional measure did, silently and with no log line.
+    for d, carried in hands.items():
+        atom = mol.GetAtomWithIdx(d)
+        if carried == Chem.ChiralType.CHI_UNSPECIFIED or atom.GetDegree() < _MIN_STEREO_NEIGHBOURS:
+            continue
+        decided = carried
+        if d in ambiguous and mol.GetNumConformers():
+            decided = _HAND_TAG.get(donor_chirality_sign(mol, -1, d), carried)
+        atom.SetChiralTag(decided)
+
+
+def _basis_is_ambiguous(mol, donor, metal) -> bool:
+    """Whether `donor`'s carried tag could equally be a parity with or without its bond to `metal`.
+
+    True exactly when that bond is DATIVE, leaves the donor, and sits at a slot the removal would mirror.
+    Anywhere else both of RDKit's conventions agree, so the symbol names one hand and is honoured as given.
+    """
+    bond = mol.GetBondBetweenAtoms(int(donor), int(metal))
+    if bond is None or bond.GetBondType() != Chem.BondType.DATIVE or bond.GetBeginAtomIdx() != int(donor):
+        return False
+    return bond_removal_mirrors(mol.GetAtomWithIdx(int(donor)), int(metal))
 
 
 _DUMMY_M_LO, _DUMMY_M_HI = 0.8, 1.8  # Å: pin the hold-dummy D near the metal (~ the coordinate-bond / lone-pair side)
@@ -238,10 +286,14 @@ def surrogate_metal(mol):
         raise ValueError("no transition metal found")
     donors = [n.GetIdx() for n in mol.GetAtomWithIdx(m).GetNeighbors()]
     em = Chem.RWMol(mol)
+    hands = {}  # donor -> the tag it must carry in the bond order the strip leaves behind
+    ambiguous = {d for d in donors if _basis_is_ambiguous(em, d, m)}  # read BEFORE the bond goes
     for d in donors:
-        em.RemoveBond(d, m)
-        _clear_labile_donor_stereo(em.GetAtomWithIdx(d))  # a donor that's a stereocentre only while bound
-        em.GetAtomWithIdx(d).SetNoImplicit(True)  # freeze donor H count so MC (openconf) adds none
+        remove_bond(em, d, m)  # re-bases the tag: an M-L bond at an odd slot mirrors the symbol it leaves
+        a = em.GetAtomWithIdx(d)
+        _clear_labile_donor_stereo(a)  # a donor that's a stereocentre only while bound
+        a.SetNoImplicit(True)  # freeze donor H count so MC (openconf) adds none
+        hands[d] = a.GetChiralTag()
     real_z = em.GetAtomWithIdx(m).GetAtomicNum()
     a = em.GetAtomWithIdx(m)
     real_q = a.GetFormalCharge()  # the oxidation state: zeroed here, handed back by `restore_metal`
@@ -252,15 +304,12 @@ def surrogate_metal(mol):
     # tetrahedral would crash ETKDG with 'nbrs.size() >= 3'.
     a.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
     out = em.GetMol()
-    donor_tags = {d: out.GetAtomWithIdx(d).GetChiralTag() for d in donors}  # re-applied below; sanitize drops them
     # Lenient (no valence checks), the same tolerance the reader admitted this structure under and the same as
     # `surrogate_all_metals`; a strict sanitize would reject what perception waived (a quinoid ring, a BPh4-).
     Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
     out.UpdatePropertyCache(strict=False)
     repair_bond_stereo(out)  # the strip can orphan a C=N whose reference atom was the metal; see there
-    for d, t in donor_tags.items():
-        if t != Chem.ChiralType.CHI_UNSPECIFIED:
-            out.GetAtomWithIdx(d).SetChiralTag(t)
+    _retag(out, hands, ambiguous)  # last: the lenient sanitize and `repair_bond_stereo` both wipe atom tags
     return out, m, donors, real_z, real_q
 
 
@@ -325,7 +374,7 @@ def disconnect_metal(mol):
         return mol
     rw = Chem.RWMol(mol)
     for a, b in dative:
-        rw.RemoveBond(a, b)
+        remove_bond(rw, a, b)
     out = rw.GetMol()
     out.UpdatePropertyCache(strict=False)
     return out
@@ -462,7 +511,7 @@ def dative_smiles(mol):
         if pos is not None:  # without a geometry the graph order is all there is to go on
             nbrs.sort(key=lambda n: float(np.sum((pos[n] - pos[h]) ** 2)))
         for n in nbrs[1:]:
-            rw.RemoveBond(h, n)
+            remove_bond(rw, h, n)  # re-seats the bond LAST at `n`, so the partner's tag moves basis with it
             rw.AddBond(h, n, Chem.BondType.DATIVE)  # H donates: a dative bond spends the END atom's valence
 
     out = rw.GetMol()
@@ -558,14 +607,17 @@ def surrogate_all_metals(mol):
     if not idxs:
         raise ValueError("no transition metal found")
     em = Chem.RWMol(mol)
-    metals = []
+    metals, hands, ambiguous = [], {}, set()
     for m in idxs:
         metals.append((m, em.GetAtomWithIdx(m).GetAtomicNum(), em.GetAtomWithIdx(m).GetFormalCharge()))
         for d in [n.GetIdx() for n in em.GetAtomWithIdx(m).GetNeighbors()]:
-            if em.GetBondBetweenAtoms(d, m) is not None:
-                em.RemoveBond(d, m)
-            _clear_labile_donor_stereo(em.GetAtomWithIdx(d))  # stale tag on a now-<3-nbr donor crashes ETKDG
-            em.GetAtomWithIdx(d).SetNoImplicit(True)
+            if _basis_is_ambiguous(em, d, m):  # read BEFORE the bond goes, as in `surrogate_metal`
+                ambiguous.add(d)
+            remove_bond(em, d, m)  # as in `surrogate_metal`; a bridging donor's two strips compose here
+            a = em.GetAtomWithIdx(d)
+            _clear_labile_donor_stereo(a)  # stale tag on a now-<3-nbr donor crashes ETKDG
+            a.SetNoImplicit(True)
+            hands[d] = a.GetChiralTag()
         a = em.GetAtomWithIdx(m)
         a.SetAtomicNum(SURROGATE)
         a.SetNoImplicit(True)
@@ -574,6 +626,7 @@ def surrogate_all_metals(mol):
     out = em.GetMol()
     Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
     out.UpdatePropertyCache(strict=False)
+    _retag(out, hands, ambiguous)
     return out, metals
 
 

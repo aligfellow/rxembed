@@ -143,6 +143,25 @@ def test_a_pendant_double_bond_is_not_locked_just_because_a_metal_is_present():
     assert stereo._coordination_locked_double_bonds(mol, metals) == set()
 
 
+def test_the_metal_strip_and_the_graft_are_exact_inverses_at_a_defined_donor():
+    """A DEFINED donor tag must survive the enumeration round trip verbatim, at an odd slot as at an even one.
+
+    `_build_enumeration_graph` re-bases each donor's tag onto the stripped bond order and `graft` writes the
+    enumerated tag back across a bond the full mol still has, so the two are one correction and its inverse.
+    They have to move together: correcting only the strip inverts every enumerated hand at an odd slot, and
+    no `.xyz` fixture reaches this route to notice (`_load_in_ligand_stereo` returns None whenever the input
+    carries a conformer, and every corpus entry is an `.xyz`).
+    """
+    for smiles in ("Cl[Pd](Cl)(Cl)<-[P@](C)(CC)C(C)(N)O", "[P@](C)(CC)(C(C)(N)O)->[Pd](Cl)(Cl)Cl"):
+        mol, metals = _with_metals(smiles)
+        donor = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "P")
+        declared = mol.GetAtomWithIdx(donor).GetChiralTag()
+        variants, n_unassigned, _total, _unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
+        assert n_unassigned == 1, f"{smiles}: the carbon centre was not enumerated, so this asserts nothing"
+        for vmol, _label in variants:
+            assert vmol.GetAtomWithIdx(donor).GetChiralTag() == declared, smiles
+
+
 def test_with_no_metal_to_exclude_the_enumeration_graph_is_the_molecule_itself():
     """Nothing to disconnect means nothing to cap, so the metal path never copies or re-sanitises an organic input."""
     mol = _mol("CC(N)C(=O)O")

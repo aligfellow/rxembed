@@ -40,6 +40,7 @@ from rxembed.utils import (
     _dihedral,
     _positions,
     _rcov,
+    assign_stereo_from_3d,
     conjugated_quartets,
 )
 
@@ -408,7 +409,9 @@ def _attr(obj, name, default):
 
 def _cip(mol, conf_id: int = -1) -> dict[int, str]:
     m = Chem.Mol(mol)
-    Chem.AssignStereochemistryFrom3D(m, confId=conf_id if conf_id >= 0 else m.GetNumConformers() - 1)
+    # through `utils`: the CIP labeller counts a dative bond leaving the centre and RDKit's 3D writer does
+    # not, so reading a label off a raw write mirrors the R/S at every dative-bonded donor.
+    assign_stereo_from_3d(m, conf_id if conf_id >= 0 else m.GetNumConformers() - 1)
     out = {}
     for atom in m.GetAtoms():
         if atom.HasProp("_CIPCode"):

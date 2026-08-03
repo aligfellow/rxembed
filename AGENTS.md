@@ -116,8 +116,13 @@ constraints by 48°. When you fix a defect the suite missed, add the test that w
 decisive triage signal for a test is mutation: break the code it names; if it still passes, it asserts
 nothing.
 
-**Numbers come from `benchmark/`.** 45 measured structures, a committed baseline, one command. Re-run it after
-any change to `bounds.py`, `mechanisms.py` or the `metal_*` stack, and argue from the table.
+**Numbers come from `benchmark/`.** 45 measured structures, a baseline, one command. Re-run it after any
+change to `bounds.py`, `mechanisms.py` or the `metal_*` stack, and argue from the table.
+
+`benchmark/` is a **local-only harness** and is gitignored: it is not on `main`, not in the wheel, and CI
+does not run it. It holds crystal geometries that are not ours to redistribute. Nothing in `src/` or `tests/`
+reads it, so a clone without it is fully testable — but a claim of the form "this improved fidelity" is not
+checkable without it. If you do not have it, say a number is unmeasured rather than inventing one.
 
 ## The development loop
 
@@ -149,7 +154,7 @@ assess → plan → implement → adversarial robustness review → edge-case re
 | `just test` | the suite. It must stay green. |
 | `tests/test_init.py` | the tier rule, by AST walk: no core→`pipeline` edge, no absolute self-reference in core, nothing outside stdlib + numpy + rdkit, at any nesting depth. It carries its own bite check |
 | `tests/pipeline/test_init.py` | every optional import in `pipeline/` is guarded and names the extra that installs it |
-| `benchmark/run.py` | coordination fidelity against 45 known geometries, versus a committed baseline |
+| `benchmark/run.py` | coordination fidelity against 45 known geometries, versus a baseline. Local-only, not in CI |
 
 **Three kinds of test, and a fourth that does not belong here.** Unit (one module, a contract) and
 integration (the chain, end to end) belong; measurement does not. A flag rate, a percentage, an average, or a
@@ -190,6 +195,18 @@ had drifted into five extra files before it was enforced.
 | a new search backend / calculator / QA check / input format | `pipeline/{search,calculators,geom_check,perceive}.py` |
 | a new optional dependency | an extra in `pyproject.toml` + a guarded import at the point of use |
 | a measured number | `benchmark/` |
+
+---
+
+## Commits
+
+**No AI attribution, ever.** No `Co-Authored-By` naming an assistant, no "generated with" line, no session
+URL, no tool name in the message or the trailer. The history is the maintainer's. If your harness adds one by
+default, strip it — and check a cherry-pick or rebase has not carried one in from the commit it copied, which
+is how one slipped through on 2026-08-03.
+
+Squash before landing. `main` is a linear history of self-contained changes, not a development log: state
+what changed and why it is right, and put the number next to the code rather than in the message.
 
 ---
 

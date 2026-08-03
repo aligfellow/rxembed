@@ -8,18 +8,18 @@ Every capability (a bare SMILES, a frozen TS core, an NCI grip, a coordination i
 `Constraints` struct, and that struct drives both halves of the engine.
 
 ```
-  fix= / constrain= / template=              rx.metal(…) / an Isomer
+  fix= / constrain= / template=        enumerate_isomers(…) / an Isomer
               │                                        │
     constraints.resolve_core                  metal_coordination.py
               │                                └ metal_polyhedron · metal_distance
               │                                  metal_donor_orient · metal_sphere
               └───────────────┬────────────────────────┘
                               ▼
-                     ┌────────────────┐   distances · angles · planes · coplanar · frozen
-                     │  Constraints   │   + the metal fields (metals · pulls · floors ·
-                     └────────────────┘     dg_floors · shapes · phantoms · haptic)
+                     ┌────────────────┐   distances · angles · planes · coplanar · frozen · contacts
+                     │  Constraints   │   + the metal fields (metals · pulls · floors · dg_floors ·
+                     └────────────────┘     shapes · phantoms · spheres · haptic)
                               ▼
-                     ┌────────────────┐   one class per field, holding both of its writers
+                     ┌────────────────┐   11 classes over those 14 fields, each holding both writers
                      │  mechanisms    │   co-located so a field cannot gain one and not the other
                      └────────────────┘
                         ╱                 ╲
@@ -60,7 +60,7 @@ exactly this reason: a subdirectory cannot signal a tier when both tiers are sub
 | module | job |
 |---|---|
 | `constraints.py` | the `Constraints` struct + `resolve_core`, the `fix`/`constrain` resolver |
-| `mechanisms.py` | one class per field: its DG writer and its FF writer, together |
+| `mechanisms.py` | each class holds its DG writer and its FF writer together; 11 cover the 14 fields |
 | `bounds.py` | the DG driver: edit RDKit's knowledge-derived matrix, smooth, ETKDG |
 | `relax.py` | the FF driver: `restrained_uff`, `ff_energies`, the `bonding_ok` arbiter |
 | `embed.py` | the front door: `embed(spec, …) -> Conformers`, and the stiffness ladder |
@@ -83,14 +83,15 @@ core extra.
 
 | module | job | extra |
 |---|---|---|
-| `ensemble.py` | `Ensemble` / `EnsembleSet` / `wrap`: the chain | via the others |
+| `api.py` | the public verbs: `embed` · `metal` · `minimize` · `wrap`. `rx.metal` is `dispatch.enumerate_isomers` under its pipeline name, so it has no `def` of its own to grep for | via the others |
+| `ensemble.py` | `Ensemble` / `EnsembleSet`: the chain | via the others |
 | `dispatch.py` | source + spec → embedded conformers (metal / template / stereo / NCI routes) | via the others |
 | `search.py` | openconf Monte-Carlo, `mc()` | `search` |
 | `select.py` | dedup, prune, cluster, the latent | `select` |
 | `calculators.py` | xtb / g-xTB / ASE, `score()` and `optimize()` | `score` |
 | `metrics.py` | connectivity + coordination diffs, behind `.filter('connectivity')` | `perceive` |
 | `stereo_check.py` | the chirality fingerprint + the preserve gate | `perceive` |
-| `perceive.py` | `.xyz` / SMILES readers (imports nothing from `rxembed`) | `perceive` |
+| `perceive.py` | `.xyz` / SMILES readers (reaches no further than `rxembed.utils`) | `perceive` |
 | `nci.py` | the `KINDS` registry + binding modes | `nci` |
 | `viz.py` | the 2D projection behind `landscape()`, kept-vs-pruned | `viz` |
 | `geom_check.py` | the TS- and metal-aware geometry gate | none, see below |
@@ -130,7 +131,11 @@ installed. `rxembed.pipeline` re-exports every core name, so it is a strict supe
 ```
 
 Perception is upstream. A source becomes an RDKit `Mol` before the engine sees it, in
-`pipeline/perceive.py`, which imports nothing from `rxembed`, so the direction cannot quietly invert.
+`pipeline/perceive.py`, which reaches no further than `rxembed.utils` — the leaf of RDKit facts that holds no
+domain knowledge. It takes exactly one name from there, `assign_stereo_from_3d`, because the door that writes
+stereo from a geometry has to be the same door on both tiers: RDKit's 3D writer omits a dative bond from the
+chirality basis that every reader counts, so two doors would disagree about which bonds a tag is a parity
+over. `tests/test_init.py` pins that boundary, so the direction cannot quietly invert.
 Bond-and-charge perception for metals and stretched TS bonds is xyzgraph's job. rxembed reads a graph, it
 does not guess one.
 

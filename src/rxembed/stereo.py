@@ -15,7 +15,7 @@ from rdkit.Chem.EnumerateStereoisomers import (
     StereoEnumerationOptions,
 )
 
-from .utils import repair_bond_stereo
+from .utils import bond_removal_mirrors, mirror_tag, remove_bond, repair_bond_stereo
 
 
 def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
@@ -89,7 +89,7 @@ def _coordination_locked_double_bonds(mol, metals):
     free = Chem.RWMol(mol)  # the metal-free graph: which double bonds are still cyclic without the metal?
     for m in sorted(metals, reverse=True):
         for nb in [n.GetIdx() for n in free.GetAtomWithIdx(m).GetNeighbors()]:
-            free.RemoveBond(m, nb)
+            remove_bond(free, m, nb)
     free = free.GetMol()
     Chem.FastFindRings(free)
     locked = set()
@@ -145,7 +145,7 @@ def _build_enumeration_graph(mol, exclude):
     for mi in exclude:
         z_metal = mol.GetAtomWithIdx(mi).GetAtomicNum()
         for nb in [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()]:
-            work.RemoveBond(mi, nb)
+            remove_bond(work, mi, nb)  # re-base the donor's tag onto the stripped order; `graft` inverts it
             if mol.GetAtomWithIdx(nb).GetHybridization() == Chem.HybridizationType.SP3:
                 d = work.AddAtom(Chem.Atom(1))
                 work.GetAtomWithIdx(d).SetIsotope(2)  # deuterium
@@ -227,8 +227,17 @@ def enumerate_unassigned(mol, cap=32, exclude=()):
     def graft(wv):  # copy the enumerated ligand stereo (atom parity + E/Z) onto the FULL mol; skip the D caps
         full = Chem.Mol(mol)
         for a in wv.GetAtoms():
-            if a.GetIdx() < n_real:  # a real atom (not an appended D)
-                full.GetAtomWithIdx(a.GetIdx()).SetChiralTag(a.GetChiralTag())
+            if a.GetIdx() >= n_real:  # an appended D cap has no counterpart on the full mol
+                continue
+            fa = full.GetAtomWithIdx(a.GetIdx())
+            # `work` is `mol` with each M-donor bond removed, so a tag enumerated there is in the STRIPPED
+            # bond order; writing it back across a bond the full mol still has is the inverse re-basing. The
+            # D cap does not enter it: appended last, it stands in the slot the metal's removal vacated.
+            tag = a.GetChiralTag()
+            for mi in exclude:
+                if bond_removal_mirrors(fa, mi):
+                    tag = mirror_tag(tag)
+            fa.SetChiralTag(tag)
         for b in wv.GetBonds():
             i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
             # skip a coordination-locked bond: its `work` stereo is the arbitrary lock value, not a real hand;

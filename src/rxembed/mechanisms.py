@@ -1,4 +1,10 @@
-"""One class per constraint field, holding its distance-geometry writer and its force-field writer together.
+"""Each mechanism holds its distance-geometry writer and its force-field writer together.
+
+Eleven classes over the fourteen `Constraints` fields, not one apiece. Eight fields have a class to
+themselves; `Floor` and `Coplanar` read four each, because those fields are only meaningful together. Two
+fields are read nowhere here: `contacts` is released a pass at a time by the driver (`embed.py`), and
+`haptic` is a recipe the transient centroid dummies are materialised from before a mechanism runs, which is
+why the class named `Haptic` reads `phantoms` and not it.
 
 Every field is written twice, as an edit to the ETKDG bounds matrix and as a restrained-UFF term.
 Co-locating the two halves is what stops them drifting into a field with a DG bound and no matching FF

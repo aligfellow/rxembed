@@ -19,6 +19,7 @@ from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers
 
 from . import mechanisms as _mech
 from .metal_core import _METAL_Z, materialise_phantoms
+from .utils import remove_bond
 
 FF_SURROGATE = (
     3  # lithium: a bond-less UFF-typeable surrogate carrying only a vdW term, a soft sphere holding non-donors
@@ -110,7 +111,7 @@ def _bond_pruned(mol, frozen):
     for a in frozen:
         rw.GetAtomWithIdx(a).SetNoImplicit(True)  # dropping a bond must not sprout an implicit H
     for i, j in ff_bonds:
-        rw.RemoveBond(i, j)
+        remove_bond(rw, i, j)
     out = rw.GetMol()
     Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
     out.UpdatePropertyCache(strict=False)

@@ -2,13 +2,20 @@
 
 Input adaptation only: no constraints, no embedding. This is the leaf the embed dispatch and the metal
 isomer load-in hand a user source to before the core `embed()` engine (which already takes a Mol)
-ever sees it. It imports nothing from ``rxembed``, only rdkit, with xyzgraph an optional guarded extra that
-``_xyz_to_mol`` falls back from to RDKit's own perception, so it forms no import cycle.
+ever sees it, with xyzgraph an optional guarded extra that ``_xyz_to_mol`` falls back from to RDKit's own
+perception.
+
+It reaches back into ``rxembed`` for exactly one thing, ``utils``, the numpy + rdkit leaf that imports no
+sibling: writing a stereo tag is the one job here that has a correctness rule attached, and duplicating that
+rule is how it drifts. Nothing else, because the cycle this module was split out to break
+(metal -> dispatch -> metal) comes back through any import with a sibling behind it.
 """
 
 from __future__ import annotations
 
 from rdkit import Chem
+
+from rxembed.utils import assign_stereo_from_3d
 
 _AROMATIC_BO_TOL = 0.25  # |bond_order - 1.5| within this reads as aromatic
 
@@ -71,10 +78,10 @@ def _xyz_to_mol(path, charge=0):
         mol, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True
     )  # rings yes, valence checks no
     try:
-        Chem.AssignStereochemistryFrom3D(mol)  # point R/S + E/Z from the geometry -> graph tags,
-    except Exception:  # so the embed preserves them exactly as it would
-        pass  # for a SMILES @/@@ (an .xyz behaves like SMILES)
-    return mol
+        assign_stereo_from_3d(mol)  # point R/S + E/Z from the geometry -> graph tags, so the embed
+    except Exception:  # preserves them exactly as it would for a SMILES @/@@ (an .xyz behaves like SMILES).
+        pass  # Through `utils`, because the sanitize above has already rewritten M-L bonds as dative and
+    return mol  # RDKit's 3D writer alone leaves those out of the tag's basis; see there.
 
 
 def parse_smiles(smi):
