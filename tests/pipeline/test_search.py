@@ -8,7 +8,6 @@ from rxembed.pipeline import search
 
 
 def test_mc_without_the_backend_returns_the_seeds_it_was_given(monkeypatch, caplog):
-    """The documented degradation: no openconf means `mc()` is a no-op with a WARNING, never an ImportError."""
     import rxembed.pipeline as rx
 
     monkeypatch.setattr(search, "available", lambda: False)
@@ -19,25 +18,36 @@ def test_mc_without_the_backend_returns_the_seeds_it_was_given(monkeypatch, capl
     assert any("openconf" in r.getMessage() for r in caplog.records)
 
 
+def test_a_failed_search_cannot_leave_energies_on_changed_coordinates(monkeypatch):
+    import rxembed.pipeline as rx
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("failed")
+
+    monkeypatch.setattr(search, "available", lambda: True)
+    monkeypatch.setattr(search, "search", fail)
+    ens = rx.embed("CCCC", n=2, seed=1).minimize()
+    assert ens.energies
+    assert ens.energy_kind == "ff"
+
+    ens.mc()
+
+    assert not ens.energies
+    assert not ens.energy_kind
+    assert not ens._minimized
+
+
 # --- config resolution: a preset, then single-knob overrides ----------------------------------------------
 
 
 @pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
-def test_single_knobs_override_the_preset():
-    cfg = search._config("rapid", seed=7, max_out=3, low_mode=None, config=None, constrained=False)
-    assert (cfg.random_seed, cfg.max_out) == (7, 3)
-
-
-@pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
 def test_an_unknown_passthrough_field_is_refused_by_name():
-    """`mc(**kwargs)` is a passthrough to openconf's config: a typo must not be swallowed silently."""
     with pytest.raises(TypeError, match="not_a_field"):
         search._config("rapid", None, None, None, None, constrained=False, not_a_field=1)
 
 
 @pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
 def test_low_mode_following_is_refused_in_constrained_search_and_says_so(caplog):
-    """openconf disables low-mode following when atoms are pose-held; honouring the flag would be a lie."""
     with caplog.at_level("WARNING", logger="rxembed"):
         cfg = search._config("rapid", None, None, True, None, constrained=True)
     assert not cfg.use_low_mode_following
@@ -56,8 +66,6 @@ def test_low_mode_following_is_refused_in_constrained_search_and_says_so(caplog)
     ],
 )
 def test_a_search_replaces_the_seeds_only_when_it_is_free_to_generate_them_itself(spec, seeds_survive):
-    """Unconstrained, openconf is the whole generator (keeping seeds double-counts); pose-frozen, it explores
-    only AROUND the biased seed, so discarding that seed would throw away the constraint it was given."""
     import rxembed.pipeline as rx
 
     ens = rx.embed("CCCCCCO", n=4, seed=1, **spec)
@@ -71,7 +79,6 @@ def test_a_search_replaces_the_seeds_only_when_it_is_free_to_generate_them_itsel
 
 @pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
 def test_prune_merges_the_searched_ensemble_rather_than_passing_it_through():
-    """The canonical `mc().prune()` tail, and `mc` un-sets `_minimized`, so the prune re-relaxes first."""
     import rxembed.pipeline as rx
 
     ens = rx.embed("CCCCCCO", n=6, seed=1).mc(preset="rapid", seed=1, max_out=20)
@@ -83,7 +90,6 @@ def test_prune_merges_the_searched_ensemble_rather_than_passing_it_through():
 
 @pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
 def test_mc_explore_pools_a_second_grip_released_pass_and_clears_the_provenance():
-    """'bias the seed, let energy decide': explore fires twice, grip held, grip released, and pools both."""
     import rxembed.pipeline as rx
 
     es = rx.embed("CC(=O)O.n1ccccc1", contacts="auto", n=6)

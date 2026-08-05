@@ -19,7 +19,7 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import GetPeriodicTable
 
-from rxembed.metal_core import _METAL_Z
+from rxembed.metal_core import COORDINATION_METALS
 from rxembed.relax import bonding_ok
 
 __all__ = ["bonding_ok", "connectivity", "coordination_changed", "describe"]
@@ -34,7 +34,7 @@ _MIN_TOPO = 3  # a new bond needs its atoms >= this many bonds apart: a 1-2 pair
 
 def _metal_indices(mol, extra=frozenset()):
     """Metal atom indices by element, plus any ``extra``; a bond-stripped carbon surrogate is not one."""
-    return {a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _METAL_Z} | set(extra)
+    return {a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS} | set(extra)
 
 
 def _perceive(mol, conf_id, charge=0, elements=None):

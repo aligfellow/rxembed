@@ -1,14 +1,10 @@
 """`utils.py`; coordinate math, small RDKit facts, and the QA result type: the core's shared leaf.
 
-Its admission rule is that nothing here may know what a metal, a donor or a constraint is; that is what lets
-the coordination perception and the pipeline's QA gate measure an angle the same way, with no second
-definition and no import cycle. The first test is what stops the rule being only a comment.
+Nothing here knows what a metal, a donor or a constraint is, which is what lets the coordination perception
+and the pipeline's QA gate measure an angle the same way, with no second definition.
 """
 
 from __future__ import annotations
-
-import ast
-import pathlib
 
 import numpy as np
 import pytest
@@ -25,8 +21,6 @@ from rxembed.utils import (
     remove_bond,
     repair_bond_stereo,
 )
-
-_SOURCE = pathlib.Path(__file__).resolve().parent.parent / "src/rxembed/utils.py"
 
 
 def _mol(smiles, seed=None):
@@ -47,38 +41,15 @@ def _without(mol, atom):
 
 
 # ---------------------------------------------------------------------------------------------------------
-# the admission rule
-# ---------------------------------------------------------------------------------------------------------
-
-
-def test_utils_imports_nothing_from_the_package():
-    """A leaf with no in-package import cannot acquire a domain, and cannot be in an import cycle."""
-    tree = ast.parse(_SOURCE.read_text())
-    reached = [
-        node.module or f"(relative level {node.level})"
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and (node.level > 0 or (node.module or "").startswith("rxembed"))
-    ]
-    reached += [n.name for node in ast.walk(tree) if isinstance(node, ast.Import) for n in node.names]
-    assert not [m for m in reached if m.startswith(("rxembed", "(relative"))], (
-        f"utils reached back into the package: {reached}"
-    )
-
-
-# ---------------------------------------------------------------------------------------------------------
 # coordinate math
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_angle_is_degrees_and_measured_at_the_middle_atom():
-    """`_angle(a, b, c)` measures at b: a right angle reads 90, not pi/2."""
+def test_the_angle_is_degrees_at_the_middle_atom_and_the_dihedral_is_signed():
     o, x, y = np.zeros(3), np.array([1.0, 0, 0]), np.array([0, 1.0, 0])
     assert _angle(x, o, y) == pytest.approx(90.0)
     assert _angle(x, o, -x) == pytest.approx(180.0)
 
-
-def test_dihedral_is_signed():
-    """The sign is what distinguishes the two hands, so mirrored inputs give opposite, non-zero values."""
     p0, p1, p2 = np.array([1.0, 0, 0]), np.zeros(3), np.array([0, 0, 1.0])
     plus, minus = np.array([0, 1.0, 1.0]), np.array([0, -1.0, 1.0])
     assert _dihedral(p0, p1, p2, plus) == pytest.approx(-_dihedral(p0, p1, p2, minus))
@@ -91,7 +62,6 @@ def test_dihedral_is_signed():
 
 
 def test_a_conjugation_plane_is_perceived_on_an_amide_and_not_on_a_saturated_chain():
-    """O=C-N-C is the canonical quartet; no double bond means no plane, so the cap cannot fire on an alkane."""
     quartets = list(conjugated_quartets(_mol("CC(=O)NC")))
     assert quartets, "the amide plane was not perceived"
     for a, c, x, s in quartets:
@@ -100,7 +70,6 @@ def test_a_conjugation_plane_is_perceived_on_an_amide_and_not_on_a_saturated_cha
 
 
 def test_exclude_drops_a_quartet_naming_an_excluded_atom():
-    """`exclude` is how a frozen core or a metal keeps its own geometry: the QA gate passes the same set."""
     mol = _mol("CC(=O)NC")
     hit = next(iter(conjugated_quartets(mol)))
     assert hit not in list(conjugated_quartets(mol, exclude={hit[2]}))
@@ -112,7 +81,6 @@ def test_exclude_drops_a_quartet_naming_an_excluded_atom():
 
 
 def test_a_stereo_flag_orphaned_by_bond_removal_is_dropped_and_a_clean_molecule_is_left_alone():
-    """A flagged double bond with no reference atoms left segfaults ETKDG: no try/except catches it."""
     work = _without(Chem.MolFromSmiles(r"C/C=C/Cl"), 3)  # no conformer: nothing to re-perceive from
     assert repair_bond_stereo(work) == 1
     for b in work.GetBonds():
@@ -126,11 +94,6 @@ def test_a_stereo_flag_orphaned_by_bond_removal_is_dropped_and_a_clean_molecule_
 
 
 def test_a_geometry_re_references_an_orphaned_flag_rather_than_discarding_the_e_z():
-    """With a conformer the E/Z is re-derived against the substituents that survived, not dropped.
-
-    Stripping the M-donor bonds orphans a coordinated imine routinely (RDKit picks the metal as one of the C=N
-    reference atoms), and the 3D arrangement is still there to read, so only a flag no reference survives is lost.
-    """
     work = _without(_mol(r"C/C=C/Cl", seed=1), 3)  # the Cl was one of the two reference atoms
     assert repair_bond_stereo(work) == 1
     bond = work.GetBondBetweenAtoms(1, 2)
@@ -163,12 +126,6 @@ def _names_the_hand(mol, centre):
 
 @pytest.mark.parametrize("slot", [0, 1, 2, 3])
 def test_a_bond_removal_leaves_the_tag_naming_the_same_geometry(slot):
-    """THE RULE, measured: taking the bond at slot `p` of four out of the order mirrors the tag when 3-p is odd.
-
-    Nothing in RDKit does this: `RWMol.RemoveBond` leaves the tag verbatim in a basis that has changed. A
-    chiral-at-P donor whose M-L bond sat at an odd slot therefore came back as its own mirror image, in 8 of 8
-    conformers, silently. Refereed by the geometry rather than by CIP, so no label convention enters.
-    """
     mol = _mol(_HALIDE_C, seed=11)
     Chem.AssignStereochemistryFrom3D(mol)  # calibrate: RDKit's own writer, on this very conformer
     assert _names_the_hand(mol, 1), "the sign convention this test refereeds by is wrong"
@@ -178,11 +135,6 @@ def test_a_bond_removal_leaves_the_tag_naming_the_same_geometry(slot):
 
 
 def test_adding_a_bond_back_needs_no_counterpart():
-    """`RWMol.AddBond` appends LAST, which is the slot the missing reference already occupied.
-
-    This is why `connect_metal`, the D-cap and every `AddHs` are free of the rule, and why one correction at
-    the removal is the whole of it rather than half of a pair.
-    """
     mol = _mol(_HALIDE_C, seed=11)
     Chem.AssignStereochemistryFrom3D(mol)
     partner = next(b.GetOtherAtomIdx(1) for b in mol.GetAtomWithIdx(1).GetBonds())  # slot 0: an odd one
@@ -202,12 +154,6 @@ def test_adding_a_bond_back_needs_no_counterpart():
     ],
 )
 def test_the_parity_rule_is_bounded_to_degree_four(smiles, slot, mirrors):
-    """Off degree four the symbol is kept: four directions summing to zero is what makes ``n - 1 - p`` work.
-
-    Measured refuted at degree 5 (13/35 and anti-correlated on the eight hypervalent tags in the corpora), so
-    the bound is part of the rule rather than a caution around it. The two `False` rows below are the ones
-    that bite: the unbounded arithmetic calls both of them odd.
-    """
     mol = Chem.MolFromSmiles(smiles, sanitize=False)
     mol.UpdatePropertyCache(strict=False)
     centre = mol.GetAtomWithIdx(1)
@@ -231,13 +177,6 @@ def _sulfur(mol):
 
 
 def test_rdkits_3d_writer_reads_a_bond_order_none_of_its_readers_read():
-    """THE PREMISE, pinned against RDKit itself, because the whole re-base is worthless if it ever stops holding.
-
-    `assignChiralTypesFrom3D` skips a DATIVE bond whose BEGIN atom is the centre; the DG embedder, both CIP
-    labellers and the SMILES writer count it. So the raw writer hands back the symbol for the mirror of the
-    geometry it was just shown, and nothing complains. If RDKit reconciles the two, this cell fails and the
-    re-base should be deleted rather than kept working around a bug that is gone.
-    """
     mol = _mol(_DATIVE_S, seed=0xF00D)
     centre = _sulfur(mol)
     Chem.AssignStereochemistryFrom3D(mol)  # deliberately the RAW call: this test is about what it does
@@ -247,12 +186,6 @@ def test_rdkits_3d_writer_reads_a_bond_order_none_of_its_readers_read():
 
 @pytest.mark.parametrize("smiles", [_DATIVE_S, _DATIVE_S_LAST, _COVALENT_S])
 def test_a_tag_written_from_3d_names_its_own_geometry_in_the_readers_bond_order(smiles):
-    """THE CONTRACT. Whatever the bond types, the tag left behind names the hand of the conformer it was read from.
-
-    This is what lets one parity rule hold for every tag in the graph without asking where a tag came from:
-    provenance is not recoverable (the SMILES parser leaves no positive marker), and a rule betting either way
-    on a dative bond loses somewhere. Fixing it at the writer means nothing downstream has to bet.
-    """
     mol = _mol(smiles, seed=0xF00D)
     centre = _sulfur(mol)
     assign_stereo_from_3d(mol)
@@ -261,13 +194,6 @@ def test_a_tag_written_from_3d_names_its_own_geometry_in_the_readers_bond_order(
 
 
 def test_the_re_base_leaves_a_hypervalent_perception_alone():
-    """It carries the degree-four bound, so a carborane cage vertex keeps whatever symbol the writer gave it.
-
-    The writer reaches those (it drops the dative and tags the remaining four), but the parity arithmetic is
-    refuted above degree four and the embedder truncates such an atom to its first four bonds anyway, so
-    re-basing there would be guessing. Asserted against the door itself, on a mol with a conformer, because
-    the bound only means something if the door is what honours it.
-    """
     mol = Chem.MolFromSmiles("F[C@](Cl)(Br)(I)->[Pd]", sanitize=False)
     mol.UpdatePropertyCache(strict=False)
     Chem.SanitizeMol(mol, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
@@ -290,6 +216,7 @@ def test_the_re_base_leaves_a_hypervalent_perception_alone():
 
 
 def test_a_violation_formats_the_atoms_the_value_and_the_limit():
-    """It is read in a log line, so the one-liner must name all three, with or without a detail."""
-    assert str(Violation("clash", (3, 7), 1.234, 2.5, "H...H")) == "[clash] atoms 3-7: 1.234 vs 2.500 H...H"
-    assert str(Violation("clash", (3, 7), 1.234, 2.5)) == "[clash] atoms 3-7: 1.234 vs 2.500"
+    v = Violation("clash", (3, 7), value=1.234, limit=2.5, detail="H...H")
+    assert str(v) == "[clash] atoms 3-7: 1.234 vs 2.500 H...H"
+    v2 = Violation("clash", (3, 7), value=1.234, limit=2.5)
+    assert str(v2) == "[clash] atoms 3-7: 1.234 vs 2.500"

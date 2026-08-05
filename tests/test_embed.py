@@ -1,7 +1,8 @@
 """`embed.py`, the front door: ``embed(spec, fix=, constrain=) -> Conformers``, and ``minimize`` beside it.
 
 The seam that stacks `bounds.embed` and `relax.restrained_uff`: encounter bounds, the donor-chirality hold, the
-embed, the Kabsch graft, then the stiffness ladder inside `Conformers.minimize`.
+embed, the Kabsch graft, then the stiffness ladder and the metal-centre handedness gate inside
+`Conformers.minimize`.
 
 Every refusal here exists because the un-guarded call returned a plausible, wrong answer rather than raising;
 a heavy-atom-only geometry, an un-surrogated metal UFF silently dropped every term for, a 0-byte dump that read
@@ -12,21 +13,21 @@ key, an out-of-range angle, one key under both verbs) belong to the resolver and
 from __future__ import annotations
 
 import importlib
-import itertools
 import logging
 import re
+import sys
 
 import numpy as np
 import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
-from rdkit.Chem.rdMolTransforms import GetBondLength
+from rdkit.Chem.rdMolTransforms import GetAngleDeg, GetBondLength
 
 from rxembed import bounds as bnd
 from rxembed.constraints import Constraints, resolve_core
-from rxembed.embed import FC_ESCALATION, Conformers, embed, fold_substrate, minimize
+from rxembed.embed import BASE_STIFFNESS, Conformers, embed, fold_substrate, minimize
 from rxembed.metal_core import TRANSITION_METALS, coplanar
-from rxembed.metal_isomers import Isomer, enumerate_isomers
+from rxembed.metal_isomers import Isomer, enumerate_isomers, from_geometry
 from rxembed.relax import bonding_ok
 
 emb = importlib.import_module("rxembed.embed")  # `rxembed.embed` the ATTRIBUTE is the front-door FUNCTION
@@ -35,6 +36,10 @@ _BIPY_PD = "Cl[Pd]1(Cl)<-n2ccccc2-c2ccccn->12"
 _EN_PD = "Cl[Pd](Cl)(<-N(C)(C)C)<-N(C)(C)C"
 # the N-bound Ni(II) isomer: the window relax tears 3 of 8 seeds at the base stiffness, the ladder's type case
 _NI_N = "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1"
+# cis-[Co(en)2Cl2], the textbook Delta/Lambda pair, and the same complex with one sp3 centre on a backbone:
+# the second is the case a reflection cannot repair, because it would invert that centre too
+_CO_EN = "Cl[Co]12(Cl)(NCCN1)NCCN2"
+_CO_EN_ME = "Cl[Co]12(Cl)(N[C@@H](C)CN1)NCCN2"
 
 
 def _mol(smiles):
@@ -74,7 +79,6 @@ def _distance(mol, cid, i, j):
 
 
 def test_embed_holds_a_numbers_fix_and_chains_to_minimize_and_dump(tmp_path):
-    """embed(mol, fix={(i, j): d}).minimize().dump(path): the fix lands and the file is real."""
     mol = _mol("OCCCN")
     confs = embed(mol, fix={(0, 4): 3.0}, n=8, seed=0xF00D)
     assert len(confs) == len(confs.ids) > 0
@@ -85,14 +89,16 @@ def test_embed_holds_a_numbers_fix_and_chains_to_minimize_and_dump(tmp_path):
     assert path.read_text().count(f"{mol.GetNumAtoms()}\n") == len(confs), "one xyz frame per tracked conformer"
 
 
-def test_the_input_molecule_is_never_touched():
-    """`embed` works on its own copy, so a caller's conformers survive the call."""
-    mol = _with_geometry("CCO")
-    before = mol.GetConformer(0).GetPositions().copy()
-    confs = embed(mol, n=3, seed=1)
-    assert confs._mol is not mol
-    assert mol.GetNumConformers() == 1
-    assert np.allclose(mol.GetConformer(0).GetPositions(), before)
+def test_numeric_fix_delivers_a_linear_three_centre_core():
+    mol = _mol("[F-].CCl")  # F(0), C(1), Cl(2)
+    fix = {(0, 1): 2.0, (1, 2): 2.2, (0, 1, 2): 178.0}
+    confs = embed(mol, fix=fix, n=8, seed=0xF00D, prune_rms=-1).minimize()
+    assert len(confs) == 8, "pruning is off so every requested seed is judged"
+    for cid in confs.ids:
+        conf = confs.mol.GetConformer(int(cid))
+        assert GetBondLength(conf, 0, 1) == pytest.approx(2.0, abs=0.1)
+        assert GetBondLength(conf, 1, 2) == pytest.approx(2.2, abs=0.1)
+        assert GetAngleDeg(conf, 0, 1, 2) == pytest.approx(178.0, abs=8.0)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -101,7 +107,6 @@ def test_the_input_molecule_is_never_touched():
 
 
 def test_indexing_returns_a_new_conformers_over_the_same_mol():
-    """`confs[0]` / `confs[:2]` select by POSITION and share the Mol; `xyz` still keys by conformer id."""
     confs = embed(_mol("CCOCC"), n=6, seed=7)
     sub = confs[:2]
     assert sub.ids == confs.ids[:2]
@@ -111,30 +116,12 @@ def test_indexing_returns_a_new_conformers_over_the_same_mol():
         sub.xyz(confs.ids[-1])  # an id the slice no longer tracks
 
 
-def test_mol_is_a_usable_rdkit_molecule_and_always_a_copy():
-    """`.mol` is a plain `Chem.Mol` an RDKit call can take directly, and never the working molecule."""
-    confs = embed(_mol("CCO"), n=3, seed=1).minimize()
-    out = confs.mol
-
-    assert out is not confs._mol
-    assert isinstance(out, Chem.Mol)
-    assert out.GetNumConformers() == len(confs)
-    assert {int(c.GetId()) for c in out.GetConformers()} == {int(i) for i in confs.ids}
-    assert Chem.MolToXYZBlock(out, confId=int(confs.ids[0])).count("\n") == out.GetNumAtoms() + 2
-
-
 def test_dump_refuses_a_result_with_no_conformers(tmp_path):
-    """A 0-byte file that reads as a successful write is the worst possible outcome."""
     with pytest.raises(ValueError, match="nothing to dump"):
         Conformers(_mol("CCO"), []).dump(tmp_path / "empty.xyz")
 
 
 def test_the_surrogate_stays_internal_while_mol_hands_back_the_real_metal():
-    """`_mol` keeps the bond-less surrogate the engine needs; `.mol` gives the real element and dative bonds.
-
-    The engine cannot work on the real element (UFF types Pd and not Ir, so the force field would depend on
-    which metal you have) and a consumer cannot use the surrogate, so the restore happens on the way OUT.
-    """
     src = _mol(_EN_PD)
     iso = Isomer(src, "SPL", {0: 0, 1: 2, 2: 3, 3: 7})
     confs = embed(iso, n=2, seed=0xF00D).minimize()
@@ -156,31 +143,26 @@ def test_the_surrogate_stays_internal_while_mol_hands_back_the_real_metal():
 
 @pytest.mark.parametrize(("kwargs", "match"), [({"seed": -1}, "not reproducible"), ({"n": 0}, "positive conformer")])
 def test_embed_refuses_an_argument_that_would_be_silently_wrong(kwargs, match):
-    """seed=-1 draws from the global RNG (non-reproducible); n<=0 meant "auto" rather than "none"."""
     with pytest.raises(ValueError, match=match):
         embed(_mol("CCO"), **kwargs)
 
 
 def test_embed_refuses_implicit_hydrogens():
-    """The documented precondition is enforced: a heavy-atom-only Mol embedded happily and looked fine."""
     with pytest.raises(ValueError, match="AddHs"):
         embed(Chem.MolFromSmiles("CCO"), n=2)
 
 
 def test_embed_refuses_a_bare_metal_mol():
-    """UFF cannot type a metal: without the surrogate every metal FF term is dropped, silently."""
     with pytest.raises(ValueError, match="Isomer"):
         embed(_mol(_EN_PD), n=2)
 
 
 def test_embed_refuses_a_source_it_would_have_to_parse():
-    """Perception is the caller's job at this door: a SMILES string is a different verb (`pipeline.embed`)."""
     with pytest.raises(TypeError, match="RDKit Mol or an Isomer"):
         embed("CCO", n=2)
 
 
 def test_a_zero_conformer_embed_warns_rather_than_reading_as_pruned(caplog):
-    """An unrealisable spec must say so; silence here reads as "embedded, then pruned"."""
     mol = _mol("C1C2CC3CC1CC(C2)C3")  # adamantane: a 1.0 A fix across the cage is not embeddable
     with caplog.at_level(logging.WARNING, logger="rxembed"):
         confs = embed(mol, fix={(0, 3): 1.0}, n=1, seed=0xF00D)
@@ -194,7 +176,6 @@ def test_a_zero_conformer_embed_warns_rather_than_reading_as_pruned(caplog):
 
 
 def test_a_pi_stack_constrain_survives_the_fold():
-    """A hand-listed merge dropped `sub.planes`; accepted, index-validated, logged, then discarded."""
     iso = _isomer()
     a, b = (tuple(r) for r in iso.mol.GetRingInfo().AtomRings() if len(r) == 6)
     cons = _fold(iso, constrain={(a, b): 3.6})
@@ -202,7 +183,6 @@ def test_a_pi_stack_constrain_survives_the_fold():
 
 
 def test_a_fix_landing_on_a_sphere_hold_overrides_it():
-    """Last-wins on distances: the user's own resolved window survives the fold, unclipped by the sphere's."""
     iso = _isomer()
     key = _sphere_key(iso)
     alone, _ref = resolve_core(iso.mol, fix={key: 2.42}, has_geometry=False)
@@ -211,11 +191,6 @@ def test_a_fix_landing_on_a_sphere_hold_overrides_it():
 
 
 def test_a_constrain_landing_on_a_sphere_hold_is_not_demoted_to_releasable():
-    """`constrain=` is normally releasable, but on a sphere hold `mc(explore=)` could dissociate the sphere.
-
-    Provenance is subtractive, not the union `compose` would give: the key keeps the window and loses the
-    release. `fix` cannot show this: it is never releasable to begin with.
-    """
     iso = _isomer()
     key = _sphere_key(iso)
     cons = _fold(iso, constrain={key: (2.3, 2.5)})
@@ -224,18 +199,11 @@ def test_a_constrain_landing_on_a_sphere_hold_is_not_demoted_to_releasable():
     assert key in cons.relaxed().distances, "the exploratory pass would drop the coordination sphere"
 
 
-def test_a_graft_pinning_two_sphere_atoms_is_refused():
-    """Two grafted sphere atoms fix their mutual placement, i.e. the arrangement, so the enumerated isomer
-    would come back wearing the reference's geometry under its own label."""
+def test_a_graft_is_refused_at_two_sphere_atoms_and_allowed_at_one():
     iso = _isomer(_EN_PD)
     fix = {iso.donors[0]: (0.0, 0.0, 0.0), iso.donors[1]: (2.0, 0.0, 0.0)}
     with pytest.raises(ValueError, match="pins coordination-sphere atoms"):
         _fold(iso, fix=fix)
-
-
-def test_a_graft_pinning_one_sphere_atom_is_allowed():
-    """One pinned vertex leaves the arrangement to the polyhedron, so it composes: the boundary of the refusal."""
-    iso = _isomer(_EN_PD)
     assert iso.donors[0] in _fold(iso, fix={iso.donors[0]: (0.0, 0.0, 0.0)}).frozen
 
 
@@ -256,7 +224,6 @@ def _burn_global_rng(n=64):
 
 
 def test_encounter_bounds_do_not_move_when_unrelated_randomness_is_consumed():
-    """The probe's own seed was unset, so a test passed alone and failed in a full suite, same wrong value."""
     mol = _two_fragments()
     assert len(Chem.GetMolFrags(mol)) >= 2, "fixture must be multi-fragment to exercise the encounter bounds"
     before = emb.encounter_bounds(mol)
@@ -266,7 +233,6 @@ def test_encounter_bounds_do_not_move_when_unrelated_randomness_is_consumed():
 
 
 def test_the_probe_seed_is_threaded_through_rather_than_hard_coded(monkeypatch):
-    """A constant baked past the signature would make the reproducibility guard above vacuous."""
     seen = []
     real = bnd.probe_conformer
     monkeypatch.setattr(emb, "probe_conformer", lambda m, s: (seen.append(s), real(m, s))[1])
@@ -275,16 +241,11 @@ def test_the_probe_seed_is_threaded_through_rather_than_hard_coded(monkeypatch):
 
 
 def test_only_fragments_no_constraint_pins_get_a_floated_bound():
-    """A pair already linked by a fix / constrain / contact is left to that constraint, not double-bounded."""
     mol = _two_fragments()
     assert emb.float_encounter_bounds(mol, Constraints()), "every pair of a free multi-fragment mol must be bounded"
 
     i, j = sorted(f[0] for f in Chem.GetMolFrags(mol))
     assert emb.float_encounter_bounds(mol, Constraints(distances={(i, j): (3.0, 3.5)})) == {}
-
-
-def test_a_single_fragment_gets_no_encounter_bound():
-    """There is no inter-fragment separation to enforce, so the whole path must be a no-op."""
     assert emb.float_encounter_bounds(_mol("CCO"), Constraints()) == {}
 
 
@@ -294,7 +255,6 @@ def test_a_single_fragment_gets_no_encounter_bound():
 
 
 def test_the_graft_restores_the_core_shape_exactly():
-    """0.000 A internal RMSD is the guarantee a TS core needs; DG alone lands 0.2-0.4 A off."""
     mol = _with_geometry("CCCl")
     core = [0, 1, 2]
     ref = np.array([[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [1.5, 1.8, 0.0]])
@@ -305,12 +265,7 @@ def test_the_graft_restores_the_core_shape_exactly():
         assert np.linalg.norm(pos[core[a]] - pos[core[b]]) == pytest.approx(want, abs=1e-9)
 
 
-def test_a_two_atom_core_keeps_one_atom_put_and_slides_the_other():
-    """A bond has no orientation to restore, so the first atom stays and the second slides along the embedded axis.
-
-    A Kabsch fit over two points reproduces the length and the axis too, but moves both atoms about their
-    centroid, which drags the frozen anchor away from the periphery that was embedded around it.
-    """
+def test_a_core_too_small_to_orient_slides_or_stands_still():
     mol = _with_geometry("CCCl")
     before = mol.GetConformer(0).GetPositions().copy()
     emb.graft_frozen(mol, [0], [1, 2], np.array([[0.0, 0.0, 0.0], [2.4, 0.0, 0.0]]))
@@ -322,13 +277,10 @@ def test_a_two_atom_core_keeps_one_atom_put_and_slides_the_other():
     cos = axis_after @ axis_before / (np.linalg.norm(axis_after) * np.linalg.norm(axis_before))
     assert cos == pytest.approx(1.0, abs=1e-9), "the embedded axis was rotated, not just rescaled"
 
-
-def test_a_one_atom_core_is_left_alone():
-    """A point has no shape, so the graft must not move it; nor raise on the degenerate case."""
-    mol = _with_geometry("CCCl")
-    before = mol.GetConformer(0).GetPositions().copy()
-    emb.graft_frozen(mol, [0], [1], np.array([[9.0, 9.0, 9.0]]))
-    assert np.allclose(mol.GetConformer(0).GetPositions(), before)
+    one = _with_geometry("CCCl")
+    before = one.GetConformer(0).GetPositions().copy()
+    emb.graft_frozen(one, [0], [1], np.array([[9.0, 9.0, 9.0]]))
+    assert np.allclose(one.GetConformer(0).GetPositions(), before)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -337,7 +289,6 @@ def test_a_one_atom_core_is_left_alone():
 
 
 def test_minimize_pulls_the_input_geometry_toward_a_target_without_searching():
-    """The input conformer is kept and pulled to the stated distance: no ETKDG, no extra conformers."""
     mol = _with_geometry("CCCl")
     before = GetBondLength(mol.GetConformer(0), 1, 2)
     confs = minimize(mol, fix={(1, 2): 2.4})
@@ -349,18 +300,11 @@ def test_minimize_pulls_the_input_geometry_toward_a_target_without_searching():
 
 
 def test_minimize_refuses_a_graph_with_no_geometry():
-    """A bare graph has nothing to relax; saying so beats embedding one silently and relaxing that."""
     with pytest.raises(ValueError, match="existing geometry"):
         minimize(_mol("CCO"))
 
 
 def test_minimize_relaxes_an_isomer_under_its_own_coordination_polyhedron():
-    """An `Isomer` states an arrangement, so the search-free verb must relax UNDER it, as `embed(iso)` does.
-
-    It used to take `spec.mol` and drop the isomer: the relax then ran on a bond-less surrogate with no
-    coordination constraint at all: the sphere drifted to ~4 Å, `.mol` handed back a carbon where the metal
-    was, and the complex came apart into fragments, all with a plausible energy.
-    """
     src = _with_geometry(_EN_PD)
     iso = Isomer(src, "SPL", {0: 0, 1: 2, 2: 3, 3: 7})
     before = iso.mol.GetConformer().GetPositions().copy()
@@ -384,10 +328,6 @@ def test_minimize_relaxes_an_isomer_under_its_own_coordination_polyhedron():
 
 
 def test_minimize_holds_a_metal_sphere_at_the_input_geometry():
-    """A relax aimed at an organic target must not rearrange a coordination sphere it was not asked about.
-
-    The bond-less surrogate carries no M-L terms of its own, which is why `prepare_relax` re-states the sphere.
-    """
     mol = _with_geometry("Cl[Pd](Cl)(N)N")
     pd = next(a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS)
     donors = [n.GetIdx() for n in mol.GetAtomWithIdx(pd).GetNeighbors()]
@@ -404,50 +344,152 @@ def test_minimize_holds_a_metal_sphere_at_the_input_geometry():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_the_ladder_starts_at_the_callers_own_force_constant_and_ascends():
-    """Rung 0 must be the caller's fc, or an unconstrained caller's `distance_fc` is silently multiplied."""
-    assert list(FC_ESCALATION) == sorted(FC_ESCALATION), "the ladder must ascend"
-    assert FC_ESCALATION[0] == 1.0, "rung 0 is the caller's own force constant"
-    assert len(FC_ESCALATION) > 1, "a one-rung ladder cannot escalate at all"
-    assert all(a < b for a, b in itertools.pairwise(FC_ESCALATION)), "a repeated rung retries the same relax"
+def test_a_conformer_the_soft_relax_tears_is_rescued_at_its_own_stiffness(caplog, monkeypatch):
+    confs = embed(_isomer(_NI_N), n=4, seed=1, threads=1, prune_rms=-1)
+    victim = int(confs.ids[0])
+    real_intact = confs._intact
+    retries = []  # stiffnesses `_rescue_torn` re-relaxed the victim at, ALONE: its signature, not the ladder's
 
+    embed_mod = sys.modules[Conformers.__module__]  # `rxembed.embed` the name is the FUNCTION, not the module
+    real_uff = embed_mod.restrained_uff
 
-def test_a_conformer_the_soft_relax_tears_is_rescued_at_its_own_stiffness(caplog):
-    """`_relax_constrained` stops at the first rung leaving any conformer intact, so `_rescue_torn` retries the rest.
+    def spy_uff(mol, cons, **kw):
+        if kw.get("conf_ids") == [victim]:
+            retries.append(kw.get("stiffness"))
+        return real_uff(mol, cons, **kw)
 
-    `threads=1, prune_rms=-1` because the assertion is on which seeds tore: RDKit prunes across threads as
-    conformers complete, so the default (all cores, 0.1 A) leaves the surviving set free to vary under load.
-    """
+    def torn_until_retried(cid):  # torn until it has been re-relaxed on its own, honest from then on
+        return False if cid == victim and not retries else real_intact(cid)
+
+    monkeypatch.setattr(embed_mod, "restrained_uff", spy_uff)
+    monkeypatch.setattr(confs, "_intact", torn_until_retried)
     with caplog.at_level(logging.INFO, logger="rxembed"):
-        confs = embed(_isomer(_NI_N), n=4, seed=1, threads=1, prune_rms=-1).minimize()
+        confs = confs.minimize()
+
     line = next((r.getMessage() for r in caplog.records if r.getMessage().startswith("relax: tore")), "")
-    assert line, "this fixture is supposed to tear at the base stiffness: the premise moved"
+    assert line, "the injected tear did not reach `_rescue_torn`"
+    assert retries, "a torn conformer must be re-relaxed on its own, not left to the global ladder"
+    assert retries[0] > BASE_STIFFNESS, f"the retry must ESCALATE, got {retries[0]} at base {BASE_STIFFNESS}"
     rescued = re.search(r"(\d+) rescued", line)
     assert rescued is not None, line
-    assert int(rescued.group(1)) >= 1, line
+    assert int(rescued.group(1)) >= 1, f"a conformer that is intact on retry must be rescued, not seeded: {line}"
+    assert victim not in confs.unrelaxed, "a rescued conformer must not be reported as unrelaxed"
     assert len(confs) == 4, "the ladder must not spend the caller's n"
 
 
 def test_a_constrained_embed_returns_intact_geometry_or_its_seed_never_a_torn_relax():
-    """Every conformer that comes back is bonded: the ladder's whole job."""
     confs = embed(_mol("CCCl"), fix={(1, 2): 2.4}, n=4, seed=1).minimize()
     assert len(confs) >= 1
     for cid in confs.ids:
         assert bonding_ok(confs.mol, int(cid), constrained=confs.cons.distances), f"conformer {cid} came back torn"
 
 
-def test_minimize_never_drops_a_conformer():
-    """Deciding is the caller's; one that survives no rung falls back to its embedded seed, still counted."""
+def test_minimize_never_drops_a_conformer_and_energises_every_one_it_keeps():
     confs = embed(_mol("CCCl"), fix={(1, 2): 2.4}, n=4, seed=1)
     before = list(confs.ids)
     assert confs.minimize().ids == before
-
-
-def test_minimize_reports_an_energy_for_every_conformer_it_keeps():
-    """An unenergised conformer would sort as if it were free: every kept id must carry a number."""
-    confs = minimize(_with_geometry("CCCl"), fix={(1, 2): 2.4})
     assert set(confs.energies) == {int(c) for c in confs.ids}
     assert all(np.isfinite(v) for v in confs.energies.values())
+
+
+def test_constrained_energies_share_one_final_objective(monkeypatch):
+    confs = embed(_mol("CCC"), fix={(0, 2): (2.0, 3.0)}, n=2, seed=1)
+    calls = []
+    real_uff = emb.restrained_uff
+
+    def marked_uff(mol, cons, **kw):
+        result = real_uff(mol, cons, **kw)
+        calls.append((kw["stiffness"], kw.get("max_iters")))
+        return np.full(len(result), 7.0 if kw.get("max_iters") == 0 else 99.0)
+
+    def replace_after_relax(self, *args):
+        self.energies = dict.fromkeys(self.ids, -50.0)  # stand in for a hand re-seed's separately scored batch
+
+    monkeypatch.setattr(emb, "restrained_uff", marked_uff)
+    monkeypatch.setattr(Conformers, "_hold_metal_hand", replace_after_relax)
+    confs.minimize()
+
+    assert calls[-1] == (BASE_STIFFNESS, 0)
+    assert set(confs.energies.values()) == {7.0}
+
+
+# ---------------------------------------------------------------------------------------------------------
+# the metal-centre handedness gate
+# ---------------------------------------------------------------------------------------------------------
+
+
+def _hands(confs):
+    """The metal-centre hand each returned conformer actually realises, read back from its coordinates."""
+    mol = confs.mol
+    return [from_geometry(Chem.Mol(mol, False, int(c))).chirality for c in confs.ids]
+
+
+@pytest.mark.parametrize("want", ["delta", "lambda"])
+def test_a_named_metal_hand_is_the_hand_that_comes_back(want):
+    iso = next(i for i in enumerate_isomers(_mol(_CO_EN), "octahedral") if i.chirality == want)
+    confs = embed(iso, n=8, seed=0xF00D).minimize()
+    assert len(confs) >= 4, "the fixture must return enough conformers to be a fair sample"
+    assert _hands(confs) == [want] * len(confs)
+    assert confs.wrong_hand == []
+
+
+def test_a_caller_who_named_no_hand_never_reaches_the_gate(monkeypatch):
+
+    def boom(self):
+        raise AssertionError("the handedness read ran for a caller who named no hand")
+
+    monkeypatch.setattr(emb.Conformers, "_metal_hands", boom)
+    assert len(embed(_mol("OCCCN"), n=4, seed=0xF00D).minimize()) == 4  # organic: there is no `iso` at all
+    achiral = next(i for i in enumerate_isomers(_mol(_CO_EN), "octahedral") if not i.chirality)
+    assert len(embed(achiral, n=4, seed=0xF00D).minimize()) >= 1  # a metal whose centre states no hand
+
+
+def test_the_mirror_is_free_only_where_the_metal_is_the_one_thing_it_inverts():
+    assert emb._mirror_is_free(_mol("OCCCN"))
+    assert emb._mirror_is_free(_mol("C/C=C/CO")), "E/Z is reflection-invariant and must not block the mirror"
+    assert not emb._mirror_is_free(_mol("C[C@H](N)CO"))
+    assert not emb._mirror_is_free(_mol("CC(N)CO")), "an sp3 centre inverts whether or not it is assigned"
+
+
+def test_a_stereocentre_costs_the_mirror_but_not_the_hand():
+    iso = next(i for i in enumerate_isomers(_mol(_CO_EN_ME), "octahedral") if i.chirality)
+    assert not emb._mirror_is_free(iso.mol), "the premise: this fixture must be beyond the free fix"
+    confs = embed(iso, n=6, seed=0xF00D).minimize()
+    before = list(confs.ids)
+    assert _hands(confs) == [iso.chirality] * len(confs)
+    assert confs.ids == before, "the swap is in place: a re-seed must not renumber the caller's conformers"
+    assert confs.wrong_hand == []
+    assert set(confs.energies) == {int(c) for c in confs.ids}, "a re-seeded conformer must bring its own energy"
+
+
+def _mirrored_input(smiles):
+    """An `Isomer` stating one hand over a conformer of the other: the delta seating on a reflected geometry."""
+    delta = next(i for i in enumerate_isomers(_mol(smiles), "octahedral") if i.chirality == "delta")
+    confs = embed(delta, n=1, seed=0xF00D).minimize()
+    mol = confs.mol
+    conf = mol.GetConformer(int(confs.ids[0]))
+    pos = conf.GetPositions()
+    pos[:, 0] *= -1.0  # the enantiomer, by hand: nothing in the constraint set can tell the two apart
+    for a, xyz in enumerate(pos):
+        conf.SetAtomPosition(a, xyz.tolist())
+    got = from_geometry(Chem.Mol(mol, False, int(confs.ids[0]))).chirality
+    assert got == "lambda", f"the premise: this geometry must be the mirror of the stated hand, got {got!r}"
+    return Isomer(mol, "octahedral", dict(enumerate(delta.vertices)))
+
+
+def test_minimize_holds_the_hand_of_the_isomer_it_was_handed():
+    confs = minimize(_mirrored_input(_CO_EN))
+    assert confs.wrong_hand == []
+    assert _hands(confs) == ["delta"]
+
+
+def test_a_hand_neither_remedy_can_fix_is_named_rather_than_silently_returned(caplog):
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        confs = minimize(_mirrored_input(_CO_EN_ME))
+    assert confs.seed is None, "nothing was embedded here, so there is no seed to re-roll"
+    assert confs.wrong_hand == list(confs.ids)
+    assert "wrong_hand" in caplog.text
+    assert confs[0].wrong_hand == [confs.ids[0]], "a slice must not silently lose the wrong-hand flag"
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -457,17 +499,11 @@ def test_minimize_reports_an_energy_for_every_conformer_it_keeps():
 
 
 def test_a_set_of_sites_is_refused():
-    """`sites` must state which donor sits at which vertex: a set seats them in iteration order, silently.
-
-    Every other guard passes for a set (each donor is seated exactly once), so the only symptom was a different
-    isomer: the same donors as a `cis` seating came back labelled `trans`.
-    """
     with pytest.raises(TypeError, match="vertex-ordered"):
         Isomer(_mol(_EN_PD), "SPL", {0, 2, 3, 7})
 
 
 def test_an_undefined_ligand_stereocentre_warns(caplog):
-    """One `Isomer` is one species: an unspecified centre would pool both hands into one result."""
     mol = _mol("[NH2](C(C)CC)->[Pd](<-[NH3])(Cl)Cl")
     with caplog.at_level(logging.WARNING, logger="rxembed"):
         Isomer(mol, "SPL", {0: 0, 1: 6, 2: 7, 3: 8})
@@ -476,13 +512,6 @@ def test_an_undefined_ligand_stereocentre_warns(caplog):
 
 
 def test_a_stated_number_can_be_read_back_on_the_core_tier():
-    """The core promises "a pull, not a snap, so verify it", so the verification verb must be core too.
-
-    `Conformers.measure` was named in this module's own `embed` docstring, in `constraints`, in `relax` and
-    in the README while living only on `pipeline.Ensemble`. A base install could state an exact distance and
-    had no supported way to check whether it held. Pinned here rather than in the pipeline tests because the
-    tier is the point.
-    """
     mol = _mol("CCCCO")
     confs = embed(mol, fix={(0, 4): 3.0}, n=6, seed=1).minimize()
     got = confs.measure((0, 4))
@@ -495,12 +524,6 @@ def test_a_stated_number_can_be_read_back_on_the_core_tier():
 
 
 def test_a_template_composes_with_every_other_way_of_stating_a_rigid_core():
-    """All four rigid spellings are one question: where do these atoms' coordinates come from.
-
-    They must compose, and none may vanish. When `template_to_fix` moved into the core it merged only a dict
-    `fix` and returned the template's coordinates alone for a list one, so `fix=[2, 3]` beside a template was
-    dropped without a word. The list is a coordinate source like the other two, so it merges.
-    """
     mol = _mol("CC(=O)Nc1ccccc1")
     rdDistGeom.EmbedMolecule(mol, randomSeed=1)
     ref = Chem.Mol(mol)

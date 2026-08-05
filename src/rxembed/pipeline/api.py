@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import logging
 
-from rxembed.embed import DISTANCE_FC as _DISTANCE_FC
+from rxembed.embed import BASE_STIFFNESS as _BASE_STIFFNESS
+from rxembed.metal_isomers import Isomer
 
 from . import calculators as _refine
 from .dispatch import (
@@ -17,7 +18,14 @@ from .dispatch import (
     _normalize,
     _stereo_enumerated_embed,
     _stereo_expand,
+    _template_to_fix,
+    _validate_stereo,
 )
+
+# `metal` is the pipeline's `enumerate_isomers`, exported under a second name rather than shadowing the core
+# one: `rxembed.pipeline` re-exports every core name (it is a strict superset), so both are on that namespace
+# and `pipeline.enumerate_isomers` is the core's. They differ in what they accept -- this one reads a SMILES
+# or an .xyz path and computes the `stereo_ref` fingerprint; the core one takes a Mol and now says so.
 from .dispatch import enumerate_isomers as metal
 from .ensemble import Ensemble, EnsembleSet
 
@@ -40,7 +48,6 @@ def embed(
     seed=0xF00D,
     knowledge=True,
     stereo="racemic",
-    **kw,
 ):
     """Embed conformers (optionally constrained), returning an `Ensemble`, an `EnsembleSet`, or a `list`.
 
@@ -66,16 +73,7 @@ def embed(
     for chirality the embed cannot keep. ``contacts=`` reaches `nci_modes`; ``metal=`` / ``coordinate=`` reach
     `rx.metal`.
     """
-    n_alias = kw.pop("n_confs", None)
-    n_alias = kw.pop("num_confs", n_alias)
-    if n is None:
-        n = n_alias  # accept n_confs= / num_confs= as friendly aliases of n=
-    stereo = {"auto": "racemic", "enumerate": "separate"}.get(stereo, stereo)  # accept the older mode names
-    if kw:
-        raise TypeError(
-            f"embed() got unexpected keyword(s) {sorted(kw)}; the constraint verbs are "
-            f"fix / constrain / template (+ contacts / metal / coordinate / n_confs)"
-        )
+    _validate_stereo(stereo)
 
     dispatch_kw = {
         "metal": metal,
@@ -112,26 +110,34 @@ def _relax_embedded(result):
     return [r._map("_relax_into_windows") for r in result]  # stereo='separate' -> a plain list of EnsembleSet
 
 
-def minimize(source, *, fix=None, constrain=None, charge=0, distance_fc=_DISTANCE_FC):
+def minimize(source, *, fix=None, constrain=None, template=None, charge=0, stiffness=_BASE_STIFFNESS):
     """Relax an existing structure toward ``fix``/``constrain`` targets: the search-free companion to `embed`.
 
     Same vocabulary as `embed` but no conformer search. Wraps the input geometry, grafts any coordinate-``fix``
-    core, and runs the restrained UFF pull toward the targets. Needs an input geometry: an .xyz, or a Mol with
-    a conformer.
+    core, and runs the restrained UFF pull toward the targets. Needs an input geometry: an .xyz, a Mol with a
+    conformer, or a metal `Isomer` whose Mol has one.
 
         rx.minimize('mol.xyz', fix={(i, j): 2.0, (i, j, k): 178})   # pull toward a linear 3-centre core
     """
     from rxembed.embed import prepare_relax
 
-    mol, has_geom = _normalize(source, charge)
+    if isinstance(source, Isomer):
+        spec, mol = source, source.mol
+        has_geom = mol.GetNumConformers() > 0
+    else:
+        mol, has_geom = _normalize(source, charge)
+        spec = mol
     if not has_geom:
         raise ValueError(
             "minimize() relaxes an existing geometry; give an .xyz or a Mol with a conformer, not a SMILES"
         )
+    if template is not None:  # the same sugar `embed` dissolves: a reference core IS a coordinate fix
+        # after the normalise above, so a `fix=[atoms]` list resolves against the geometry just read
+        fix = _template_to_fix(template, fix, mol.GetConformer().GetPositions())
     # The surrogate / sphere-hold / graft assembly is the core's (`rxembed.embed.minimize` is the same call
     # with a `Conformers` result); this only wraps it as an `Ensemble` so the pipeline verbs chain off it.
-    mol, ids, cons, iso = prepare_relax(mol, fix=fix, constrain=constrain)
-    return Ensemble(mol, ids, cons, iso).minimize(distance_fc=distance_fc)
+    mol, ids, cons, iso = prepare_relax(spec, fix=fix, constrain=constrain)
+    return Ensemble(mol, ids, cons, iso).minimize(stiffness=stiffness)
 
 
 def wrap(mol, ids=None, *, energies=None, minimized=False):

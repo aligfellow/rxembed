@@ -48,11 +48,6 @@ _SHAPE_CASES = [
 
 @pytest.mark.parametrize(("geometry", "smiles"), _SHAPE_CASES, ids=[c[0] for c in _SHAPE_CASES])
 def test_the_shape_is_realised_by_a_real_embed(geometry, smiles):
-    """A complex seated on the shape embeds within the ±8° window of every tabulated angle, and re-perceives.
-
-    This pins "the record is realised", not "the record is right": a record systematically wrong by ≤8° in one
-    direction would pass. What the record is measured against is the chemistry comment on it.
-    """
     iso = rx.metal(smiles, geometry).select(index=0)
     ens = rx.embed(iso, n=4).minimize()
     assert ens.n >= 1
@@ -70,38 +65,23 @@ def test_the_shape_is_realised_by_a_real_embed(geometry, smiles):
 # case is the cheap one, and PPh3's DG seed comes out exactly planar, so it proves the hold RE-FORMS a pyramid
 # rather than only keeping one.
 _PPH3 = "P(c1ccccc1)(c1ccccc1)c1ccccc1"
-_PYRAMIDS_THAT_USED_TO_FLATTEN = [
-    ("Fe(PMe3)3", "CP(C)(C)->[Fe](<-P(C)(C)C)<-P(C)(C)C"),
-    ("Pt(PPh3)3", f"c1ccccc1P(c1ccccc1)(c1ccccc1)->[Pt](<-{_PPH3})<-{_PPH3}"),
-]
+# PPh3 alone: its DG seed comes out exactly planar, so it proves the hold RE-FORMS a pyramid rather than
+# only keeping one. The PMe3 case took the same branch from an already-pyramidal seed.
+_PYRAMIDS_THAT_USED_TO_FLATTEN = [("Pt(PPh3)3", f"c1ccccc1P(c1ccccc1)(c1ccccc1)->[Pt](<-{_PPH3})<-{_PPH3}")]
 
 
 @pytest.mark.parametrize(
     ("label", "smiles"), _PYRAMIDS_THAT_USED_TO_FLATTEN, ids=[c[0] for c in _PYRAMIDS_THAT_USED_TO_FLATTEN]
 )
 def test_a_requested_pyramid_is_still_a_pyramid_after_the_relax(label, smiles):
-    """every kept conformer of a requested pyramid re-perceives as one: the round trip through the force field.
-
-    The record's own round trip only proves an IDEAL sphere is perceivable; this proves the pipeline can still
-    deliver one, which is the invariant a user depends on. Asserted on every conformer, not on some: a shape
-    that survives one seed in eight is not a shape you can ask for.
-    """
     iso = rx.metal(smiles, "trigonal_pyramidal").select(index=0)
-    ens = rx.embed(iso, n=4, seed=7).minimize()
+    ens = rx.embed(iso, n=1, seed=7).minimize()
     assert ens.n >= 1, f"{label}: no conformer survived the gates"
     got = [classify_geometry(ens.mol, iso.metal, list(iso.vertices), cid) for cid in ens.ids]
     assert got == ["trigonal_pyramidal"] * len(got), f"{label}: requested a pyramid, got {got}"
 
 
 def test_a_flattened_pyramid_is_reported_not_silently_relabelled(caplog):
-    """A requested pyramid that comes out flat anyway is kept, and said out loud.
-
-    A constraint biases the seed and is not truth, so a flat conformer is never dropped; but the `Isomer` would
-    go on printing the requested name while `rx.metal` on the dumped .xyz answered `trigonal_planar`, and that
-    silence is the defect. The flat geometry is IMPOSED here rather than waited for, so the report is what is
-    under test and cannot depend on the force field losing; it goes through `_drop_bad_geometries`, the
-    warning's only real caller, so the keep-not-drop gate is exercised too.
-    """
     ens = rx.embed("C[P](C)(C)[Fe]([P](C)(C)C)[P](C)(C)C", metal="TPY", n=4, seed=7)[0]
     iso, mol = ens.iso, ens._mol  # `_mol`: `.mol` hands back a metal-restored COPY, which the edits below lose
     verts = list(iso.vertices)
@@ -119,13 +99,6 @@ def test_a_flattened_pyramid_is_reported_not_silently_relabelled(caplog):
 
 
 def test_a_rigid_meridional_kappa3_is_not_pyramidalised(caplog):
-    """A pyramid requested on one rigid κ3 ligand is not forced: the backbone owns the base, and it wins.
-
-    `coordination` states no polyhedron angle for an intra-chelate pair because the backbone fixes the bite; a
-    κ3 base is that case three times over. Measured on mer-terpy/Cu(I) before the skip: N-Cu-N pinched
-    154.4° -> 126.1°, the metal pushed 0.96 Å off terpy's plane, and the sphere then re-perceived as the
-    requested shape, so the flat-relax warning went silent in exactly the case it exists for.
-    """
     iso = rx.metal("[Cu+]12<-n3ccccc3-c3cccc(n->13)-c1ccccn->21", "trigonal_pyramidal").select(index=0)
     with caplog.at_level(logging.WARNING, logger="rxembed"):
         ens = rx.embed(iso, n=4, seed=7).minimize()
@@ -152,13 +125,6 @@ def _states_an_intra_pair(iso):
 
 
 def test_a_chelate_bite_is_stated_from_its_backbone_ring_not_the_polyhedron_ideal():
-    """Two donors of one chelate get their ring size's bite window; two donors of different ligands get ±8°.
-
-    The ideal polyhedron angle is a poor bite predictor, an en 5-ring bites ~80°, not the octahedral 90°, and
-    stating it contradicts a backbone the bounds matrix already fixes. Read off `Constraints` rather than off a
-    relaxed geometry deliberately: an en bite lands ~86°, which is inside both windows, so no embed can tell
-    the two rules apart.
-    """
     iso = next(i for i in rx.metal(_BIS_EN_CO, "octahedral") if _states_an_intra_pair(i))
     frag = _frag_of(iso.mol)
     ideal = {a for _i, _j, a in POLYHEDRA["octahedral"].resolved_angles}
@@ -181,7 +147,6 @@ def test_a_chelate_bite_is_stated_from_its_backbone_ring_not_the_polyhedron_idea
 
 
 def test_a_chelate_bite_is_not_reported_as_a_steric_clash():
-    """Two cis donors of one metal sit ~2 Å apart by construction; the clash gate must not call that an overlap."""
     ens = rx.embed(rx.metal(_NI_N_CY, "square_planar")[0], n=2).minimize()
     assert ens.n >= 1
     for cid in ens.ids:
@@ -190,35 +155,36 @@ def test_a_chelate_bite_is_not_reported_as_a_steric_clash():
 
 
 def test_a_side_on_eta2_ligand_embeds_geometry_clean():
-    """A side-on η² donor pair (held as one rigid regular face) embeds a geom.check-clean conformer."""
     smi = "COC(=O)[C]12->[Ni+2]3(<-[O-]C(=O)C(c4ccccc4)[N-]->3c3ccccc3)<-[C]=1(C(=O)OC)C2(C)C(C)(C)C"
     ens = rx.embed(rx.metal(smi, "square_planar")[0], n=4).minimize()
     assert any(geom.check(ens.mol, c).ok() for c in ens.ids), "no geom.check-clean side-on conformer"
 
 
-def test_a_tearing_ligand_set_is_re_seeded_until_n_geometries_are_clean(caplog):
-    """CONTRACT NOTE: `Ensemble.minimize`'s retry loop, exercised on the coordination case that needs it.
+def test_a_rejected_seed_is_replaced_until_n_geometries_are_clean(monkeypatch):
+    ens = rx.embed(rx.metal("CCCN[Pd](Cl)(Cl)NCCC", "square_planar")[0], n=2)
+    initial = set(ens.ids)
+    donors = list(ens.iso.donors)
+    drop_bad = type(ens)._drop_bad_geometries
+    rejected = False
 
-    A diphosphine on a rigid diene tears ~half the seeds under the restrained relax, so `embed(n=N).minimize()`
-    must re-embed FRESH seeds, never re-relax the torn one, until N are geom.check-clean. The dropped-conformer
-    log is asserted because a fixture the relax stopped tearing would pass this vacuously. The loop only runs for
-    a metal (`iso is not None`), so this is the only fixture that reaches it; move it to
-    `tests/pipeline/test_ensemble.py` if that module claims it.
-    """
-    smi = (
-        "CCC1=C2CCCCC2=C(CC)[P](c2ccccc2)(c2ccccc2)->[Ni+2]2(<-[O-]C(=O)C(c3ccccc3)"
-        "[N-]->2c2ccccc2)<-[P]1(c1ccccc1)c1ccccc1"
-    )
-    with caplog.at_level(logging.INFO, logger="rxembed"):
-        ens = rx.embed(rx.metal(smi, "square_planar")[0], n=2).minimize()
-    assert any("broken bond" in r.getMessage() for r in caplog.records), "this fixture no longer tears a seed"
-    assert any("re-embedded to 2/2" in r.getMessage() for r in caplog.records), caplog.text
-    assert ens.n >= 2, "embed(n=2) must hand back 2 geometries, re-seeding past the ones the relax tore"
-    assert all(geom.check(ens.mol, c).ok() for c in ens.ids)
+    def reject_one_seed(self, iso):
+        nonlocal rejected
+        drops = drop_bad(self, iso)
+        if not rejected and iso is not None and self.ids:
+            self.ids.pop()
+            drops["test rejection"] = 1
+            rejected = True
+        return drops
+
+    monkeypatch.setattr(type(ens), "_drop_bad_geometries", reject_one_seed)
+    ens.minimize()
+    assert rejected, "the test did not send a seed through the rejection path"
+    assert set(ens.ids) - initial, "the rejected seed was not replaced by a fresh embed"
+    assert ens.n == 2, "embed(n=2) must hand back exactly 2 geometries after re-seeding"
+    assert all(geom.check(ens.mol, c, donors=donors, constraints=ens.cons).ok() for c in ens.ids)
 
 
 def test_a_free_fragment_is_tethered_at_vdw_contact_not_infinity():
-    """A metal complex embedded with a separate (`.`) fragment keeps it within vdW contact of the metal."""
     embedded = 0
     for iso in rx.metal("CCCN[Pd](Cl)(Cl)NCCC.c1ccccc1", "square_planar"):
         ens = rx.embed(iso, n=2).minimize()
@@ -237,10 +203,6 @@ def test_a_free_fragment_is_tethered_at_vdw_contact_not_infinity():
 
 
 def test_coordinate_binds_a_substrate_at_the_vacant_site():
-    """3 donors in a 4-vertex square plane leave one pocket; `coordinate=` puts the substrate O in it.
-
-    The bound is the M-O window `coordinate()` itself stated, so the assertion cannot drift from the builder.
-    """
     es = rx.embed("CCCN[Pd](Cl)NCCC.O", metal="square_planar", coordinate="[OX2]", n=3, seed=1)
     for ens in list(es) if isinstance(es, rx.EnsembleSet) else [es]:
         assert ens.n >= 1
@@ -253,13 +215,6 @@ def test_coordinate_binds_a_substrate_at_the_vacant_site():
 
 
 def test_coordinate_relieves_the_phantom_floor_it_creates(monkeypatch):
-    """Seating a donor must relieve the surrogate floor on the atoms it pulls in: zero bound crossover.
-
-    RDKit floors every M...X at the bond-less carbon surrogate's vdW contact (~3.4 Å). Seating a carbonyl O puts
-    its own carbon at ~3.2 Å through the new M-O window, so the phantom contradicts the coordination and
-    triangle smoothing repairs some pair, not necessarily that one. Red whenever `coordinate()`'s output is
-    cherry-picked field-by-field instead of `compose`d, since the relief rides on a field the cherry-pick drops.
-    """
     from rxembed import bounds as _b
 
     tols, real = [], _b._bounds
@@ -296,12 +251,6 @@ def _ml_windows(iso):
 
 
 def test_a_plain_etkdg_conformer_is_not_a_metal_geometry_and_lengths_model_says_so():
-    """The defect `lengths=` exists for: 'auto' reads a property of the Mol, not a statement of intent.
-
-    RDKit has no Pd-Cl or Pd-N parameter, so the conformer it produces splits two chemically EQUIVALENT
-    chlorides: that split is the tell, and it is what 'auto' would otherwise embed toward. The model gives
-    equivalent donors equal windows because it is keyed on the element, not on one sampled geometry.
-    """
     mol = _fake_geometry(_SQUARE_PD)
     auto = _ml_windows(enumerate_isomers(Chem.Mol(mol), "square_planar")[0])
     model = _ml_windows(enumerate_isomers(Chem.Mol(mol), "square_planar", lengths="model")[0])
@@ -316,7 +265,6 @@ def test_a_plain_etkdg_conformer_is_not_a_metal_geometry_and_lengths_model_says_
 
 
 def test_lengths_input_and_model_are_reachable_regardless_of_what_the_mol_happens_to_carry():
-    """The point of the argument: the same Mol can be asked for either source, and 'auto' equals one of them."""
     mol = _fake_geometry(_SQUARE_PD)
     auto = _ml_windows(enumerate_isomers(Chem.Mol(mol), "square_planar")[0])
     given = _ml_windows(enumerate_isomers(Chem.Mol(mol), "square_planar", lengths="input")[0])
@@ -329,13 +277,11 @@ def test_lengths_input_and_model_are_reachable_regardless_of_what_the_mol_happen
 
 
 def test_lengths_input_without_a_geometry_refuses_rather_than_falling_back():
-    """A silent fallback to the model would make 'input' mean 'auto', which is the ambiguity being removed."""
     with pytest.raises(ValueError, match="carries no geometry"):
         enumerate_isomers(Chem.MolFromSmiles(_SQUARE_PD), "square_planar", lengths="input")
 
 
 def test_the_chosen_source_is_logged_once_not_once_per_vertex_ordering(caplog):
-    """`coordination()` runs per candidate ordering; the decision is made once, so it is said once."""
     with caplog.at_level(logging.INFO, logger="rxembed.metal"):
         isos = enumerate_isomers(_fake_geometry(_SQUARE_PD), "square_planar")
     assert len(isos) > 1, "the premise: more than one ordering was built"

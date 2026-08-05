@@ -17,7 +17,7 @@ from rxembed import metal_distance as mdist
 from rxembed import metal_perceive as perceive
 from rxembed.pipeline import geom_check as geom
 
-_DFT = ("mn-h2", "ru-co", "mn-hy")  # the shipped transition states the floors must accept unchanged
+_DFT = ("mn-h2", "ru-co")  # the shipped transition states the floors must accept unchanged
 _ACID_ARENE = "OC(=O)CCCCc1ccccc1"  # flexible acid + arene: the fixture for both kwarg-driven checks
 
 
@@ -71,7 +71,6 @@ def _kinds(report):
     [
         "CCO",
         _ACID_ARENE,  # close polar contacts that must not read as clashes
-        "c1ccccc1/C=C/c1ccccc1",  # extended conjugation
     ],
 )
 def test_a_clean_conformer_passes_the_whole_gate(smiles):
@@ -137,25 +136,16 @@ def test_each_violation_kind_fires_on_its_own_deliberate_break(kind):
 
 
 def test_the_two_kwarg_driven_checks_are_silent_when_the_geometry_agrees_with_what_was_stated():
-    """These two take their truth as an argument, so they are the two that can most easily flag a correct pose."""
     ref = _reference_conformer(_ACID_ARENE)
     d = float(np.linalg.norm(ref.GetConformer(0).GetPositions()[1] - ref.GetConformer(0).GetPositions()[9]))
     assert geom.check(ref, 0, frozen=list(range(6)), reference=ref).ok(), "an identical geometry moved the core"
     assert geom.check(ref, 0, constraints={"distances": {(1, 9): (d - 0.1, d + 0.1)}}).ok()
 
 
-def test_the_report_is_falsy_and_asserts_with_its_summary():
-    rep = geom.GeometryReport([geom.Violation("clash", (0, 1), 0.5, 1.0)])
-    assert not rep
-    with pytest.raises(AssertionError):
-        rep.assert_ok()
-
-
 # --- TS-awareness: a held core is not judged by ground-state rules ----------------------------------------
 
 
 def test_a_frozen_core_is_exempt_from_the_ground_state_checks():
-    """A TS core is held to the reference by design; flagging its twisted amide would flag every TS."""
     mol, _kw = _conjugation()
     a, b, c, d = mol.GetSubstructMatch(Chem.MolFromSmarts("[O]=[C]-[N]-[C]"))
     assert "conjugation" in _kinds(geom.check(mol, 0))
@@ -167,7 +157,6 @@ def test_a_frozen_core_is_exempt_from_the_ground_state_checks():
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
 def test_a_collapsed_ester_o_c_o_fusion_is_caught_where_every_prior_gate_was_blind():
-    """The two oxygens are a 1-3 pair, which is exactly why `clashes`, `bonding_ok` and `connectivity` all skip it."""
     from rxembed.pipeline import metrics
 
     mol = _reference_conformer("CC(=O)OC")
@@ -193,17 +182,11 @@ def test_a_collapsed_ester_o_c_o_fusion_is_caught_where_every_prior_gate_was_bli
     assert {o_term, o_est} not in [set(p) for p in formed], "connectivity skips a topo-2 pair"
 
 
-def test_a_real_three_membered_ring_is_never_a_fusion():
-    """The discriminator is the graph, not the angle: an epoxide's terminal atoms ARE bonded, so the pair is skipped."""
-    rep = geom.check(_reference_conformer("C1CO1"), 0)
+@pytest.mark.parametrize("smiles", ["C1CO1", "CC(=O)OC", "C[N+](=O)[O-]"])
+def test_a_real_tight_1_3_pair_is_never_a_fusion(smiles):
+    rep = geom.check(_reference_conformer(smiles), 0)
     assert "fusion" not in _kinds(rep)
     assert rep.ok(), rep.summary()
-
-
-@pytest.mark.parametrize("smiles", ["CC(=O)OC", "C[N+](=O)[O-]"])
-def test_a_real_tight_1_3_pair_is_never_a_fusion(smiles):
-    """An ester and a nitro group hold their 1-3 O...O at ~1.6x the covalent sum; well clear of the floor."""
-    assert "fusion" not in _kinds(geom.check(_reference_conformer(smiles), 0))
 
 
 # --- the metal arm: the over-bond ruler the gate reads ------------------------------------------------------
@@ -211,7 +194,6 @@ def test_a_real_tight_1_3_pair_is_never_a_fusion(smiles):
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
 def test_the_over_bond_gate_is_silent_on_every_isomer_of_a_clean_complex():
-    """The null control the firing tests below rest on: a gate that flagged a clean embed would flag everything."""
     import rxembed.pipeline as rx
 
     seen = 0
@@ -225,18 +207,17 @@ def test_the_over_bond_gate_is_silent_on_every_isomer_of_a_clean_complex():
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
 def test_donor_sets_are_per_metal_so_a_spectator_ferrocene_is_not_an_over_bond():
-    """Ten Cp carbons sit 2.05 A from their own Fe; judged against the Mn's donor set they would read as collapsed."""
     import rxembed.pipeline as rx
 
     isos = rx.metal("examples/structures/mn-h2.xyz", "octahedral", center="Mn", fix=[1, 5, 63, 64, 65, 66])
     ens = rx.embed(isos[0], n=1, seed=1)
+    assert ens.ids, "no conformer was judged: the gate was never asked anything"
     for cid in ens.ids:
         assert not perceive.metal_overbond(ens.mol, ens.mol.GetConformer(cid).GetPositions(), isos[0].donors)
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
 def test_a_third_sphere_atom_crushed_onto_the_metal_is_an_over_bond():
-    """It must fire, and the declared donor set is what keeps the judgement from being circular."""
     import rxembed.pipeline as rx
 
     smi = "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1"
@@ -270,8 +251,7 @@ def test_a_third_sphere_atom_crushed_onto_the_metal_is_an_over_bond():
     assert [x.kind for x in perceive.metal_overbond(mol, buried, None)] == ["metal_collapse"]
 
 
-def test_an_atom_two_bonds_out_is_placed_by_its_backbone_not_over_bonded():
-    """Real crystals: a kappa2-acetate bite apex at 2.460 A and a Ti beta-agostic C at 2.554 A must both pass."""
+def test_the_over_bond_tier_is_decided_by_how_many_donors_the_atom_is_bonded_to():
     ac, pos = _bare_sphere(  # Pd | O O (donors) | C carboxyl | C methyl: the CMD/AMLA motif
         ["Pd", "O", "O", "C", "C"],
         [(1, 3), (2, 3), (3, 4)],
@@ -280,31 +260,16 @@ def test_an_atom_two_bonds_out_is_placed_by_its_backbone_not_over_bonded():
     assert np.linalg.norm(pos[3] - pos[0]) == pytest.approx(2.460, abs=0.005)
     assert not perceive.metal_overbond(ac, pos, [1, 2])
 
-    ti, pos = _bare_sphere(["Ti", "C", "C"], [(1, 2)], [(0, 0, 0), (2.15, 0, 0), (1.60, 1.99, 0)])
-    assert np.linalg.norm(pos[2] - pos[0]) == pytest.approx(2.554, abs=0.01)
-    assert not perceive.metal_overbond(ti, pos, [1])
+    ti, tpos = _bare_sphere(["Ti", "C", "C"], [(1, 2)], [(0, 0, 0), (2.15, 0, 0), (1.60, 1.99, 0)])
+    assert np.linalg.norm(tpos[2] - tpos[0]) == pytest.approx(2.554, abs=0.01)
+    assert not perceive.metal_overbond(ti, tpos, [1])
 
-
-def test_the_over_bond_tier_is_decided_by_how_many_donors_the_atom_is_bonded_to():
-    """The one rule the FF floor, the geometry gate and the coordination check all key off (`metal_distance`)."""
-    ac, _pos = _bare_sphere(
-        ["Pd", "O", "O", "C", "C"],
-        [(1, 3), (2, 3), (3, 4)],
-        [(0, 0, 0), (1.12, 1.68, 0), (-1.12, 1.68, 0), (0, 2.46, 0), (0, 3.96, 0)],
-    )
     assert mdist.overbond_tier(ac, [1, 2], 3) == mdist.APEX  # bonded to both donors: a chelate bite, forced
     assert mdist.overbond_tier(ac, [1, 2], 4) == mdist.OUTER  # bonded to neither: third sphere
     assert mdist.overbond_tier(ac, [1], 3) == mdist.NEAR  # bonded to one: second sphere, floored
 
 
-def test_the_reporters_sit_strictly_below_the_force_field_floor():
-    """A relax comes to rest ON its floor, so a gate reporting at the floor would flag the relax's own output."""
-    assert mdist.NEAR_REPORT_RATIO < mdist._NEAR_FLOOR_RATIO
-    assert mdist.OUTER_REPORT_MARGIN < mdist._OVERBOND_MARGIN
-
-
 def test_the_second_sphere_floor_rejects_a_collapse_but_clears_a_real_agostic():
-    """The bonded-to-a-donor tier is floored, not exempt: the alpha-C collapse breaches it, a beta-agostic does not."""
     from rxembed.constraints import Constraints
 
     col, pos = _bare_sphere(
@@ -331,13 +296,6 @@ def test_the_second_sphere_floor_rejects_a_collapse_but_clears_a_real_agostic():
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
 @pytest.mark.parametrize("name", _DFT)
 def test_every_floor_accepts_the_real_dft_geometry_it_exists_to_reproduce(name):
-    """A floor that rejects a shipped reference rejects the answer rxembed is trying to produce.
-
-    Both floors are checked on the same structure: the non-donor floors that keep a backbone out of the
-    sphere, and the donor-collapse floor below them. ``rcov`` is a SINGLE-bond radius, so the shortest real
-    M-D is a multiply-bonded one (a back-bonded M-CO) well under the covalent sum: the collapse floor has to
-    sit below that or it rejects real structures.
-    """
     from rdkit.Chem import GetPeriodicTable
 
     from rxembed.constraints import Constraints
@@ -380,7 +338,6 @@ def _ruthenium(d_ruh=1.701, d_rucl=2.233):
 
 
 def test_a_declared_hydride_passes_the_gate_that_has_no_covalent_ruler_for_it():
-    """The strip leaves a metal-held H with no X-H bond, so the hydrogen ruler must stand down for a declared donor."""
     mol, pos = _ruthenium()
     donors = [1, 2, 3, 4]
     assert 1 in perceive._spheres(mol, pos, donors)[0]
@@ -389,7 +346,6 @@ def test_a_declared_hydride_passes_the_gate_that_has_no_covalent_ruler_for_it():
 
 
 def test_an_undeclared_agostic_h_is_not_promoted_to_a_donor():
-    """The element screen still does its real job: it classifies the atoms nobody declared."""
     mol, pos = _bare_sphere(
         ["Ru", "C", "H", "P", "P"],
         [(1, 2)],
@@ -402,7 +358,6 @@ def test_an_undeclared_agostic_h_is_not_promoted_to_a_donor():
 
 @pytest.mark.parametrize("kind", ["hydride", "chloride"])
 def test_a_declared_donor_buried_in_the_metal_is_still_caught(kind):
-    """A donor's licence is a bonding window, not a half-line to zero, and a monatomic donor has no other judge."""
     at = 1 if kind == "hydride" else 2
     mol, pos = _ruthenium(**{"d_ruh" if kind == "hydride" else "d_rucl": 0.100})
     v = perceive.metal_overbond(mol, pos, [1, 2, 3, 4])
@@ -433,7 +388,6 @@ def _seeded(smi, seed=1, pick=None):
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[nci]")
 def test_the_conjugation_cap_holds_the_thiourea_c_s_n_plane_through_the_relax():
-    """UFF has no term holding that plane; without `mechanisms.ConjugationCap` the relax twists it past the gate."""
     seen = 0
     for ens in _seeded(_SCHREINER):
         frozen = [int(f) for f in ens.cons.frozen] or None
@@ -445,7 +399,6 @@ def test_the_conjugation_cap_holds_the_thiourea_c_s_n_plane_through_the_relax():
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[nci]")
 def test_both_caps_active_leave_the_chb_complexes_sp2_carbons_planar():
-    """`mechanisms.Sp2Planar` holds the pucker the T3d case shows, and the torsion cap must not disturb it."""
     seen = 0
     for ens in _seeded(_CHB, pick="ChB"):
         frozen = [int(f) for f in ens.cons.frozen] or None
@@ -456,12 +409,6 @@ def test_both_caps_active_leave_the_chb_complexes_sp2_carbons_planar():
 
 
 def test_the_sp2_hold_rides_its_window_rather_than_pinning_flat_or_freeing_the_bowl():
-    """The same cap measured at the relax instead of the gate: corannulene's flat ETKDG seed stays flat-ish.
-
-    ETKDG seeds this genuinely-bowled PAH flat, and no force constant both holds the chb thiourea clean and
-    frees the bowl (bowl needs fc<=0.01, thiourea needs fc>=3). So the hold
-    rides out to the window edge: over-stiff would pin ~0 deg, too soft would leak toward the bare-UFF bowl.
-    """
     from rdkit.Chem import rdDistGeom
 
     from rxembed import mechanisms

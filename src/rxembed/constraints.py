@@ -27,7 +27,8 @@ from __future__ import annotations
 import itertools
 import logging
 import os
-from dataclasses import dataclass, field, fields
+from copy import deepcopy
+from dataclasses import dataclass, field, fields, replace
 from typing import NamedTuple
 
 import numpy as np
@@ -35,7 +36,12 @@ from rdkit import Chem
 
 
 class SphereRecipe(NamedTuple):
-    """How one metal centre's coordination targets were derived: enough to re-derive them on a solved sphere."""
+    """One metal centre's polytope as it was seated: which donor sits at which vertex, and of which shape.
+
+    The windows themselves are already in `distances` / `angles`; this is the seating behind them, which a
+    pairwise window cannot express. `Umbrella` is its one reader, needing the three base vertices in vertex
+    order to state a pyramid's improper.
+    """
 
     metal: int
     donors: tuple
@@ -73,8 +79,8 @@ class Constraints:
     phantoms: frozenset = field(default_factory=frozenset)  # zero-volume dummies: an eta>=3 face's centroid,
     #   standing in as the one vertex a Cp/arene presents. Transient: materialised inside the embed and the
     #   relax, never in a stored Mol, so nothing downstream (gate, metrics, dump, calculator) sees one.
-    spheres: tuple = field(default_factory=tuple)  # one `SphereRecipe` per metal centre: how its targets were
-    #   derived, so they can be re-derived on a realisable point set. Read by the engine, never by a writer.
+    spheres: tuple = field(default_factory=tuple)  # one `SphereRecipe` per metal centre: which donor sits at
+    #   which vertex of which polytope, which no pairwise window records. Read by `Umbrella`, never by a writer.
     haptic: dict = field(default_factory=dict)  # {centroid dummy -> its ring atoms}; the source of truth for
     #   eta>=3 faces. The stored mol and donor list stay real: the ring atoms are the donors.
 
@@ -84,17 +90,8 @@ class Constraints:
         return bool(self.distances or self.angles or self.planes or self.frozen)
 
     def copy(self, **overrides) -> "Constraints":
-        """Return a field-complete copy, with any keyword replacing that field outright.
-
-        Field-driven via ``_CLONE`` rather than hand-listed, so a field added to the dataclass but not the
-        registry fails at import instead of being silently dropped at some copy site.
-        """
-        out = {name: _CLONE[name](getattr(self, name)) for name in _CLONE}
-        out.update(overrides)
-        # ty reports this once per field: it cannot check a ** splat into a dataclass whose fields have
-        # different types, so it tests the union of the dict's values against every one of them. Splatting is
-        # the point: a field added to the dataclass but not to _CLONE must fail at import, not be dropped.
-        return Constraints(**out)  # ty: ignore[invalid-argument-type]
+        """Return a field-complete deep copy, with any keyword replacing that field outright."""
+        return replace(deepcopy(self), **overrides)
 
     def relaxed(self) -> "Constraints":
         """Return a copy with the seeded NCI/user contacts released, for the exploratory search.
@@ -120,24 +117,6 @@ class Constraints:
         for ring_a, ring_b, _ in self.planes:
             s |= set(ring_a) | set(ring_b)
         return s - set(self.phantoms)  # a haptic centroid dummy is transient embed scaffolding, never a real atom
-
-
-_CLONE = {  # field -> how to clone it. `shapes` is the only field whose elements are mutable; the
-    "distances": dict,  # frozenset/tuple fields are immutable, so they are shared.
-    "angles": dict,
-    "planes": list,
-    "coplanar": list,
-    "frozen": set,
-    "contacts": lambda v: v,
-    "metals": set,
-    "pulls": dict,
-    "floors": dict,
-    "dg_floors": dict,
-    "shapes": lambda v: [set(s) for s in v],
-    "phantoms": lambda v: v,
-    "spheres": lambda v: v,  # a tuple of immutable recipe tuples
-    "haptic": dict,
-}
 
 
 def _merge_last_wins(a, b):
@@ -187,11 +166,10 @@ _MERGE = {  # field -> how two sources combine. See `compose`.
     "haptic": _merge_exclusive("haptic"),  # a shared key = two faces claiming one reserved index = corruption
 }
 
-for _reg, _what in ((_CLONE, "_CLONE"), (_MERGE, "_MERGE")):  # a new field must be given a policy, not defaulted
-    _names = {f.name for f in fields(Constraints)}
-    if set(_reg) != _names:
-        raise RuntimeError(f"{_what} is out of sync with Constraints: {_names ^ set(_reg)}")
-del _reg, _what, _names
+_names = {f.name for f in fields(Constraints)}  # a new field must be given a merge policy, not defaulted
+if set(_MERGE) != _names:
+    raise RuntimeError(f"_MERGE is out of sync with Constraints: {_names ^ set(_MERGE)}")
+del _names
 
 
 def compose(*parts: Constraints) -> Constraints:

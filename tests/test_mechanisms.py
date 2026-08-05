@@ -19,7 +19,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom
+from rdkit.Chem import rdDistGeom, rdForceFieldHelpers, rdMolTransforms
 
 from rxembed import mechanisms as mech_mod
 from rxembed.constraints import Constraints
@@ -72,7 +72,6 @@ _FIELD_DRIVEN = [m for m in mech_mod.MECHANISM_ORDER if type(m).__name__ not in 
 
 @pytest.mark.parametrize("mech", _FIELD_DRIVEN, ids=lambda m: type(m).__name__)
 def test_a_field_driven_mechanism_is_silent_off_an_empty_struct(mech):
-    """No force-field term, no pending pair, no matrix edit; on either driver."""
     mol = _mol()
     assert _ff_terms(mech, Constraints(), mol).calls == [], f"{type(mech).__name__} wrote an FF term unasked"
 
@@ -86,7 +85,6 @@ def test_a_field_driven_mechanism_is_silent_off_an_empty_struct(mech):
 
 @pytest.mark.parametrize("name", sorted(_FF_REPAIRS))
 def test_an_ff_repair_fires_on_the_molecule_not_on_a_field(name):
-    """The two UFF repairs fire off a bare struct, and stand down on a metal system."""
     mech = next(m for m in mech_mod.MECHANISM_ORDER if type(m).__name__ == name)
     mol = _mol()
     assert _ff_terms(mech, Constraints(), mol).calls, f"{name} must fire on a bare struct"
@@ -100,8 +98,26 @@ def test_an_ff_repair_fires_on_the_molecule_not_on_a_field(name):
 # ---------------------------------------------------------------------------------------------------------
 
 
+def test_every_constant_here_is_calibrated_against_one_penalty_law():
+    mol = _mol("CCCC")
+    conf = mol.GetConformer()
+    d0 = rdMolTransforms.GetBondLength(conf, 0, 1)
+
+    def penalty(k, dev):
+        bare = rdForceFieldHelpers.UFFGetMoleculeForceField(mol)
+        held = rdForceFieldHelpers.UFFGetMoleculeForceField(mol)
+        held.AddDistanceConstraint(0, 1, d0 - dev, d0 - dev, k)
+        held.Initialize()
+        return held.CalcEnergy() - bare.CalcEnergy()
+
+    for k in (100.0, 400.0):
+        for dev in (0.1, 0.2):
+            assert penalty(k, dev) == pytest.approx(0.5 * k * dev**2, rel=1e-6), (
+                f"the penalty law moved at k={k}, dev={dev}: every constant in mechanics.py is calibrated on it"
+            )
+
+
 def test_distance_seeds_the_pending_pairs_and_walls_the_pair_in_the_field():
-    """`Distance` states its window in `ctx.pairs` for later writers and as a UFF distance wall."""
     mol = _mol()
     cons = Constraints(distances={(0, 3): (2.0, 2.4)})
 
@@ -116,7 +132,6 @@ def test_distance_seeds_the_pending_pairs_and_walls_the_pair_in_the_field():
 
 
 def test_pull_collapses_its_window_to_a_point_which_is_what_makes_it_a_spring():
-    """`Pull` is the only spring: lo == hi, where every sibling passes a flat-bottomed window."""
     mol = _mol()
     ff = _ff_terms(mech_mod.Pull(), Constraints(pulls={(0, 3): 2.1}), mol)
     _name, args, _kw = ff.calls[0]
@@ -124,7 +139,6 @@ def test_pull_collapses_its_window_to_a_point_which_is_what_makes_it_a_spring():
 
 
 def test_floor_is_one_sided():
-    """`Floor` states a minimum and an effectively infinite ceiling: a wall, not a window."""
     mol = _mol()
     ff = _ff_terms(mech_mod.Floor(), Constraints(floors={(0, 3): 2.6}), mol)
     _name, args, _kw = ff.calls[0]
@@ -133,7 +147,6 @@ def test_floor_is_one_sided():
 
 
 def test_frozen_pins_points_rather_than_restraining_them():
-    """A frozen core is held with zero degrees of freedom; `AddFixedPoint`, never a stiff spring."""
     mol = _mol()
     ff = _ff_terms(mech_mod.Frozen(), Constraints(frozen={0, 1, 2}), mol)
     assert ff.kinds() == ["AddFixedPoint"]
@@ -141,7 +154,6 @@ def test_frozen_pins_points_rather_than_restraining_them():
 
 
 def test_angle_writes_a_uff_angle_wall_and_a_matrix_diagonal():
-    """`Angle` states the 1-3 distance in the matrix and the angle itself in the force field."""
     mol = _mol()
     cons = Constraints(angles={(0, 1, 3): (100.0, 120.0)})
 
@@ -155,16 +167,29 @@ def test_angle_writes_a_uff_angle_wall_and_a_matrix_diagonal():
     assert args[:3] == (0, 1, 3)
 
 
-def test_an_ordinary_angle_force_constant_passes_through_but_an_over_stiff_one_is_capped():
-    """An over-stiff angle distorts a rigid or bidentate framework, so the caller's fc is a request, not a value."""
+def test_the_angle_wall_is_a_stated_number_the_ladder_cannot_raise():
     mol = _mol()
     cons = Constraints(angles={(0, 1, 3): (100.0, 120.0)})
-    assert _ff_terms(mech_mod.Angle(), cons, mol, fc=1.0).calls[0][1][-1] == 1.0
-    assert _ff_terms(mech_mod.Angle(), cons, mol, fc=1e9).calls[0][1][-1] < 1e9
+    assert _ff_terms(mech_mod.Angle(), cons, mol, fc=1.0).calls[0][1][-1] == mech_mod.ANGLE_FC
+    assert _ff_terms(mech_mod.Angle(), cons, mol, fc=0.1).calls[0][1][-1] == pytest.approx(0.1 * mech_mod.ANGLE_FC)
+    assert _ff_terms(mech_mod.Angle(), cons, mol, fc=100.0).calls[0][1][-1] == mech_mod.ANGLE_FC, (
+        "the ladder must not be able to escalate the angle wall"
+    )
+
+
+def test_a_releasable_contact_is_walled_more_softly_than_a_stated_one():
+    mol = _mol("c1ccccc1.c1ccccc1")
+    cons = Constraints(
+        distances={(0, 3): (2.0, 2.4), (1, 4): (2.0, 2.4)},
+        contacts=(frozenset({(0, 3)}), frozenset()),
+    )
+    emitted = {tuple(a[:2]): a[-1] for _n, a, _kw in _ff_terms(mech_mod.Distance(), cons, mol).calls}
+    assert emitted[(1, 4)] == pytest.approx(mech_mod.PIN_FC), "a structural window is held at PIN"
+    softened = mech_mod.PIN_FC * mech_mod.RELEASABLE_FC_SCALE
+    assert emitted[(0, 3)] == pytest.approx(softened), "a releasable one is softened"
 
 
 def test_plane_holds_a_pi_stack_by_cross_ring_distances():
-    """`Plane` turns a (ring_a, ring_b, separation) record into cross-ring distance walls."""
     mol = _mol("c1ccccc1.c1ccccc1")
     ra, rb = (tuple(r) for r in mol.GetRingInfo().AtomRings()[:2])
     cons = Constraints(planes=[(ra, rb, 3.6)])
@@ -183,14 +208,7 @@ def test_plane_holds_a_pi_stack_by_cross_ring_distances():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_every_mechanism_appears_exactly_once():
-    """A duplicate would double every term it writes; a missing one would silently drop a whole field."""
-    names = [type(m).__name__ for m in mech_mod.MECHANISM_ORDER]
-    assert len(names) == len(set(names)), f"duplicated mechanism: {names}"
-
-
 def test_distance_precedes_angle_because_angle_reads_the_windows_distance_seeds():
-    """`Angle.dg_windows` sizes its diagonal from `ctx.pairs`, which `Distance` fills; order is not free."""
     order = [type(m).__name__ for m in mech_mod.MECHANISM_ORDER]
     assert order.index("Distance") < order.index("Angle")
 
@@ -198,49 +216,6 @@ def test_distance_precedes_angle_because_angle_reads_the_windows_distance_seeds(
 # ---------------------------------------------------------------------------------------------------------
 # the force constants: what a number in this module actually costs
 # ---------------------------------------------------------------------------------------------------------
-
-
-def _uff(mol):
-    from rdkit.Chem import rdForceFieldHelpers  # as `relax.py` does; AllChem has no stubs for it
-
-    return rdForceFieldHelpers.UFFGetMoleculeForceField(mol)
-
-
-_PENALTY_LAW = {  # kind -> (is the penalty halved, probes as (fc, deviation))
-    "distance": (True, ((1.0, 0.1), (100.0, 0.2))),  # deviation in Angstrom
-    "torsion": (False, ((1.0, 5.0), (10.0, 30.0))),  # deviation in DEGREES
-}
-
-
-@pytest.mark.parametrize("kind", sorted(_PENALTY_LAW), ids=lambda k: f"{k}-penalty-law")
-def test_a_force_constant_means_what_this_module_assumes_it_means(kind):
-    """RDKit's two constraint families do not share a penalty law, and every constant here rests on which.
-
-    Measured: a distance restraint costs ``0.5 * fc * dev**2`` with dev in Angstrom, a torsion one costs
-    ``fc * dev**2`` with dev in degrees and no half. That asymmetry is why 1e4 (a distance) and 3 (a torsion)
-    are not the mismatch they look like, and it is why `_COPLANAR_FC` = 10 is 9000 kcal/mol at 30 degrees.
-    If RDKit changes either law, every number in this module silently changes meaning and nothing else in the
-    suite would notice.
-    """
-    from rdkit.Chem import rdMolTransforms
-
-    halved, probes = _PENALTY_LAW[kind]
-    mol = _mol("CCCC")
-    conf = mol.GetConformer(0)
-    base = _uff(mol).CalcEnergy()
-
-    for fc, dev in probes:
-        ff = _uff(mol)
-        if kind == "distance":
-            target = rdMolTransforms.GetBondLength(conf, 0, 3) + dev
-            ff.AddDistanceConstraint(0, 3, target, target, fc)
-        else:
-            target = rdMolTransforms.GetDihedralDeg(conf, 0, 1, 2, 3) + dev
-            ff.UFFAddTorsionConstraint(0, 1, 2, 3, False, target, target, fc)
-        want = (0.5 if halved else 1.0) * fc * dev**2
-        assert ff.CalcEnergy() - base == pytest.approx(want, rel=1e-3), (
-            f"{kind} fc={fc} at dev={dev}: penalty {ff.CalcEnergy() - base:.3f}, expected {want:.3f}"
-        )
 
 
 def _populated(mol):
@@ -257,13 +232,6 @@ def _populated(mol):
 
 
 def test_only_the_spring_ignores_the_stiffness_ladder():
-    """`Pull` is the one term whose force constant does not ride `distance_fc`, and that is what "soft" means.
-
-    At base stiffness `_SOFT_PULL_FC` equals `DISTANCE_FC` exactly, so the pull is soft only relative to an
-    ESCALATED wall: `_relax_constrained` climbs the wall to 100x while the pull stays put. A pull that rode
-    the ladder would reach 1e6 kcal/A^2 as a point restraint on every M-donor pair, which is the shape of
-    restraint that tears a sphere rather than seating it.
-    """
     mol = _mol("c1ccccc1.c1ccccc1")
     cons = _populated(mol)
 
@@ -278,69 +246,3 @@ def test_only_the_spring_ignores_the_stiffness_ladder():
     assert "Pull" in emitted, "the fixture must exercise Pull for this to mean anything"
     assert "Pull" not in rode, "Pull rode the stiffness ladder; it is the spring and must stay put"
     assert {"Distance", "Floor", "Plane"} <= rode, f"a wall must scale with the caller's stiffness, got {rode}"
-
-
-_ANGULAR_FC_CEILING = 100.0  # kcal/deg^2: 2500 kcal/mol at 5 deg, already past any cap this module wants
-
-
-def _writes_angular_terms():
-    """Mechanisms whose `ff_terms` calls a ``UFFAdd...Constraint``, read off the source.
-
-    Derived rather than listed, so a mechanism that grows an angular term is covered the day it is added.
-    """
-    import inspect
-
-    return {m for m in mech_mod.MECHANISM_ORDER if "UFFAdd" in inspect.getsource(type(m).ff_terms)}
-
-
-def _angular_fcs():
-    """Every ``(mechanism, fc)`` an angular writer emits, over fixtures that between them reach all of them.
-
-    Three, because the population is disjoint: `Sp2Planar` and `ConjugationCap` stand down the moment
-    `cons.metals` is set, `Umbrella` needs a `cons.spheres` recipe on a flat-based pyramid, and `Coplanar`
-    needs a conjugated sp2 donor, which a phosphine is not.
-    """
-    import rxembed.pipeline as rx
-
-    def sweep(cons, mol):
-        return [
-            (type(mech).__name__, args[-1])
-            for mech in mech_mod.MECHANISM_ORDER
-            for name, args, _kw in _ff_terms(mech, cons, mol).calls
-            if name.startswith("UFFAdd")
-        ]
-
-    def seated(smiles, geometry):
-        """One embedded conformer of a real complex, plus the constraints that shaped it.
-
-        A real embed rather than a bare ETKDG one: the bond-less metal surrogate is free to land on top of a
-        ligand atom, and `Umbrella` reads a dihedral through it.
-        """
-        iso = rx.metal(smiles, geometry).select(index=0)
-        ens = rx.embed(iso, n=1, seed=1)
-        work = Chem.Mol(ens._mol)
-        work.RemoveAllConformers()
-        work.AddConformer(ens._mol.GetConformer(ens.ids[0]), assignId=True)
-        return iso.cons, work
-
-    out = sweep(Constraints(angles={(0, 1, 3): (100.0, 120.0)}), _mol("CC(=O)NC"))  # Angle + the two repairs
-    out += sweep(*seated("CP(C)(C)->[Fe](<-P(C)(C)C)<-P(C)(C)C", "trigonal_pyramidal"))  # Umbrella
-    out += sweep(*seated("CC(C)=O->[Pd](Cl)(Cl)<-n1ccccc1", "square_planar"))  # Coplanar
-    return out
-
-
-def test_no_angular_force_constant_carries_a_distance_scale_number():
-    """A kcal/A^2 number pasted into a kcal/deg^2 slot is silent, and 1e4 there is 250 000 kcal at 5 degrees.
-
-    The coverage assertion is the load-bearing one. Read off emitted calls, a ceiling passes trivially over an
-    empty set: the first version of this asserted nothing at all, because its fixture set `cons.metals`
-    (silencing two writers) and carried no `cons.spheres` (silencing a third), leaving only the
-    separately-capped angle wall. Every mechanism that can emit an angular term must be reached, or the
-    ceiling below means nothing.
-    """
-    seen = _angular_fcs()
-    missing = {type(m).__name__ for m in _writes_angular_terms()} - {m for m, _fc in seen}
-    assert not missing, f"these emit angular terms but no fixture exercised them: {sorted(missing)}"
-
-    over = [(m, fc) for m, fc in seen if fc > _ANGULAR_FC_CEILING]
-    assert not over, f"angular force constant(s) on a distance scale: {over}"

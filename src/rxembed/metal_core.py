@@ -32,6 +32,12 @@ from .utils import bond_removal_mirrors, remove_bond, repair_bond_stereo
 logger = logging.getLogger("rxembed.metal")  # spelled out, not __name__ ("rxembed.metal_core"): this is
 #   the name `set_verbose` configures and every caplog filter in the suite matches.
 
+# The d-block proper: Sc-Zn, Y-Cd, La, Lu, Hf-Hg. A chemistry set, not the centre predicate. It names the
+# elements the tmQM-fitted tables were trained on (exactly the keys of `metal_distance._METAL_GROUP`), which
+# is why La and Lu are in it and Ce-Yb are not. "Is this atom a coordination centre" is `COORDINATION_METALS`
+# below; every reader that asked the centre question through this name (`metal_distance`, `metal_isomers`,
+# `metal_smiles`, `pipeline/nci`, `pipeline/ensemble`) now reads that one instead, so no module in `src/`
+# reads this set. It states what the fit covers, and the suite reads it to find the metal in a d-block input.
 TRANSITION_METALS = {
     21,
     22,
@@ -67,7 +73,15 @@ TRANSITION_METALS = {
 }
 # Any coordination centre, f-block included: the question is meaningful wherever ligands coordinate, and
 # M-L bonds are dative, so a clash gate must exclude them or a metal reads as clashing with its own sphere.
-_METAL_Z = frozenset(range(21, 31)) | frozenset(range(39, 49)) | frozenset(range(57, 81)) | frozenset(range(89, 113))
+#
+# One question, one set. Every gate acting on "there is a metal here" reads this one, or two of them disagree
+# about the same atom: `embed._check_bare_mol` refused an un-surrogated centre on the narrow d-block set while
+# `relax.bonding_ok` exempted it from the clash gate on this one, so a lanthanide walked past the guard and
+# then lost the gate that would have caught the result (measured: `[Ce](Cl)(Cl)Cl` embedded, RDKit printing
+# "UFFTYPER: Unrecognized atom type: Ce2+3", while `[Fe](Cl)(Cl)Cl` was correctly refused).
+COORDINATION_METALS = (
+    frozenset(range(21, 31)) | frozenset(range(39, 49)) | frozenset(range(57, 81)) | frozenset(range(89, 113))
+)
 SURROGATE = 6  # carbon: its excluded volume stops a ligand folding into the metal, so the distance geometry keeps it
 
 
@@ -87,8 +101,8 @@ def _vertex_atom(haptic, v):
 
 
 def metal_index(mol):
-    """Index of the first transition-metal atom, or None."""
-    return next((a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS), None)
+    """Index of the first metal coordination centre (d- or f-block), or None."""
+    return next((a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS), None)
 
 
 _MIN_STEREO_NEIGHBOURS = 3  # a tetrahedral stereocentre needs >=3 explicit neighbours (else ETKDG raises)
@@ -283,7 +297,7 @@ def surrogate_metal(mol):
     """Remove metal-donor bonds and swap the metal to a UFF surrogate. Returns (mol, metal, donors, real_Z, real_q)."""
     m = metal_index(mol)
     if m is None:
-        raise ValueError("no transition metal found")
+        raise ValueError("no metal centre found")
     donors = [n.GetIdx() for n in mol.GetAtomWithIdx(m).GetNeighbors()]
     em = Chem.RWMol(mol)
     hands = {}  # donor -> the tag it must carry in the bond order the strip leaves behind
@@ -292,7 +306,9 @@ def surrogate_metal(mol):
         remove_bond(em, d, m)  # re-bases the tag: an M-L bond at an odd slot mirrors the symbol it leaves
         a = em.GetAtomWithIdx(d)
         _clear_labile_donor_stereo(a)  # a donor that's a stereocentre only while bound
-        a.SetNoImplicit(True)  # freeze donor H count so MC (openconf) adds none
+        a.SetNumExplicitHs(a.GetTotalNumHs())  # freeze the count, rather than deleting it: `SetNoImplicit`
+        a.SetNoImplicit(True)  # alone zeroes an implicit H, and an aqua that loses its two protons then reads
+        # as a terminal oxo (`ligand_valence`). A no-op on the explicit-H mol `embed` requires.
         hands[d] = a.GetChiralTag()
     real_z = em.GetAtomWithIdx(m).GetAtomicNum()
     a = em.GetAtomWithIdx(m)
@@ -325,7 +341,7 @@ def restore_metal(mol, metal, real_z, real_q):
     a.SetFormalCharge(real_q)
 
 
-def connect_metal(mol, donor_bonds):
+def connect_metal(mol, donor_bonds, *, order=Chem.BondType.DATIVE):
     """Re-add the surrogate-stripped M-donor bonds as dative (donor->metal), returning a connected Mol.
 
     `restore_metal` is calculator-minimal, since xtb needs no graph, so it leaves the metal topologically
@@ -336,12 +352,16 @@ def connect_metal(mol, donor_bonds):
     connectivity without touching any ligand's valence, H-count or charge. Coordinates untouched, idempotent.
     A bond the input drew covalent comes back dative, so the metal picks up radical electrons RDKit would
     otherwise pair; element, oxidation state and total charge, which is what a calculator reads, are unaffected.
+
+    `order` exists for the one caller that needs the opposite: `metal_smiles.canonical_smiles` asks for single
+    on the sigma donors, because writing a string has to re-derive the ionic form from the donor's valence,
+    and a dative bond is already the answer to that question. Every other caller wants the default.
     """
     rw = Chem.RWMol(mol)
     added = False
     for d, m in donor_bonds:
         if rw.GetBondBetweenAtoms(int(d), int(m)) is None:
-            rw.AddBond(int(d), int(m), Chem.BondType.DATIVE)
+            rw.AddBond(int(d), int(m), order)
             added = True
     if not added:
         return mol
@@ -366,8 +386,8 @@ def disconnect_metal(mol):
         for b in mol.GetBonds()
         if b.GetBondType() == Chem.BondType.DATIVE
         and (
-            mol.GetAtomWithIdx(b.GetBeginAtomIdx()).GetAtomicNum() in TRANSITION_METALS
-            or mol.GetAtomWithIdx(b.GetEndAtomIdx()).GetAtomicNum() in TRANSITION_METALS
+            mol.GetAtomWithIdx(b.GetBeginAtomIdx()).GetAtomicNum() in COORDINATION_METALS
+            or mol.GetAtomWithIdx(b.GetEndAtomIdx()).GetAtomicNum() in COORDINATION_METALS
         )
     ]
     if not dative:
@@ -381,8 +401,12 @@ def disconnect_metal(mol):
 
 
 def metal_indices(mol):
-    """Return the indices of all transition-metal atoms."""
-    return [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS]
+    """Return the indices of every metal coordination centre (d- or f-block).
+
+    The one answer to "which atoms does the surrogate own", so every door reads it: the `Isomer` enumeration,
+    `prepare_relax`'s perceived-complex path, and the `embed` guard that refuses an un-surrogated centre.
+    """
+    return [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS]
 
 
 def _haptic_sites(mol, donors):
@@ -471,7 +495,7 @@ def ligands(mol):
     """
     metals = metal_indices(mol)
     if not metals:
-        raise ValueError("no transition metal found: this reads a metal complex's coordination sphere")
+        raise ValueError("no metal centre found: this reads a metal complex's coordination sphere")
     bound = {m: {n.GetIdx() for n in mol.GetAtomWithIdx(m).GetNeighbors()} for m in metals}
     base, _info = surrogate_all_metals(mol)
     mapping = []
@@ -486,46 +510,44 @@ def ligands(mol):
     return out
 
 
-_H_VALENCE = 1  # all SMILES will spend on a hydrogen; a second connection has to be dative
+_PT = Chem.GetPeriodicTable()
 
 
-def dative_smiles(mol):
-    """Write the complex as a SMILES with dative M-donor bonds, checked to parse back to the same atoms.
+def ligand_valence(atom):
+    """Bond orders `atom` spends on its LIGAND side, protons included; every bond to a metal is excluded.
 
-    Perception already writes M-donor bonds as dative, so this is `MolToSmiles` plus the one repair SMILES
-    needs. A hydrogen with more than one connection - a side-on H2, a bridging hydride, an H-bond relay
-    perceived as a bond - has no valence left for a second single bond, so it keeps its shortest bond and
-    donates through the rest. That is the real electron flow for sigma-donated H2 and a convention for the
-    relay, which SMILES has no way to say otherwise.
-
-    Raises rather than hand back a string that does not round-trip, since a SMILES you cannot read back is
-    worse than none.
+    Metal-blind by construction, so it reads the same on the real complex and on `surrogate_metal`'s bond-less
+    one. Implicit and explicit hydrogens both count, since they are exactly what separates an aqua from an oxo.
     """
-    rw = Chem.RWMol(mol)
-    pos = mol.GetConformer().GetPositions() if mol.GetNumConformers() else None
-    for atom in mol.GetAtoms():
-        if atom.GetAtomicNum() != 1 or atom.GetDegree() <= _H_VALENCE:
-            continue
-        h = atom.GetIdx()
-        nbrs = [n.GetIdx() for n in atom.GetNeighbors()]
-        if pos is not None:  # without a geometry the graph order is all there is to go on
-            nbrs.sort(key=lambda n: float(np.sum((pos[n] - pos[h]) ** 2)))
-        for n in nbrs[1:]:
-            remove_bond(rw, h, n)  # re-seats the bond LAST at `n`, so the partner's tag moves basis with it
-            rw.AddBond(h, n, Chem.BondType.DATIVE)  # H donates: a dative bond spends the END atom's valence
+    return atom.GetTotalNumHs() + sum(
+        b.GetBondTypeAsDouble()
+        for b in atom.GetBonds()
+        if b.GetOtherAtom(atom).GetAtomicNum() not in COORDINATION_METALS
+    )
 
-    out = rw.GetMol()
-    out.UpdatePropertyCache(strict=False)
-    smi = Chem.MolToSmiles(out)
-    back = Chem.MolFromSmiles(smi)
-    if back is None or Chem.AddHs(back).GetNumAtoms() != mol.GetNumAtoms():
-        got = "does not parse" if back is None else f"parses back as {Chem.AddHs(back).GetNumAtoms()} atoms"
-        raise ValueError(
-            f"could not write a round-tripping SMILES for this complex ({mol.GetNumAtoms()} atoms): the "
-            f"result {got}. The perceived graph is likely one SMILES cannot express (a hypervalent or "
-            f"partial-bond centre); work from the Mol itself."
-        )
-    return smi
+
+def donated_charge(donor):
+    """Give the charge a donor carries once its bond to the metal is written the ionic way, donor -> metal.
+
+    Decided from VALENCE, never from the perceived M-L bond order, because no two perceivers agree on that one:
+    xyzgraph types a terminal oxo as a neutral single-bonded `[O]` and the nitrido beside it as `[N-3]`, while
+    a SMILES writes the same oxo `O=[M]`. What survives all three is what the LIGAND side leaves unsatisfied.
+    A donor with nothing but metals on it has no other way to fill its shell, so it donates its whole valence
+    and carries the matching charge: `M=O` is `[M2+]<-[O2-]`, `M#N` is `[M3+]<-[N3-]`, `M-Cl` is `[M+]<-[Cl-]`.
+    A donor its ligand side already satisfies (a phosphine, an aqua, an ether) donates a lone pair and stays
+    neutral, which is what a dative bond means; charging a coordinated PR3 would invent an ion.
+
+    Zero for anything a metal is not the whole of: the alkoxide / amide / carbanion case, where a partly-filled
+    donor's charge is a Kekule accident and belongs to `metal_distance.delocalised_charges` instead. Reaching
+    past the empty ligand side is measured and refuted (see `ml_distance`), and it must never reach a pi face:
+    counting a Cp carbon short is what wrote ferrocene as `[Fe+10]` with ten `[c-]`.
+
+    Call it on a donor. A bare counterion has an empty ligand side too, and would come back charged.
+    """
+    valence = _PT.GetDefaultValence(donor.GetAtomicNum())
+    if valence <= 0 or ligand_valence(donor):  # a metal (no default valence), or a donor its ligand already fills
+        return 0
+    return -valence
 
 
 def materialise_phantoms(mol, haptic):
@@ -597,7 +619,7 @@ def _site_radius(mol, site, cid=-1):
 
 
 def surrogate_all_metals(mol):
-    """Surrogate every transition metal (bonds removed, carbon) for a multi-metal complex.
+    """Surrogate every metal centre (bonds removed, carbon) for a multi-metal complex.
 
     UFF must type the whole complex of a bimetallic TS, and `surrogate_metal` only does the first metal.
     Returns ``(mol, metals)`` where ``metals`` is ``[(idx, real_z, real_q), ...]``, the element and oxidation
@@ -605,7 +627,7 @@ def surrogate_all_metals(mol):
     """
     idxs = metal_indices(mol)
     if not idxs:
-        raise ValueError("no transition metal found")
+        raise ValueError("no metal centre found")
     em = Chem.RWMol(mol)
     metals, hands, ambiguous = [], {}, set()
     for m in idxs:
@@ -726,20 +748,26 @@ def classify_geometry(mol, metal, sites, cid=-1):
     )
     logger.log(
         logging.WARNING if poor else logging.INFO,
-        "metal: %s %s from the conformer; sphere is %s (coplanarity RMS %.3f A vs %.2f tol, M-L %.2f A), "
-        "shape residual %.3f; %s%s%s",
+        # Two lines, not one 200-char line, and the geometry is stated FIRST because that is what a caller
+        # asked for. The coplanarity numbers only earn their space when they are the reason for a poor
+        # verdict, so they are DEBUG unless `poor`; a good octahedron used to report its own RMS as if
+        # complaining about it.
+        "metal: %s %s from the conformer (shape residual %.3f); %s%s%s",
         verdict,
         _describe(best),
-        "in-plane" if rms <= COPLANAR_TOL else "out-of-plane",
-        rms,
-        COPLANAR_TOL,
-        r,
         best_err,
         f"runner-up {_describe(ranked[1][1])} at {ranked[1][0]:.3f}"
         if len(ranked) > 1
         else "the only candidate at this CN",
         f"; a flat sphere excluded {', '.join(_describe(n) for n in dropped)}" if dropped else "",
         advice,
+    )
+    logger.debug(
+        "metal: sphere is %s, coplanarity RMS %.3f A vs %.2f tol, M-L %.2f A",
+        "in-plane" if rms <= COPLANAR_TOL else "out-of-plane",
+        rms,
+        COPLANAR_TOL,
+        r,
     )
     return best
 
@@ -817,18 +845,63 @@ def label(mol, metal, donors, cid, geometry=None):
     return "cis"
 
 
+def _flat_ranks(mol):
+    """Canonical ranks on the resonance-insensitive skeleton: bond orders, aromaticity, charge and stereo flat.
+
+    Perception has to pick one localised resonance form, and which atom it leaves holding the charge or the
+    double bond is not a fact about the molecule. Measured over `benchmark/corpus`: this ties ferrocene's ten
+    ring atoms (as perceived they fall in three classes, because a five-ring cannot alternate), JIWHOQ's two
+    allyl termini, and VOacac2's four acac oxygens, which the perceived ranks split into a ketone and an
+    enolate pair. The E/Z on the C=C is what splits the acac oxygens, so bond stereo has to go too.
+
+    The total H count is pinned rather than dropped: a resonance-localised carbanion carries an explicit H
+    where its ring-mates carry an implicit one, and unpinning it reads a symmetric ring as asymmetric.
+    """
+    rw = Chem.RWMol(mol)
+    total_h = [a.GetTotalNumHs() for a in rw.GetAtoms()]
+    for bond in rw.GetBonds():
+        bond.SetBondType(Chem.BondType.SINGLE)
+        bond.SetIsAromatic(False)
+        bond.SetStereo(Chem.BondStereo.STEREONONE)
+    for atom, h in zip(rw.GetAtoms(), total_h, strict=True):
+        atom.SetFormalCharge(0)
+        atom.SetIsAromatic(False)
+        atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+        atom.SetNumExplicitHs(h)
+        atom.SetNoImplicit(True)
+    flat = rw.GetMol()
+    flat.UpdatePropertyCache(strict=False)
+    Chem.FastFindRings(flat)  # the RWMol edit cleared RingInfo, which canonical ranking reads
+    return list(Chem.CanonicalRankAtoms(flat, breakTies=False))
+
+
 def _donor_classes(mol, donors):
     """Map each donor atom -> its symmetry-equivalence class; interchangeable donors share one.
 
     Canonical rank with ``breakTies=False`` gives graph automorphism classes, which is what the handedness
-    parity must key on: the two N of one en, or three equivalent chlorides, rank equal. Falls back to the
-    element symbol if ranking is unavailable.
+    parity must key on: the two N of one en, or three equivalent chlorides, rank equal. Coarsened by
+    `_flat_ranks` where a frozen resonance form is all that separates two donors. The merge only ever
+    coarsens, by construction: two donors join iff they agree on EITHER reading, transitively, so a flat
+    reading that split a perceived class could not act on it. That direction matters, because a lost
+    labelling is a lost arrangement, where an over-merge only reports a false achirality, which the mirror
+    audit sees. Falls back to the element symbol if ranking is unavailable.
     """
     try:
         ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
-        return {d: ranks[d] for d in donors}
+        flat = _flat_ranks(mol)
     except Exception:  # pragma: no cover - canonical ranking is robust, but never let chirality crash embed
         return {d: mol.GetAtomWithIdx(d).GetSymbol() for d in donors}
+    root = {}
+
+    def find(x):
+        while root.setdefault(x, x) != x:
+            x = root[x] = root[root[x]]
+        return x
+
+    for d in donors:  # a class is a component of "same perceived rank OR same flat rank"
+        a, b = find(("perceived", ranks[d])), find(("flat", flat[d]))
+        root[max(a, b)] = min(a, b)  # the representative is a reading, so it is order-invariant too
+    return {d: find(("perceived", ranks[d])) for d in donors}
 
 
 def _chelate_edges(mol, vertices, haptic=None):

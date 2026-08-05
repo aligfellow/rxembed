@@ -10,22 +10,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import networkx as nx
 import numpy as np
 from rdkit import Chem
 
-from rxembed.metal_core import TRANSITION_METALS, _frag_map
+from rxembed.metal_core import COORDINATION_METALS, _frag_map
 
 if TYPE_CHECKING:
-    import networkx as nx
     from xyzgraph.nci import NCIAnalyzer
 
 
 def _graph(mol: Chem.Mol, conf_id: int = -1) -> nx.Graph:
-    try:
-        import networkx as nx
-    except ImportError as exc:
-        raise ImportError("_graph needs networkx; pip install 'rxembed[nci]'") from exc
-
     conf = mol.GetConformer(conf_id)
     g = nx.Graph()
     for a in mol.GetAtoms():
@@ -98,12 +93,15 @@ class ContactKind:
     anchor: str = "heavy"
 
 
-# the registry: one row per contact type. H-bonds tolerate bending (~140°); sigma-holes are sharply linear.
+# The registry: one row per contact type. H-bonds tolerate bending (~140°); sigma-holes are sharply linear.
+# XB 2.5-3.1 is the GFN-FF-surviving window on the I...pyridine probe. CATPI stays at the generic 3.5 A:
+# its cation-dependent GFN-FF optima span 1.55-4.41 A, which one registry row cannot encode without overfitting.
+# Measured by `benchmark/nci_wall.py`; ring values are centroid heights, expanded to atom windows downstream.
 KINDS = {
     k.name: k
     for k in [
         ContactKind("HB", "atom", (1.6, 2.2), orient=(140.0, 180.0), apex="donor", anchor="donor_h"),
-        ContactKind("XB", "atom", (3.0, 3.6), orient=(160.0, 180.0), apex="sigma"),
+        ContactKind("XB", "atom", (2.5, 3.1), orient=(160.0, 180.0), apex="sigma"),
         ContactKind("ChB", "atom", (3.0, 3.6), orient=(155.0, 180.0), apex="sigma"),
         ContactKind("PnB", "atom", (3.0, 3.6), orient=(155.0, 180.0), apex="sigma"),
         ContactKind("IONIC", "atom", (2.6, 3.8)),
@@ -510,13 +508,13 @@ def _metal_hydride_contacts(work, an, pos, frag, sym, seen, inter_fragment, kind
     """Build terminal metal-hydride (M-H) H-bond donor contacts, one per hydride to its nearest acceptor.
 
     Nearest N/O/F acceptor in another fragment (so a substrate with many heteroatoms doesn't spawn a
-    contradictory pile). Structural detection (a terminal H on a transition metal), not SMARTS, so it works
-    on an xyz-perceived Mol too. Dev-stage simplification: an M-H is always a donor (the metal is the 'donor
+    contradictory pile). Structural detection (a terminal H on a coordination centre), not SMARTS, so it
+    works on an xyz-perceived Mol too. Dev-stage simplification: an M-H is always a donor (the metal is the 'donor
     heavy', orientation M-H...A linear); the di-hydrogen-bond and S/Cl-acceptor cases are left for later.
     xyzgraph does not type these, so they are *seeded* but not *re-detected* by binding_modes().
     """
     out = {}
-    metals = [a.GetIdx() for a in work.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS]
+    metals = [a.GetIdx() for a in work.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS]
     hydrides = [
         (metal, nbr.GetIdx())
         for metal in metals

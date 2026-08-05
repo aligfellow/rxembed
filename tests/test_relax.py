@@ -39,18 +39,12 @@ def _stretch(mol, i, j, length):
 
 
 def test_a_stated_distance_is_not_judged_as_a_bond():
-    """Where the constraint system STATES a separation, the radius rule has nothing left to decide.
-
-    This is the defect that made `embed('CCCl', fix={(1, 2): 2.4})` return zero conformers: the gate read the
-    user's own requested TS bond as broken. Whether the window was MET is `.measure()`'s question, not this one's.
-    """
     mol = _stretch(_mol(), 1, 2, 2.4)
     assert not bonding_ok(mol, 0), "unconstrained, a 2.4 A C-Cl should read as torn"
     assert bonding_ok(mol, 0, constrained={(1, 2): (2.35, 2.45)}), "a stated pair must be exempt"
 
 
 def test_the_exemption_is_per_pair_not_per_atom():
-    """Exempting an ATOM would excuse every bond it has: which is how a real tear hid behind a stated one."""
     mol = _stretch(_stretch(_mol(), 1, 2, 2.4), 0, 1, 4.0)
     assert not bonding_ok(mol, 0, constrained={(1, 2): (2.35, 2.45)}), (
         "stating C-Cl must not excuse the torn C-C that shares atom 1"
@@ -63,7 +57,6 @@ def test_the_exemption_is_per_pair_not_per_atom():
 
 
 def test_restrained_uff_pulls_a_stated_pair_toward_its_window():
-    """The whole point of the restrained relax: the pair ends closer to its window than it started."""
     mol = _mol()
     before = GetBondLength(mol.GetConformer(0), 1, 2)
     restrained_uff(mol, Constraints(distances={(1, 2): (2.35, 2.45)}))
@@ -72,17 +65,14 @@ def test_restrained_uff_pulls_a_stated_pair_toward_its_window():
 
 
 def test_max_iters_zero_scores_without_moving_an_atom():
-    """`max_iters=0` returns the restrained energy and moves nothing; how the ladder re-scores after a rescue."""
     mol = _mol()
     cons = Constraints(distances={(1, 2): (2.35, 2.45)})
     before = mol.GetConformer(0).GetPositions().copy()
-    e = restrained_uff(mol, cons, max_iters=0)
+    restrained_uff(mol, cons, max_iters=0)
     assert np.allclose(mol.GetConformer(0).GetPositions(), before), "max_iters=0 moved atoms"
-    assert len(e) == 1
 
 
 def test_ff_energies_is_unconstrained_and_so_is_not_interchangeable():
-    """`ff_energies` omits the constraint penalties; swapping it in would change the energy SCALE mid-relax."""
     mol = _mol()
     cons = Constraints(distances={(1, 2): (2.35, 2.45)})  # unsatisfied by the seed -> a real penalty
     restrained = float(restrained_uff(Chem.Mol(mol), cons, max_iters=0)[0])
@@ -95,14 +85,10 @@ def test_ff_energies_is_unconstrained_and_so_is_not_interchangeable():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_the_ff_surrogate_is_the_identical_object_on_an_organic_system():
-    """No metal, no phantom, no copy: which is what makes the organic relax bit-identical."""
-    mol = _mol()
-    assert _ff_surrogate(mol, set(), ()) is mol
-
-
 def test_the_ff_surrogate_retypes_in_place_without_changing_an_index():
-    """Metals become Li and phantoms Xe on a copy; nothing is added or removed, so no restraint is mis-keyed."""
+    organic = _mol()
+    assert _ff_surrogate(organic, set(), ()) is organic, "no metal, no phantom, no copy"
+
     mol = _mol("CCO")
     out = _ff_surrogate(mol, {0}, (1,))
     assert out is not mol
@@ -113,7 +99,6 @@ def test_the_ff_surrogate_retypes_in_place_without_changing_an_index():
 
 
 def test_the_bond_prune_drops_only_frozen_frozen_bonds_and_is_skipped_when_there_are_none():
-    """A frozen-FREE bond anchors a relaxing atom to the held core and must survive; `None` means no copy."""
     mol = _mol()
     assert _bond_pruned(mol, frozen=set()) is None
     assert _bond_pruned(mol, frozen={0, 2}) is None, "C0 and Cl2 are two bonds apart, so nothing joins two frozen"

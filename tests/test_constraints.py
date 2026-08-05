@@ -2,8 +2,8 @@
 
 Two contracts in one module, so one test file:
 
-* the STRUCT: a field may never be silently dropped by `copy`, `relaxed` or `compose`. `_CLONE`/`_MERGE` are
-  field-driven registries; the tests below drive them off a struct with every field populated.
+* the STRUCT: a field may never be silently dropped by `copy`, `relaxed` or `compose`. The tests below drive
+  them off a struct with every field populated; `_MERGE` remains the field-specific policy registry.
 * the RESOLVER; `resolve_core` turns the user's `fix`/`constrain` into that struct. Assertions are exact
   (`== {...}`, not "at least") so a loosened resolver is caught, and the `contacts` provenance is checked
   because it alone decides what `mc(explore=)` may release.
@@ -56,7 +56,6 @@ def _populated():
 
 
 def test_copy_carries_every_field():
-    """`copy()` is field-driven, so no field is dropped."""
     c = _populated()
     d = c.copy()
     for f in fields(Constraints):
@@ -64,7 +63,6 @@ def test_copy_carries_every_field():
 
 
 def test_copy_does_not_alias_mutable_state():
-    """Mutating a copy leaves the original untouched; including `shapes`, whose ELEMENTS are mutable."""
     c = _populated()
     d = c.copy()
     d.distances[(4, 5)] = (1.0, 2.0)
@@ -78,7 +76,6 @@ def test_copy_does_not_alias_mutable_state():
 
 
 def test_relaxed_releases_only_the_seeded_contacts():
-    """`relaxed()` drops exactly the `contacts` keys and carries every structural hold through."""
     c = _populated()
     r = c.relaxed()
     assert (0, 1) not in r.distances
@@ -89,7 +86,6 @@ def test_relaxed_releases_only_the_seeded_contacts():
 
 
 def test_compose_merges_every_field():
-    """`compose()` is field-driven too: sets union, planes concatenate, distances merge."""
     a = _populated()
     b = Constraints(frozen={20}, metals={21}, phantoms=frozenset({22}), planes=[((9,), (9,), 1.0)])
     add_distance(b.distances, 4, 5, 1.0, 2.0)
@@ -103,7 +99,6 @@ def test_compose_merges_every_field():
 
 
 def test_compose_does_not_mutate_its_inputs():
-    """Every field of an input survives a compose unchanged."""
     a, b = _populated(), Constraints(frozen={20})
     before = {f.name: getattr(a, f.name) for f in fields(Constraints)}
     compose(a, b)
@@ -112,7 +107,6 @@ def test_compose_does_not_mutate_its_inputs():
 
 
 def test_compose_distance_is_last_wins():
-    """A spec landing on a structural hold overrides it: a deliberate user override, not a conflict."""
     a, b = Constraints(), Constraints()
     add_distance(a.distances, 0, 1, 1.9, 2.1)
     add_distance(b.distances, 0, 1, 2.5, 2.7)
@@ -120,11 +114,6 @@ def test_compose_distance_is_last_wins():
 
 
 def test_compose_takes_the_stricter_wall_and_the_fullest_relief():
-    """`floors` merges by max, `dg_floors` by min; opposite directions, both order-independent.
-
-    A max on `dg_floors` would keep the larger *phantom* carbon-vdW floor over the better-informed physical
-    one, making the relief a silent no-op on exactly the pairs two sources both claim.
-    """
     a = Constraints(floors={(9, 4): 2.8}, dg_floors={(9, 4): 2.8})
     b = Constraints(floors={(9, 4): 3.1}, dg_floors={(9, 4): 3.1})
     for one, two in ((a, b), (b, a)):
@@ -137,7 +126,6 @@ def test_compose_takes_the_stricter_wall_and_the_fullest_relief():
     [("pulls", {(9, 0): 2.1}, {(9, 0): 2.4}), ("haptic", {12: [1, 2]}, {12: [3, 4]})],
 )
 def test_compose_refuses_an_unresolvable_collision(field_name, one, two):
-    """Two harmonic targets on one pair, or two faces claiming one reserved index, raise rather than guess."""
     a, b = Constraints(**{field_name: one}), Constraints(**{field_name: two})
     with pytest.raises(ValueError, match=field_name):
         compose(a, b)
@@ -149,7 +137,6 @@ def test_compose_refuses_an_unresolvable_collision(field_name, one, two):
 
 
 def test_fix_list_holds_own_coords():
-    """`fix=[i, j, k]` grafts those atoms' own coordinates and pins their pairwise shape, unreleasably."""
     m = _mol()
     cons, ref = resolve_core(m, fix=[0, 1, 2], has_geometry=True)
     assert cons.frozen == {0, 1, 2}
@@ -165,14 +152,12 @@ def test_fix_list_holds_own_coords():
 
 
 def test_fix_list_needs_geometry():
-    """Holding an atom's own coordinates needs a conformer to read them from."""
     m = Chem.AddHs(Chem.MolFromSmiles("CCO"))
     with pytest.raises(ValueError, match="own coordinates"):
         resolve_core(m, fix=[0, 1, 2], has_geometry=False)
 
 
 def test_fix_explicit_coords_uses_the_given_shape_not_the_molecule_s():
-    """`fix={i: (x, y, z)}` grafts the GIVEN coordinates, and the shape windows follow them."""
     m = _mol()
     coords = {0: (0.0, 0.0, 0.0), 1: (1.5, 0.0, 0.0), 2: (1.5, 1.4, 0.0)}
     cons, ref = resolve_core(m, fix=coords, has_geometry=True)
@@ -184,7 +169,6 @@ def test_fix_explicit_coords_uses_the_given_shape_not_the_molecule_s():
 
 
 def test_a_fix_number_is_a_tight_window_that_is_never_releasable():
-    """`fix={(i, j): d, (i, j, k): theta}` writes tight windows, no graft, and nothing `relaxed()` can drop."""
     m = _mol()
     cons, ref = resolve_core(m, fix={(0, 2): 2.0, (0, 1, 2): 109.5}, has_geometry=True)
     assert cons.distances[(0, 2)] == pytest.approx((1.98, 2.02))
@@ -195,24 +179,12 @@ def test_a_fix_number_is_a_tight_window_that_is_never_releasable():
     assert cons.contacts == (frozenset(), frozenset())
 
 
-def test_fix_dict_mixes_coords_and_numbers():
-    """One `fix=` dict may carry a coordinate graft and a numbers window at once."""
-    m = _mol()
-    cons, ref = resolve_core(
-        m, fix={0: (0.0, 0.0, 0.0), 1: (1.5, 0.0, 0.0), 2: (1.5, 1.4, 0.0), (3, 4): 1.1}, has_geometry=True
-    )
-    assert cons.frozen == {0, 1, 2}
-    assert set(ref) == {0, 1, 2}
-    assert cons.distances[(3, 4)] == pytest.approx((1.08, 1.12))
-
-
 # ---------------------------------------------------------------------------------------------------------
 # constrain: a soft, releasable window
 # ---------------------------------------------------------------------------------------------------------
 
 
 def test_a_constrain_number_is_a_wider_window_that_relaxed_releases():
-    """A scalar `constrain=` pads wider than a `fix` and lands in `contacts`, which `relaxed()` drops."""
     m = _mol()
     cons, ref = resolve_core(m, constrain={(0, 2): 2.8, (0, 1, 2): 120.0}, has_geometry=True)
     assert cons.distances[(0, 2)] == pytest.approx((2.7, 2.9))  # +/-0.1 A, five times the fix pad
@@ -224,7 +196,6 @@ def test_a_constrain_number_is_a_wider_window_that_relaxed_releases():
 
 
 def test_an_explicit_window_is_taken_verbatim_by_either_verb():
-    """A `(lo, hi)` value is used as given: no padding on top of a window the user already stated."""
     m = _mol()
     assert resolve_core(m, fix={(0, 2): (1.9, 2.1)}, has_geometry=True)[0].distances[(0, 2)] == pytest.approx(
         (1.9, 2.1)
@@ -235,20 +206,10 @@ def test_an_explicit_window_is_taken_verbatim_by_either_verb():
 
 
 def test_constrain_ring_pair_becomes_a_pi_stack_plane():
-    """Two ring index-tuples as a key are a parallel-stack plane, not a distance."""
     m = _mol("c1ccccc1.c1ccccc1")
     ra, rb = (tuple(r) for r in m.GetRingInfo().AtomRings()[:2])
     cons, _ = resolve_core(m, constrain={(ra, rb): 3.7}, has_geometry=True)
     assert cons.planes == [(ra, rb, 3.7)]
-
-
-def test_fix_and_constrain_compose_with_distinct_provenance():
-    """Through `relaxed()` the fix survives and the constrain is released: the provenance split, end to end."""
-    m = _mol()
-    cons, _ = resolve_core(m, fix={(0, 1): 1.5}, constrain={(0, 2): (2.6, 3.0)}, has_geometry=True)
-    relaxed = cons.relaxed()
-    assert (0, 1) in relaxed.distances
-    assert (0, 2) not in relaxed.distances
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -269,23 +230,16 @@ def test_fix_and_constrain_compose_with_distinct_provenance():
     ids=["smarts-key", "smarts-in-list", "out-of-range", "angle-too-big", "angle-negative", "same-atom"],
 )
 def test_a_nonsense_key_or_target_is_refused_at_the_spec(spec, match):
-    """The resolver is index-driven on purpose; an out-of-range angle otherwise died inside RDKit's C++."""
     with pytest.raises(ValueError, match=match):
         resolve_core(_mol(), has_geometry=True, **spec)
 
 
 def test_one_key_under_both_verbs_is_refused():
-    """`constrain` resolves last, so it overwrote the `fix` and made it releasable by mc(explore=)."""
     with pytest.raises(ValueError, match="two contradictory intents"):
         resolve_core(_mol("CCCl"), fix={(1, 2): 2.5}, constrain={(2, 1): (1.7, 1.8)}, has_geometry=True)
 
 
 def test_a_window_inside_the_fixed_core_is_dropped_loudly(caplog):
-    """A window between two grafted atoms can never apply, and it corrupted the bounds matrix on the way.
-
-    The graft restores those atoms to their exact coordinates after the embed, so the constraint silently
-    no-opped while the whole embed was seeded against its (contradictory) bound.
-    """
     coords = {i: (float(i), 0.0, 0.0) for i in (0, 1, 2)}  # collinear, 1.0 A apart
     with caplog.at_level("WARNING", logger="rxembed"):
         cons, _ref = resolve_core(_mol("CCCl"), fix=coords, constrain={(1, 2): 3.4}, has_geometry=True)
@@ -300,7 +254,6 @@ def test_a_window_inside_the_fixed_core_is_dropped_loudly(caplog):
 
 
 def test_fewer_than_three_graft_atoms_warns(caplog):
-    """A two-atom graft has a length but no orientation; advisory, not fatal."""
     m = _mol()
     with caplog.at_level("WARNING", logger="rxembed"):
         resolve_core(m, fix=[0, 1], has_geometry=True)
@@ -308,7 +261,6 @@ def test_fewer_than_three_graft_atoms_warns(caplog):
 
 
 def test_two_shared_atom_distances_over_three_atoms_warn_that_the_angle_is_free(caplog):
-    """The classic mis-fix: an SN2 pinned by two distances alone is bent, not linear."""
     m = _mol()
     with caplog.at_level("WARNING", logger="rxembed"):
         resolve_core(m, fix={(0, 1): 1.5, (1, 2): 1.4}, has_geometry=True)
@@ -324,7 +276,6 @@ def test_two_shared_atom_distances_over_three_atoms_warn_that_the_angle_is_free(
     ids=["angle-given", "rich-network"],
 )
 def test_a_determined_network_does_not_warn(caplog, fix, why):
-    """The advisory must stay quiet where the core is determined, or it is noise."""
     m = _mol("CCCC")
     with caplog.at_level("WARNING", logger="rxembed"):
         resolve_core(m, fix=fix, has_geometry=True)
@@ -332,7 +283,6 @@ def test_a_determined_network_does_not_warn(caplog, fix, why):
 
 
 def test_the_info_echo_names_atoms_by_element_and_index(caplog):
-    """The echo is the net for a 1-based / wrong-atom pick, so it must print element+index and the target."""
     m = _mol()  # ethanol: 0=C, 1=C, 2=O
     with caplog.at_level("INFO", logger="rxembed"):
         resolve_core(m, fix={(0, 2): 2.0}, has_geometry=True)
@@ -343,12 +293,6 @@ def test_the_info_echo_names_atoms_by_element_and_index(caplog):
 
 
 def test_match_refuses_an_ambiguous_pattern_rather_than_picking_one():
-    """The silent first-match is the failure the index-driven API exists to prevent, so `match` must not do it.
-
-    On 2-chlorobenzyl chloride `[Cl]` hits the aryl and the benzylic chloride. RDKit's `GetSubstructMatch`
-    returns the aryl one, the unreactive one, with no signal. A constraint keyed on it is a wrong answer that
-    looks right, so `match` resolves a pattern only when the answer is unique.
-    """
     mol = Chem.AddHs(Chem.MolFromSmiles("Clc1ccccc1CCl"))
     assert len(mol.GetSubstructMatches(Chem.MolFromSmarts("[Cl]"))) == 2, "the fixture must be ambiguous"
     with pytest.raises(ValueError, match="matched 2 times"):

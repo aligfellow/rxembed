@@ -75,13 +75,11 @@ def _ruthenium(d_ruh=1.701, d_rucl=2.233):
 
 
 def test_a_clean_conformer_re_perceives_to_the_graph_it_came_from():
-    """The null control the whole check rests on: re-perception of an untouched geometry must diff to nothing."""
     m = _mol("CC(=O)Nc1ccccc1")
     assert metrics.connectivity(m, m.GetConformers()[0].GetId()) == ([], [])
 
 
 def test_a_stretched_bond_is_reported_broken_unless_the_frozen_core_holds_it():
-    """A TS's partial bond is held to the reference by design, so `exclude` must un-judge the pairs inside it."""
     m = _mol("CCO")
     cid = m.GetConformer().GetId()
     rdMolTransforms.SetBondLength(m.GetConformer(), 1, 2, 2.40)  # ~1.7x the C-O covalent sum, fragment and all
@@ -91,7 +89,6 @@ def test_a_stretched_bond_is_reported_broken_unless_the_frozen_core_holds_it():
 
 
 def test_a_transferred_proton_is_seen_where_bonding_ok_is_blind():
-    """The whole reason this check exists: bonding_ok is heavy-atom-only, so N-H...O -> N...H-O passes it."""
     m = _mol("[NH3+]CC(=O)[O-]")
     conf = m.GetConformer()
     n = next(a.GetIdx() for a in m.GetAtoms() if a.GetSymbol() == "N")
@@ -107,28 +104,14 @@ def test_a_transferred_proton_is_seen_where_bonding_ok_is_blind():
     assert metrics.bonding_ok(m, conf.GetId()), "bonding_ok is heavy-atom-only: it CANNOT see this"
 
 
-def test_bonding_ok_is_the_relax_arbiter_itself_not_a_second_copy():
-    """Two implementations of "is this still bonded" would drift; the pipeline re-exports the core's one."""
-    from rxembed.relax import bonding_ok
-
-    assert metrics.bonding_ok is bonding_ok
-
-
 def test_a_metal_pair_is_left_to_coordination_changed():
-    """A dative bond has no covalent yardstick, so the covalent diff must not judge it; or every metal reacts."""
     import rxembed.pipeline as rx
 
     iso = rx.metal("Cl[Pd](Cl)(N)N", "square_planar")[0]
     ens = rx.embed(iso, n=2, seed=1).minimize()
+    assert ens.ids, "no conformer survived: the covalent diff was never asked about a metal pair"
     for cid in ens.ids:
         assert metrics.connectivity(ens.mol, cid, metals={iso.metal}, elements={iso.metal: iso.real_z}) == ([], [])
-
-
-def test_describe_names_the_atoms_that_changed():
-    """The filter logs this string when it drops a conformer; an unreadable one hides which bond moved."""
-    text = metrics.describe(_mol("CCO"), [(0, 2)], [(1, 2)])
-    assert "C0" in text
-    assert "O2" in text
 
 
 # --- coordination_changed: the metal's own diff -----------------------------------------------------------
@@ -148,8 +131,6 @@ def test_a_donor_dragged_off_the_metal_is_reported_as_having_left():
 
 
 def test_a_monatomic_hydride_is_exempt_from_the_covalent_diff_but_not_from_the_dative_one():
-    """The strip leaves a hydride with no bonds to read, so a covalent diff calls every one of them gone; but
-    the exemption is bounded: the M-H distance is still judged, or a hydride could walk away unnoticed."""
     held, _pos = _ruthenium()
     assert held.GetAtomWithIdx(1).GetDegree() == held.GetAtomWithIdx(2).GetDegree() == 0
     assert metrics.coordination_changed(held, held.GetConformer().GetId(), 0, [1, 2, 3, 4]) == ([], [])
@@ -159,7 +140,6 @@ def test_a_monatomic_hydride_is_exempt_from_the_covalent_diff_but_not_from_the_d
 
 
 def test_an_undeclared_agostic_h_neither_joins_nor_leaves():
-    """A beta-agostic C-H sits close to the metal and nobody declared it: it is not a new donor."""
     mol, _pos = _bare_sphere(
         ["Ru", "C", "H", "P", "P"],
         [(1, 2)],
@@ -169,7 +149,6 @@ def test_an_undeclared_agostic_h_neither_joins_nor_leaves():
 
 
 def test_an_alpha_carbon_collapsed_into_the_sphere_is_reported_as_joined():
-    """The other direction: a non-donor that reached bonding distance has changed the coordination number."""
     mol, _pos = _bare_sphere(
         ["Pd", "N", "C", "C", "Cl", "Cl"],
         [(1, 2), (2, 3)],

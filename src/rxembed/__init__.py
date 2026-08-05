@@ -5,8 +5,9 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .constraints import Constraints, compose, match, resolve_core
 from .embed import Conformers, embed, minimize
-from .metal_core import Ligand, dative_smiles, ligands
+from .metal_core import Ligand, ligands
 from .metal_isomers import Isomer, IsomerSet, enumerate_isomers
+from .metal_smiles import canonical_smiles, dative_smiles, parse_smiles
 from .relax import ff_energies, restrained_uff
 
 logger = logging.getLogger("rxembed")
@@ -27,6 +28,7 @@ __all__ = [
     "Isomer",
     "IsomerSet",
     "Ligand",
+    "canonical_smiles",
     "compose",
     "dative_smiles",
     "embed",
@@ -35,6 +37,7 @@ __all__ = [
     "ligands",
     "match",
     "minimize",
+    "parse_smiles",
     "resolve_core",
     "restrained_uff",
     "set_verbose",

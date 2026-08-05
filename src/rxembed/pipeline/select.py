@@ -19,7 +19,8 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 
-from rxembed.metal_core import _frag_map, metal_index
+from rxembed.metal_core import COORDINATION_METALS, _frag_map, metal_index
+from rxembed.metal_perceive import _coordinating
 from rxembed.utils import _angle
 
 _ROT = Chem.MolFromSmarts("[!$(*#*)&!D1]-!@[!$(*#*)&!D1]")
@@ -55,7 +56,6 @@ def dihedrals(mol, conf_id, quads=None):
 
 # The single per-conformer latent, behind both clustering and the landscape: one representation, so a plot
 # and a dedup never disagree about which conformers are alike.
-_M_DONOR_CUT = 2.8  # Angstrom: a heavy atom within this of the metal counts as a donor
 _MIN_FRAGS = 2  # a binding-mode block needs at least two fragments
 _MIN_DONORS = 2  # two donors are needed to define an L-M-L angle
 _EPS = 1e-9  # std floor for z-scoring
@@ -66,17 +66,24 @@ def _norm(m):
 
 
 def _metal_donors(mol, ids):
-    """``(metal, heavy atoms inside `_M_DONOR_CUT` of it)``, or ``(None, None)`` when there is no metal."""
+    """``(metal, its coordination sphere)``, or ``(None, None)`` when there is no metal.
+
+    A bonded graph states the complete non-metal sphere directly; a bond-less wrapped Mol falls back to
+    `metal_perceive`'s covalent-radius rule. Do not intersect the two: that QA policy deliberately drops a
+    donor that leaves the shell, while a descriptor needs one stable column schema across every conformer.
+    A partially bonded sphere is therefore treated as declared, not guessed complete.
+
+    A 2.8 Å cutoff cannot serve either source: coordination distance scales with both radii, so it misses
+    long La-Se bonds and admits nearby chelate backbone atoms. `benchmark/select_sphere.py` measures the corpus.
+    """
     m = metal_index(mol)
     if m is None:
         return None, None
     pos0 = mol.GetConformer(ids[0]).GetPositions()
-    donors = [
-        a.GetIdx()
-        for a in mol.GetAtoms()
-        if a.GetIdx() != m and a.GetAtomicNum() > 1 and np.linalg.norm(pos0[a.GetIdx()] - pos0[m]) < _M_DONOR_CUT
-    ]
-    return m, donors
+    neighbors = list(mol.GetAtomWithIdx(m).GetNeighbors())
+    if neighbors:
+        return m, sorted(n.GetIdx() for n in neighbors if n.GetAtomicNum() not in COORDINATION_METALS)
+    return m, sorted(_coordinating(mol, pos0, m))
 
 
 def _metal_features(mol, ids):
@@ -387,7 +394,7 @@ def apply(
     if method == "energy":
         return keep_mask(energy_prune(en, energy_tol=energy_tol))
     raise ValueError(
-        f"unknown dedup method {method!r} (use 'moi' | 'rmsd' | 'descriptor' | 'energy', "
+        f"unknown dedup method {method!r} (use 'moi' | 'rmsd' | 'descriptor' | 'energy' | 'none', "
         f"or representatives() for a binding-mode summary)"
     )
 
@@ -463,6 +470,3 @@ def descriptor_prune(coords, features, energies, *, labels=None, max_dist=1.0, e
         raise ImportError("descriptor_prune needs prism_pruner; pip install 'rxembed[select]'") from exc
 
     return np.asarray(_run(cfg)[1], bool)
-
-
-prune = apply  # the public name for the dedup step (descriptor_prune / energy_prune keep their own names)

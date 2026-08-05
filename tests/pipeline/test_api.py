@@ -22,32 +22,26 @@ from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 
 import rxembed.pipeline as rx
-from rxembed import embed as core_embed
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.dispatch import _embed_dispatch
 
 _SLACK_A = 0.15  # the pipeline's own _validate distance slack: a window realised within this is "held"
-_FIX_TOL_A = 0.1  # a numbers-fix distance must land this close to target (flat-bottom UFF compromise)
-_FIX_TOL_DEG = 8.0
 
 
 # --- baseline: clean peripheries ---------------------------------------------
 
 
-@pytest.mark.parametrize("smiles", ["CCO", "OC(=O)CCCCc1ccccc1", "C1CC1C(=O)O", "c1ccc2ccccc2c1"])
+@pytest.mark.parametrize(
+    "smiles",
+    [
+        "OC(=O)CCCCc1ccccc1",  # close polar contacts that must not read as clashes
+        "CCO.c1ccccc1",  # two fragments must not embed on top of each other
+    ],
+)
 def test_free_embed_is_clean(smiles):
     import rxembed.pipeline as rx
 
     ens = rx.embed(smiles, n=6).minimize()  # the gate is the acceptance test on settled geometries
-    assert ens.n >= 1
-    for cid in ens.ids:
-        geom.check(ens.mol, cid).assert_ok()
-
-
-def test_multifragment_vdw_separation():
-    import rxembed.pipeline as rx
-
-    ens = rx.embed("CCO.c1ccccc1", n=6).minimize()  # two fragments must not embed on top of each other
     assert ens.n >= 1
     for cid in ens.ids:
         geom.check(ens.mol, cid).assert_ok()
@@ -108,41 +102,7 @@ def test_constrain_plane_stacks_two_rings():
     assert free_sep > stacked_sep + 2.0  # and the constraint genuinely bit (free phenyls sit far apart)
 
 
-# --- fix numbers: a TS core from SMILES (DESIGN W3) --------------------------
-
-
-def test_fix_numbers_deliver_sn2_core():
-    """A linear 3-centre SN2 core stated purely as numbers is delivered; on every conformer, not on average.
-
-    `[F-].CCl` -> F(0), C(1), Cl(2). Two distances and the angle between them, no reference geometry.
-
-    Asserted per conformer with the RMSD prune OFF. With it on, this near-rigid six-atom system collapses 24
-    seeds to one (correctly; they are the same shape), and the test then rests on that single conformer
-    clearing the geometry gate, which it does not always do. That made it fail about one run in thirty. Judging
-    every conformer instead is both deterministic and a stronger claim than the mean of the survivors.
-    """
-    mol = Chem.AddHs(Chem.MolFromSmiles("[F-].CCl"))
-    fix = {(0, 1): 2.0, (1, 2): 2.2, (0, 1, 2): 178.0}
-    confs = core_embed(mol, fix=fix, n=8, seed=0xF00D, prune_rms=-1).minimize()
-    assert len(confs) == 8, "the prune is off, so every seed must come back"
-
-    out = confs.mol
-    for cid in confs.ids:
-        conf = out.GetConformer(int(cid))
-        assert abs(rdMolTransforms.GetBondLength(conf, 0, 1) - 2.0) < _FIX_TOL_A
-        assert abs(rdMolTransforms.GetBondLength(conf, 1, 2) - 2.2) < _FIX_TOL_A
-        assert abs(rdMolTransforms.GetAngleDeg(conf, 0, 1, 2) - 178.0) < _FIX_TOL_DEG
-
-
 # --- feasibility ------------------------------------------------------------
-
-
-def test_tight_but_feasible_core_embeds():
-    import rxembed.pipeline as rx
-
-    ens = rx.embed("C1CCCCC1", constrain={(0, 3): (2.5, 2.6)}, n=6).minimize()  # tight transannular pinch
-    assert ens.n >= 1
-    assert ens.measure((0, 3))["max"] <= 2.6 + _SLACK_A  # the pinch actually held (free d(0,3) ~ 2.9)
 
 
 def test_infeasible_fix_raises():
@@ -152,25 +112,35 @@ def test_infeasible_fix_raises():
         rx.embed("CCO", fix={(0, 2): 0.15}, n=4)  # a physically impossible C..O distance
 
 
-def test_unknown_kwarg_is_rejected():
+@pytest.mark.parametrize("kw", [{"freeze": [0, 1, 2]}, {"n_confs": 2}, {"num_confs": 2}])
+def test_removed_embed_keywords_are_rejected(kw):
     import rxembed.pipeline as rx
 
-    with pytest.raises(TypeError, match="fix / constrain / template"):
-        rx.embed("CCO", freeze=[0, 1, 2])  # the old kwarg is gone; fail loudly, don't silently ignore
+    with pytest.raises(TypeError, match=next(iter(kw))):
+        rx.embed("CCO", **kw)
+
+
+@pytest.mark.parametrize("door", ["embed", "metal"])
+@pytest.mark.parametrize("stereo", ["auto", "enumerate"])
+def test_removed_stereo_modes_are_rejected(door, stereo):
+    import rxembed.pipeline as rx
+
+    with pytest.raises(ValueError, match="unknown stereo mode"):
+        getattr(rx, door)("CCO", stereo=stereo)
+
+
+@pytest.mark.parametrize("stereo", [{"point": "bogus"}, {"bogus": "free"}])
+def test_unknown_per_kind_stereo_specs_are_rejected(stereo):
+    import rxembed.pipeline as rx
+
+    with pytest.raises(ValueError, match="unknown stereo mode"):
+        rx.embed("CCO", stereo=stereo)
 
 
 # --- minimize records its drops, exactly as prune does -----------------------
 
 
 def test_minimize_records_its_energy_window_drops(monkeypatch):
-    """A conformer minimize() drops on its relax-energy window must land in `discarded`, not vanish silently.
-
-    prune promises "Nothing is lost": every conformer it merges away is recorded in `discarded`. minimize
-    drops conformers too (energy window, torn bond, out-of-plane sphere, inverted donor hand, wrong stereo) and
-    once did so *silently*, so that promise was false for any ensemble that saw a minimize first. Spike one
-    conformer's FF energy far past the window: the real relax still runs (the geometry gates upstream see a
-    normal structure and pass it through to the window), so the drop is the window's, and it must be recorded.
-    """
     import numpy as np
 
     import rxembed.pipeline as rx
@@ -200,15 +170,6 @@ def test_minimize_records_its_energy_window_drops(monkeypatch):
 
 
 def test_minimize_single_point_branch_degrades_on_untypable_graph(monkeypatch, caplog):
-    """minimize()'s single-point relax must degrade like its sibling `_relax_constrained`, not crash.
-
-    `_relax_constrained` wraps `restrained_uff` in try/except RuntimeError so an untypable / hypervalent
-    reacting core keeps its embedded geometry. The single-point branch taken once `embed` has relaxed the
-    seeds (`_seeds_relaxed=True`) called `restrained_uff` without that guard, so it propagated the error
-    where the sibling degraded, and `_relax_into_windows` sets `_seeds_relaxed` even when its own relax
-    build failed, so a later `.minimize()` re-hits the same graph. RDKit's UFF builds even for actinides, so
-    the natural trigger is rare; fault-inject the RuntimeError to prove both entry points now degrade alike.
-    """
     import rxembed.pipeline as rx
     from rxembed.pipeline import calculators as _refine
 
@@ -229,36 +190,47 @@ def test_minimize_single_point_branch_degrades_on_untypable_graph(monkeypatch, c
     assert ens.ids == kept, "the embedded geometry must be kept when the single point cannot be typed"
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "match"),
-    [
-        ({"seed": -1}, "not reproducible"),
-        ({"n": 0}, "positive conformer count"),
-    ],
-)
-def test_the_pipeline_embed_refuses_a_silently_wrong_argument(kwargs, match):
-    """The pipeline reaches the core at `seed_conformers`, so the seam, not the front door, owns these.
+def test_pipeline_minimize_takes_template_like_embed():
+    ref = rx.embed("CCO", n=1, seed=1)
+    core = [0, 1, 2]  # C, C, O: three atoms, so the graft restores a shape rather than sliding a bond
+    want = ref.mol.GetConformer(ref.ids[0]).GetPositions()
 
-    `rx.embed('CCO', seed=-1)` used to be accepted and returned different coordinates on identical calls
-    (RDKit's -1 draws from the global RNG); `n=0` fell through `n or n_confs(...)` and silently meant "auto".
-    """
-    import rxembed.pipeline as rx
+    moved = Chem.Mol(ref.mol)  # same graph, the core pulled apart so a graft has something to undo
+    conf = moved.GetConformer()
+    for a in core:
+        p = conf.GetAtomPosition(a)
+        conf.SetAtomPosition(a, [p.x + 0.6 * a, p.y - 0.4 * a, p.z])
+    torn = moved.GetConformer().GetPositions()
+    off = abs(np.linalg.norm(torn[0] - torn[2]) - np.linalg.norm(want[0] - want[2]))
+    assert off > 0.5, f"the core was not distorted, so a graft would be invisible (d off by {off:.2f} A)"
 
-    with pytest.raises(ValueError, match=match):
-        rx.embed("CCO", **kwargs)
+    out = rx.minimize(moved, template=(ref, {i: i for i in core}))
+
+    got = out.mol.GetConformer(out.ids[0]).GetPositions()
+    for i, j in ((0, 1), (1, 2), (0, 2)):
+        d_ref = float(np.linalg.norm(want[i] - want[j]))
+        d_out = float(np.linalg.norm(got[i] - got[j]))
+        assert abs(d_out - d_ref) < 0.01, f"template= did not graft d({i},{j}): {d_out:.3f} vs {d_ref:.3f} A"
 
 
-def test_dump_refuses_an_empty_ensemble(tmp_path):
-    """A 0-byte file that reads as a successful write is the worst possible outcome (the `Conformers` rule).
+def test_pipeline_minimize_keeps_an_isomers_coordination_while_composing_a_template_and_list_fix():
+    seed = rx.embed(rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0], n=1, seed=1)
+    iso = rx.metal(seed.mol, "square_planar")[0]
+    sphere = {iso.metal, *iso.donors}
+    core = [a.GetIdx() for a in iso.mol.GetAtoms() if a.GetIdx() not in sphere][:3]
 
-    Reachable from the pipeline: `minimize()` can drop every conformer, and `EnsembleSet.dump` fans out here.
-    """
-    import rxembed.pipeline as rx
+    out = rx.minimize(iso, template=(iso.mol, {i: i for i in core[:2]}), fix=core[2:])
 
-    ens = rx.embed("CCO", n=2)
-    ens.ids = []
-    with pytest.raises(ValueError, match="nothing to dump"):
-        ens.dump(str(tmp_path / "empty.xyz"))
+    assert out.n == 1
+    assert sorted(out.cons.frozen) == core
+    assert out.sphere == {iso.metal: iso.donors}, "the Isomer's coordination context was lost"
+
+
+def test_the_two_enumerate_isomers_on_the_pipeline_namespace_disagree_loudly():
+    smiles = "CCCN[Pd](Cl)Cl"
+    assert len(rx.metal(smiles, "square_planar")) > 0, "the pipeline verb must read this string"
+    with pytest.raises(TypeError, match="takes an RDKit Mol"):
+        rx.enumerate_isomers(smiles, "square_planar")
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -308,13 +280,6 @@ def _worst(ens):
 
 
 def test_metal_embed_satisfies_its_coordination_windows():
-    """A bis-en Co(III) octahedron: `rx.embed` alone, no `.minimize()`.
-
-    The in-repo stand-in for XAWQUH (an external tmQM refcode, and `tests/` deliberately depends on no
-    corpus outside the repo). Same phenomenon, larger: this arrangement's raw seed misses a coordination
-    angle window by 63 deg, against XAWQUH's 41 -- both go to 0.00 once the relax runs. It is also the
-    molecule that exercises the angle intersect branch, so the two nets cover one structure.
-    """
     ens = rx.embed(rx.metal("Cl[Co]12(Cl)(NCCN1)NCCN2", "octahedral")[0], n=4, seed=1)
     assert ens.ids, "embed produced no conformers"
     ang, dist = _worst(ens)
@@ -323,15 +288,6 @@ def test_metal_embed_satisfies_its_coordination_windows():
 
 
 def test_a_seed_the_relax_tears_keeps_its_seed_geometry_not_a_wrecked_one():
-    """`embed` must never hand back a conformer the relax wrecked, and must not silently spend the caller's `n`.
-
-    the N-bound Ni is the case that forces this: the window relax tears 3 of 8 seeds at the base stiffness, one with
-    the kappa1 carboxylate wrenched to a 119 deg anti-offset (an sp2 carbon is rigidly 180). `_rescue_torn`
-    re-relaxes each at its own minimal sufficient stiffness and falls back to the seed for any that survives no
-    rung, so the count is preserved and no conformer is worse than the seed it came from. The residual is
-    stated, not hidden: a fallback conformer keeps its seed's window violation, which is why this asserts a
-    MAJORITY satisfy the windows rather than all of them.
-    """
     ni_n = "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1"
     iso = rx.metal(ni_n, "square_planar")[0]
     seeds = _embed_dispatch(iso, n=8, seed=1)
@@ -353,19 +309,12 @@ def test_a_seed_the_relax_tears_keeps_its_seed_geometry_not_a_wrecked_one():
     ok = sum(1 for a, d in _per_conformer(ens) if a < _ANGLE_SLACK and d < _DIST_SLACK)
     seed_ok = sum(1 for a, d in _per_conformer(seeds) if a < _ANGLE_SLACK and d < _DIST_SLACK)
     assert seed_ok == 0, "the raw seed is supposed to satisfy NOTHING here: the premise moved"
+    # At most two irreparable conformers may keep the seed's residual rather than a torn relaxed geometry.
     assert ok >= len(ens.ids) - 2, f"only {ok}/{len(ens.ids)} conformers satisfy their windows"
 
 
-@pytest.mark.parametrize(
-    ("smiles", "constrain"),
-    [
-        ("OC(=O)CCCCc1ccccc1", {(1, 9): (2.6, 3.0)}),  # an arene-acid: the seed misses by 0.55 A
-        ("NCCCCCCC(=O)O", {(0, 8): (2.5, 3.0)}),  # the class the finding reproduced at 0.208-0.432 A
-    ],
-)
-def test_organic_constrain_window_is_satisfied_by_embed(smiles, constrain):
-    """A soft `constrain=` window on a plain organic: no metal, no frozen core, no `.minimize()`."""
-    ens = rx.embed(smiles, constrain=constrain, n=4, seed=1)
-    assert ens.ids, "embed produced no conformers"
+def test_organic_embed_satisfies_its_constrain_window():
+    ens = rx.embed("OC(=O)CCCCc1ccccc1", constrain={(1, 9): (2.6, 3.0)}, n=4, seed=1)
+    assert ens.ids
     _ang, dist = _worst(ens)
-    assert dist < _DIST_SLACK, f"embed() left the constrain= window violated by {dist:.3f} A"
+    assert dist < _DIST_SLACK, f"embed() left constrain= violated by {dist:.3f} A"

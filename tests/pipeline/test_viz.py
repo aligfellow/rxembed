@@ -5,9 +5,7 @@ from importlib.util import find_spec
 import numpy as np
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    find_spec("matplotlib") is None or find_spec("seaborn") is None, reason="needs rxembed[viz]"
-)
+pytestmark = pytest.mark.skipif(find_spec("matplotlib") is None, reason="needs rxembed[viz]")
 
 
 @pytest.fixture(autouse=True)
@@ -18,7 +16,6 @@ def _headless():
 
 
 def test_every_known_projection_lands_in_two_dimensions_and_an_unknown_one_is_refused():
-    """The landscape plots x/y off this, so a projection that came back 7-wide would draw silent nonsense."""
     from rxembed.pipeline.viz import project
 
     feats = np.random.default_rng(0).normal(size=(12, 7))
@@ -29,7 +26,6 @@ def test_every_known_projection_lands_in_two_dimensions_and_an_unknown_one_is_re
 
 
 def test_the_landscape_draws_the_kept_and_the_pruned_in_one_projection():
-    """Kept and dropped are projected together, so a pruned region is visible where it actually was."""
     import rxembed.pipeline as rx
     from rxembed.pipeline.viz import landscape
 

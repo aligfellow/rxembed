@@ -4,10 +4,15 @@ The isomer identity rxembed selects on is geometric, not a chemistry name: cis/t
 a tris-chelate is lambda/delta rather than mer/fac. One flat ``Polyhedron`` record per geometry, and two
 pure-numpy pieces over a record's ``vertex_dirs``:
 
-- the point-group split (`point_group`): every vertex permutation is a proper (rotation) or improper
-  (reflection) isometry of the template, and that group is what an arrangement canonicalises over.
+- the point-group split (`point_group`, named for callers as `rotation_group`): every vertex permutation is
+  a proper (rotation) or improper (reflection) isometry of the template. The full group is ``proper x Z2``
+  and that Z2 is the handedness, so an arrangement folds over the PROPER half and no more.
 - handedness (`handedness`): the centre's chirality as the parity of the canonicalising frame, achiral iff
-  some reflection fixes the donor-class plus chelate-bite labelling.
+  some reflection fixes the donor-class plus chelate-bite labelling. It needs a seating that can tell the
+  two hands apart, which is what `seat_properly` guarantees.
+- the canonical slot labelling (`canonical_slots`): the same fold applied to the arrangement itself, so a
+  slot number is a fact about the molecule rather than about the order its atoms arrived in, plus the
+  `slot_note` / `read_slot_note` pair that renders one and reads it back.
 
 Parity rather than RDKit's native metal stereo because that permutation is not order-invariant for equivalent
 ligands. Attribution for the templates and the algorithm: README, "References".
@@ -17,6 +22,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import permutations
@@ -116,22 +122,25 @@ _TBP_ISOMERS = (
     (2, 4, 0, 1, 3),
     (3, 4, 0, 1, 2),
 )
+# C4v, so 5!/8 = 15 arrangements. Two orderings are one isomer iff `q[k] == p[g[k]]` for a template symmetry;
+# by that test the previous list named only 10, five entries repeating an earlier one. The last five below
+# replace them. Every other canned list here passes the same check unchanged.
 _SPY_ISOMERS = (
     (0, 1, 2, 3, 4),
     (0, 1, 3, 2, 4),
-    (0, 1, 4, 2, 3),
     (1, 0, 2, 3, 4),
     (1, 0, 3, 2, 4),
-    (1, 0, 4, 2, 3),
     (2, 1, 0, 3, 4),
     (2, 1, 3, 0, 4),
-    (2, 1, 4, 0, 3),
     (3, 1, 2, 0, 4),
     (3, 1, 0, 2, 4),
-    (3, 1, 4, 2, 0),
     (4, 1, 2, 3, 0),
     (4, 1, 3, 2, 0),
-    (4, 1, 0, 2, 3),
+    (0, 1, 2, 4, 3),
+    (1, 0, 2, 4, 3),
+    (2, 0, 1, 3, 4),
+    (3, 0, 1, 2, 4),
+    (4, 0, 2, 1, 3),
 )
 _OCT_ISOMERS = (
     (0, 1, 2, 3, 4, 5),
@@ -525,6 +534,97 @@ def point_group(dirs):
         return frozenset(tuple(int(x) for x in perms[p]) for p in np.flatnonzero(resid < _SYM_TOL))
 
     return realises(sgn), realises(-sgn)  # (rotations det +1, reflections det -1)
+
+
+def rotation_group(geometry):
+    """Return `geometry`'s proper (rotation) vertex permutations, or ``None`` when it has no template.
+
+    The named accessor over `point_group`, because the proper half is the only group an arrangement may be
+    folded over: the full group is ``proper x Z2`` and that Z2 is the handedness, so anything larger deletes
+    Lambda/Delta and nothing else. Cached with the template, so a repeat call costs microseconds.
+    """
+    dirs = vertex_dirs(geometry)
+    return None if dirs is None else point_group(tuple(map(tuple, dirs)))[0]
+
+
+def seat_properly(dirs_obs, dirs, order):
+    """Return `order` re-seated so the template reaches the observed sphere by a ROTATION, not a reflection.
+
+    `_fit_trace` sums singular values, which a reflection leaves alone, so a structure and its mirror score
+    identically at every candidate seating and the search cannot tell them apart: measured identical on 45
+    of 45 corpus centres, including the 7 the descriptor called chiral. Composing the winner with one
+    improper template symmetry flips the fit's parity and leaves its singular values untouched, so this
+    reaches the best reflection-free seating over all n! labellings without enlarging the candidate set or
+    rescoring it. That matters: rescoring with the reflection forbidden, against a candidate list that holds
+    one representative per FULL-group orbit, is what seated three DUGVUX donors into trans slots 93 degrees
+    apart, because the enantiomeric labelling was not in the list to be found.
+
+    A planar template realises the identity permutation improperly, so `min` picks the identity there and
+    this is a no-op, which is right: a planar centre has no handedness to seat.
+
+    A re-seat is not free downstream, and the reason is `resolved_angles` naming a MINIMAL subset of the
+    vertex pairs (6 of 10 for a bipyramid). Every angle over all pairs is mirror-invariant, but that subset
+    is not, so re-seating changes which DONOR pairs are stated: 15 of the 45 corpus structures re-seat, 12
+    with an identical multiset of windows and 3 whose content moves. See `metal_coordination`'s chelate
+    branch for the one that ends up stating fewer.
+    """
+    ideal = np.array(dirs, float)
+    u, _s, vt = np.linalg.svd(np.asarray(dirs_obs)[list(order)].T @ ideal)
+    refl = point_group(tuple(map(tuple, dirs)))[1]
+    if not refl or np.linalg.det(u @ vt) >= 0:
+        return list(order)
+    q = min(refl)  # any one improper element; which one only moves the result within its proper orbit
+    return [order[q[v]] for v in range(len(order))]
+
+
+def canonical_slots(dirs, keys, bites=frozenset()):
+    """Return the canonical slot per vertex: the vertex labelling minimised over the proper rotations.
+
+    `keys[v]` is an order-invariant identity for whatever sits at vertex v (``None`` for a vacant one), and
+    `bites` the chelating vertex pairs `handedness` also reads. A slot number is only a fact about the
+    molecule modulo the template's own rotations, so a raw seating still carries a ``|rot|``-fold ambiguity
+    that the input atom order breaks; this picks the orbit's representative instead.
+
+    The fold is over the PROPER rotations alone, and the key is built from slots and chemistry only, never
+    from an atom index or a position in some string, so any renderer folding this way reaches the same
+    answer. A tie means the tied vertices carry interchangeable sites, and which representative comes back
+    is then arbitrary by construction: a renderer must pair sorted sites with sorted slots within a key
+    class rather than trust the per-vertex number.
+    """
+    rot = point_group(tuple(map(tuple, dirs)))[0]
+    n = len(dirs)
+    if not rot:
+        return None
+    edges = [tuple(e) for e in bites]
+
+    def form(q):
+        seats = tuple(sorted((q[v], keys[v]) for v in range(n) if keys[v] is not None))
+        return seats, tuple(sorted(tuple(sorted((q[a], q[b]))) for a, b in edges))
+
+    return list(min(rot, key=form))
+
+
+_SLOT_NOTE = re.compile(r"^s(\d+)([+-]?)$")  # a donor's canonical slot, with an optional haptic winding sign
+
+
+def slot_note(slot, winding=""):
+    """Render vertex `slot` as the note a canonical string carries on a donor: ``s<n>`` plus a winding sign.
+
+    The grammar lives with the slots it spells rather than with either end of the string: `metal_smiles`
+    writes these and `metal_isomers.stated_arrangement` reads them back, and a grammar with two owners is
+    how the two halves come to disagree. This module is the leaf both already import.
+    """
+    return f"s{slot}{winding}"
+
+
+def read_slot_note(note):
+    """Return the ``(slot, winding)`` `note` states, or ``None`` when it is not a slot note at all.
+
+    ``None`` is also the discriminator a reader needs: one `atomProp` key carries both notes a canonical
+    string writes, so anything that is not an ``s<n>`` is the metal's own geometry code.
+    """
+    m = _SLOT_NOTE.match(note)
+    return None if m is None else (int(m.group(1)), m.group(2))
 
 
 def handedness(dirs, order, donor_class, chelate_edges=frozenset()):
