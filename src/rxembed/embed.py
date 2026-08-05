@@ -7,7 +7,8 @@ coordination `Isomer` contributes its polyhedron, onto which the substrate spec 
 them under exactly those constraints.
 
 The physics is `bounds.embed` (the edited ETKDG bounds matrix) + `relax.restrained_uff`, unchanged; this
-module is the seam that stacks them: encounter bounds -> donor-chirality hold -> embed -> Kabsch graft.
+module is the seam that stacks them: encounter bounds -> donor-chirality hold -> embed -> Kabsch graft, then
+`minimize`'s stiffness ladder and the metal-centre handedness gate that closes it (`_hold_metal_hand`).
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from . import metal_polyhedron as _poly
 from .bounds import DEFAULT_SEED, n_confs, probe_conformer
 from .bounds import embed as _dg_embed
 from .constraints import Constraints, compose, resolve_atom, resolve_core, template_to_fix
-from .metal_isomers import Isomer
+from .metal_isomers import Isomer, from_geometry
 from .relax import MAX_ITERS, bonding_ok, restrained_uff
 
 logger = logging.getLogger("rxembed")  # the package logger itself, as the front door has always used:
@@ -33,13 +34,19 @@ logger = logging.getLogger("rxembed")  # the package logger itself, as the front
 _EPS = 1e-6  # near-zero norm floor for the graft axis
 _BOND_ATOMS = 2  # a two-atom frozen core is a bond: fix its length, not an orientation
 _MIN_FRAGS = 2  # below this there is no inter-fragment separation to enforce
-DISTANCE_FC = 1e4  # restrained-UFF distance force constant every relax entry point starts from
-# half-order steps (not 10x jumps) so escalation lands on the MINIMAL stiffness that holds the sphere: 1e4..1e6
+# Restraint stiffness is dimensionless here and every constant it multiplies lives in `mechanisms`, on the one
+# scale stated there. 1.0 is shipped. Half-order steps (not 10x jumps) so escalation lands on the MINIMAL
+# stiffness that holds the sphere.
+BASE_STIFFNESS = 1.0
 FC_ESCALATION = (1.0, 3.0, 10.0, 30.0, 100.0)
 # a ~1.5x-stretched bond in a coplanar coordination is a surrogate/tight-bite artifact xtb recovers, so the
 # metal path keeps it (the coplanarity gate is the real plane check). Non-metal stays 1.3.
 METAL_BOND_TOL = 1.5
 BOND_TOL = 1.3
+# A fresh seed re-rolls the metal hand, so each rescue round is a coin flip per conformer: bound the rounds
+# (the pipeline's `_reembed_until_clean` bound) and over-embed a couple per round to cover that flip.
+_MAX_HAND_ROUNDS = 5
+_HAND_BUFFER = 2
 
 
 def encounter_bounds(mol, slack=1.5, seed=DEFAULT_SEED):
@@ -223,6 +230,50 @@ def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, pru
     return mol, ids
 
 
+def _mirror_is_free(mol):
+    """Return True when reflecting a conformer of `mol` would invert nothing but its metal centre.
+
+    A reflection inverts every atomic and axial (allene, atropisomer) stereocentre in one go, so it is a free
+    fix for the metal only where there are none to invert. The exception is what makes it worth asking: E/Z is
+    reflection-INVARIANT, since mirroring a cis double bond leaves it cis, so a stated alkene geometry costs
+    nothing here -- which is most of a coordination corpus.
+
+    Chiral tags are read as well as perceived stereo, because the surrogate strips a donor's M-L bond and with
+    it RDKit's view of a carbanion/amine stereocentre: only the tag `_hold_donor_chirality` enforces survives.
+    """
+    if any(a.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED for a in mol.GetAtoms()):
+        return False
+    return not any(e.type != Chem.StereoType.Bond_Double for e in Chem.FindPotentialStereo(mol))
+
+
+def _reflect(mol, cid):
+    """Negate x on conformer `cid` in place: the exact enantiomer, same graph, same atom order, same energy.
+
+    Every term that shaped this geometry is mirror-symmetric -- UFF, and constraint rows that are distances,
+    angles and a coplanarity window symmetric about 180 -- so the reflected conformer is not an approximation
+    of a relaxed structure, it IS the converged relax of the reflected seed. Measured on a relaxed
+    cis-[Co(en)2Cl2] batch: max |dE| under the reflection is 0.0 kcal/mol, not merely small.
+    """
+    conf = mol.GetConformer(int(cid))
+    pos = conf.GetPositions()
+    pos[:, 0] *= -1.0
+    for a, xyz in enumerate(pos):
+        conf.SetAtomPosition(a, xyz.tolist())
+
+
+def _realised_hand(mol, iso, cid):
+    """Return the metal-centre hand conformer `cid` of `mol` realises, ``''`` when it cannot be decided.
+
+    `mol` is the connected, real-element graph (`Conformers.mol`): `from_geometry` re-derives the seating from
+    the conformer, so its `chirality` is what the geometry HAS, against `Isomer.chirality`, which is what the
+    caller ASKED for. The reading only means that when it names the same centre on the same polyhedron: a
+    distorted sphere gets classified as some other shape and carries a tag over different vertices, and a
+    spectator metal would be read in place of this one. Both come back '' rather than a confident wrong answer.
+    """
+    got = from_geometry(Chem.Mol(mol, False, int(cid)))  # a single-conformer copy: `from_geometry` takes a Mol
+    return got.chirality if got.metal == iso.metal and got.geometry == iso.geometry else ""
+
+
 @dataclass
 class Conformers:
     """An embed result: one Mol carrying many conformers, plus the `Constraints` that shaped them.
@@ -241,6 +292,21 @@ class Conformers:
     iso: Isomer | None = None
     energies: dict = field(default_factory=dict)  # {conf id: energy}, restrained-UFF here, filled by
     # `minimize`; a subclass that scores with a real calculator reuses this dict and tracks the kind itself
+    unrelaxed: list = field(default_factory=list, kw_only=True)
+    # ids handed back at their EMBED SEED: `_rescue_torn` found no
+    # stiffness that relaxed them without tearing, so these coordinates never completed a constrained relax. They
+    # are still returned (a seed beats a torn geometry) and still scored, so this list is the only thing that says
+    # which -- their energy gives them away by 4-5 orders, but only a caller that reads energies sees it, and an
+    # RMSD-ranking caller does not. Measured on benchmark/corpus: 17 of 269 conformers over 8 of 45 structures.
+    seed: int | None = field(default=None, kw_only=True)
+    # the ETKDG seed these came from, or None when they were not embedded here
+    # (`minimize(spec)` relaxes what it is given). `_hold_metal_hand` re-seeds off it, so its absence is also
+    # what keeps the search-free verb from searching.
+    wrong_hand: list = field(default_factory=list, kw_only=True)
+    # ids whose metal centre came back the MIRROR of the isomer
+    # the caller named, and that neither the reflection nor a fresh seed could fix. Same contract as
+    # `unrelaxed`: they are still returned, and this list is the only thing that says the arrangement you
+    # selected is not the one this conformer realises.
 
     @property
     def mol(self):
@@ -283,12 +349,12 @@ class Conformers:
         # a haptic face is one vertex
         return _metal.coplanar(pos, iso.metal, iso.donors, haptic=self.cons.haptic)
 
-    def _relax_constrained(self, distance_fc, max_iters=MAX_ITERS, conf_ids=None):
-        """Restrained-UFF relax; if the soft relax tears *every* bond, stiffen the distances and retry.
+    def _relax_constrained(self, stiffness, max_iters=MAX_ITERS, conf_ids=None):
+        """Restrained-UFF relax; if the soft relax tears *every* bond, stiffen the walls and retry.
 
-        The surrogate's carbon vdW crowds donors out to ~2.1 Å, so a soft (``1e4``) constraint lets an unusual
-        ligand tear; escalating the force constant (``1e5`` → ``1e6``) lets the coordination distances dominate
-        so the bonds survive. Escalation fires only when the softer relax leaves zero intact conformers, so
+        The surrogate's carbon vdW crowds donors out to ~2.1 Å, so a base-stiffness constraint lets an unusual
+        ligand tear; escalating (3x → 100x) lets the coordination windows dominate so the bonds survive.
+        Escalation fires only when the softer relax leaves zero intact conformers, so
         a genuinely infeasible arrangement (an en forced *trans*) still tears at every stiffness and is dropped
         with no phantom resurrected. Returns the accepted relax's energies, or ``None`` if UFF can't type it.
 
@@ -301,7 +367,7 @@ class Conformers:
         iso = self.iso
         held = _metal._hold_donor_chirality(self._mol, iso.metal, iso.donors, self.cons) if iso else (self._mol, [])
         self._mol, hold = held
-        e, fc = None, distance_fc
+        e, fc = None, stiffness
         try:
             all_ids = [c.GetId() for c in self._mol.GetConformers()]
             relaxing = all_ids if conf_ids is None else [int(c) for c in conf_ids]
@@ -315,9 +381,9 @@ class Conformers:
                         conf = self._mol.GetConformer(cid)
                         for a, xyz in enumerate(pos):
                             conf.SetAtomPosition(a, xyz)
-                fc = distance_fc * mult
+                fc = stiffness * mult
                 try:
-                    e = restrained_uff(self._mol, self.cons, distance_fc=fc, max_iters=max_iters, conf_ids=conf_ids)
+                    e = restrained_uff(self._mol, self.cons, stiffness=fc, max_iters=max_iters, conf_ids=conf_ids)
                 except RuntimeError as err:  # UFF can't build a force field for this graph, so keep the embed
                     logger.warning(
                         "minimize: UFF could not relax this system (%s); keeping the embedded geometry",
@@ -329,14 +395,19 @@ class Conformers:
                 kept = [i for i in self.ids if self._intact(i) and self._coordination_ok(i)]
                 if kept or step == len(FC_ESCALATION) - 1:  # some survived (accept), or out of steps (caller drops)
                     if step and kept:
-                        logger.info("minimize: relax tore the sphere; escalated distance_fc to %.0e", fc)
+                        logger.info("minimize: relax tore the sphere; escalated restraint stiffness to %gx", fc)
+                    elif step:  # exhausted: what comes back is the %gx relax, not the stiffness that was asked
+                        logger.warning(  # for, and nothing else says so. Fail loud.
+                            "minimize: no stiffness up to %gx satisfied the accept gate; returning the ungated relax",
+                            fc,
+                        )
                     break
         finally:  # release the hold on every exit path, including the early UFF-failure return; the dummy D
             if hold:  # is scaffolding for this relax alone
                 self._mol = _metal._release_donor_chirality(self._mol, hold, self.cons)
         return e
 
-    def _rescue_torn(self, seed_pos, distance_fc):
+    def _rescue_torn(self, seed_pos, stiffness):
         """Re-relax each conformer the relax tore at its own minimal sufficient stiffness; else keep its seed.
 
         `_relax_constrained` escalates GLOBALLY and stops at the first rung leaving any conformer intact, so a
@@ -360,7 +431,7 @@ class Conformers:
             for mult in FC_ESCALATION[1:]:  # rung 0 is the pass that already tore it
                 place(cid, seed_pos[cid])
                 try:
-                    restrained_uff(self._mol, self.cons, distance_fc=distance_fc * mult, conf_ids=[int(cid)])
+                    restrained_uff(self._mol, self.cons, stiffness=stiffness * mult, conf_ids=[int(cid)])
                 except RuntimeError:  # UFF cannot build for this graph, so the seed is the best available
                     break
                 if self._intact(cid):
@@ -368,11 +439,13 @@ class Conformers:
                     break
             else:
                 place(cid, seed_pos[cid])
+                self.unrelaxed.append(cid)  # never relaxed: say so, or nothing downstream can tell
                 continue
             if not self._intact(cid):
                 place(cid, seed_pos[cid])
+                self.unrelaxed.append(cid)
         if torn:
-            logger.info(
+            logger.warning(  # a geometry that never completed a relax is not what `minimize` promises: say so
                 "relax: tore %d of %d conformer(s); %d rescued by escalating their stiffness, "
                 "%d kept their unrelaxed geometry",
                 len(torn),
@@ -382,11 +455,131 @@ class Conformers:
             )
         return len(torn)
 
-    def minimize(self, distance_fc=DISTANCE_FC, max_iters=MAX_ITERS):
+    def _rescore_restrained(self, stiffness):
+        """Record one comparable restrained-UFF single point for every tracked conformer."""
+        try:
+            e = restrained_uff(self._mol, self.cons, stiffness=stiffness, max_iters=0, conf_ids=self.ids)
+        except RuntimeError as err:
+            logger.warning("minimize: UFF could not score the relaxed conformers (%s)", err)
+            self.energies = {}
+            return
+        self.energies = {i: float(v) for i, v in zip(self.ids, e, strict=True)}
+
+    def _metal_hands(self):
+        """Return ``{conformer id: realised metal-centre hand}`` over the tracked conformers.
+
+        The perception logger is held at WARNING for the read: `from_geometry` re-classifies the polyhedron
+        once per conformer and announces each, which is `n` near-identical lines describing a diagnostic
+        rather than the caller's embed. Anything actionable still comes through.
+        """
+        mol = self.mol  # bind once: the finalize copies the whole molecule
+        perception = logging.getLogger("rxembed.metal")
+        was = perception.level
+        perception.setLevel(max(was, logging.WARNING))
+        try:
+            return {c: _realised_hand(mol, self.iso, c) for c in self.ids}
+        finally:
+            perception.setLevel(was)
+
+    def _reseed_hand(self, wrong, stiffness, max_iters):
+        """Swap each id in `wrong` for a freshly embedded conformer of the right hand; return the ids left over.
+
+        The remedy when the mirror is not free. Nothing biases the hand, so a fresh seed simply re-rolls it and
+        a round is a coin flip per conformer: hence the bounded rounds and the over-embedded batch. The swap is
+        positional (same graph, same atom order), so conformer ids and any slice a caller holds survive it, and
+        the replacement brings its own energy rather than inheriting the geometry's it displaced.
+
+        Each round works on a COPY of the constraints, because both `seed_conformers` and the batch relax edit
+        the set they are handed (encounter bounds, and `_shift_phantoms` moving the reserved haptic-centroid
+        block up past the labile-donor caps). `self.cons` is the record of what shaped the conformers this
+        result already holds, and a retry must not rewrite it.
+        """
+        seed, iso = self.seed, self.iso
+        if seed is None or iso is None:  # `_hold_metal_hand` gates both; a direct caller gets a no-op, not a
+            return list(wrong)  # crash, and "fixed none of them" is the honest answer without a seed to re-roll
+        left = list(wrong)
+        for attempt in range(1, _MAX_HAND_ROUNDS + 1):
+            if not left:
+                break
+            cons = self.cons.copy()
+            mol, ids = seed_conformers(Chem.Mol(self._mol), cons, iso, len(left) + _HAND_BUFFER, seed=seed + attempt)
+            if not ids:
+                continue
+            batch = Conformers(mol, ids, cons, iso).minimize(stiffness, max_iters, _retry=False)
+            hands = batch._metal_hands()  # `_retry=False` above: this batch is read here, never re-seeded again
+            spare = [c for c in batch.ids if hands[c] == iso.chirality and c not in batch.unrelaxed]
+            for cid, src in zip(list(left), spare, strict=False):
+                pos = batch._mol.GetConformer(int(src)).GetPositions()
+                conf = self._mol.GetConformer(int(cid))
+                for a, xyz in enumerate(pos):
+                    conf.SetAtomPosition(a, xyz.tolist())
+                self.energies.pop(cid, None)
+                if src in batch.energies:
+                    self.energies[cid] = batch.energies[src]
+                if cid in self.unrelaxed:  # the geometry that flag described is gone: the replacement relaxed
+                    self.unrelaxed.remove(cid)
+                left.remove(cid)
+        return left
+
+    def _hold_metal_hand(self, stiffness, max_iters):
+        """Make every conformer realise the hand `iso.chirality` names, or record which one does not.
+
+        Nothing else in this engine can choose a metal-centre hand: the coordination constraints are
+        distances, angles, pulls, floors and a coplanarity window symmetric about 180, every one of them
+        mirror-invariant, and the surrogate metal is bond-less so ETKDG has no stereocentre to enforce. The
+        hand is therefore whatever the seed fell on, and a caller who named an isomer got its mirror about
+        half the time (measured on benchmark/corpus: 41.6% of conformers came back the input's enantiomer).
+        Naming an isomer has to mean something, so this is where it is made to.
+
+        Read after the relax, not at the seed. A raw DG seed's sphere is not yet the polyhedron that was
+        stated -- 8 of 8 cis-[Co(en)2Cl2] seeds classify as trigonal_prismatic -- so its hand is not readable,
+        and the reading that can be forced there disagrees with the relaxed one on 7 of 8. Post-relax also
+        makes the reflection exact rather than approximate (see `_reflect`).
+
+        A caller who named no hand is untouched: `iso.chirality` is '' for an achiral or undecidable centre,
+        and an organic embed has no `iso` at all, so neither reaches the per-conformer read.
+        """
+        iso = self.iso
+        if iso is None or not iso.chirality or not self.ids:
+            return
+        wrong = [c for c, hand in self._metal_hands().items() if hand and hand != iso.chirality]
+        if not wrong:
+            return
+        reflected, reseeded = 0, 0
+        # The mirror is free only where the metal centre is the one thing it inverts: no other stereocentre
+        # (`_mirror_is_free`), no grafted core (its contract is the caller's EXACT geometry, and a chiral
+        # core's mirror is a different core -- re-seeding re-grafts it instead), and no haptic face, which can
+        # be planar-chiral in a way this tier cannot perceive (`pipeline.select_stereo` owns that).
+        if _mirror_is_free(self._mol) and not self.cons.frozen and not iso.haptic:
+            for cid in wrong:
+                _reflect(self._mol, cid)
+            reflected, wrong = len(wrong), []
+        elif self.seed is not None:
+            reseeded = len(wrong)
+            wrong = self._reseed_hand(wrong, stiffness, max_iters)
+            reseeded -= len(wrong)
+        self.wrong_hand = wrong
+        logger.info(
+            "minimize: %d conformer(s) came back mirrored at the metal; %d reflected, %d re-seeded",
+            reflected + reseeded + len(wrong),
+            reflected,
+            reseeded,
+        )
+        if wrong:  # the caller asked for one hand and is getting the other: only this list says so
+            logger.warning(
+                "minimize: %d of %d conformer(s) are not the %s centre that was asked for (see .wrong_hand)",
+                len(wrong),
+                len(self.ids),
+                iso.chirality,
+            )
+
+    def minimize(self, stiffness=BASE_STIFFNESS, max_iters=MAX_ITERS, _retry=True):
         """Relax every conformer under the carried constraints (restrained UFF); in place, chainable.
 
-        `distance_fc` is the flat-bottomed window's force constant; raise it (1e5) to pull a tight `fix`
-        harder. Records the FF energies in `.energies`; they are a surrogate, not comparable across species.
+        `stiffness` scales every flat-bottomed WALL (1.0 is shipped); raise it (10) to pull a tight `fix`
+        harder. It does not touch the biases, which carry their own constants: see `mechanisms`, where the
+        tiers and the physical scale they are stated on both live. Records the FF energies in `.energies`;
+        they are a surrogate, not comparable across species.
 
         A constrained relax runs the stiffness ladder, not one pass: the restrained UFF can satisfy a
         window by pulling a bond apart, and nothing in an energy says so. So the force constant escalates
@@ -395,20 +588,35 @@ class Conformers:
         `n` conformers it was given, and *deciding* is the caller's (measured on the metal corpus: without the
         ladder 7 of 7 BEGLUU conformers came back torn, and the first of them scored 1.161 Å against 0.518 Å
         with it).
+
+        That promise is THIS verb's, not the class's. `pipeline.Ensemble` REPLACES it rather than extending it
+        (there is no `super()` call in that module) and does drop, on five gates, because an unconverged seed
+        reaching `prune` / `score` / `best` carries a plausible energy with nothing to say it is broken. A
+        conformer handed back here at its seed is named in `.unrelaxed` and warned about, so a caller that
+        wants the raw geometry -- to hand to a real optimiser, say -- can have it and know what it is.
+
+        The relaxed sphere is also the first place the metal-centre hand can be read, so `_hold_metal_hand`
+        runs here; `_retry=False` is how that gate relaxes its own replacement batch without recursing.
         """
         if not self.ids:
             return self
         if not self.cons.is_constrained:  # no window to tear against, so no ladder to climb
-            e = restrained_uff(self._mol, self.cons, distance_fc=distance_fc, max_iters=max_iters, conf_ids=self.ids)
+            e = restrained_uff(self._mol, self.cons, stiffness=stiffness, max_iters=max_iters, conf_ids=self.ids)
             self.energies = {i: float(v) for i, v in zip(self.ids, e, strict=False)}
             return self
+        self.unrelaxed = []  # a re-minimize re-decides it; a stale list would outlive the geometry it described
+        self.wrong_hand = []
         seed_pos = {c: self._mol.GetConformer(c).GetPositions() for c in self.ids}
-        e = self._relax_constrained(distance_fc, max_iters, conf_ids=self.ids)
-        if self._rescue_torn(seed_pos, distance_fc) and e is not None:
-            # the rescue MOVED geometries after `e` was taken, so re-score rather than publish a stale energy
-            e = restrained_uff(self._mol, self.cons, distance_fc=distance_fc, max_iters=0, conf_ids=self.ids)
+        e = self._relax_constrained(stiffness, max_iters, conf_ids=self.ids)
+        self._rescue_torn(seed_pos, stiffness)
         if e is not None:
             self.energies = {i: float(v) for i, v in zip(self.ids, e, strict=False)}
+        if _retry:
+            self._hold_metal_hand(stiffness, max_iters)
+        if e is not None or self.energies:
+            # Rescue and hand re-seeding may relax different conformers at different stiffnesses. Rank them
+            # only after one single-point pass on the caller's stated objective.
+            self._rescore_restrained(stiffness)
         return self
 
     def measure(self, atoms):
@@ -456,7 +664,16 @@ class Conformers:
         """Pick conformer(s) by position as a new `Conformers`: ``confs[0]``, ``confs[:3]``."""
         sel = self.ids[key]
         sel = sel if isinstance(sel, list) else [sel]
-        return Conformers(self._mol, sel, self.cons, self.iso, {i: self.energies[i] for i in sel if i in self.energies})
+        return Conformers(
+            self._mol,
+            sel,
+            self.cons,
+            self.iso,
+            {i: self.energies[i] for i in sel if i in self.energies},
+            unrelaxed=[i for i in self.unrelaxed if i in sel],  # a slice must not silently lose these flags
+            seed=self.seed,
+            wrong_hand=[i for i in self.wrong_hand if i in sel],
+        )
 
     def __len__(self):
         """Return the number of conformers in play."""
@@ -469,19 +686,27 @@ class Conformers:
 
 
 def _check_bare_mol(mol):
-    """Refuse a plain `Mol` this engine would embed WRONG: implicit Hs, or an un-surrogated metal.
+    """Refuse a plain `Mol` this engine would embed WRONG: implicit Hs, or an un-surrogated metal centre.
 
-    Both produce a plausible-looking result rather than an error: heavy-atom-only geometries, or a metal UFF
-    cannot type (every metal FF term dropped, no excluded-volume sphere in the DG). A metal complex has its own
-    door, which owns the surrogate.
+    Both produce a plausible-looking result rather than an error: heavy-atom-only geometries, or a metal with
+    no coordination model at all (every metal FF term dropped, no excluded-volume sphere in the DG, no M-L
+    length and no polyhedron). A metal complex has its own door, which owns the surrogate.
+
+    The refusal is keyed on being a coordination centre (`metal_core.COORDINATION_METALS`), not on UFF
+    typing, because UFF typing is not a property of the element: RDKit builds its label from element +
+    coordination + oxidation state, so `Cl[Hg]Cl` types and `[Fe](Cl)(Cl)Cl` does not (measured over all 68
+    centres). An element set keyed on the label would be a list of accidents, and the sphere is missing
+    either way.
     """
     if any(a.GetTotalNumHs() for a in mol.GetAtoms()):
         raise ValueError("embed() needs a Mol with explicit hydrogens; pass Chem.AddHs(mol)")
     metals = _metal.metal_indices(mol)
     if metals:
         raise ValueError(
-            f"atom(s) {metals} are transition metals: UFF cannot type a metal, so route the complex through "
-            f"Isomer(mol, geometry, sites) or enumerate_isomers(mol, geometry), which own the surrogate"
+            f"atom(s) {metals} are metal centres: a metal is embedded through a SURROGATE, because neither "
+            f"the bounds matrix nor UFF describes one directly. Route the complex through "
+            f"Isomer(mol, geometry, sites) or enumerate_isomers(mol, geometry), which own that surrogate and "
+            f"the coordination model with it"
         )
 
 
@@ -563,7 +788,7 @@ def embed(
         "s" if n_frag != 1 else "",
         len(cons.distances) + len(cons.angles),
     )
-    return Conformers(mol, ids, cons, iso)
+    return Conformers(mol, ids, cons, iso, seed=int(seed))  # `minimize`'s handedness gate re-seeds off this
 
 
 def prepare_relax(spec, *, fix=None, constrain=None):
@@ -572,6 +797,13 @@ def prepare_relax(spec, *, fix=None, constrain=None):
     The assembly `minimize` needs, exposed because a caller wanting its own result type reuses it (the
     pipeline's `Ensemble` does). `spec` is the Mol-or-`Isomer` `embed` takes, and is never touched: the
     working mol is a copy. A coordinate-`fix` core is grafted.
+
+    `pipeline/dispatch.py` builds the same six-step surrogate assembly a second time and this function cannot
+    yet be reused there, for reasons written up at that site. Two are structural rather than stylistic: this
+    one hardcodes `has_geometry=True` because it relaxes a geometry that already exists, and it CONSUMES the
+    graft reference where the embed path needs that reference to survive as far as `seed_conformers`, which
+    grafts fresh seeds instead. Unifying them is a change HERE -- take `has_geometry`, hand `ref` back -- not
+    a change there.
 
     The coordination sphere is held either way, from whichever record states it:
 
@@ -611,7 +843,7 @@ def prepare_relax(spec, *, fix=None, constrain=None):
     return mol, ids, cons, iso
 
 
-def minimize(spec, *, fix=None, constrain=None, template=None, distance_fc=None):
+def minimize(spec, *, fix=None, constrain=None, template=None, stiffness=None):
     """Relax an existing geometry toward ``fix``/``constrain``: the search-free companion to `embed`.
 
     Same vocabulary as `embed`, no conformer search: the input geometry is kept and pulled toward the targets.
@@ -636,4 +868,4 @@ def minimize(spec, *, fix=None, constrain=None, template=None, distance_fc=None)
         )
     mol, ids, cons, iso = prepare_relax(spec, fix=fix, constrain=constrain)
     confs = Conformers(mol, ids, cons, iso)
-    return confs.minimize() if distance_fc is None else confs.minimize(distance_fc=distance_fc)
+    return confs.minimize() if stiffness is None else confs.minimize(stiffness=stiffness)

@@ -18,12 +18,6 @@ def _setup():
         import matplotlib.pyplot as plt
     except ImportError as exc:
         raise ImportError("_setup needs matplotlib; pip install 'rxembed[viz]'") from exc
-    try:
-        import seaborn as sns
-    except ImportError as exc:
-        raise ImportError("_setup needs seaborn; pip install 'rxembed[viz]'") from exc
-
-    sns.set_theme(style="ticks", context="talk", palette=PALETTE)
     plt.rcParams["figure.figsize"] = (6, 5)
     return plt
 

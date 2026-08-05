@@ -1,14 +1,23 @@
-"""Each mechanism holds its distance-geometry writer and its force-field writer together.
+"""Each mechanism holds the writers one `Constraints` field needs, distance-geometry and force-field, together.
 
-Eleven classes over the fourteen `Constraints` fields, not one apiece. Eight fields have a class to
-themselves; `Floor` and `Coplanar` read four each, because those fields are only meaningful together. Two
-fields are read nowhere here: `contacts` is released a pass at a time by the driver (`embed.py`), and
-`haptic` is a recipe the transient centroid dummies are materialised from before a mechanism runs, which is
-why the class named `Haptic` reads `phantoms` and not it.
+Eleven classes over the fourteen fields, not one apiece: nine field-driven mechanisms plus two UFF repairs.
+`Sp2Planar` and `ConjugationCap` are the repairs and read no `Constraints` field at all. They perceive from
+the molecule and fire unconditionally, because a UFF defect (a 3-neighbour sp2 carbon that pyramidalises, a
+conjugated plane that twists) is a property of the molecule, not of anything a caller asked for;
+They are grouped apart from the field-driven nine, because the negative contract (an empty field writes
+nothing) is asserted only where it holds. Of the fields, `Floor` and `Coplanar` read four each, because those
+are only meaningful together, and `haptic` is read nowhere here: it is the recipe the transient centroid
+dummies are materialised from before a mechanism runs, which is why the class named `Haptic` reads
+`phantoms` and not it.
 
-Every field is written twice, as an edit to the ETKDG bounds matrix and as a restrained-UFF term.
-Co-locating the two halves is what stops them drifting into a field with a DG bound and no matching FF
-term. `MECHANISM_ORDER` at the bottom is the one place their order is stated.
+Five of the nine write both halves, an edit to the ETKDG bounds matrix and a restrained-UFF term: `Distance`,
+`Floor`, `Angle`, `Coplanar`, `Plane`. Where both exist, co-locating them is what stops a field acquiring a
+DG bound with no matching FF term. The other four have one half because the other has nothing to say:
+`Frozen` is FF-only (`AddFixedPoint` is zero degrees of freedom, and the DG side is the pairwise shape the
+builder already wrote into `distances`), `Pull` is FF-only (it says where inside an existing window to sit,
+so a DG bound could only restate a window the matrix holds), `Umbrella` is FF-only (an improper is signed and
+a bounds matrix is mirror-blind), and `Haptic` is DG-only (its centroid dummy is retyped to an untypeable
+element before any FF term is added). `MECHANISM_ORDER` at the bottom is the one place their order is stated.
 
 The split is by field, not by source: splitting by source would reorder `cons.angles` iteration, and the
 bounds matrix depends on it, `leg()` reading the `pairs` dict the angle loop is still mutating.
@@ -35,13 +44,13 @@ from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 
 # The perception rulers these FF caps read, imported as MODULES (not their names): the gate and the caps must
-# see the same function object, so a test that swaps one out swaps it for both.
+# see the same function object, so replacing one replaces it for both.
 from . import metal_donor_orient as _donor
 
 # one definition each, in the metal constants hub: RDKit's inter-fragment topological distance, the
 # empty-vertex sentinel, and the atom -> ligand-fragment map.
 from .metal_core import VACANT, _frag_map
-from .metal_polyhedron import POLYHEDRA, resolve_geometry
+from .metal_polyhedron import _IMPROPER_VERTICES, POLYHEDRA, resolve_geometry
 from .utils import _CARBON_Z, _DISCONNECTED, _SP2_DEGREE, conjugated_quartets
 
 _PHANTOM_FLOOR = 0.30  # Å: a haptic centroid dummy may sit this close to any atom, living inside its own ring
@@ -49,16 +58,117 @@ _RIGHT_ANGLE = 90.0  # deg, two landmarks at one number: the syn/anti split of a
 #   (`Coplanar`), and the open end of a pyramid's improper window (`Umbrella`).
 _COPLANAR_SCAN = 12  # samples across the stated M-D-X angle window when sizing a coplanarity bound
 _PLANE_PAD = 0.3  # Å half-width on a pi-stack cross-ring distance
-_FLOOR_HI = 1e3  # Å: a floor is one-sided, [floor, +inf), and 1e3 stands in for infinity
-_SOFT_PULL_FC = 1e4  # soft harmonic onto the M-donor target, inside the flat-bottomed wall: the wall forbids
-#   leaving the window, this says where in it to sit. Full strength would fight the field and wreck convergence.
-_COPLANAR_FC = 10.0  # kcal/deg² (UFF torsion penalty is k*dev², dev in degrees): the two organic-plane
-#   caps. Far softer than the distance walls, since real out-of-plane scatter runs to ~40° (tmQM census p95):
-#   remove the gross deviation, never pin flat. Below 5 a diphosphine-on-rigid-diene chelate tears.
-_UMBRELLA_FC = 3.0  # kcal/deg²: a wall, so what matters is the knee, and it moves with M-L because the wall
-#   is a scale-free improper while survival is an absolute out-of-plane RMS. Long M-L saturates by 0.1, short
-#   (anionic amide/alkoxide) not until 2-3: sweep an anionic amide before lowering this.
-_PLANE_FC_SCALE = 0.2  # a stack hold is softer than a stated distance wall
+_MIN_HALF_WIDTH = 0.01  # Å: floor under a contact window's half-width, so a caller who states a
+#   near-zero window gets a stiff bias rather than a division by zero.
+_FLOOR_INF = 1e3  # Å, a length and not a force constant: a floor is one-sided, [floor, +inf), and this stands
+#   in for infinity.
+
+# --- The one scale every force constant here is stated on -------------------------------------------------
+#
+# `AddDistanceConstraint` / `UFFAddAngleConstraint` / `UFFAddTorsionConstraint` are each E = ½·k·dev² outside
+# their window and exactly zero inside it, so k IS the curvature the restraint adds along that coordinate. A
+# constant therefore means nothing on its own and everything against the field it is added to. Both references
+# are measured on BONDED coordinates (`benchmark/uff_reference.py`); the FF surrogate metal is bond-less, so a
+# reference taken by moving it describes nothing.
+#
+#     distance   ~700 kcal/mol/Å²      UFF's own single-bond stretch: analytic 664.12·Z*ᵢ·Z*ⱼ/r³ for C-C, and
+#                                      716.9 from an independent probe. Displacing one atom along the bond
+#                                      costs ~1350 (C-C 1348, C-O 1323, C-N 1548, C=C 1709) because it also
+#                                      bends what is attached; a two-atom restraint acts on the ~700 term.
+#     angle      0.106 kcal/mol/deg²   UFF's own bend, median over C-C-C, C-O-C, C-N-C, C=C-C, C-S-C, C-P-C.
+#
+# The distance and angle constants below are each stated against their own reference and are not derived from
+# one another: no single lever arm converts between the two units, because a window's leg is not one number.
+# A multiple of ~700 quoted for an angle constant would be fiction. `benchmark/leg_arms.py` measures 483 windows.
+
+# --- What each restraint is allowed to push, and how hard -------------------------------------------------
+# The difference between these is not stiffness but what the constant is for. A wall forbids leaving a window
+# and contributes exactly zero inside it, so it acts only on the fraction that is outside; a bias carries a
+# target and acts everywhere.
+#
+# Read them as four independent numbers, not as a hardness ladder: `PIN_FC` and `ML_TARGET_FC` are both 1e4,
+# so a ladder reading would claim a distinction the values do not make. The M-L window is numerical seed room,
+# not a prediction interval, so model error does not justify a different force constant.
+#
+# `Frozen` is a fifth thing again and needs no constant at all:
+# `AddFixedPoint` is zero degrees of freedom, measured at 1.3e-15 Å deviation, which no spring can match.
+PIN_FC = 1e4  # kcal/mol/Å², 14x a bond: a stated number (`fix=`, a coordination window, a rigid-body pad) the
+#   answer must satisfy, so the chemistry bends around it rather than the reverse. Measured: 1e5 / 3e4 / 1e4 /
+#   3e3 are indistinguishable on the metal corpus (median sphere spans 0.0121 Å against its own 0.0143 Å seed
+#   floor), so this sits on a plateau rather than a peak, and the plateau runs down to ~500 before the
+#   coordination sphere goes. It is at the top because a `fix=` number is the one thing a caller stated.
+RELEASABLE_FC_SCALE = 0.3  # a RATIO on the force constant, not a constant itself: x whichever wall applies.
+#   Releasable means exactly the keys `cons.contacts` names -- `constrain=` and every seeded NCI contact --
+#   which `Constraints.relaxed()` may drop outright. On the ANGLE coordinate the ratio means no one thing:
+#   what an angle constant is worth in A^-2 depends on the leg it rotates, and the corpus's legs run
+#   1.01-3.10 A. So read it as one ratio applied twice, not as one hardness on both coordinates.
+#
+#   Swept on the NCI path over 10 systems, 13 seeded grips, 10 settings, 3 seeds (`benchmark/nci_wall.py`).
+#   One law covers it: `overshoot x k` is FLAT at 18-21 kcal/mol/A across three decades, so the field's whole
+#   push on an NCI contact is ~20 -- against 835 on a metal donor. An NCI wall faces a 40x weaker adversary
+#   than `PIN_FC` was sized against, and 0.3 leaves p90 overshoot at 0.014 A with nothing breaking through by
+#   more than 0.1 A. It was 0.07 on the argument that ~1x a covalent bond lets the field overrule a contact so
+#   the search discovers an untenable mode. That argument is refuted: shifting a contact 0.5 A against
+#   k=700 costs 87 kcal/mol and the field has 20. Discovery only happens at k 20-40, where 92% break through
+#   and detection falls to 55% -- or at zero, which is what `Constraints.relaxed()` and `mc(explore=True)`
+#   already do. The wall is not the discovery mechanism; releasing it is.
+CONTACT_PUSH = 320.0  # kcal/mol/Å: the midpoint spring's force at either wall. Dividing by each window's
+#   half-width makes that force width-independent. On 10 representative systems, 14 grips and 3 seeds, 20 leaves the
+#   median at the upper wall (normalised position 1.001); 80 / 160 / 320 / 640 give 0.794 / 0.706 / 0.636 /
+#   0.584, with p90 0.877 / 0.769 / 0.682 / 0.615. Detection stays 83.3% and yield is flat, so 320 is the knee:
+#   the delivered contact is inside its stated range without doubling stiffness merely to chase exact centring.
+#   Measured by `benchmark/nci_wall.py --pushes 20 80 160 320 640 --n 4`.
+ANGLE_FC = 30.0  # kcal/mol/deg²: the angle wall. A MEASURED number, not a derived one; see the lever-arm note
+#   above for why no single conversion from `PIN_FC` exists. 30 is where the sweep below flattens: softer buys
+#   nothing more and 1e3 is where the wall starts causing the violations it forbids.
+#
+#   Measured (`benchmark/angle_fc_sweep.py`, the first sweep of this constant alone, distance wall at shipped).
+#   Softening it does not cost fidelity and buys back the break-through it was supposed to prevent:
+#
+#       angle fc   sphere   heavy   vtx>1deg  fold>1deg  vtx p90   M-L>0.02
+#           1000   0.1689  0.5549       12%         3%     5.53        7%
+#            300   0.1731  0.5082        8%         3%     0.00        6%
+#            100   0.1818  0.4277        9%         2%     0.07        6%
+#             30   0.1728  0.5333        7%         2%     0.02        3%
+#             10   0.1728  0.5336        5%         3%     0.03        2%
+#              3   0.1729  0.4563        5%         1%     0.07        1%
+#              1   0.1824  0.4286        5%         1%     0.17        1%
+#
+#   Median sphere spans 0.0135 Å over three decades, inside its own 0.0143 Å seed floor, so fidelity is flat.
+#   The four break-through columns are one seed and carry a ±5-point noise floor of their own (measured; the
+#   sphere column's 0.0143 Å floor is three seeds), so read them as a level and not as a trend: `M-L>0.02`
+#   at 3/2/1% below 30 is inside that floor and is no reason to soften further. What is outside it is the
+#   top row: at 1e3 the wall fights the field hard enough that the minimiser leaves 12% of vertex windows
+#   broken and the p90 overshoot at 5.53°, where at 10 it leaves 5% and 0.03°. A wall that is hard enough to
+#   cause the violations it forbids is not holding anything.
+PI_STACK_FC = 2e3  # kcal/mol/Å², 3x a bond: a π-stack hold. Softer than a stated window because it is a
+#   preference about how two rings face and the seed has already realised it.
+ML_TARGET_FC = 1e4  # kcal/mol/Å² on the M-donor distance, 14x a covalent bond stretch: a zero-width window at
+#   the fitted target, sitting inside the flat-bottomed `PIN_FC` wall. What sets it is not a comparison to a
+#   bond but the accuracy it must hold: the ligand backbone pulls the donor off the fitted target with a
+#   measured ~43 kcal/mol/Å, and a spring rests where k·drift balances that, so k = 43/drift. 1e4 buys drift
+#   0.004 Å, 3e3 buys 0.015, 1e3 buys 0.029, against a ±0.05 Å window. Lowering it to 100 was measured at
+#   three seeds and refuted: sphere and M-L MAE degrade in all three, and the heavy gain that motivated it
+#   was one seed reading a different metric's argmin.
+_COPLANAR_FC = 10.0  # kcal/deg² = 8210 kcal/mol/Å², 12x a bond: the two organic-plane caps. Softer than the
+#   distance walls, since real out-of-plane scatter runs to ~40° (tmQM census p95): remove the gross
+#   deviation, never pin flat. Below 5 a diphosphine-on-rigid-diene chelate tears.
+_UMBRELLA_FC = 3.0  # kcal/deg² = 2460 kcal/mol/Å², 3.5x a bond: a wall, so what matters is the knee, and it
+#   moves with M-L because the wall is a scale-free improper while survival is an absolute out-of-plane RMS.
+#   Long M-L saturates by 0.1, short (anionic amide/alkoxide) not until 2-3: sweep an anionic amide before
+#   lowering this.
+_PLANAR_CAP = 15.0  # deg: how far off its own vertex plane a `planar` record's metal may sit (`Umbrella`).
+#   Three independent readings agree on ~15 (`benchmark/plane_scale.py`):
+#     * the CRYSTAL improper of 37 planar-declared corpus + tmQM spheres is median 0.97, p90 8.28, p95 9.83;
+#       the one structure past it (18.4°) is a square plane whose own crystal is 0.36 Å out, i.e. not planar;
+#     * a CN3 sphere's out-of-plane RMS is proportional to r, so capping the improper caps the RATIO: measured
+#       at this wall it is 0.063 x r, which stays under `metal_core.COPLANAR_TOL` out to M-L 4.0 Å -- past any
+#       real coordinate bond, including the 3.08 Å covalent-sum fallback an unfitted f-block centre gets. That
+#       is what makes the ABSOLUTE tolerance scale-safe without moving it: the scale-free statement belongs
+#       on this side of the seam, not in the ruler;
+#     * it is 43% of the CN3 pyramid's own 35.264° ideal, so a held plane cannot re-perceive as the pyramid.
+#   Unheld, the ±8° D-M-D window's lower corner (112.0°) is an improper of 31.1° = 0.125 x r, which trips the
+#   0.25 Å tolerance for every M-L over 2.0 Å: HgI3 rebuilt 0.345 Å out of a crystal that is 0.000.
 _STRAIGHT = 180.0
 _SP2_HOLD_FC = (
     10.0  # kcal/deg², equal to `_COPLANAR_FC` and kept there: a sweep to 0.01 showed the two demands do not overlap
@@ -115,8 +225,13 @@ class Mechanism:
     def dg_post(self, cons, ctx):
         """POST: read the committed matrix and tighten it."""
 
-    def ff_terms(self, ff, cons, conf, fc):
-        """FF: add restraint terms for this field. ``fc`` is the distance force constant."""
+    def ff_terms(self, ff, cons, conf, stiffness):
+        """FF: add restraint terms for this field, every wall scaled by ``stiffness`` (1.0 = shipped).
+
+        ``stiffness`` is the escalation ladder's rung, dimensionless, and it multiplies the WALLS only. A bias
+        (`Pull`, the torsion caps) states where to prefer sitting and pushing that preference harder because a
+        bond tore elsewhere would be meaningless, so it keeps its own constant at every rung.
+        """
 
 
 class Frozen(Mechanism):
@@ -126,7 +241,7 @@ class Frozen(Mechanism):
     builder writes into `distances`.
     """
 
-    def ff_terms(self, ff, cons, conf, fc):
+    def ff_terms(self, ff, cons, conf, stiffness):
         for idx in cons.frozen:
             ff.AddFixedPoint(idx)
 
@@ -135,27 +250,50 @@ class Distance(Mechanism):
     """A distance window: the bounds-matrix cell, and a flat-bottomed wall that forbids leaving it.
 
     Seeds `ctx.pairs` first, so every later writer's `leg()` reads stated windows rather than matrix defaults.
+
+    Two tiers over one field, read off `cons.contacts`, which already records which keys came from a
+    releasable `constrain=` / NCI contact rather than a structural hold: those are scaled by
+    `RELEASABLE_FC_SCALE`, the rest take `PIN_FC` whole.
+    No new field and no new code path, because the provenance was already recorded for `relaxed()`.
     """
 
     def dg_windows(self, cons, ctx):
         ctx.pairs.update(cons.distances)  # override only the constrained pairs; RDKit keeps the rest
 
-    def ff_terms(self, ff, cons, conf, fc):
+    def ff_terms(self, ff, cons, conf, stiffness):
+        releasable, _ = cons.contacts
         for (i, j), (lo, hi) in cons.distances.items():
-            ff.AddDistanceConstraint(i, j, lo, hi, fc)
+            fc = PIN_FC * (RELEASABLE_FC_SCALE if (i, j) in releasable else 1.0)
+            ff.AddDistanceConstraint(i, j, lo, hi, stiffness * fc)
 
 
 class Pull(Mechanism):
-    """A soft harmonic at the M-donor target, inside the flat-bottomed wall. No DG half.
+    """The M-donor bias: a zero-width window at the fitted target, inside the flat-bottomed wall. No DG half.
 
     `AddDistanceConstraint` exerts zero force between lo and hi, so without a target the donor rides whichever
-    wall it was last pushed to; this says where in the window to sit. Skipped for a rigid-body member, where
-    pulling a subset of its windows tears the rest.
+    wall it was last pushed to; this says where in the window to sit. A spring is not a second concept here,
+    it is a window whose two bounds are equal, which is why it is the same RDKit call as `Distance`. Skipped
+    for a rigid-body member, where pulling a subset of its windows tears the rest.
+
+    Unscaled by `stiffness` on purpose: escalating a preference because a bond tore somewhere else says
+    nothing, and this constant is set by the M-L accuracy it must hold rather than by the ladder (`ML_TARGET_FC`).
     """
 
-    def ff_terms(self, ff, cons, conf, fc):
+    def ff_terms(self, ff, cons, conf, stiffness):
         for (i, j), target in cons.pulls.items():
-            ff.AddDistanceConstraint(i, j, target, target, _SOFT_PULL_FC)
+            ff.AddDistanceConstraint(i, j, target, target, ML_TARGET_FC)
+        # A releasable contact gets the same treatment at a hundredth the constant, and it needs it more: an
+        # M-L window at least sits between two bonded neighbours, where an NCI contact has nothing in UFF
+        # holding it anywhere. `cons.pulls` is the metal's own; these are derived from the window rather than
+        # stored, because a contact's target IS its midpoint and a second copy would be one more thing to drift.
+        releasable, _ = cons.contacts
+        for key in releasable:
+            window = cons.distances.get(key)
+            if window is None or key in cons.pulls:  # a metal pull already states where this pair sits
+                continue
+            half = max(0.5 * (window[1] - window[0]), _MIN_HALF_WIDTH)
+            mid = 0.5 * (window[0] + window[1])
+            ff.AddDistanceConstraint(key[0], key[1], mid, mid, CONTACT_PUSH / half)
 
 
 class Floor(Mechanism):
@@ -180,9 +318,9 @@ class Floor(Mechanism):
             if floor < ctx.bm[b][a] <= ctx.bm[a][b]:  # only ever relax, and only if genuinely too high
                 ctx.bm[b][a] = floor
 
-    def ff_terms(self, ff, cons, conf, fc):
+    def ff_terms(self, ff, cons, conf, stiffness):
         for (i, j), floor in cons.floors.items():
-            ff.AddDistanceConstraint(i, j, floor, _FLOOR_HI, fc)
+            ff.AddDistanceConstraint(i, j, floor, _FLOOR_INF, stiffness * PIN_FC)
 
 
 class Angle(Mechanism):
@@ -209,10 +347,25 @@ class Angle(Mechanism):
             else:
                 ctx.pairs[(a, b)] = (ang_lo, ang_hi)
 
-    def ff_terms(self, ff, cons, conf, fc):
-        afc = min(fc, 1e3)  # deg^-2, not rad^-2: an over-stiff angle distorts a rigid/bidentate framework
+    def ff_terms(self, ff, cons, conf, stiffness):
+        # deg^-2, not rad^-2: an over-stiff angle distorts a rigid/bidentate framework. A caller softening the
+        # whole field softens this proportionally, but the ladder cannot escalate it -- deliberate, since
+        # escalating the angle wall was measured to cost one structure 0.67 A. Clamp `stiffness`, never the
+        # product: `min(stiffness * PIN_FC, ANGLE_FC)` compares kcal/mol/A^2 against kcal/mol/deg^2, and 1e4
+        # always wins, so the wall goes FLAT at `ANGLE_FC` for every stiffness above ~0.003 and
+        # `minimize(stiffness=0.1)` softens every other term tenfold and this one not at all.
+        afc = min(stiffness, 1.0) * ANGLE_FC
+        _, releasable = cons.contacts
         for (i, j, k), (lo, hi) in cons.angles.items():
-            ff.UFFAddAngleConstraint(i, j, k, False, max(0.0, lo), min(180.0, hi), afc)
+            ff.UFFAddAngleConstraint(
+                i,
+                j,
+                k,
+                False,
+                max(0.0, lo),
+                min(180.0, hi),
+                afc * (RELEASABLE_FC_SCALE if (i, j, k) in releasable else 1.0),
+            )
 
 
 class Coplanar(Mechanism):
@@ -252,7 +405,7 @@ class Coplanar(Mechanism):
             elif not anti and ctx.bm[b][a] <= max(edges) < ctx.bm[a][b]:  # syn: ceiling at the cap edge
                 ctx.bm[a][b] = max(edges)
 
-    def ff_terms(self, ff, cons, conf, fc):
+    def ff_terms(self, ff, cons, conf, stiffness):
         if not cons.coplanar:  # organic / no metal: nothing to hold, and skip the hybridisation perception cost
             return
         # A conjugated bidentate's plane is already pinned by the polyhedron's two M-D distances plus the
@@ -287,12 +440,12 @@ class Plane(Mechanism):
                     d = math.hypot(sep, offset)
                     ctx.pairs.setdefault((min(au, bv), max(au, bv)), (d - _PLANE_PAD, d + _PLANE_PAD))
 
-    def ff_terms(self, ff, cons, conf, fc):
+    def ff_terms(self, ff, cons, conf, stiffness):
         pos = conf.GetPositions()  # hold the stack as embedded; the seed already realised the separation
         for ring_a, ring_b, _sep in cons.planes:
             for a, b in itertools.product(ring_a, ring_b):
                 d = float(np.linalg.norm(pos[a] - pos[b]))
-                ff.AddDistanceConstraint(a, b, d - _PLANE_PAD, d + _PLANE_PAD, _PLANE_FC_SCALE * fc)
+                ff.AddDistanceConstraint(a, b, d - _PLANE_PAD, d + _PLANE_PAD, stiffness * PI_STACK_FC)
 
 
 class Haptic(Mechanism):
@@ -323,13 +476,13 @@ class Sp2Planar(Mechanism):
     flat, stays flat. Additive, supplying an FF term nothing else does.
 
     Organic only (`not cons.metals`). On a metal system the Li FF-surrogate has its bonds stripped and is not
-    in `_METAL_Z`, so it defeats `geometry.planarity`'s metal/coordinated-carbon exemption:
+    in `COORDINATION_METALS`, so it defeats `geometry.planarity`'s metal/coordinated-carbon exemption:
     `_coordinating_carbons` perceives no shell, and the hold lands on coordinated carbons and fights the
     coordination (measured: tears 5 metal cases). On an organic system, excluding `cons.frozen` reproduces the
     gate's population exactly.
     """
 
-    def ff_terms(self, ff, cons, conf, fc):
+    def ff_terms(self, ff, cons, conf, stiffness):
         if cons.metals:  # see class docstring: the Li surrogate defeats gate-matching on a metal system
             return
         mol = conf.GetOwningMol()
@@ -361,7 +514,7 @@ class ConjugationCap(Mechanism):
     Organic only (`not cons.metals`), and skips a quartet touching `cons.frozen`; same scoping as `Sp2Planar`.
     """
 
-    def ff_terms(self, ff, cons, conf, fc):
+    def ff_terms(self, ff, cons, conf, stiffness):
         if cons.metals:  # see class docstring: the Li surrogate defeats gate-matching on a metal system
             return
         for a, c, x, s in conjugated_quartets(conf.GetOwningMol()):
@@ -373,32 +526,39 @@ class ConjugationCap(Mechanism):
 
 
 class Umbrella(Mechanism):
-    """Keep a requested pyramid's metal off its donor plane: a one-sided minimum pyramidalisation, FF-only.
+    """Hold the metal on the side of its donor plane the record states: pyramid off it, plane in it. FF-only.
 
-    The angular twin of `Floor` rather than `Pull`: a bound to clear, not a target to spike to. The
-    polyhedron's ±8° window is flat-bottomed and its wall falls on the planar side of `classify_geometry`'s
-    ruler, so trigonal_pyramidal survived embed+relax in 13 of 49 conformers where the other 11 shapes
-    survived 100%.
+    One coordinate, two bounds. The polyhedron's ±8° D-M-D window is flat-bottomed, so whatever residual force
+    the field leaves parks the sphere on a corner of it, and at CN3 both corners are wrong:
+
+    * a `trigonal_pyramidal` record flattens to 117.5°, inside trigonal_planar's basin, and survived embed+relax
+      in 13 of 49 conformers where the other 11 shapes survived 100%;
+    * a `planar` record pyramidalises to 112.0° on every donor pair whose UFF vdW is past its minimum (measured:
+      the surrogate's own energy falls monotonically with pyramidalisation, so the wall is what stops it).
 
     Refuted: narrowing that window instead (the ruler is an absolute RMS while an angle is scale-free, so the
-    wall would be bond-length dependent), and three D-M-D point targets (which pin the in-plane Y-distortion
-    one weakly-coupled improper leaves free).
+    wall would be bond-length dependent), three D-M-D point targets (which pin the in-plane Y-distortion one
+    weakly-coupled improper leaves free), and a (D,M,D) angular spring (it over-determines a chelate's bite:
+    a side-on η² imine pulled toward 90° crushed its Ni-N to 1.42 Å).
 
-    The wall is the record's ideal (h = r/3), not perception's threshold, which would be teaching to the test;
-    the price is that a shallow real pyramid seeds ~55% too deep. There is no DG half, and `optimize` hands
-    xtb only `cons.frozen`, so a real energy stays free to flatten it. This biases the seed; it is not a claim
-    the pyramid is right. The hand is not declared: `phi >= 0` reads the seed's own sign.
+    The pyramid's wall is the record's ideal (h = r/3), not perception's threshold, which would be teaching to
+    the test; the price is that a shallow real pyramid seeds ~55% too deep. There is no DG half, and `optimize`
+    hands xtb only `cons.frozen`, so a real energy stays free to flatten either. This biases the seed; it is
+    not a claim the shape is right. The pyramid's hand is not declared: `phi >= 0` reads the seed's own sign.
 
-    Fires only on a `cons.spheres` recipe.
+    Fires only on a `cons.spheres` recipe, and only where three vertices state an improper (`linear` does not).
     """
 
-    def ff_terms(self, ff, cons, conf, fc):
+    def ff_terms(self, ff, cons, conf, stiffness):
         frag = _frag_map(conf.GetOwningMol())  # same ligand = same fragment
         for recipe in cons.spheres:
-            ideal = POLYHEDRA[resolve_geometry(recipe.geometry)].umbrella_improper
-            if ideal is None:  # not a flat-based pyramid: nothing one improper can say
+            poly = POLYHEDRA[resolve_geometry(recipe.geometry)]
+            ideal = poly.umbrella_improper  # None for a planar record and for anything genuinely 3-D
+            if ideal is None and not poly.planar:  # neither a flat-based pyramid nor a plane: nothing to say
                 continue
             base = [recipe.donors[k] for k in recipe.order]
+            if len(base) < _IMPROPER_VERTICES:  # `linear`: two vertices state no improper at all
+                continue
             haptic = {d for d, _ring in recipe.haptic}
             if any(d == VACANT or d in haptic for d in base):  # an empty vertex or centroid face: no case
                 continue
@@ -411,7 +571,13 @@ class Umbrella(Mechanism):
                 continue
             d0, d1, d2 = base[0], base[1], base[2]  # the same three vertices `umbrella_improper` measures
             phi = rdMolTransforms.GetDihedralDeg(conf, d0, d1, d2, recipe.metal)
-            lo, hi = (ideal, _RIGHT_ANGLE) if phi >= 0 else (-_RIGHT_ANGLE, -ideal)  # keep the seed's own hand
+            lo, hi = (
+                (-_PLANAR_CAP, _PLANAR_CAP)  # a plane has one ideal (zero) and no hand, so the cap is symmetric
+                if ideal is None
+                else (ideal, _RIGHT_ANGLE)
+                if phi >= 0
+                else (-_RIGHT_ANGLE, -ideal)  # keep the seed's own hand
+            )
             ff.UFFAddTorsionConstraint(d0, d1, d2, recipe.metal, False, lo, hi, _UMBRELLA_FC)
 
 

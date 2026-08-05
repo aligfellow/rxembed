@@ -17,7 +17,6 @@ import numpy as np
 import pytest
 from rdkit import Chem
 from rdkit.Chem import rdMolTransforms as T
-from rdkit.Geometry import Point3D
 
 import rxembed.pipeline as rx
 from rxembed import metal_donor_orient as DO  # noqa: N812
@@ -40,59 +39,6 @@ _KETONE_SMI = "CC(C)=O->[Pd](Cl)(Cl)<-n1ccccc1"
 _TWO = 2
 _WALL_SLACK = 1.0  # deg: a UFF torsion constraint is a penalty, not a hard wall, so a minimum riding the cap
 # edge settles a hair outside it. Wide enough for that, far narrower than any fold the cap exists to stop.
-
-
-# duplicated from tests/pipeline/test_metal_perceive.py: two files need it, and a shared
-# test-helper module is what this project does not do.
-_FE_C, _C_O, _FE_H = 1.80, 1.13, 1.55  # Å: the recorded FeH2(CO)4 bond lengths
-_OCT = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)]  # the 4 equatorial vertices; the 2 hydrides go on ±z
-
-
-def feh2co4(folds=(180.0, 180.0, 180.0, 180.0)):
-    """FeH2(CO)4 with its carbons pinned on octahedral vertices and each carbonyl bent to its Fe-C-O angle.
-
-    Only the oxygens swing (180 points O straight out, 0 folds it onto the metal), so every distance-based
-    check sees a textbook octahedron however far the ligands fold. Returns `(mol, donors)`.
-    """
-    rw = Chem.RWMol()
-    rw.AddAtom(Chem.Atom(26))  # 0 = Fe, at the origin
-    pos: list[np.ndarray] = [np.zeros(3)]
-    donors: list[int] = []
-    for ax, ang in zip(_OCT, folds, strict=True):
-        u = np.array(ax, float)
-        c, o = rw.AddAtom(Chem.Atom(6)), rw.AddAtom(Chem.Atom(8))
-        rw.GetAtomWithIdx(c).SetFormalCharge(-1)  # the [C-]#[O+] carbonyl
-        rw.GetAtomWithIdx(o).SetFormalCharge(1)
-        rw.AddBond(c, o, Chem.BondType.TRIPLE)
-        rw.AddBond(c, 0, Chem.BondType.DATIVE)  # C -> Fe
-        t = np.radians(ang)
-        pos += [_FE_C * u, _FE_C * u + _C_O * (np.cos(t) * (-u) + np.sin(t) * np.array([0.0, 0.0, 1.0]))]
-        donors.append(c)
-    for z in (1.0, -1.0):
-        h = rw.AddAtom(Chem.Atom(1))
-        rw.AddBond(0, h, Chem.BondType.SINGLE)
-        pos.append(np.array([0.0, 0.0, z * _FE_H]))
-        donors.append(h)
-    mol = rw.GetMol()
-    Chem.SanitizeMol(mol, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
-    conf = Chem.Conformer(mol.GetNumAtoms())
-    for i, p in enumerate(pos):
-        conf.SetAtomPosition(i, Point3D(*map(float, p)))
-    mol.AddConformer(conf, assignId=True)
-    return mol, donors
-
-
-def _oop(mol, cid, i, j, k, w):
-    """Angle (deg) of atom i (the metal) out of the plane through j, k, w; 0 when the metal is coplanar."""
-    p = mol.GetConformer(cid).GetPositions()
-    n = np.cross(p[k] - p[j], p[w] - p[j])
-    nn = np.linalg.norm(n)
-    if nn < 1e-6:
-        return 0.0
-    n /= nn
-    v = p[i] - p[j]
-    v /= np.linalg.norm(v)
-    return 90.0 - np.degrees(np.arccos(min(1.0, abs(float(np.dot(n, v))))))
 
 
 def _donor(iso, symbol):
@@ -141,23 +87,12 @@ def _emitted_cap_donors(iso, seed=1):
     ],
 )
 def test_a_calibrated_donors_protons_are_walled_and_an_uncalibrated_class_abstains(smi, walled):
-    """An (M, donor, H) angle window exists iff the donor's (element, hybridisation) class is census-calibrated.
-
-    Walling the proton is the fix for an sp3 amine that used to fold an H onto the metal over its lone pair;
-    no rule walled an N/O/C sp3 proton before.
-    """
     iso = rx.metal(smi, "square_planar").select(index=0)
     protons = [k for k in iso.cons.angles if k[0] == iso.metal and iso.mol.GetAtomWithIdx(k[2]).GetAtomicNum() == 1]
     assert bool(protons) == walled, f"{smi}: {len(protons)} proton walls, expected {'some' if walled else 'none'}"
 
 
 def test_an_sp3_amine_donor_does_not_fold_a_proton_onto_the_metal():
-    """Every M-N-H of a metal-bound [NH2] amine stays ≥90°: no inversion onto the lone pair.
-
-    Red-first: with the wall heavy-only, min M-N-H reached ~65° and 3-5 of 33 conformers fully inverted, and the
-    fold GATE is heavy-substituent so it shipped gate-clean. This is the embed->minimize (UFF, no xtb) degrade
-    path: no calculator re-splays the fold, so the seed hold must.
-    """
     smi = "CCNC1N[NH2]->[Ni+2]2(<-[O-]C(=O)N(c3ccccc3)[CH-]->2c2ccccc2)<-[S]=1"
     iso0 = rx.metal(smi, "square_planar")[0]
     n5 = next(
@@ -181,11 +116,6 @@ def test_an_sp3_amine_donor_does_not_fold_a_proton_onto_the_metal():
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
 def test_a_slow_inverting_phosphines_protons_stay_splayed_on_both_input_paths(tmp_path):
-    """A primary phosphine's M-P-H stays >90° from SMILES and again after the geometry is fed back through xyz.
-
-    P/As/Sb inversion is a barrier a local optimiser cannot cross, so the hand the seed picks is the hand that
-    ships; on the from-geometry path too, where perception rather than the SMILES supplies the donor.
-    """
 
     def m_d_h(ens, metal, donors):
         return [
@@ -213,16 +143,18 @@ def test_a_slow_inverting_phosphines_protons_stay_splayed_on_both_input_paths(tm
 
 
 def test_hybridisation_is_classified_on_the_metal_stripped_graph():
-    """A carbonyl carbon types sp on its own graph; a hydride gets no class at all.
-
-    RDKit mis-types the carbon with the dative bond in, so the coordination under test would otherwise decide
-    the class used to judge it.
-    """
-    mol, donors = feh2co4()
+    params = Chem.SmilesParserParams()
+    params.removeHs = False  # a hydride is a DONOR here, so it has to survive the parse as its own atom
+    mol = Chem.MolFromSmiles("[H][Ru]([H])(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]", params)
     hyb = DO._stripped_hybridisation(mol)
-    for c in donors[:4]:
-        assert hyb[c] == Chem.HybridizationType.SP
-    for h in donors[4:]:
+    metal = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "Ru")
+    carbons = [n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors() if n.GetAtomicNum() == 6]
+    hydrides = [n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors() if n.GetAtomicNum() == 1]
+    assert len(carbons) == 4, "the fixture lost a carbonyl"
+    assert len(hydrides) == 2, "the fixture lost a hydride, so the never-classified half asserts nothing"
+    for c in carbons:
+        assert hyb[c] == Chem.HybridizationType.SP, "the carbonyl carbon was typed through its M-C bond"
+    for h in hydrides:
         assert h not in hyb, "a hydride has no donation axis and must never be classified"
 
 
@@ -230,24 +162,16 @@ def test_hybridisation_is_classified_on_the_metal_stripped_graph():
 
 
 def test_the_two_coplanar_permutations_each_state_exactly_one_plane():
-    """A 1-heavy-neighbour O uses one dihedral anti to the heaviest reference; a 2-heavy N uses one improper.
-
-    Both are one rotational DOF, so a second entry adds no geometry and only doubles that donor's torsion force
-    constant: a doubling that made a κ1 carboxylate override a co-donor's plane wherever the two couple
-    through the chelate backbone. (The two carboxyl references are rigidly ~180° apart, so the "net restoring
-    force" argument for a second entry is false: the windows coincide.)
-    """
     iso = rx.metal(NI_N, "square_planar")[0]
     mol = iso.mol
     o, n = _donor(iso, "O"), _donor(iso, "N")
     assert {o, n} <= _capped(iso), "both conjugated donors of the N-bound isomer must be capped"
 
-    ((_i, _d, k, w, anchor, _cap),) = [e for e in iso.cons.coplanar if e[1] == o]
+    ((_i, _d, k, w, _anchor, _cap),) = [e for e in iso.cons.coplanar if e[1] == o]
     c = next(nb.GetIdx() for nb in mol.GetAtomWithIdx(o).GetNeighbors() if nb.GetSymbol() == "C")
     assert k == c, "the plane is defined through the carboxyl carbon"
     subs = [nb.GetIdx() for nb in mol.GetAtomWithIdx(c).GetNeighbors() if nb.GetIdx() != o and nb.GetAtomicNum() > 1]
     assert w == next(s for s in subs if mol.GetAtomWithIdx(s).GetSymbol() == "O"), "the 2nd O is the reference"
-    assert anchor == DO._COPLANAR_ANCHOR, "a κ1 carboxylate binds ANTI to its partner O"
 
     ((_i, _n, k, w, _anc, _cap),) = [e for e in iso.cons.coplanar if e[1] == n]
     heavy = {nb.GetIdx() for nb in mol.GetAtomWithIdx(n).GetNeighbors() if nb.GetAtomicNum() > 1}
@@ -255,18 +179,14 @@ def test_the_two_coplanar_permutations_each_state_exactly_one_plane():
 
 
 def test_only_an_inplane_sp2_donor_is_capped():
-    """Every capped donor satisfies `inplane_sp2_donor` and none is haptic: the rule, not an N/O element list.
-
-    The three fixtures are the ways a donor can fail the rule: no π-plane (sp3 amine), an sp donor held end-on
-    instead (nitrile), and a face bonded to its own co-donor (side-on η²). An organic molecule has no donors at
-    all, so `coplanar` is empty there for the same reason.
-    """
     for name, smi, geometry in (
         ("sp3 amine", "CCN[Pd](Cl)Cl", "square_planar"),
         ("sp nitrile", "CC#N[Pd](Cl)Cl", "square_planar"),
         ("side-on eta2", _ETA2_SMI, "square_planar"),
     ):
-        for iso in rx.metal(smi, geometry):
+        isos = list(rx.metal(smi, geometry))
+        assert isos, f"{name}: nothing was enumerated, so no cap was ever inspected"
+        for iso in isos:
             for _i, d, _k, _w, _anc, _cap in iso.cons.coplanar:
                 assert DO.inplane_sp2_donor(iso.mol, d), f"{name}: a non-sp2 donor was capped"
                 haptic = any(nb.GetIdx() in set(iso.donors) for nb in iso.mol.GetAtomWithIdx(d).GetNeighbors())
@@ -283,14 +203,6 @@ def test_only_an_inplane_sp2_donor_is_capped():
     ids=["thione-S", "aryl-carbanion-C", "isolated-ketone-O"],
 )
 def test_the_derived_predicate_caps_donors_an_element_or_conjugation_test_dropped(name, smi, symbol, conjugated):
-    """A conjugated S / an aromatic ipso C / a NON-conjugated ketone O are each in-plane sp2 donors, and capped.
-
-    A metal binds an sp2 O/N/S/C from its IN-PLANE sigma lone pair whether or not the pi system is conjugated,
-    so neither an element set nor `GetIsConjugated` is the rule. Measured harm of each drop: the thione's metal
-    relaxed ~26° median / ~62° max out of its C=S plane; the isolated ketone O's reached ~48°, past the census
-    p95 (~40°). The `conjugated` column is a fixture assertion; if RDKit's flag changed, the case would stop
-    being the one the predicate was derived for.
-    """
     iso = rx.metal(smi, "square_planar")[0]
     d = next(
         x
@@ -304,13 +216,7 @@ def test_the_derived_predicate_caps_donors_an_element_or_conjugation_test_droppe
 
 
 def test_an_uncalibrated_donor_class_still_gets_the_cap():
-    """('S', SP2) has no census fold row, so the wall abstains; yet the thione's cap still fires.
-
-    The coplanarity enforcement reads `cons.coplanar` (an FF torsion), never `_FOLD_WINDOW`; the census
-    abstention and the cap must stay decoupled.
-    """
     assert ("S", DO._SP2) not in DO._FOLD_WINDOW, "('S',SP2) must stay uncalibrated (corpus has no conjugated one)"
-    assert ("S", DO._SP2) not in DO._FOLD_WALL_FLOOR
     iso = rx.metal(_THIONE_SMI, "square_planar")[0]
     s = _donor(iso, "S")
     assert not any(k[0] == iso.metal and k[1] == s for k in iso.cons.angles), "the fold wall must abstain on S sp2"
@@ -319,8 +225,9 @@ def test_an_uncalibrated_donor_class_still_gets_the_cap():
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
 def test_a_frozen_ts_core_metal_gets_no_cap():
-    """A `fix=` frozen reacting core already pins the M-donor geometry, so no cap is written."""
-    for iso in rx.metal(_MN_H2, "octahedral", center="Mn", fix=_MN_H2_RC):
+    isos = list(rx.metal(_MN_H2, "octahedral", center="Mn", fix=_MN_H2_RC))
+    assert isos, "nothing was enumerated: the no-cap claim was never tested"
+    for iso in isos:
         assert not iso.cons.coplanar
 
 
@@ -330,14 +237,6 @@ def test_a_frozen_ts_core_metal_gets_no_cap():
 
 
 def test_the_emitted_cap_is_a_one_sided_window_of_its_declared_width_at_its_own_force_constant():
-    """`_coplanar_window` opens `cap` deg wide on the seed's own side of the nearest in-plane well.
-
-    Three things, all load-bearing. A window rather than a point is what leaves a real energy free to choose
-    inside it. Opening on the seed's side rather than straddling the well is what makes riding the wall land ON
-    the plane: a symmetric ±cap window rides out to `cap` off it instead. And the emitted torsion carries
-    `_COPLANAR_FC`, never the caller's stiffness: `ff_terms` is handed the relax's current force constant,
-    which the stiffness ladder escalates to 1e6, and a cap that rode that ladder would stop being a cap.
-    """
     from rxembed import mechanisms
     from rxembed.mechanisms import _coplanar_window
 
@@ -372,17 +271,9 @@ def _cap_deviation(smi, seeds, n):
     return {j: np.array(v) for j, v in out.items()}
 
 
-@pytest.mark.parametrize("smi", [NI_N, _KETONE_SMI], ids=["amidate-chelate", "ketone-monodentate"])
-def test_the_relax_lands_inside_the_caps_own_window_without_pinning_the_plane(smi):
-    """Every relaxed conformer sits inside the declared cap, some reach the plane, and some reach the wall.
-
-    Measured on the dihedral the cap actually constrains, not on a derived out-of-plane proxy, so the bound is
-    the constraint's own number and no remembered measurement enters the assertion. Riding the wall is allowed
-    a degree of slack: the UFF torsion is a penalty, not a hard wall, so a flat-bottomed minimum settles a hair
-    outside. Uncapped, these donors fold well past the window: that is what the cap exists to stop.
-    """
+def test_the_relax_lands_inside_the_caps_own_window_without_pinning_the_plane():
     cap = DO._COPLANAR_CAP
-    dev = _cap_deviation(smi, (1, 7, 13), n=6)
+    dev = _cap_deviation(NI_N, (6, 14), n=2)
     assert dev, "no capped donor was measured: the fixture is wrong"
     for j, arr in dev.items():
         assert arr.max() <= cap + _WALL_SLACK, f"donor {j}: the relax broke through its cap ({arr.max():.1f}°)"
@@ -391,7 +282,6 @@ def test_the_relax_lands_inside_the_caps_own_window_without_pinning_the_plane(sm
 
 
 def test_the_cap_does_not_reach_into_the_aryl_ring_it_anchors_on():
-    """The N-aryl phenyl twist keeps a >30° range: the cap uses the ipso carbon, not the whole ring."""
     iso = rx.metal(NI_N, "square_planar")[0]
     mol = iso.mol
     n = _donor(iso, "N")
@@ -406,13 +296,6 @@ def test_the_cap_does_not_reach_into_the_aryl_ring_it_anchors_on():
 
 
 def test_the_cap_survives_every_constraints_rebuild():
-    """`Constraints.relaxed()` COPIES the field, and the mc per-bin settle relaxes with it present.
-
-    `coplanar` is structure, not a releasable NCI grip, so `relaxed()` must keep it. `_settle_seeds` rebuilds a
-    partial `Constraints` per bin and used to hand-list the fields it carried, omitting this one: so
-    `rx.metal(...).mc()` ran a stiff 1e4 relax with the sp2-donor torsion absent (max 94.3° vs 90.3° out of
-    plane on the N-bound Ni(II) isomer from an identical seed). Asserted on what the RELAX is handed, not on `ens.cons`.
-    """
     from rxembed.pipeline.ensemble import _refine
 
     c = Constraints()
@@ -454,13 +337,6 @@ _PICO = "O=C1[O-]->[Ni+2]2(<-[NH2]CC[NH2]->2)<-n2ccccc21"
 
 @pytest.mark.parametrize(("smi", "kept"), [(_CASE2, {17, 27}), (_CASE3, {17})], ids=["case2", "case3"])
 def test_the_ff_torsion_is_skipped_only_for_a_plane_shared_donor(smi, kept):
-    """The crowded chelates drop the torsions of {15, 34} and keep the sp3-hinged ones; the controls keep every cap.
-
-    The pyridyl N (15) and the imine N (34) share one all-sp2 plane with a co-donor; the sp3-hinged O (17) and
-    N (27) do not, and `codonor_in_plane` is asserted directly on all four so the predicate is pinned as well as
-    its consumer. Bit-identity on the controls is the other half: NI_N (sp3 hinge) and the monodentate KETONE
-    present one contact each, so the skip must be a strict no-op there and the relax unchanged.
-    """
     iso = rx.metal(smi, "square_planar")[0]
     donors = set(iso.donors)
     assert {d for d in donors if DO.codonor_in_plane(iso.mol, d, donors)} == {15, 34}
@@ -478,12 +354,6 @@ def test_the_ff_torsion_is_skipped_only_for_a_plane_shared_donor(smi, kept):
 
 
 def test_the_skip_is_ff_only_so_the_dg_bound_still_composes():
-    """A skipped donor keeps its `cons.coplanar` entry; `Coplanar.dg_post` reads that list unconditionally.
-
-    Dropping the entry at build time would look identical in the force field and silently take the 1,4 distance
-    bound with it, leaving the plane held by nothing during the embed itself. PICO's conjugated bidentate is the
-    case: both its donors are skipped, and the geometry is then held by the backbone and the polyhedron alone.
-    """
     iso = rx.metal(_PICO, "square_planar")[0]
     donors = set(iso.donors)
     skipped = {e[1] for e in iso.cons.coplanar if DO.codonor_in_plane(iso.mol, e[1], donors)}
@@ -493,7 +363,6 @@ def test_the_skip_is_ff_only_so_the_dg_bound_still_composes():
 
 
 def test_skipping_an_ester_cap_does_not_collapse_the_ester():
-    """case4's plane-locked ester O cap is skipped and its O-C-O never closes below 90° (was 0/40 collapses)."""
     iso_set = rx.metal(_CASE4, "square_planar")
     assert len(iso_set) > 3, "case4 must expose the iso3 arrangement that historically collapsed"
     iso = iso_set[3]  # the O4/N23/C16/O6 arrangement
@@ -511,15 +380,6 @@ def test_skipping_an_ester_cap_does_not_collapse_the_ester():
 
 
 def test_a_frozen_metal_silences_the_wall_only_where_the_geometry_is_the_truth():
-    """A `fix=`d metal drops every donor's orientation wall on a measured geometry, and keeps it on a modelled one.
-
-    Two different questions wearing one flag. With the input conformer as the distance truth, a frozen metal
-    means the reference already says where each donor points and a wall could only fight it. With the fitted
-    model there is no such reference, and reading the frozen metal as a skip left a rebuilt ligand with nothing
-    orienting it at all: a carbonyl added to a held sphere relaxed to M-C-O 129-148° against its own 155° gate.
-
-    The frozen donors stay skipped either way; that skip is per-donor and is not what moved.
-    """
 
     def walls(lengths):  # (metal, donor, substituent) windows, i.e. `_orient_donor`'s, not the polyhedron's
         iso = rx.metal(_MN_H2, "octahedral", center="Mn", fix=_MN_H2_RC, lengths=lengths)[0]

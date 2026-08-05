@@ -1,10 +1,11 @@
 """Metal coordination-sphere gates -- has an atom collapsed onto the metal, and does a ligand still point right.
 
-Read-only and off the embed path: these gates judge a finished geometry, and `pipeline.geom_check` is the
-only consumer. They look *into* the coordination sphere, which every ``geometry`` check excludes because a
-dative distance is not covalent: ``metal_overbond`` asks whether an atom reached bonding distance,
+Read-only and off the embed path: these gates judge a finished geometry, and `pipeline.geom_check` consumes
+them. They look *into* the coordination sphere, which every ``geometry`` check excludes because a dative
+distance is not covalent: ``metal_overbond`` asks whether an atom reached bonding distance,
 ``donor_orientation`` whether a ligand still donates along its axis, and ``donor_fold`` reports the metric
-behind the same walk. The rest is the sphere perception both resolve on.
+behind the same walk. The rest is the sphere perception both resolve on; `pipeline.select` also reads its
+`_coordinating` leaf when a wrapped metal has no bonds.
 
 This is the *gate* side; enforcement (``_orient_donor`` / ``_coplanar_donor``) lives in ``donor_orient``,
 imported below so the two cannot drift. The organic conjugation perception the gate and the FF caps share
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from rdkit import Chem
 
-from .metal_core import _METAL_Z
+from .metal_core import COORDINATION_METALS
 from .metal_distance import (
     APEX,
     DONOR_COLLAPSE_RATIO,
@@ -40,7 +41,13 @@ from .utils import _CARBON_Z, Violation, _angle, _dihedral, _positions, _rcov
 
 _COORD_FACTOR = 1.3  # a heavy atom within this x covalent-sum of a metal is a coordinating donor
 _SIDEON_SYM = 0.5  # Å: max |d(M,a) - d(M,b)| for a pi pair to count as symmetric side-on (else donor + backbone)
-_SIDEON_MAX = 2.6  # Å: both eta-2 atoms must bind within this; beyond it a pi atom is backbone, not a donor
+_SIDEON_MAX = 2.6  # Å: both eta-2 atoms must bind within this; beyond it a pi atom is backbone, not a donor.
+# Absolute, where `_COORD_FACTOR` above is a ratio of the covalent sum on the same axis, and the ratio form is
+# measured and refuted over the 57 corpus geometries. WELROW's La...Se=P at 3.10/3.45 Å is only 1.10 x the
+# covalent sum (La's radius alone is 2.07 Å), so any ratio loose enough to keep GODNOD's genuine Ni eta2-C=S
+# (1.23 x) admits it too, and that is wrong: the P is the backbone behind the Se donor, the alpha-diimine
+# false positive one shell out. COJKAO pins the inversion from the other side, its Pd...S=O rejected at
+# 1.226 x against GODNOD's accepted 1.233 x, two verdicts 0.007 apart in ratio and 0.27 Å apart here
 
 
 def metal_overbond(mol, pos, donors=None, margin: float | None = None) -> list[Violation]:
@@ -65,7 +72,7 @@ def metal_overbond(mol, pos, donors=None, margin: float | None = None) -> list[V
         rm = _rcov(mol.GetAtomWithIdx(m).GetAtomicNum())
         for a in mol.GetAtoms():
             i = a.GetIdx()
-            if i == m or a.GetAtomicNum() in _METAL_Z:
+            if i == m or a.GetAtomicNum() in COORDINATION_METALS:
                 continue
             r_sum = rm + _rcov(a.GetAtomicNum())
             if i in sphere:  # a donor gets a floor too (see docstring): its licence is a bonding window, not a
@@ -82,11 +89,11 @@ def metal_overbond(mol, pos, donors=None, margin: float | None = None) -> list[V
             if d < floor:
                 out.append(
                     Violation(
-                        "metal_collapse" if what == "donor" else "metal_overbond",
-                        (m, i),
-                        d,
-                        floor,
-                        f"{what} {a.GetSymbol()}{i} is {d:.2f} A from the metal (floor {floor:.2f} A): it has "
+                        kind="metal_collapse" if what == "donor" else "metal_overbond",
+                        atoms=(m, i),
+                        value=d,
+                        limit=floor,
+                        detail=f"{what} {a.GetSymbol()}{i} is {d:.2f} A from the metal (floor {floor:.2f} A): it has "
                         + ("collapsed into it" if what == "donor" else "effectively bonded to it"),
                     )
                 )
@@ -100,12 +107,12 @@ class DonorAngle:
     metal: int
     donor: int
     sub: int  # X, a heavy substituent of the donor
-    element: str  # the donor's element, half the class key: a thiolate donates at 103 deg, a carboxylate at
-    hyb: Chem.HybridizationType  # 126 deg, so pooling by hybridisation alone voids the gate
-    angle: float
-    deviation: float  # |angle - class census median|: the reference-free `fold`
-    planarity: float | None  # deg the metal sits out of a conjugated donor's ligand plane (None if not
-    # conjugated); report-only, since real crystals reach 87.6 deg out of plane and it can never gate
+    element: str = field(kw_only=True)  # the donor's element; thiolate at 103°, carboxylate at
+    hyb: Chem.HybridizationType = field(kw_only=True)  # 126°: pooling by hyb alone voids the gate
+    angle: float = field(kw_only=True)
+    deviation: float = field(kw_only=True)  # |angle - class median|: the reference-free `fold`
+    planarity: float | None = field(default=None, kw_only=True)  # metal out-of-plane in ligand plane (None
+    # if not conjugated); report-only: crystals reach 87.6° and it can never gate
 
     @property
     def cls(self) -> tuple[str, Chem.HybridizationType]:
@@ -194,11 +201,11 @@ def donor_orientation(mol, pos, donors=None, frozen=frozenset()) -> list[Violati
         xsym = mol.GetAtomWithIdx(a.sub).GetSymbol()
         out.append(
             Violation(
-                "donor_orientation",
-                (a.metal, a.donor, a.sub),
-                a.angle,
-                lo,
-                f"{a.element}{a.donor} ({str(a.hyb).lower()}) donates at {a.angle:.1f}° to {xsym}{a.sub} "
+                kind="donor_orientation",
+                atoms=(a.metal, a.donor, a.sub),
+                value=a.angle,
+                limit=lo,
+                detail=f"{a.element}{a.donor} ({str(a.hyb).lower()}) donates at {a.angle:.1f}° to {xsym}{a.sub} "
                 f"(real {a.element} {str(a.hyb).lower()} donations: {lo:.0f}-{hi:.0f}°, median "
                 f"{_FOLD_MEDIAN[a.cls]:.0f}°): the ligand has folded back over the metal",
             )
@@ -217,7 +224,7 @@ def _eta2_pi_atoms(mol, pos) -> set[int]:
     Equal-distance rejects a false positive the flat 1.3x shell lets through: an alpha-diimine's imine C drifts
     inside the shell behind its sigma-donor N, but that N/C pair is lopsided, not side-on.
     """
-    metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _METAL_Z]
+    metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS]
     out: set[int] = set()
     for a, b in _coordination_pairs(mol, pos):
         bond = mol.GetBondBetweenAtoms(a, b)
@@ -244,7 +251,7 @@ def _donor_walk(mol, pos, donors=None, frozen=frozenset()) -> tuple[list[DonorAn
     unknown: list[int] = []
     for m, sphere in spheres.items():
         for d in sorted(sphere):
-            subs = donation_axis(mol, d, all_donors, sphere, frozen)
+            subs = donation_axis(mol, d, all_donors, sphere=sphere, frozen=frozen)
             if subs is None:  # hydride, bridging or haptic: the donation question does not apply
                 continue
             cls = (mol.GetAtomWithIdx(d).GetSymbol(), hyb[d]) if d in hyb else None  # None when estimators disagree
@@ -255,11 +262,22 @@ def _donor_walk(mol, pos, donors=None, frozen=frozenset()) -> tuple[list[DonorAn
             for x in subs:
                 ang = _angle(pos[m], pos[d], pos[x])
                 dev = abs(ang - _FOLD_MEDIAN[cls])
-                out.append(DonorAngle(m, d, x, cls[0], cls[1], ang, dev, _planarity_dev(mol, pos, hyb, m, d, x)))
+                out.append(
+                    DonorAngle(
+                        m,
+                        d,
+                        x,
+                        element=cls[0],
+                        hyb=cls[1],
+                        angle=ang,
+                        deviation=dev,
+                        planarity=_planarity_dev(mol, pos, hyb=hyb, m=m, d=d, x=x),
+                    )
+                )
     return out, unknown
 
 
-def _planarity_dev(mol, pos, hyb, m, d, x) -> float | None:
+def _planarity_dev(mol, pos, *, hyb, m, d, x) -> float | None:
     """Deg the metal lies out of a CONJUGATED donor's ligand plane (None when the D-X bond is not conjugated).
 
     A carboxylate/pyridine plane rotated into the coordination sphere with an acceptable M-D-X angle. Report-only
@@ -272,7 +290,7 @@ def _planarity_dev(mol, pos, hyb, m, d, x) -> float | None:
     best = None
     for y in mol.GetAtomWithIdx(x).GetNeighbors():
         j = y.GetIdx()
-        if j in (d, m) or y.GetAtomicNum() == 1 or y.GetAtomicNum() in _METAL_Z:
+        if j in (d, m) or y.GetAtomicNum() == 1 or y.GetAtomicNum() in COORDINATION_METALS:
             continue
         t = abs(_dihedral(pos[m], pos[d], pos[x], pos[j]))
         dev = min(t, abs(180.0 - t))  # 0 = metal lies in the ligand plane
@@ -286,7 +304,7 @@ def _coordinating_carbons(mol, pos) -> set[int]:
     A carbanion / carbene / eta2 carbon legitimately pyramidalises out of the flat sp2 plane RDKit assigns it,
     so judging it by the strict sp2 rule reports a defect that is not one.
     """
-    metals = (a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _METAL_Z)
+    metals = (a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS)
     return {i for m in metals for i in _coordinating(mol, pos, m) if mol.GetAtomWithIdx(i).GetAtomicNum() == _CARBON_Z}
 
 
@@ -301,7 +319,7 @@ def _coordinating(mol, pos, m, declared=frozenset()) -> set[int]:
     out = set()
     for a in mol.GetAtoms():
         i, z = a.GetIdx(), a.GetAtomicNum()
-        if i == m or z in _METAL_Z or (z == 1 and i not in declared):
+        if i == m or z in COORDINATION_METALS or (z == 1 and i not in declared):
             continue
         if float(np.linalg.norm(pos[m] - pos[i])) <= _COORD_FACTOR * (rm + _rcov(z)):
             out.add(i)
@@ -317,7 +335,7 @@ def _spheres(mol, pos, donors=None) -> dict[int, set[int]]:
     """
     known = set() if donors is None else {int(d) for d in donors}
     out: dict[int, set[int]] = {}
-    for m in (a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _METAL_Z):
+    for m in (a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS):
         shell = _coordinating(mol, pos, m, known)  # `known` also admits a declared hydride the element screen
         out[m] = (known & shell) or shell  # would drop; else `known & shell` silently loses it
     return out
@@ -330,7 +348,7 @@ def _coordination_pairs(mol, pos) -> set[tuple[int, int]]:
     clash. The metal-donor bonds are stripped on the rxembed surrogate, so donors are found geometrically.
     """
     out: set[tuple[int, int]] = set()
-    for m in (a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _METAL_Z):
+    for m in (a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS):
         donors = sorted(_coordinating(mol, pos, m))
         for x in range(len(donors)):
             for y in range(x + 1, len(donors)):

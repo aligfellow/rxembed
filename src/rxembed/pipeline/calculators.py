@@ -2,7 +2,8 @@
 
 `resolve(refine, ...)` maps a spec to a Calculator: "ff" (no calc), "gxtb"/"gfn2"/"gfnff" (the xtb
 executable), or any Calculator instance. Wrap an ASE calculator (MACE, AIMNet2, ORCA, …) with ASE(...),
-or subclass Calculator.energy for anything else.
+or subclass Calculator.energy for anything else. The adapter imports ASE only when used; installing the
+calculator supplies that dependency, rather than making every scoring install carry it.
 
 The executable half talks to `xtb` on PATH. g-xTB has no ALPB parameters, so solvent comes from a GFN2
 correction::
@@ -177,7 +178,7 @@ class XTB(Calculator):
 
 
 class ASE(Calculator):
-    """Wrap any ASE calculator."""
+    """Wrap an optional ASE calculator without making ASE a package dependency."""
 
     def __init__(self, ase_calc):
         self.calc = ase_calc
@@ -187,7 +188,7 @@ class ASE(Calculator):
         try:
             from ase import Atoms
         except ImportError as exc:
-            raise ImportError("energy needs ase; pip install 'rxembed[score]'") from exc
+            raise ImportError("ASE.energy needs ase; pip install ase or the package providing your calculator") from exc
 
         conf = mol.GetConformer(conf_id)
         atoms = Atoms(numbers=[a.GetAtomicNum() for a in mol.GetAtoms()], positions=conf.GetPositions())

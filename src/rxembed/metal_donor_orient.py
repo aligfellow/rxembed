@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from rdkit import Chem
 
-from .metal_core import _METAL_Z
+from .metal_core import COORDINATION_METALS
 from .metal_distance import _APEX_DONORS, APEX, overbond_tier
 from .utils import remove_bond
 
@@ -123,7 +123,7 @@ def _stripped_hybridisation(mol) -> dict[int, Chem.HybridizationType]:
     """
     rw = Chem.RWMol(mol)
     for a in mol.GetAtoms():
-        if a.GetAtomicNum() in _METAL_Z:
+        if a.GetAtomicNum() in COORDINATION_METALS:
             for nb in [n.GetIdx() for n in a.GetNeighbors()]:
                 remove_bond(rw, a.GetIdx(), nb)  # index-stable: removing a bond never renumbers atoms
     stripped = rw.GetMol()
@@ -204,7 +204,7 @@ def donation_axis(mol, d, all_donors, sphere=None, frozen=frozenset()) -> list[i
     a = mol.GetAtomWithIdx(d)
     if a.GetAtomicNum() == 1:  # hydride / η²-H₂ / agostic H: no lone pair, so no donation axis
         return None
-    if sum(1 for nb in a.GetNeighbors() if nb.GetAtomicNum() in _METAL_Z) > 1:  # bridging: set by the bridge
+    if sum(1 for nb in a.GetNeighbors() if nb.GetAtomicNum() in COORDINATION_METALS) > 1:  # bridging: set by the bridge
         return None
     if any(nb.GetIdx() in all_donors for nb in a.GetNeighbors()):  # haptic: side-on, the metal is off-axis
         return None
@@ -213,7 +213,7 @@ def donation_axis(mol, d, all_donors, sphere=None, frozen=frozenset()) -> list[i
         nb.GetIdx()
         for nb in a.GetNeighbors()
         if nb.GetAtomicNum() > 1  # protons have their own window (`_orient_donor`)
-        and nb.GetAtomicNum() not in _METAL_Z
+        and nb.GetAtomicNum() not in COORDINATION_METALS
         and nb.GetIdx() not in all_donors  # co-donor
         and overbond_tier(mol, sphere, nb.GetIdx()) != APEX  # a κ2 bite apex is forced by its ring
         and not (d in frozen and nb.GetIdx() in frozen)  # the frozen core's own orientation, grafted from the TS
@@ -262,8 +262,8 @@ def _orient_donor(mol, metal, d, donor_set, cons, core_frozen=()):
         window = _CENTRED_SP2_WINDOW  # monodentate sp2 C/N: centre the in-plane axis (see `_CENTRED_SP2_WINDOW`)
     for nb in a.GetNeighbors():
         z = nb.GetAtomicNum()
-        if z in _METAL_Z:  # the M-D bond is stripped by now, but the surrogate keeps the fiction: never wall M
-            continue
+        if z in COORDINATION_METALS:  # the M-D bond is stripped by now, but the surrogate keeps the fiction:
+            continue  # never wall M
         if z > 1 and sum(1 for x in donor_set if mol.GetBondBetweenAtoms(nb.GetIdx(), x) is not None) >= _APEX_DONORS:
             continue  # a heavy APEX substituent (bonded to >= 2 donors): a geometrically forced bite apex
         cons.angles.setdefault((metal, d, nb.GetIdx()), window)

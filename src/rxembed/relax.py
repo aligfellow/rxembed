@@ -18,7 +18,7 @@ from rdkit import Chem, rdBase
 from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers
 
 from . import mechanisms as _mech
-from .metal_core import _METAL_Z, materialise_phantoms
+from .metal_core import COORDINATION_METALS, materialise_phantoms
 from .utils import remove_bond
 
 FF_SURROGATE = (
@@ -44,7 +44,9 @@ def bonding_ok(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset(), c
 
     * pairs inside a frozen or reacting core (``exclude``): a partial forming or breaking bond is held to the
       reference, not a ground-state bond;
-    * any pair involving a metal, whose dative/coordinate distances covalent radii don't describe;
+    * any pair involving a metal centre, whose dative/coordinate distances covalent radii don't describe.
+      `metal_core.COORDINATION_METALS` and not the d-block set, and it must stay the set `embed`'s guard refuses an
+      un-surrogated centre on: an atom exempted here but waved through there gets neither;
     * pairs in ``constrained`` (pass ``Constraints.distances``): a pair whose separation the constraint
       system *states* has no chemistry left for a radius rule to judge. ``rx.embed('CCCl', fix={(1, 2): 2.4})``
       asks for a dissociating C-Cl; calling the result broken rejects exactly the requested geometry. Whether
@@ -56,7 +58,7 @@ def bonding_ok(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset(), c
     """
     pos = mol.GetConformer(conf_id).GetPositions()
     heavy = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
-    metals = {i for i in heavy if mol.GetAtomWithIdx(i).GetAtomicNum() in _METAL_Z}
+    metals = {i for i in heavy if mol.GetAtomWithIdx(i).GetAtomicNum() in COORDINATION_METALS}
     exclude = set(exclude)
     stated = {frozenset(p) for p in constrained}
     rcov = {i: _PT.GetRcovalent(mol.GetAtomWithIdx(i).GetAtomicNum()) for i in heavy}
@@ -167,13 +169,17 @@ def _ff_surrogate(mol, metals, phantoms=()):
     return out
 
 
-def restrained_uff(mol, cons, distance_fc=500.0, max_iters=MAX_ITERS, conf_ids=None):
+def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=None):
     """Minimise each conformer enforcing distance/angle windows + frozen atoms (pinned exactly, zero DOF).
 
     A metal brings more fields, all empty for an organic system (so this is bit-identical there): ``cons.metals``
-    re-types the metal to the zero-vdW surrogate, ``cons.pulls`` adds the soft harmonic inside the flat-bottomed
+    re-types the metal to the zero-vdW surrogate, ``cons.pulls`` adds the M-donor bias inside the flat-bottomed
     distance walls, ``cons.floors`` the anti-overbond guard, ``cons.coplanar`` the coplanarity cap. They ship
     together; each dropped alone regresses (see `FF_SURROGATE` / `distance.ff_terms`).
+
+    ``stiffness`` is dimensionless and 1.0 is the shipped setting: every restraint constant lives in
+    `mechanisms`, stated on one scale, and this is the escalation ladder's rung multiplying the walls among
+    them.
 
     `conf_ids` restricts the settle to a subset of conformers (default: all), used to settle different seeds to
     different in-window targets.
@@ -193,7 +199,7 @@ def restrained_uff(mol, cons, distance_fc=500.0, max_iters=MAX_ITERS, conf_ids=N
             ff = rdForceFieldHelpers.UFFGetMoleculeForceField(target, confId=conf_id, ignoreInterfragInteractions=False)
         conf = target.GetConformer(conf_id)
         for m in _mech.MECHANISM_ORDER:
-            m.ff_terms(ff, cons, conf, distance_fc)
+            m.ff_terms(ff, cons, conf, stiffness)
         ff.Initialize()
         return ff
 

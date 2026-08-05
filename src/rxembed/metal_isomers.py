@@ -31,7 +31,7 @@ from .metal_core import (
     _SPAN_TOL,
     _TRANS_ANGLE,
     _TRIAD,
-    TRANSITION_METALS,
+    COORDINATION_METALS,
     VACANT,
     _collapse_haptic,
     _frag_map,
@@ -61,7 +61,9 @@ from .metal_polyhedron import (
     describe,
     geometries_for_cn,
     isomer_permutations,
+    read_slot_note,
     resolve_geometry,
+    seat_properly,
     vertex_dirs,
 )
 
@@ -401,14 +403,14 @@ def from_geometry(mol):
     vertices = [sites[k] for k in order] if order else list(sites)  # no template (or a mismatched CN): as given
     return Isomer._from_parts(
         strip_phantoms(base, set(haptic)),  # the stored mol is real; the centroid dummy is transient
-        cons,
-        m,
-        donors,
-        real_z,
-        real_q,
-        label(base, m, sites, base.GetConformer().GetId(), geom),  # measured from the conformer, not the seating
-        geom,
-        vertices,
+        cons=cons,
+        metal=m,
+        donors=donors,
+        real_z=real_z,
+        real_q=real_q,
+        label=label(base, m, sites, base.GetConformer().GetId(), geom),  # measured from the conformer, not the seating
+        geometry=geom,
+        vertices=vertices,
         chirality=chirality_of(base, sites, geom, vertices, haptic=haptic),
         haptic=dict(haptic),
         donor_bonds=[(d, m) for d in donors],  # the M-donor bonds surrogate_metal stripped, re-added on output
@@ -424,7 +426,17 @@ def from_surrogate(mol, metals, donor_bonds, donors=()):
     """
     (m, real_z, real_q), extra = metals[0], metals[1:]
     return Isomer._from_parts(
-        mol, Constraints(), m, list(donors), real_z, real_q, "", "", [], extra=extra, donor_bonds=donor_bonds
+        mol,
+        cons=Constraints(),
+        metal=m,
+        donors=list(donors),
+        real_z=real_z,
+        real_q=real_q,
+        label="",
+        geometry="",
+        vertices=[],
+        extra=extra,
+        donor_bonds=donor_bonds,
     )
 
 
@@ -569,7 +581,7 @@ def _prepare_spectators(mol, metals, center):
         )
 
     def non_metal(nbrs):
-        return [a.GetIdx() for a in nbrs if a.GetAtomicNum() not in TRANSITION_METALS]
+        return [a.GetIdx() for a in nbrs if a.GetAtomicNum() not in COORDINATION_METALS]
 
     donors = non_metal(mol.GetAtomWithIdx(m).GetNeighbors())  # a partner metal is not a coordination donor
     # Only this path skips `_collapse_haptic`, so a Cp would count as five sigma donors and pick the wrong
@@ -739,14 +751,14 @@ def _isomers_for_geometry(
         out.append(
             Isomer._from_parts(
                 strip_phantoms(Chem.Mol(base), set(haptic)),
-                cons,
-                m,
-                real_donors,
-                real_z,
-                real_q,
-                _order_label(base, padded, geom, order),
-                geom,
-                od,
+                cons=cons,
+                metal=m,
+                donors=real_donors,
+                real_z=real_z,
+                real_q=real_q,
+                label=_order_label(base, padded, geom, order),
+                geometry=geom,
+                vertices=od,
                 chirality=chirality_of(base, donors, geom, od, haptic),
                 extra=extra,
                 stereo_ref=ref_sig,
@@ -774,6 +786,35 @@ def _number_shared_labels(out):
             i.label = f"{i.label}{nth[key]}"
 
 
+def stated_arrangement(mol):
+    """Return the ``(geometry, {vertex: donor atom})`` a canonical string put on `mol`, or ``None``.
+
+    The reading half of `metal_smiles.canonical_smiles`, and it lives here rather than there because what it
+    reads is RDKit atom properties on a `Mol`: an arrangement, which is this module's subject, not a string,
+    which is that one's. `metal_smiles.parse_smiles` has already kept the block's indices addressing the
+    atoms they were written for, so a string that carries an arrangement arrives as an ordinary `Mol` wearing
+    it and `enumerate_isomers` seats it instead of enumerating. Returns ``None`` for a plain SMILES, which is
+    the signal that there is nothing to seat.
+
+    A vacant vertex simply has no donor, so a coordination pocket survives the round trip.
+    """
+    # One key for both notes, so the VALUE says which it is: a slot is `s<n>` with an optional winding sign
+    # (`metal_polyhedron` owns that grammar, since it owns the slots), and anything else on a noted atom is
+    # the metal's geometry code.
+    noted = {a.GetIdx(): a.GetProp("atomNote") for a in mol.GetAtoms() if a.HasProp("atomNote")}
+    slots = {i: read for i, v in noted.items() if (read := read_slot_note(v)) is not None}
+    geom = [i for i in noted if i not in slots]
+    if len(geom) != 1:
+        return None
+    name = resolve_geometry(noted[geom[0]].split("-")[0])
+    sites = {}
+    for atom_idx, (slot, _winding) in slots.items():
+        sites.setdefault(slot, atom_idx)  # a haptic face writes one slot on every ring atom; any names it
+    if name not in POLYHEDRA:
+        raise ValueError(f"the arrangement on this string names {name!r}, which is not a polyhedron rxembed has")
+    return name, sites
+
+
 def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic", stereo_ref=None, lengths="auto"):
     """Enumerate all distinct coordination isomers of a `Mol` as ready-to-embed `Isomer` objects (metal surrogated).
 
@@ -790,13 +831,36 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic
     `stereo_ref` is the input's chirality fingerprint, computed by the caller because it needs a perception
     the engine does not carry, and passed to each `Isomer` for a ``stereo='preserve'`` gate.
 
+    A `Mol` that already states an arrangement (one read from a `canonical_smiles` string) has nothing to
+    enumerate: that one `Isomer` comes back, seated as written.
+
     `lengths` says where the M-donor windows are measured from: ``'auto'`` (the input conformer if there is
     one, else the fitted model), ``'input'``, or ``'model'``. Set it when `mol` carries a geometry that is not
     metal-aware, since a plain ETKDG conformer has no M-L parameter and ``'auto'`` would embed toward it.
+
+    Takes a `Mol`: parsing is the consumer's job (see the module docstring), and `rxembed.pipeline.metal` is
+    the same enumeration with the SMILES / ``.xyz`` reader and the `stereo_ref` fingerprint in front of it.
     """
+    if not isinstance(mol, Chem.Mol):  # else the first `mol.GetNumConformers()` below raises a bare
+        raise TypeError(  # AttributeError, on exactly the string `rxembed.pipeline.metal` accepts
+            f"enumerate_isomers() takes an RDKit Mol, got {type(mol).__name__}. Perception is upstream of the "
+            f"engine: parse a SMILES with rxembed.parse_smiles, or call rxembed.pipeline.metal, which reads a "
+            f"SMILES or an .xyz path and computes the stereo fingerprint the 'preserve' gate compares against"
+        )
     loaded = _load_in_ligand_stereo(mol, geometry, center, fix, stereo, lengths)
     if loaded is not None:
-        return loaded
+        return loaded  # each ligand-stereo variant recurses, so a stated arrangement is seated on every one
+    stated = stated_arrangement(mol)
+    if stated is not None:
+        name, sites = stated
+        if (geometry is not None and resolve_geometry(geometry) != name) or fix:
+            raise ValueError(
+                f"this input already states a {name} arrangement, so "
+                f"{'fix=' if fix else f'geometry={geometry!r}'} has nothing to act on; drop it to use what "
+                f"the input says, or strip the arrangement to enumerate"
+            )
+        logger.info("metal: %s arrangement stated by the input; enumerating nothing", describe(name))
+        return IsomerSet([Isomer(mol, name, sites, lengths=lengths)])
     metals = metal_indices(mol)
     if not metals:
         raise ValueError("no transition metal found")
@@ -860,6 +924,10 @@ def _input_ordering(mol, metal, donors, geometry):
     candidate vertex orderings. This lets a ``fix=`` hold each frozen donor at its real vertex so only the
     free sites are enumerated; otherwise the enumeration permutes a frozen donor into a vertex it cannot
     occupy, producing isomers that contradict the frozen core, such as a hydride forced off its TS site.
+
+    The candidate list holds one representative per FULL-group orbit, so the winner is only a seating up to
+    a reflection and a mirror image scores identically at every candidate; `seat_properly` turns it into the
+    reflection-free one, without which `chirality_of` hands both hands the same tag.
     """
     dirs_ref = vertex_dirs(geometry)
     if dirs_ref is None or mol.GetNumConformers() == 0 or len(donors) != len(dirs_ref):
@@ -870,13 +938,13 @@ def _input_ordering(mol, metal, donors, geometry):
     v_ideal = np.array(dirs_ref, float)
     canned = isomer_permutations(geometry)
     if canned is None:  # no canned list (CN7/8): searching only the identity would seat donors in PERCEPTION
-        return _seat_by_alignment(dd, v_ideal)  # order, which is not a seating at all
+        return seat_properly(dd, dirs_ref, _seat_by_alignment(dd, v_ideal))  # order, not a seating at all
     best_score, best_order = -1.0, list(range(len(donors)))
     for order in canned:
         score = _fit_trace(dd[list(order)].T @ v_ideal)  # best alignment; see `_fit_trace` on reflections
         if score > best_score:
             best_score, best_order = score, order
-    return best_order
+    return seat_properly(dd, dirs_ref, best_order)
 
 
 def _central_trans(od, frag, dmat, dirs, haptic=None):
@@ -922,7 +990,7 @@ def _reach(bm, i, j):
     return float(bm[min(i, j)][max(i, j)])
 
 
-def _donor_faces_metal(mol, d, other, d_md, d_mo, need, bm, hyb, donors):
+def _donor_faces_metal(mol, d, *, other, d_md, d_mo, need, bm, hyb, donors):
     """Return False if donor ``d``, stretched to span trans, cannot still point its lone pair at the metal.
 
     The reach test asks only whether the donors can get ``need`` apart; this asks whether the backbone that
@@ -954,7 +1022,7 @@ def _donor_faces_metal(mol, d, other, d_md, d_mo, need, bm, hyb, donors):
     return True
 
 
-def _chelate_span_ok(mol, od, frag, dirs, bm, r_metal, hyb, donors, haptic=None):
+def _chelate_span_ok(mol, od, *, frag, dirs, bm, r_metal, hyb, donors, haptic=None):
     """Return False if a chelate is placed trans across a metal its backbone can't reach, or can't donate to.
 
     A cis bidentate always folds in, so only a wide separation (`_SPAN_ANGLE` or more, i.e. trans) is tested.
@@ -989,9 +1057,13 @@ def _chelate_span_ok(mol, od, frag, dirs, bm, r_metal, hyb, donors, haptic=None)
                 return False
             # The orientation test asks whether the donor can still aim its lone pair at the metal, which is
             # meaningless for a haptic face: it donates a π face and has no axis, so a centroid abstains.
-            if a not in (haptic or {}) and not _donor_faces_metal(mol, ra, rb, d_ma, d_mb, need, bm, hyb, donors):
+            if a not in (haptic or {}) and not _donor_faces_metal(
+                mol, ra, other=rb, d_md=d_ma, d_mo=d_mb, need=need, bm=bm, hyb=hyb, donors=donors
+            ):
                 return False
-            if b not in (haptic or {}) and not _donor_faces_metal(mol, rb, ra, d_mb, d_ma, need, bm, hyb, donors):
+            if b not in (haptic or {}) and not _donor_faces_metal(
+                mol, rb, other=ra, d_md=d_mb, d_mo=d_ma, need=need, bm=bm, hyb=hyb, donors=donors
+            ):
                 return False
     return True
 
@@ -1028,7 +1100,9 @@ def _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, *, 
         od = [donors[k] for k in order]  # od[position] = donor atom (or VACANT) at that polyhedron vertex
         if _central_trans(od, frag, dmat, dirs, haptic):  # a tridentate's central donor trans to its own arm
             continue
-        if not _chelate_span_ok(mol, od, frag, dirs, bm, r_metal, hyb, real_donors, haptic):  # can't span/donate trans
+        if not _chelate_span_ok(
+            mol, od, frag=frag, dirs=dirs, bm=bm, r_metal=r_metal, hyb=hyb, donors=real_donors, haptic=haptic
+        ):  # can't span/donate trans
             continue
         sig = tuple(
             sorted((tuple(sorted((elem[od[p]], elem[od[q]]))), link(od, p, q), angle[(p, q)]) for p, q in pairs)

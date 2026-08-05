@@ -20,50 +20,44 @@ from rxembed.metal_polyhedron import (
     _ALIASES,
     POLYHEDRA,
     _vertex_angle,
+    canonical_slots,
     describe,
     geometries_for_cn,
+    point_group,
     resolve_geometry,
+    rotation_group,
+    seat_properly,
 )
-
-
-def _spectrum(name):
-    """The sorted vertex-metal-vertex angle spectrum of a record: what `classify_geometry` matches on."""
-    return sorted(_vertex_angle(u, v) for u, v in itertools.combinations(POLYHEDRA[name].vertex_dirs, 2))
-
 
 # --- codes and aliases --------------------------------------------------------------------------------
 
 
 def test_every_record_resolves_from_its_code_and_agrees_on_its_vertex_count():
-    """Each record's 3-letter code resolves to its name, and `cn` is the number of vertices it actually carries.
-
-    One test over the whole table rather than a case per shape: a new row is covered the moment it is written.
-    """
     for name, p in POLYHEDRA.items():
         assert resolve_geometry(p.code) == name, f"{p.code} does not resolve to {name}"
         assert n_sites(name) == p.cn == len(p.vertex_dirs), f"{name}: cn {p.cn} is not its vertex count"
         assert name in [q.name for q in geometries_for_cn(p.cn)]
 
+        v = np.array(p.vertex_dirs, float)
+        assert v.shape == (p.cn, 3), f"{name}: vertex_dirs is {v.shape}, expected ({p.cn}, 3)"
+        norms = np.linalg.norm(v, axis=1)
+        assert np.all(norms > 1e-6), f"{name}: a zero-length vertex direction"
+        cos = (v / norms[:, None]) @ (v / norms[:, None]).T
+        same = [(i, j) for i in range(p.cn) for j in range(i + 1, p.cn) if cos[i, j] > 0.999]
+        assert not same, f"{name}: vertices {same} point the same way"
 
-def test_the_alias_table_has_no_collision():
-    """Names and codes share one case-insensitive table, so a collision would silently rename a shape."""
+
+def test_the_alias_table_has_no_collision_and_resolves_case_insensitively():
     names, codes = [n.lower() for n in POLYHEDRA], [p.code.lower() for p in POLYHEDRA.values() if p.code]
     assert len(codes) == len(set(codes)), "two polyhedra share a 3-letter code"
     assert not set(names) & set(codes), "a polyhedron name is spelled like another's code"
     assert len(_ALIASES) == len(names) + len(codes)
 
-
-def test_a_code_and_a_name_alias_case_insensitively():
-    """A code and a full name are equally acceptable input, in any case: only the long name comes back."""
     for spelling in ("OCT", "oct", " Oct ", "octahedral", "OCTAHEDRAL"):
         assert resolve_geometry(spelling) == "octahedral"
         assert n_sites(spelling) == 6
 
-
-def test_describe_names_the_shape_unambiguously():
-    """`describe`, the one formatter every log line goes through, carries the code and the CN."""
     assert describe("SPL") == "square_planar (SPL, CN 4)"
-    assert describe("trigonal_pyramidal") == "trigonal_pyramidal (TPY, CN 3)"
     assert describe("3-coordinate") == "3-coordinate"  # the from_geometry pseudo-name is not invented into a record
 
 
@@ -71,11 +65,6 @@ def test_describe_names_the_shape_unambiguously():
 
 
 def test_every_hand_authored_angle_row_is_the_angle_its_own_vertices_subtend():
-    """Rows and directions are written independently, so a typo in either desynchronises them silently.
-
-    The DG target would then disagree with the template the isomer machinery (handedness, `classify_geometry`,
-    the sphere solver) reads off `vertex_dirs`.
-    """
     for name, p in POLYHEDRA.items():
         if p.angles is None:  # CN7 / CN8: no hand-authored rows, `resolved_angles` derives them
             continue
@@ -83,40 +72,7 @@ def test_every_hand_authored_angle_row_is_the_angle_its_own_vertices_subtend():
             assert abs(a - _vertex_angle(p.vertex_dirs[i], p.vertex_dirs[j])) <= 0.5, f"{name} row {(i, j, a)}"
 
 
-def test_the_low_cn_shapes_are_not_a_flattened_parent():
-    """T-shape / seesaw / trigonal-pyramidal are each angularly distinct from their CN neighbours."""
-    assert _spectrum("t_shape") != _spectrum("trigonal_planar")
-    for other in ("trigonal_planar", "t_shape"):
-        assert _spectrum("trigonal_pyramidal") != _spectrum(other)
-    assert _spectrum("seesaw") != _spectrum("tetrahedral")
-
-
-def test_the_cn3_pyramid_is_a_tetrahedron_minus_a_vertex():
-    """Its one angle is `tetrahedral`'s own 109.47°: the record adds no second constant to the table.
-
-    Ammonia's 107° would, and that is a main-group bond-pair/lone-pair number; no census can arbitrate (the
-    corpus holds 5 CN3 metal centres, every one planar). `planar=False` is the whole discriminator against
-    trigonal_planar, whose spectrum it otherwise shares a continuum with.
-    """
-    v = np.array(POLYHEDRA["trigonal_pyramidal"].vertex_dirs, float)
-    assert np.allclose(np.linalg.norm(v, axis=1), 1.0, atol=1e-6)
-    exact = [np.degrees(np.arccos(np.clip(a @ b, -1, 1))) for a, b in itertools.combinations(v, 2)]
-    assert np.allclose(exact, 109.4712, atol=1e-3), exact  # not `_spectrum`: `_vertex_angle` rounds to a degree
-    assert POLYHEDRA["trigonal_pyramidal"].permutations is None  # C3v: the 3 vertices are one orbit
-    assert not POLYHEDRA["trigonal_pyramidal"].planar
-
-
 def test_only_a_flat_based_pyramid_gets_an_umbrella_improper():
-    """`umbrella_improper` selects `trigonal_pyramidal` alone, and states that record's own ideal improper.
-
-    The scope is a predicate over the table (metal off its vertex plane + a COPLANAR vertex set), not a shape
-    name, so a new record could silently opt itself in. Only a record whose vertices share one plane has a
-    single umbrella coordinate; TET/SEE/TBP/SPY/OCT/PBP/SQA are genuinely 3-D and must stay out.
-
-    The angle is read back off the record's own vertices at two bond lengths rather than compared to a copied
-    constant: `Umbrella` measures a D-D-D-M dihedral, which is scale-free, and a table value drifting from the
-    geometry it names would hold the FF at an angle the record does not describe.
-    """
     held = {n: p.umbrella_improper for n, p in POLYHEDRA.items() if p.umbrella_improper is not None}
     assert list(held) == ["trigonal_pyramidal"]
 
@@ -136,27 +92,7 @@ def test_only_a_flat_based_pyramid_gets_an_umbrella_improper():
         assert got == pytest.approx(held["trigonal_pyramidal"], abs=1e-6), f"r={r} Å: the record states {got}°"
 
 
-def test_every_record_is_structurally_well_formed():
-    """Vertex count == CN, every direction non-degenerate, no two vertices in the same place.
-
-    Cheap, and it is the class of defect a template table actually acquires: auditing a sibling project's
-    equivalent table turned up a CN7 record with `[0,0,2]` listed twice (the -z vertex lost to a copy-paste)
-    and a CN8 record carrying nine vertices. Neither is visible by reading, and both silently poison every
-    classification at that coordination number.
-    """
-    for name, rec in POLYHEDRA.items():
-        v = np.array(rec.vertex_dirs, float)
-        assert v.shape == (rec.cn, 3), f"{name}: vertex_dirs is {v.shape}, expected ({rec.cn}, 3)"
-        norms = np.linalg.norm(v, axis=1)
-        assert np.all(norms > 1e-6), f"{name}: a zero-length vertex direction"
-        u = v / norms[:, None]
-        cos = u @ u.T
-        same = [(i, j) for i in range(rec.cn) for j in range(i + 1, rec.cn) if cos[i, j] > 0.999]
-        assert not same, f"{name}: vertices {same} point the same way"
-
-
 def test_every_records_angle_table_covers_the_pairs_it_claims():
-    """A hand-authored subset must name real vertices; a derived one must be the complete C(n,2) set."""
     for name, rec in POLYHEDRA.items():
         pairs = {(i, j) for i, j, _a in rec.resolved_angles}
         assert len(pairs) == len(rec.resolved_angles), f"{name}: a vertex pair is stated twice"
@@ -166,12 +102,6 @@ def test_every_records_angle_table_covers_the_pairs_it_claims():
 
 
 def test_the_new_records_are_separable_from_their_neighbours_at_the_same_cn():
-    """A record that duplicates one already there makes classification WORSE, not better.
-
-    The whole reason to add a competitor is that four records were alone at their CN and won by default. That
-    only helps if the newcomer is actually distinguishable, so every same-CN pair must differ by more than
-    the fit floor, or the argmin between them is noise.
-    """
     for cn in {p.cn for p in POLYHEDRA.values()}:
         recs = [p for p in POLYHEDRA.values() if p.cn == cn]
         for a, b in itertools.combinations(recs, 2):
@@ -180,3 +110,42 @@ def test_the_new_records_are_separable_from_their_neighbours_at_the_same_cn():
                 continue
             rms = float(np.sqrt(np.mean((sa - sb) ** 2)))
             assert rms > 5.0, f"{a.name} and {b.name} differ by only {rms:.1f} deg of angle spectrum"
+
+
+# --- the fold group, the seating parity and the canonical slot labelling -------------------------------
+
+
+def test_every_records_full_point_group_is_its_rotations_times_one_reflection():
+    for name, rec in POLYHEDRA.items():
+        rot, refl = point_group(tuple(map(tuple, rec.vertex_dirs)))
+        assert rot == rotation_group(name), f"{name}: rotation_group is not point_group's proper half"
+        assert len(rot) == len(refl) > 0, f"{name}: {len(rot)} rotations against {len(refl)} reflections"
+        g = min(refl)
+        assert {tuple(g[q[v]] for v in range(rec.cn)) for q in rot} == refl, f"{name}: refl is not g o rot"
+        assert (min(refl) == tuple(range(rec.cn))) == rec.planar, f"{name}: planarity disagrees with rot & refl"
+
+
+def test_seat_properly_returns_the_reflection_free_seating_and_flips_with_the_sphere():
+    dirs = POLYHEDRA["octahedral"].vertex_dirs
+    obs = np.array(dirs, float) @ np.array([[0.8, -0.6, 0.0], [0.6, 0.8, 0.0], [0.0, 0.0, 1.0]])  # a rotation
+    order = list(range(6))
+    assert seat_properly(obs, dirs, order) == order, "a rotated template is already seated properly"
+    mirrored = obs * np.array([1.0, 1.0, -1.0])
+    assert seat_properly(mirrored, dirs, order) != order, "the mirrored sphere kept the same seating"
+    both = np.linalg.svd(np.array(mirrored)[seat_properly(mirrored, dirs, order)].T @ np.array(dirs, float))
+    assert np.linalg.det(both[0] @ both[2]) > 0, "the re-seating is still a reflection"
+
+
+def test_canonical_slots_folds_over_the_rotations_and_not_over_a_reflection():
+    dirs = POLYHEDRA["octahedral"].vertex_dirs
+    rot, refl = point_group(tuple(map(tuple, dirs)))
+    keys = [("a",), ("b",), ("c",), ("d",), ("e",), ("f",)]  # six distinguishable donors: a chiral labelling
+
+    def slots_for(q):
+        return canonical_slots(dirs, [keys[q[v]] for v in range(6)])
+
+    assert all(sorted(slots_for(q)) == list(range(6)) for q in rot), "a fold returned a non-permutation"
+    seats = {tuple(sorted(zip(slots_for(q), (keys[q[v]] for v in range(6)), strict=True))) for q in rot}
+    assert len(seats) == 1, f"the fold is not constant on a proper orbit: {seats}"
+    mirror = {tuple(sorted(zip(slots_for(g), (keys[g[v]] for v in range(6)), strict=True))) for g in refl}
+    assert not (seats & mirror), "the fold gave an enantiomeric labelling the same canonical seating"

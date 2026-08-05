@@ -1,160 +1,89 @@
 # Architecture
 
-How rxembed is assembled, in one page. `AGENTS.md` is how we change it.
+`README.md` is the API. `AGENTS.md` is the development contract. This file owns the module boundaries.
 
-## The flow
+## Flow
 
-Every capability (a bare SMILES, a frozen TS core, an NCI grip, a coordination isomer) ends up as one
-`Constraints` struct, and that struct drives both halves of the engine.
-
-```
-  fix= / constrain= / template=        enumerate_isomers(…) / an Isomer
-              │                                        │
-    constraints.resolve_core                  metal_coordination.py
-              │                                └ metal_polyhedron · metal_distance
-              │                                  metal_donor_orient · metal_sphere
-              └───────────────┬────────────────────────┘
-                              ▼
-                     ┌────────────────┐   distances · angles · planes · coplanar · frozen · contacts
-                     │  Constraints   │   + the metal fields (metals · pulls · floors · dg_floors ·
-                     └────────────────┘     shapes · phantoms · spheres · haptic)
-                              ▼
-                     ┌────────────────┐   11 classes over those 14 fields, each holding both writers
-                     │  mechanisms    │   co-located so a field cannot gain one and not the other
-                     └────────────────┘
-                        ╱                 ╲
-               dg_windows                  ff_terms
-                    ▼                         ▼
-            ┌───────────────┐        ┌───────────────┐
-            │   bounds.py   │        │   relax.py    │
-            │ edit RDKit's  │        │ restrained UFF│
-            │ bounds matrix │        │ + the Li metal│
-            │ → smooth →    │        │ surrogate     │
-            │ ETKDG embed   │        │               │
-            └───────────────┘        └───────────────┘
-                        ╲                 ╱
-                         ▼               ▼
-                     ┌────────────────┐   {mol, ids, cons} · .minimize() · .xyz() · .dump() · [i]
-                     │  Conformers    │   `bonding_ok` is the arbiter every relax stage accepts on
-                     └────────────────┘
+```text
+Mol | Isomer
+  +-- fix= / constrain= / template= --> constraints.resolve_core --+
+  +-- Isomer.coordination() ---------------------------------------+
+                                                                   v
+                                                              Constraints
+                                                                   |
+                                                            MECHANISM_ORDER
+                                                              /          \
+                                                    DG windows            FF terms
+                                                        |                    |
+                                                     bounds.py            relax.py
+                                                        \                    /
+                                                         +--> Conformers <--+
 ```
 
-`embed.py` is the front door that drives that: resolve → `bounds.embed` → `Conformers`, whose `.minimize()`
-runs `relax.restrained_uff` up a stiffness ladder and never hands back a torn geometry wearing a plausible
-energy.
+`Constraints` is the sole constraint payload. `embed.py` also carries the `Isomer` identity and temporary
+graft coordinates while it drives the sequence. `bounds.py` edits RDKit's bounds matrix, `relax.py` applies
+the matching restrained-UFF terms, and the result is `Conformers`.
 
-Arrows point one way: `metal_*` produces `Constraints` and the engine consumes them. No mechanism knows
-what a polyhedron is, and no coordination builder knows what a bounds matrix is. The same holds one level
-up: `pipeline/` drives the core, and no core module imports `pipeline`, enforced by `tests/test_init.py`.
+The pipeline adapts strings, paths and external tools around that core:
 
-## The two tiers
+```text
+str | path | Mol | Isomer -> perceive / dispatch -> core embed -> Ensemble | EnsembleSet -> search / select / score
+```
 
-> **Flat is core. The single directory needs extras.**
+## Tiers
 
-Visible from `ls src/rxembed/`: the root, `__init__.py` plus the 15 modules below, is `numpy + rdkit` and
-nothing else, and the one subdirectory is the optional half. `metal/` was flattened to `metal_*.py` for
-exactly this reason: a subdirectory cannot signal a tier when both tiers are subdirectories.
+`src/rxembed/*.py` is core. Its modules import NumPy, RDKit and siblings with relative imports. Core never
+imports `pipeline`.
 
-### Core: `src/rxembed/`, the engine
+`src/rxembed/pipeline/` owns input perception, orchestration and optional tools. It imports core absolutely.
+Optional dependencies are imported at the point of use.
 
-| module | job |
-|---|---|
-| `constraints.py` | the `Constraints` struct + `resolve_core`, the `fix`/`constrain` resolver |
-| `mechanisms.py` | each class holds its DG writer and its FF writer together; 11 cover the 14 fields |
-| `bounds.py` | the DG driver: edit RDKit's knowledge-derived matrix, smooth, ETKDG |
-| `relax.py` | the FF driver: `restrained_uff`, `ff_energies`, the `bonding_ok` arbiter |
-| `embed.py` | the front door: `embed(spec, …) -> Conformers`, and the stiffness ladder |
-| `stereo.py` | undefined stereocentres → the distinct species to embed |
-| `utils.py` | coordinate math, small RDKit facts, `Violation`; no domain knowledge |
-| `metal_isomers.py` | `Isomer` / `IsomerSet` / `enumerate_isomers`: the arrangements |
-| `metal_polyhedron.py` | the `POLYHEDRA` records + the slot/parity chirality descriptor |
-| `metal_coordination.py` | the builders: an `Isomer` → its polytope `Constraints` |
-| `metal_core.py` | the surrogate (`surrogate_metal` / `restore_metal` / `connect_metal`) + sphere helpers |
-| `metal_distance.py` | `ml_distance`, the fitted M–L model, + the anti-overbond floors |
-| `metal_donor_orient.py` | the orientation holds the stripped M–donor bond took away |
-| `metal_perceive.py` | the ruler behind the QA gate: who coordinates, donor fold / overbond. Off the embed path |
-| `metal_sphere.py` | the geometric sphere solver: a rare fallback, scipy, soft-guarded |
+The base distribution also installs `networkx` for the vendored xyz2mol perceiver. No core module imports it;
+the embed engine remains NumPy and RDKit.
 
-`metal_sphere.py` is the one core module that reaches past `numpy + rdkit`: its solver is a rarely-taken
-fallback that guards its own scipy import and degrades with a message, which is why `sphere` is the single
-core extra.
+`read_xyz` prefers xyzgraph. A failed perceiver warns and falls back to the other one. Without xyzgraph, a
+metal complex uses vendored xyz2mol and an organic molecule uses RDKit. A fallback may not drop or reorder
+atoms.
 
-### Optional: `src/rxembed/pipeline/`, the batteries
-
-| module | job | extra |
-|---|---|---|
-| `api.py` | the public verbs: `embed` · `metal` · `minimize` · `wrap`. `rx.metal` is `dispatch.enumerate_isomers` under its pipeline name, so it has no `def` of its own to grep for | via the others |
-| `ensemble.py` | `Ensemble` / `EnsembleSet`: the chain | via the others |
-| `dispatch.py` | source + spec → embedded conformers (metal / template / stereo / NCI routes) | via the others |
-| `search.py` | openconf Monte-Carlo, `mc()` | `search` |
-| `select.py` | dedup, prune, cluster, the latent | `select` |
-| `calculators.py` | xtb / g-xTB / ASE, `score()` and `optimize()` | `score` |
-| `metrics.py` | connectivity + coordination diffs, behind `.filter('connectivity')` | `perceive` |
-| `stereo_check.py` | the chirality fingerprint + the preserve gate | `perceive` |
-| `perceive.py` | `.xyz` / SMILES readers (reaches no further than `rxembed.utils`) | `perceive` |
-| `nci.py` | the `KINDS` registry + binding modes | `nci` |
-| `viz.py` | the 2D projection behind `landscape()`, kept-vs-pruned | `viz` |
-| `geom_check.py` | the TS- and metal-aware geometry gate | none, see below |
-
-`geom_check.py` is the one module here that needs no wheel: it is `numpy + rdkit`, and it sits in `pipeline/`
-because it is a downstream QA consumer, reading the core's `metal_perceive` ruler and never the reverse. The
-tier is about direction as much as dependencies.
-
-Nothing in `pipeline/` imports its dependency at module top level. Each optional import is a plain
-`try/except ImportError` at the point of use, raising a message that names the extra to `pip install`, so
-`import rxembed.pipeline` works on a base install and only the path that needs a wheel asks for one
-(enforced by `tests/pipeline/test_init.py`).
-
-## The two `embed` verbs
+## Public surfaces
 
 ```python
-import rxembed as rx                     # core:     Mol | Isomer -> Conformers
-rx.embed(mol, fix={(i, j): 2.0}).minimize()
+import rxembed as rx
 
-import rxembed.pipeline as rx            # batteries: str | path | Mol -> Ensemble | EnsembleSet
+rx.embed(mol, fix={(i, j): 2.0}).minimize()  # Mol | Isomer -> Conformers
+
+import rxembed.pipeline as rx
+
 rx.embed("cat.substrate", contacts="auto").mc().prune().score("gxtb")
 ```
 
-Different functions, different signatures. The root verb does not change behaviour with which extras are
-installed. `rxembed.pipeline` re-exports every core name, so it is a strict superset.
+The two `embed` functions have different signatures. Installing extras never changes the root function.
+`rxembed.pipeline` re-exports the core surface and adds pipeline names.
 
-## Neighbours: what is not ours
+## Ownership
 
-```
-  UPSTREAM (not ours)                rxembed                  DOWNSTREAM (optional)
-  ───────────────────                ───────                  ─────────────────────
-  xyzgraph  (metals, TS bonds)       Constraints              openconf      search
-                                     mechanisms               prism_pruner  select
-  RDKit MolFromXYZFile, SMILES  →    bounds | relax      →    xtb / g-xTB   score
-  ───────────────────                Conformers               scikit-learn  cluster
-  bond + charge perception                                    matplotlib    landscape
-```
-
-Perception is upstream. A source becomes an RDKit `Mol` before the engine sees it, in
-`pipeline/perceive.py`, which reaches no further than `rxembed.utils` — the leaf of RDKit facts that holds no
-domain knowledge. It takes exactly one name from there, `assign_stereo_from_3d`, because the door that writes
-stereo from a geometry has to be the same door on both tiers: RDKit's 3D writer omits a dative bond from the
-chirality basis that every reader counts, so two doors would disagree about which bonds a tag is a parity
-over. `tests/test_init.py` pins that boundary, so the direction cannot quietly invert.
-Bond-and-charge perception for metals and stretched TS bonds is xyzgraph's job. rxembed reads a graph, it
-does not guess one.
-
-Selection is downstream, and not locked to our embedder. `rxembed.pipeline.wrap(mol, energies=…,
-minimized=True)` adopts conformers produced anywhere (a CREST or xtb run, a DFT scan, a crystal set) into an
-`Ensemble` and gives them the same `prune` / `representatives` / `score` / `landscape` chain. Pass
-`minimized=True` and the geometries are not touched.
-
-## Where a new thing goes
-
-| adding… | goes in |
+| owner | responsibility |
 |---|---|
-| a new constraint kind | a `Constraints` field + a `Mechanism`, in the root |
-| a new coordination shape | a `POLYHEDRA` row in `metal_polyhedron.py` |
-| a new NCI contact type | a `KINDS` row in `pipeline/nci.py` |
-| a new search backend | `pipeline/search.py` |
-| a new calculator | `pipeline/calculators.py` |
-| a new QA check | `pipeline/geom_check.py` |
-| a new input format | `pipeline/perceive.py` |
-| a new optional dependency | an extra in `pyproject.toml` + a guarded import at the point of use |
+| `constraints.py`, `mechanisms.py` | constraint data and its DG/FF interpretation |
+| `bounds.py`, `embed.py`, `relax.py` | seed, orchestrate and relax conformers |
+| `metal_polyhedron.py`, `metal_isomers.py`, `metal_coordination.py` | shapes, arrangements and coordination constraints |
+| `metal_core.py`, `metal_distance.py`, `metal_donor_orient.py`, `metal_perceive.py` | metal graph surgery, distances, donor geometry and QA rulers |
+| `metal_smiles.py`, `stereo.py`, `utils.py` | string round trips, organic stereo and shared RDKit geometry facts |
+| `pipeline/api.py`, `pipeline/dispatch.py`, `pipeline/ensemble.py` | public pipeline verbs, routing and the chainable result |
+| `pipeline/perceive.py`, `pipeline/xyz2mol_*.py` | coordinate input and bond perception |
+| `pipeline/{search,select,calculators,nci,viz,geom_check,metrics,stereo_check}.py` | optional or downstream capabilities |
 
-If a change needs a new directory, the abstraction is probably wrong.
+## Extension points
+
+| adding | location |
+|---|---|
+| constraint kind | `Constraints` field and a `Mechanism` |
+| coordination shape | `POLYHEDRA` row |
+| NCI contact kind | `pipeline.nci.KINDS` row |
+| search backend | `pipeline/search.py` |
+| calculator | `pipeline/calculators.py` |
+| QA check | `pipeline/geom_check.py` |
+| coordinate reader | `pipeline/perceive.py` |
+| optional dependency | `pyproject.toml` extra and a guarded point-of-use import |
+
+Do not add another package directory to mark a tier.

@@ -1,40 +1,130 @@
-"""`pipeline/perceive.py`: a user source (SMILES / .xyz path) becomes a Mol, or fails loudly."""
+"""`pipeline/perceive.py`: an .xyz becomes a Mol with perceived bonds, or fails loudly.
 
+Reading a SMILES needs no perception and lives in `rxembed.metal_smiles`, next to the writer whose atom order
+its ``atomProp`` handling has to agree with; it is tested there.
+"""
+
+import logging
+import sys
 from importlib.util import find_spec
+from pathlib import Path
 
 import pytest
 from rdkit import Chem
 
-from rxembed.pipeline.perceive import _xyz_to_mol, parse_smiles
+from rxembed.pipeline import perceive
+from rxembed.pipeline.perceive import _xyz_to_mol
 
 _BIMP = "examples/structures/bimp.xyz"  # a metal-free TS with a stretched reacting core
-_MN_H2 = "examples/structures/mn-h2.xyz"  # bimetallic: Mn centre + a spectator ferrocene
 
-
-def test_a_bad_smiles_raises_instead_of_returning_the_none_rdkit_gives():
-    """RDKit's None crashes three calls later with no mention of the input that caused it."""
-    assert parse_smiles("CCO").GetNumAtoms() == 3
-    with pytest.raises(ValueError, match="could not parse SMILES"):
-        parse_smiles("C1CC")
+_CORPUS = Path(__file__).resolve().parents[2] / "benchmark/corpus"
+# `benchmark/` is gitignored and local-only (AGENTS.md), so a clean clone must skip, not error.
+needs_corpus = pytest.mark.skipif(not _CORPUS.is_dir(), reason="needs the local-only benchmark/corpus")
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
 def test_an_xyz_becomes_a_molecule_with_bond_orders_not_a_bag_of_atoms():
-    """`build_graph(quick=True)` would return all-single bonds, and a TS core would lose every double bond."""
     mol = _xyz_to_mol(_BIMP, 0)
     assert mol.GetNumConformers() == 1
     assert mol.GetConformer().GetPositions().shape == (mol.GetNumAtoms(), 3)
     assert any(b.GetBondTypeAsDouble() > 1.0 for b in mol.GetBonds())
 
 
+def test_missing_xyzgraph_warns_and_names_each_fallback(monkeypatch, caplog, tmp_path):
+    monkeypatch.setitem(sys.modules, "xyzgraph", None)
+    caplog.set_level(logging.WARNING, logger="rxembed")
+    mol = _xyz_to_mol("examples/structures/ru-co.xyz", 0)
+    assert any(a.GetSymbol() == "Ru" for a in mol.GetAtoms())
+    assert "xyzgraph unavailable; using xyz2mol" in caplog.text
+
+    caplog.clear()
+    water = tmp_path / "water.xyz"
+    water.write_text("3\nwater\nO 0 0 0\nH 0.96 0 0\nH -0.24 0.93 0\n")
+    mol = _xyz_to_mol(str(water), 0)
+    assert mol.GetNumBonds() == 2
+    assert "xyzgraph unavailable; using RDKit" in caplog.text
+
+    with pytest.raises(ValueError, match="single-metal"):
+        _xyz_to_mol("examples/structures/mn-h2.xyz", 0)
+
+    monkeypatch.setattr(perceive, "_rank_orders", lambda *_args: pytest.fail("xyz2mol fallback was ranked twice"))
+    _xyz_to_mol("examples/structures/ru-co.xyz", 0, bond_orders="xyz2mol")
+
+    for argument in ("connectivity", "bond_orders"):
+        with pytest.raises(ValueError, match=argument):
+            _xyz_to_mol(_BIMP, 0, **{argument: "typo"})
+
+
+def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog):
+    fallback = Chem.MolFromXYZFile(_BIMP)
+    assert fallback is not None
+
+    def fail(*_args):
+        raise ValueError("no assignment")
+
+    monkeypatch.setattr(perceive, "_from_xyz2mol", fail)
+    monkeypatch.setattr(perceive, "_from_xyzgraph", lambda *_args: fallback)
+    caplog.set_level(logging.WARNING, logger="rxembed")
+    assert _xyz_to_mol(_BIMP, 0, connectivity="xyz2mol", bond_orders="xyz2mol") is fallback
+    assert "xyz2mol failed (no assignment); using xyzgraph" in caplog.text
+
+    rw = Chem.RWMol()
+    for atomic_number in (44, 7, 7):
+        rw.AddAtom(Chem.Atom(atomic_number))
+    rw.AddBond(1, 0, Chem.BondType.DATIVE)
+    rw.AddBond(2, 0, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    conf = Chem.Conformer(3)
+    for i, xyz in enumerate(((0, 0, 0), (2, 0, 0), (-2, 0, 0))):
+        conf.SetAtomPosition(i, xyz)
+    mol.AddConformer(conf)
+
+    monkeypatch.setattr("rxembed.pipeline.xyz2mol_tmc.get_tmc_mol", fail)
+    assert perceive._rank_orders(mol, 0) is mol
+    assert "keeping input bond orders" in caplog.text
+
+    def drop_a_bond(*_args, **kwargs):
+        graph = kwargs["graph"][0]
+        changed = Chem.RWMol(graph)
+        bond = changed.GetBondWithIdx(0)
+        changed.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+        return (changed.GetMol(),)
+
+    caplog.clear()
+    monkeypatch.setattr("rxembed.pipeline.xyz2mol_tmc.get_tmc_mol", drop_a_bond)
+    assert perceive._rank_orders(mol, 0) is mol
+    assert "changed connectivity" in caplog.text
+
+
+# --- choosing a perceiver -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("connectivity", "bond_orders"),
+    [("xyzgraph", "xyzgraph"), ("xyzgraph", "xyz2mol"), ("xyz2mol", "xyz2mol")],
+)
+@needs_corpus
+def test_every_perceiver_combination_reads_a_complex(connectivity, bond_orders):
+    path = _CORPUS / "CisPlatin.xyz"
+    mol = _xyz_to_mol(str(path), 0, connectivity=connectivity, bond_orders=bond_orders)
+    assert mol.GetNumAtoms() == 11
+    assert mol.GetNumConformers() == 1
+
+
+@needs_corpus
+def test_xyzgraph_bond_orders_need_xyzgraph_connectivity():
+    path = _CORPUS / "CisPlatin.xyz"
+    with pytest.raises(ValueError, match="connectivity='xyzgraph'"):
+        _xyz_to_mol(str(path), 0, connectivity="xyz2mol", bond_orders="xyzgraph")
+
+
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_a_transition_metal_is_perceived_where_rdkits_own_perceiver_refuses():
-    """Why perception is xyzgraph's job and not ours: `rdDetermineBonds` raises on the same file."""
-    from rdkit.Chem import rdDetermineBonds
+def test_xyz2mol_bond_orders_preserve_xyzgraph_connectivity():
+    path = "examples/structures/ru-co.xyz"
+    before = _xyz_to_mol(path, 0)
+    after = _xyz_to_mol(path, 0, bond_orders="xyz2mol")
 
-    mol = _xyz_to_mol(_MN_H2, 0)
-    mn = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "Mn")
-    assert mol.GetAtomWithIdx(mn).GetDegree() > 0, "the metal came back with no ligands"
+    def bonds(mol):
+        return {frozenset((b.GetBeginAtomIdx(), b.GetEndAtomIdx())) for b in mol.GetBonds()}
 
-    with pytest.raises((ValueError, RuntimeError)):  # red-first: RDKit alone, same file
-        rdDetermineBonds.DetermineBonds(Chem.MolFromXYZFile(_MN_H2), charge=0)
+    assert bonds(after) == bonds(before)

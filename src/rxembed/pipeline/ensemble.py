@@ -21,8 +21,8 @@ from rxembed import bounds as _bounds
 from rxembed import metal_core as _metal
 from rxembed import metal_polyhedron as _poly
 from rxembed.constraints import match, resolve_atom
+from rxembed.embed import BASE_STIFFNESS as _BASE_STIFFNESS
 from rxembed.embed import BOND_TOL as _BOND_TOL
-from rxembed.embed import DISTANCE_FC as _DISTANCE_FC
 from rxembed.embed import METAL_BOND_TOL as _METAL_BOND_TOL
 from rxembed.embed import Conformers
 from rxembed.relax import MAX_ITERS as _MAX_ITERS
@@ -239,8 +239,6 @@ class EnsembleSet(list):
             paths.append(str(p))
         return paths
 
-    write = dump  # alias, matching Ensemble
-
 
 @dataclass
 class Ensemble(Conformers):
@@ -335,6 +333,11 @@ class Ensemble(Conformers):
                 len(self.cons.constrained_atoms()),
             )
 
+        # Search may mutate existing coordinates before it fails, and its new geometries have no score yet.
+        # Invalidate before either can happen so stale energies never describe a changed conformer.
+        self.energies = {}
+        self.energy_kind = ""
+        self._minimized = False
         if self.metal_bonds:  # a prior minimize() left the output connected; UFF can't type a bonded metal, and
             self._mol = _metal.disconnect_metal(self._mol)  # minimize re-connects afterwards
         self._settle_seeds()  # spread the seeds across their windows before openconf pose-freezes them
@@ -374,8 +377,7 @@ class Ensemble(Conformers):
             logger.info(
                 "mc: +%d (openconf '%s', pose-constrained around seeds; total %d)", len(added), preset, len(self.ids)
             )
-        self._minimized = self._seeds_relaxed = False  # openconf's geometries are its own FF's, so a follow-up
-        # minimize() must genuinely re-relax them
+        self._seeds_relaxed = False  # openconf's geometries are its own FF's, so minimize must genuinely relax
 
         if explore and any(self.cons.contacts):  # second pass: contacts released, structure kept
             from rxembed.embed import encounter_bounds
@@ -424,7 +426,7 @@ class Ensemble(Conformers):
                 m = lo + frac * (hi - lo)
                 tgt.angles[k] = (max(lo, m - 2.0), min(hi, m + 2.0))
             try:  # settling is best-effort pre-conditioning; an RDKit BFGS divergence must not sink mc()
-                _refine.restrained_uff(self._mol, tgt, distance_fc=_DISTANCE_FC, conf_ids=[int(i) for i in group])
+                _refine.restrained_uff(self._mol, tgt, stiffness=_BASE_STIFFNESS, conf_ids=[int(i) for i in group])
             except RuntimeError:  # keep the raw ETKDG seeds for this group (openconf still searches around them)
                 logger.debug("mc: seed-settle relax diverged on a group; keeping the raw seeds")
 
@@ -467,23 +469,28 @@ class Ensemble(Conformers):
         if not self.ids or not self.cons.is_constrained:
             return self
         seed_pos = {c: self._mol.GetConformer(c).GetPositions() for c in self.ids}
-        self._relax_constrained(_DISTANCE_FC)
+        self._relax_constrained(_BASE_STIFFNESS)
         # The relax can TEAR a seed; `embed` must not spend the caller's `n` re-embedding (that is `minimize`'s
         # job), so a torn conformer keeps its seed coordinates: output is never worse than the seed.
-        self._rescue_torn(seed_pos, _DISTANCE_FC)
+        self._rescue_torn(seed_pos, _BASE_STIFFNESS)
         self._seeds_relaxed = True
         return self
 
-    def minimize(self, distance_fc=_DISTANCE_FC, max_iters=_MAX_ITERS, _retry=True):
+    def minimize(self, stiffness=_BASE_STIFFNESS, max_iters=_MAX_ITERS, _retry=True):
         """FF relax (stiff restrained UFF if constrained, else MMFF), restore any metal, drop clashes, validate.
 
-        `distance_fc` / `max_iters` are `Conformers.minimize`'s, and this is that relax plus the pipeline's
+        `stiffness` / `max_iters` are `Conformers.minimize`'s, and this is that relax plus the pipeline's
         gates: every conformer one rejects (torn bond, puckered sphere, non-physical relax energy, inverted
         donor hand, wrong stereo) is appended to ``discarded`` and, like prune's, stays in ``mol``.
 
-        Two narrowings of the base verb: it is idempotent (a second call is a no-op until `mc` clears the
-        flag), and it consumes `iso`, restoring the metal for good so the identity lives on in `sphere` /
-        `metal_bonds` / `tag`.
+        Three narrowings of the base verb, which this replaces rather than extends: nothing here calls
+        `super()`, so `Conformers.minimize` is unreachable from the pipeline and only its helpers
+        (`_relax_constrained`, `_rescue_torn`) are inherited. It DROPS, where the base promises nothing ever
+        is and leaves deciding to the caller. That promise fits a verb whose `n` conformers the caller then
+        inspects; culling is this tier's job, and an unconverged seed reaching `prune` / `score` / `best`
+        would carry a plausible energy with nothing to say it is broken. It is idempotent, a second call
+        being a no-op until `mc` clears the flag. And it consumes `iso`, restoring the metal for good so the
+        identity lives on in `sphere` / `metal_bonds` / `tag`.
         """
         if self._minimized:
             return self
@@ -494,7 +501,7 @@ class Ensemble(Conformers):
         target = len(self.ids)  # embed(n=N) means N good geometries; the retry re-embeds if the relax tears some
         # a pristine surrogate to re-embed on
         template = Chem.Mol(self._mol) if (_retry and iso is not None) else None
-        self._relax_and_record(distance_fc, max_iters)
+        self._relax_and_record(stiffness, max_iters)
         if iso is not None:
             if iso.donors:  # remember the sphere: `iso` goes, but who coordinates whom is durable
                 self.sphere.setdefault(iso.metal, list(iso.donors))
@@ -511,7 +518,7 @@ class Ensemble(Conformers):
                 len(self.ids),
             )
         if template is not None:  # a metal seed the relax tore is a bad embed, not a bad relax: re-embed fresh
-            self._reembed_until_clean(template, iso, target, distance_fc, max_iters)  # until N are geom.check-clean
+            self._reembed_until_clean(template, iso, target, stiffness, max_iters)  # until N are geom.check-clean
         self._cull_inverted_donors()  # a labile donor that inverted vs its enumerated hand
         if not self.ids:
             logger.warning(  # `embed` relaxes, so this fires at embed time: state the gates, not a guess
@@ -520,6 +527,10 @@ class Ensemble(Conformers):
                 ", ".join(f"{n}x {why}" for why, n in drops.items() if n) or "no gate recorded",
             )
         self._cull_wrong_stereo()  # embed-uncapturable handedness (metallocene planar / axial / helical)
+        if self.cons.is_constrained and self.energies:
+            # Re-embedded batches may have needed different restraint stiffnesses. The final public energies
+            # must share one objective before prune/lowest compares them.
+            self._rescore_restrained(stiffness)
         self.discarded += [i for i in before if i not in set(self.ids)]
         self._validate()
         if iso is not None and not self.metal_bonds:  # remember the stripped M-L bonds durably (past `iso`):
@@ -530,7 +541,7 @@ class Ensemble(Conformers):
         self._minimized = True
         return self
 
-    def _relax_and_record(self, distance_fc, max_iters):
+    def _relax_and_record(self, stiffness, max_iters):
         """FF-relax the conformers (restrained UFF if constrained, else MMFF) and store the surrogate energies."""
         e = None
         if self.cons.is_constrained:
@@ -538,7 +549,7 @@ class Ensemble(Conformers):
                 # the flat-bottomed walls further (measured: primary-phosphine M-P-H median 129.47 -> 130.00,
                 # the splay cap's exact bound). Take a single point on the same FF; the gates below are owed.
                 try:
-                    e = _refine.restrained_uff(self._mol, self.cons, distance_fc=distance_fc, max_iters=0)
+                    e = _refine.restrained_uff(self._mol, self.cons, stiffness=stiffness, max_iters=0)
                 except RuntimeError as err:  # mirror _relax_constrained's guard so both relax entry points
                     # degrade identically: an untypable/hypervalent core keeps its embedded geometry
                     logger.warning(
@@ -546,7 +557,7 @@ class Ensemble(Conformers):
                         err,
                     )
             else:
-                e = self._relax_constrained(distance_fc, max_iters)  # escalates if the soft relax tears every bond
+                e = self._relax_constrained(stiffness, max_iters)  # escalates if the soft relax tears every bond
         else:
             e = _refine.ff_energies(self._mol, minimize=True)
         if e is not None:
@@ -650,7 +661,7 @@ class Ensemble(Conformers):
         self.ids = kept
         self._stereo = None
 
-    def _reembed_until_clean(self, template, iso, target, distance_fc, max_iters):
+    def _reembed_until_clean(self, template, iso, target, stiffness, max_iters):
         """Re-embed fresh seeds until `target` conformers pass acceptance, merging the good ones in.
 
         The raw embed is clean and the FF relax tears a bad seed, so the fix is a fresh seed, never re-relaxing
@@ -691,7 +702,7 @@ class Ensemble(Conformers):
             if not new_ids:
                 continue
             tmpl = _metal._release_donor_chirality(tmpl, held, self.cons)  # drop dummy + cons key; batch relax re-holds
-            batch = Ensemble(tmpl, new_ids, self.cons, iso).minimize(distance_fc, max_iters, _retry=False)
+            batch = Ensemble(tmpl, new_ids, self.cons, iso).minimize(stiffness, max_iters, _retry=False)
             for cid in batch.ids:  # merge only good ones; the fallback already holds the bonding-ok geometries
                 if not is_good(batch._mol, cid):
                     continue
@@ -702,7 +713,9 @@ class Ensemble(Conformers):
         kept = good()
         if kept:  # good first, then the bonding-ok fallback, capped at target (embed(n=N) hands back N)
             self.ids = (kept + [i for i in self.ids if i not in kept])[:target]
-        logger.info("minimize: re-embedded to %d/%d clean geometries", len(kept), target)
+        # `min`, not `len(kept)`: the line above caps `self.ids` at `target`, so a round that found more
+        # clean geometries than were asked for would otherwise report "10/8".
+        logger.info("minimize: re-embedded to %d/%d clean geometries", min(len(kept), target), target)
 
     def _validate(self, dist_slack=0.15, ang_slack=5.0):
         """Warn if a constraint the relax can enforce is not realised within its window, plus a small slack.
@@ -716,7 +729,7 @@ class Ensemble(Conformers):
         frozen = self.cons.frozen
         # a metal-donor distance or L-M-L angle is an approximate bias (a covalent-radius guess; the real value
         # is the calculator's, and the surrogate vdW legitimately pushes donors out), so off-window is DEBUG
-        metals = {a.GetIdx() for a in self._mol.GetAtoms() if a.GetAtomicNum() in _metal.TRANSITION_METALS}
+        metals = {a.GetIdx() for a in self._mol.GetAtoms() if a.GetAtomicNum() in _metal.COORDINATION_METALS}
         n = self._mol.GetNumAtoms()  # a haptic centroid dummy is transient (index >= n); its real counterpart
 
         def realised(fn, *atoms):
@@ -770,7 +783,7 @@ class Ensemble(Conformers):
                 self.cons,
                 None,
                 {i: by[i] for i in self.ids if i in by},
-                True,
+                _minimized=True,
                 tag=dict(self.tag),
                 metal_bonds=list(self.metal_bonds),
             )
@@ -795,7 +808,7 @@ class Ensemble(Conformers):
             self.cons,
             None,
             energies,
-            True,
+            _minimized=True,
             tag=dict(self.tag),
             metal_bonds=list(self.metal_bonds),
         )
@@ -870,7 +883,7 @@ class Ensemble(Conformers):
             self.cons,
             None,
             energies,
-            True,
+            _minimized=True,
             tag=dict(self.tag),
             sphere=dict(self.sphere),
             metal_bonds=list(self.metal_bonds),
@@ -968,14 +981,23 @@ class Ensemble(Conformers):
         self.reacted = {**self.reacted, **changed}
         return self
 
-    def prune(self, by="auto", **kw):
+    def prune(
+        self,
+        by="auto",
+        *,
+        energy_window=12.0,
+        max_dist=0.75,
+        moi_dev=0.01,
+        max_rmsd=0.5,
+        energy_tol=0.05,
+    ):
         """Deduplicate by geometry, in place.
 
         Relaxes once via `minimize()` first, which moves atoms and is idempotent if already minimized, then
         dedups, so a raw embed is FF-settled before comparison.
 
-        `by` (alias `method`) is 'auto' (the default, meaning rotation-invariant 'rmsd', safe anywhere), or
-        one of 'rmsd' | 'moi' | 'descriptor' | 'energy', or a cheap-first cascade like ['moi', 'rmsd']. 'moi'
+        `by` is 'auto' (the default, meaning rotation-invariant 'rmsd', safe anywhere), or one of 'rmsd' | 'moi'
+        | 'descriptor' | 'energy', or a cheap-first cascade like ['moi', 'rmsd']. 'moi'
         on a multi-fragment system merges distinct encounter geometries, being nearly blind to a
         light/symmetric fragment's relative pose; rxembed warns. For a binding-mode summary use
         `representatives()`.
@@ -984,13 +1006,6 @@ class Ensemble(Conformers):
         `energy_window` (kcal/mol gate). Nothing is lost: discarded conformers stay in `ens.mol`, listed by
         `ens.discarded` / `ens.duplicates()`.
         """
-        by = kw.pop("method", by)  # 'method=' is the intuitive name; accept it as an alias of by=
-        allowed = {"energy_window", "max_dist", "moi_dev", "max_rmsd", "energy_tol"}
-        if set(kw) - allowed:
-            raise TypeError(
-                f"prune() got unexpected keyword(s) {sorted(set(kw) - allowed)}; the method is "
-                f"by=/method= (e.g. by='rmsd'), tuning knobs are {sorted(allowed)}"
-            )
         self.minimize()
         if not self.ids:  # a geometrically-infeasible isomer minimised to empty
             return self
@@ -1014,7 +1029,17 @@ class Ensemble(Conformers):
             before = list(self.ids)
             energies = [self.energies.get(i, float("inf")) for i in self.ids]  # no energy -> outside any window,
             # never merged into a phantom 0.0-kcal band nor kept over a real-energy duplicate
-            self.ids, _ = _dedup.apply(self._mol, self.ids, energies, method=method, **kw)
+            self.ids, _ = _dedup.apply(
+                self._mol,
+                self.ids,
+                energies,
+                method=method,
+                energy_window=energy_window,
+                max_dist=max_dist,
+                moi_dev=moi_dev,
+                max_rmsd=max_rmsd,
+                energy_tol=energy_tol,
+            )
             kept = set(self.ids)
             dropped = [i for i in before if i not in kept]
             self.discarded += dropped
@@ -1102,7 +1127,7 @@ class Ensemble(Conformers):
             self.cons,
             self.iso,
             {i: self.energies[i] for i in ids if i in self.energies},
-            self._minimized,
+            _minimized=self._minimized,
             tag=dict(self.tag),
             energy_kind=self.energy_kind,
             sphere=dict(self.sphere),
@@ -1270,8 +1295,6 @@ class Ensemble(Conformers):
             for i in self.ids:
                 f.write(Chem.MolToXYZBlock(mol, confId=i))
         return path
-
-    write = dump  # alias
 
     def __repr__(self):
         """Summarise the ensemble: conformer count, state, and energy spread."""

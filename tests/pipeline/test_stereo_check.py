@@ -36,20 +36,17 @@ def test_each_mode_accepts_the_handedness_it_names(mode, kept, flipped):
 
 
 def test_preserve_holds_only_the_nongraph_kinds_where_all_holds_every_kind():
-    """A labile protic-amine centre is the embed's own business; locking it by default would drop real poses."""
     flipped = {"point": Counter({"S": 1})}
     assert satisfies_spec(flipped, _POINT, "preserve")
     assert not satisfies_spec(flipped, _POINT, "all")
 
 
 def test_handedness_is_the_judgement_and_the_count_is_not():
-    """xyzgraph's per-conformer perception is count-unstable ({}, {Sₚ:1}, {Sₚ:2}) for one configuration."""
     for sig in ({}, {"planar": Counter({"Rₚ": 1})}, {"planar": Counter({"Rₚ": 2})}):
         assert satisfies_spec(sig, _PLANAR, "preserve")
 
 
 def test_every_reference_kind_must_pass_and_a_dict_spec_sets_them_one_at_a_time():
-    """Passing on the planar element must not excuse an inverted axial one, and per-kind modes compose."""
     ref = {"planar": Counter({"Rₚ": 1}), "axial": Counter({"Rₐ": 1})}
     assert not satisfies_spec({"planar": Counter({"Rₚ": 1}), "axial": Counter({"Sₐ": 1})}, ref, "preserve")
 
@@ -64,7 +61,6 @@ def test_every_reference_kind_must_pass_and_a_dict_spec_sets_them_one_at_a_time(
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
 def test_the_two_enantiomers_get_opposite_point_labels():
-    """The fingerprint is read from the GEOMETRY, so mirror-image conformers must not share a label."""
     left = signature(_reference_conformer("C[C@H](N)C(=O)O", optimize=False), 0)
     right = signature(_reference_conformer("C[C@@H](N)C(=O)O", optimize=False), 0)
     assert set(left.get("point", ())), f"no point label read from the R conformer: {left}"

@@ -23,7 +23,7 @@ import numpy as np
 from rdkit import Chem
 
 # metals excluded from every ground-state check (dative, not vdW):
-from rxembed.metal_core import _METAL_Z
+from rxembed.metal_core import COORDINATION_METALS
 from rxembed.metal_perceive import (
     _coordinating_carbons,
     _coordination_pairs,
@@ -100,13 +100,31 @@ def bond_lengths(mol, pos, lo: float = 0.7, hi: float = 1.3, exclude=frozenset()
         d = float(np.linalg.norm(pos[i] - pos[j]))
         ideal = _rcov(mol.GetAtomWithIdx(i).GetAtomicNum()) + _rcov(mol.GetAtomWithIdx(j).GetAtomicNum())
         if d < lo * ideal:
-            out.append(Violation("bond_length", (i, j), d, lo * ideal, "compressed"))
+            out.append(
+                Violation(
+                    kind="bond_length",
+                    atoms=(i, j),
+                    value=d,
+                    limit=lo * ideal,
+                    detail="compressed",
+                )
+            )
         elif d > hi * ideal:
-            out.append(Violation("bond_length", (i, j), d, hi * ideal, "stretched"))
+            out.append(
+                Violation(
+                    kind="bond_length",
+                    atoms=(i, j),
+                    value=d,
+                    limit=hi * ideal,
+                    detail="stretched",
+                )
+            )
     return out
 
 
-def hydrogens(mol, pos, lo: float = 0.8, hi: float = 1.3, exclude=frozenset(), donors=frozenset()) -> list[Violation]:
+def hydrogens(
+    mol, pos, *, lo: float = 0.8, hi: float = 1.3, exclude=frozenset(), donors=frozenset()
+) -> list[Violation]:
     """Each H bonded to exactly one heavy atom at a sane X-H length (bad-H-position detector).
 
     The upper limit is element-aware: a P-H/Si-H/S-H bond is genuinely longer than a C/N/O-H, so the heavy
@@ -127,18 +145,34 @@ def hydrogens(mol, pos, lo: float = 0.8, hi: float = 1.3, exclude=frozenset(), d
         if h in exclude or h in donors or any(nb.GetIdx() in exclude for nb in nbrs):
             continue
         if len(nbrs) != 1:
-            out.append(Violation("hydrogen", (h,), float(len(nbrs)), 1.0, "H not bonded to exactly one atom"))
+            out.append(
+                Violation(
+                    kind="hydrogen",
+                    atoms=(h,),
+                    value=float(len(nbrs)),
+                    limit=1.0,
+                    detail="H not bonded to exactly one atom",
+                )
+            )
             continue
         x = nbrs[0].GetIdx()
         hi_x = max(hi, _PT.GetRcovalent(nbrs[0].GetAtomicNum()) + _PT.GetRcovalent(1) + _XH_TOL)
         d = float(np.linalg.norm(pos[h] - pos[x]))
         if d < lo or d > hi_x:
-            out.append(Violation("hydrogen", (x, h), d, hi_x if d > hi_x else lo, "X-H length"))
+            out.append(
+                Violation(
+                    kind="hydrogen",
+                    atoms=(x, h),
+                    value=d,
+                    limit=hi_x if d > hi_x else lo,
+                    detail="X-H length",
+                )
+            )
     return out
 
 
 def clashes(
-    mol, pos, heavy_vdw: float = 0.7, hh_floor: float = 1.5, xh_cov: float = 1.1, exclude=frozenset()
+    mol, pos, *, heavy_vdw: float = 0.7, hh_floor: float = 1.5, xh_cov: float = 1.1, exclude=frozenset()
 ) -> list[Violation]:
     """No non-bonded pair (excluding 1-3 angle pairs) in steric overlap.
 
@@ -177,7 +211,7 @@ def clashes(
             else:
                 limit, why = heavy_vdw * (_rvdw(z[i]) + _rvdw(z[j])), "heavy-atom steric overlap"
             if d < limit:
-                out.append(Violation("clash", (i, j), d, limit, why))
+                out.append(Violation(kind="clash", atoms=(i, j), value=d, limit=limit, detail=why))
     return out
 
 
@@ -214,11 +248,11 @@ def over_compression(mol, pos, exclude=frozenset(), ratio: float = _FUSE_RATIO) 
                     m_s = f"{mol.GetAtomWithIdx(mid).GetSymbol()}{mid}"
                     out.append(
                         Violation(
-                            "fusion",
-                            (a, mid, c),
-                            d,
-                            floor,
-                            f"{a_s}...{c_s} fused to {d:.2f} A across {m_s} (angle {ang:.0f}°): "
+                            kind="fusion",
+                            atoms=(a, mid, c),
+                            value=d,
+                            limit=floor,
+                            detail=f"{a_s}...{c_s} fused to {d:.2f} A across {m_s} (angle {ang:.0f}°): "
                             "a bond the graph does not have",
                         )
                     )
@@ -245,14 +279,30 @@ def planarity(mol, pos, oop: float = 0.15, ring_rms: float = 0.10, exclude=froze
             continue
         off = _plane_offset(pos[atom.GetIdx()], pos[nbrs])
         if off > oop:
-            out.append(Violation("planarity", (atom.GetIdx(), *nbrs), off, oop, "sp2 out of plane"))
+            out.append(
+                Violation(
+                    kind="planarity",
+                    atoms=(atom.GetIdx(), *nbrs),
+                    value=off,
+                    limit=oop,
+                    detail="sp2 out of plane",
+                )
+            )
     for ring in mol.GetRingInfo().AtomRings():
         if any(i in exclude for i in ring) or not all(mol.GetAtomWithIdx(i).GetIsAromatic() for i in ring):
             continue
         p = pos[list(ring)]
         rms = float(np.sqrt((np.linalg.svd(p - p.mean(0))[1][2] ** 2) / len(ring)))
         if rms > ring_rms:
-            out.append(Violation("planarity", tuple(ring), rms, ring_rms, "aromatic ring puckered"))
+            out.append(
+                Violation(
+                    kind="planarity",
+                    atoms=tuple(ring),
+                    value=rms,
+                    limit=ring_rms,
+                    detail="aromatic ring puckered",
+                )
+            )
     return out
 
 
@@ -271,7 +321,15 @@ def conjugation(mol, pos, tol_deg: float = 30.0, exclude=frozenset(), flex=froze
         dih = abs(_dihedral(pos[a], pos[c], pos[x], pos[s]))
         dev = min(dih, abs(180.0 - dih))
         if dev > limit:
-            out.append(Violation("conjugation", (a, c, x, s), dev, limit, "twisted out of plane"))
+            out.append(
+                Violation(
+                    kind="conjugation",
+                    atoms=(a, c, x, s),
+                    value=dev,
+                    limit=limit,
+                    detail="twisted out of plane",
+                )
+            )
     return out
 
 
@@ -281,7 +339,7 @@ def frozen_core(mol, pos, frozen, reference, tol: float = 0.05) -> list[Violatio
     ref = _positions(reference)
     rmsd = _kabsch_rmsd(pos[frozen], ref[frozen])
     if rmsd > tol:
-        return [Violation("frozen_core", tuple(frozen), rmsd, tol, "core moved")]
+        return [Violation(kind="frozen_core", atoms=tuple(frozen), value=rmsd, limit=tol, detail="core moved")]
     return []
 
 
@@ -300,13 +358,29 @@ def check_constraints(mol, pos, spec, dist_slack: float = 0.15, ang_slack: float
         lo, hi = win if isinstance(win, tuple) else (win, win)
         d = float(np.linalg.norm(pos[i] - pos[j]))
         if not (lo - dist_slack <= d <= hi + dist_slack):
-            out.append(Violation("constraint", (i, j), d, hi + dist_slack, f"distance window [{lo}, {hi}]"))
+            out.append(
+                Violation(
+                    kind="constraint",
+                    atoms=(i, j),
+                    value=d,
+                    limit=hi + dist_slack,
+                    detail=f"distance window [{lo}, {hi}]",
+                )
+            )
     for (i, j, k), (lo, hi) in angles.items():
         if i >= n or j >= n or k >= n:
             continue
         a = _angle(pos[i], pos[j], pos[k])
         if not (lo - ang_slack <= a <= hi + ang_slack):
-            out.append(Violation("constraint", (i, j, k), a, hi + ang_slack, f"angle window [{lo}, {hi}]"))
+            out.append(
+                Violation(
+                    kind="constraint",
+                    atoms=(i, j, k),
+                    value=a,
+                    limit=hi + ang_slack,
+                    detail=f"angle window [{lo}, {hi}]",
+                )
+            )
     return out
 
 
@@ -317,7 +391,15 @@ def stereo_violations(mol, pos, reference, conf_id: int = -1) -> list[Violation]
     out = []
     for idx, tag in want.items():
         if got.get(idx) != tag:
-            out.append(Violation("stereo", (idx,), 0.0, 0.0, f"{tag} -> {got.get(idx)}"))
+            out.append(
+                Violation(
+                    kind="stereo",
+                    atoms=(idx,),
+                    value=0.0,
+                    limit=0.0,
+                    detail=f"{tag} -> {got.get(idx)}",
+                )
+            )
     return out
 
 
@@ -346,7 +428,7 @@ def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=No
         reference = Chem.MolFromXYZFile(reference)  # coords only; atom order must match `mol`
     pos = _positions(mol, conf_id)
     exclude = set(frozen) if frozen is not None else set()
-    exclude |= {a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _METAL_Z}  # dative, not vdW
+    exclude |= {a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS}  # dative, not vdW
     exclude = frozenset(exclude)
     # A metal-coordinated carbon (carbanion, carbene, side-on η²) is not held to organic valence: the dative
     # bond is not covalent, so counting it would flag every real one.

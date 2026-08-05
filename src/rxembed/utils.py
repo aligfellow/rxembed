@@ -8,7 +8,7 @@ second definition or an import cycle.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from rdkit import Chem
@@ -31,9 +31,9 @@ class Violation:
 
     kind: str
     atoms: tuple[int, ...]
-    value: float
-    limit: float
-    detail: str = ""
+    value: float = field(kw_only=True)
+    limit: float = field(kw_only=True)
+    detail: str = field(default="", kw_only=True)
 
     def __str__(self) -> str:
         """Format the violation as a readable one-liner."""
@@ -128,7 +128,8 @@ def remove_bond(rw, i, j) -> None:
     """`RWMol.RemoveBond`, with each end's chiral tag left naming the geometry it already named.
 
     The single door for bond removal in the core, so the `bond_removal_mirrors` rule cannot be forgotten at a
-    new surgery site (`tests/test_init.py` walks the AST to keep it that way). The metal-donor strip is the
+    new surgery site. Nothing enforces it automatically, so a second call to `RWMol.RemoveBond` anywhere in
+    the core is a review catch. The metal-donor strip is the
     case that bit: a chiral-at-P donor whose M-L bond sat at an odd slot came back as its own mirror image,
     silently, with no CIP or valence complaint anywhere. Four centres over three structures, read as a
     perceived R/S descriptor rather than an RMSD, which cannot tell an inversion from two equivalent donors

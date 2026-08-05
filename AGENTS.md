@@ -11,18 +11,18 @@ satisfy it. It is a library, not a CLI.
 
 ## The one structural rule
 
-> **Flat is core. The single directory needs extras.**
+> Flat is core. Pipeline owns batteries.
 
 `ls src/rxembed/` is the documentation. The flat modules at the root are the embedder (`numpy + rdkit`,
-nothing else); the one subdirectory, `pipeline/`, is the optional half. `metal/` was flattened to `metal_*.py`
-so that the one directory means one thing, and `pipeline/` stays a directory for the same reason: the
-asymmetry is the signal. Do not create a second directory to mark a tier.
+nothing else); the one subdirectory, `pipeline/`, owns input adaptation and downstream capabilities, including
+the optional tools. `metal/` was flattened to `metal_*.py` so the asymmetry remains the tier signal. Do not
+create a second directory to mark a tier.
 
 ```python
 import rxembed as rx                     # core:      Mol | Isomer -> Conformers      numpy + rdkit
 rx.embed(mol, fix={(i, j): 2.0}).minimize()
 
-import rxembed.pipeline as rx            # batteries: str | path | Mol -> Ensemble | EnsembleSet
+import rxembed.pipeline as rx            # batteries: str | path | Mol | Isomer -> Ensemble | EnsembleSet
 rx.embed("cat.substrate", contacts="auto").mc().prune().score("gxtb")
 ```
 
@@ -68,8 +68,9 @@ reads. Nothing reaches into the pipeline sideways.
 **Bias the seed, let energy decide.** Constraints bias the *starting* geometry; they are not truth.
 
 **Fail loud, not silent.** A calculator that produces no energies raises; never a silent fallback. Errors
-say what the user can do about them. A warning no action can resolve is noise, and a failure that returns a
-plausible-looking result silently is a defect.
+say what the user can do about them. A fallback that can change a molecular graph warns and names the backend
+it selected. A warning no action can resolve is noise, and a failure that returns a plausible-looking result
+silently is a defect.
 
 ---
 
@@ -81,8 +82,13 @@ one caveat needed to use it correctly. `ruff D` (numpy convention) enforces the 
 Comment the load-bearing why: a chemistry decision, a measured result, a rejected alternative. Never
 restate the code.
 
-Do not mass-delete chemistry prose. A comment recording a measurement (`all-pairs SPY: 4.64° → 4.66°, no
-gain`) is what stops a settled question being re-litigated. Delete the hedging around it; keep the numbers.
+Do not mass-delete chemistry prose from the source or benchmark that owns it. A comment recording a
+measurement (`all-pairs SPY: 4.64° → 4.66°, no gain`) stops a settled question being re-litigated. Delete the
+hedging around it; keep the numbers.
+
+Tests are not a second archive for that prose. A test name and assertion usually state the contract; delete a
+docstring that only repeats them. Keep test prose only when it explains why the failure means rxembed broke or
+records chemistry that has no owning explanation elsewhere.
 
 Explain a thing once. The module that owns it carries the explanation; everywhere else names it and points.
 Three copies of the constraint vocabulary is how they drift.
@@ -116,13 +122,17 @@ constraints by 48°. When you fix a defect the suite missed, add the test that w
 decisive triage signal for a test is mutation: break the code it names; if it still passes, it asserts
 nothing.
 
+**Tests are contracts, not a census.** Keep the smallest example that distinguishes correct from broken.
+Delete duplicated paths once a unit contract and one end-to-end test pin the seam. Do not test an internal
+constant, branch or spelling merely because it exists; test the behaviour that depends on it.
+
 **Numbers come from `benchmark/`.** 45 measured structures, a baseline, one command. Re-run it after any
 change to `bounds.py`, `mechanisms.py` or the `metal_*` stack, and argue from the table.
 
 `benchmark/` is a **local-only harness** and is gitignored: it is not on `main`, not in the wheel, and CI
-does not run it. It holds crystal geometries that are not ours to redistribute. Nothing in `src/` or `tests/`
-reads it, so a clone without it is fully testable — but a claim of the form "this improved fidelity" is not
-checkable without it. If you do not have it, say a number is unmeasured rather than inventing one.
+does not run it. It holds crystal geometries that are not ours to redistribute. Nothing in `src/` reads it,
+and tests may read it only behind an existence-based skip marker, so a clone without it is fully testable.
+A claim of the form "this improved fidelity" is not checkable without it; say unmeasured instead.
 
 ## The development loop
 
@@ -142,7 +152,7 @@ assess → plan → implement → adversarial robustness review → edge-case re
 - **Agents share one scratchpad.** Name scratch files distinctively: a generic `cmp.py` has been silently
   overwritten by a concurrent agent here, and the stale script then ran under the original name.
 - **Proof lives in notebooks.** New capability is demonstrated in `examples/*.ipynb` with the real inline
-  API, no hidden wrappers, each gated by `rx.geom_check.check`. Clear outputs
+  API, no hidden wrappers, gated by `rx.geom_check.check` wherever a structure is embedded. Clear outputs
   (`jupyter nbconvert --clear-output --inplace 0*.ipynb`) before committing.
 
 ---
@@ -152,8 +162,8 @@ assess → plan → implement → adversarial robustness review → edge-case re
 | gate | what it protects |
 |---|---|
 | `just test` | the suite. It must stay green. |
-| `tests/test_init.py` | the tier rule, by AST walk: no core→`pipeline` edge, no absolute self-reference in core, nothing outside stdlib + numpy + rdkit, at any nesting depth. It carries its own bite check |
-| `tests/pipeline/test_init.py` | every optional import in `pipeline/` is guarded and names the extra that installs it |
+| `tests/test_init.py` | logging and selected core surface names. The tier rule is reviewed manually |
+| `tests/pipeline/test_init.py` | one representative optional-dependency error: operation, distribution and extra |
 | `benchmark/run.py` | coordination fidelity against 45 known geometries, versus a baseline. Local-only, not in CI |
 
 **Three kinds of test, and a fourth that does not belong here.** Unit (one module, a contract) and
@@ -165,25 +175,28 @@ and prefer a bound the code itself declares over a threshold copied out of a mea
 
 ## Layout
 
-**The tier rule.** A module at `src/rxembed/` may import `numpy`, `rdkit` and its siblings, and nothing else.
-A module needing more goes in `pipeline/`, guards its import with `try/except ImportError` **at the point of
-use** naming the extra, and gets that extra in `pyproject.toml`. The one core exception is `metal_sphere.py`'s
-scipy solver, a rarely-reached fallback that guards its own import and degrades with a message, which is why
-`sphere` is a *core* extra. Do not grow a second one without the same shape.
+**The tier rule.** A module at `src/rxembed/` may import the base tier and its siblings, and nothing else. The
+base tier is what `pip install rxembed` gives you: `numpy`, `rdkit`, `networkx`. A module needing more goes in
+`pipeline/`, guards its import with `try/except ImportError` **at the point of use** naming the extra, and gets
+that extra in `pyproject.toml`. There is no core exception: `metal_sphere.py` was one, a scipy solver behind a
+*core* `sphere` extra, and it was deleted for firing on 4 structures in 331 and changing no output on any of
+them. Do not grow another.
+
+`networkx` is base for the vendored xyz2mol perceiver; the dependency rationale lives next to it in
+`pyproject.toml`. No core module imports it. Adding another base dependency is a tier decision.
 
 **Imports.** Core modules import siblings relatively, single-dot (`from .metal_core import …`), and never
 name `rxembed` absolutely, so the core stays relocatable as a unit. `pipeline/` reaches core absolutely
 (`from rxembed.relax import …`), so the direction of every edge reads at a glance.
 
-**Tests mirror the source, exactly.** One test module per source module including `__init__.py`, named for
-it, so `ls tests/` is only `test_*.py`, the listing is the coverage map, and `test_init.py` pins the mirror
-in both directions. No `conftest.py` and no shared helper module: a test needing an extra carries its own
-predicate (`@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")`), and a
-helper two files both need is duplicated. One that fails on a base install rather than skipping is the
-optional tier leaking into the core.
+**Tests follow source ownership.** A test normally lives in `test_<owner>.py`, so the listing remains a useful
+coverage map. This is an ownership convention, not a quota or an AST gate. A cross-cutting test goes with the
+module whose behaviour it pins. Share substantial stable setup when that removes real duplication; keep tiny
+fixtures local, and use `conftest.py` only for genuinely suite-wide pytest fixtures.
 
-A cross-cutting test goes in the file for the module whose behaviour it pins, not in a new file. That rule
-had drifted into five extra files before it was enforced.
+Tests needing an extra must skip cleanly. Reuse a named marker when it removes real repetition; keep a
+one-off predicate local. A test that fails on a base install rather than skipping is the optional tier leaking
+into the core.
 
 **Where a new thing goes.**
 
@@ -221,5 +234,5 @@ suite full of ImportErrors. Nothing passes `--all-extras`: the flag would mask a
 (`[tool.uv] default-extras` is not a key uv accepts, measured on uv 0.11.32.) The base tier is
 `uv pip install .`, or `uv sync --no-default-groups`; neither reads the group.
 
-Extras: `search select score perceive nci viz sphere all`. Version is single-sourced from `pyproject.toml`
+Extras: `search select perceive nci viz all`. Version is single-sourced from `pyproject.toml`
 via `importlib.metadata`; never hardcode a second copy.

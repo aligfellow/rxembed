@@ -7,11 +7,14 @@ carbon/lithium surrogate deletes. Carved out of `metal`; imports only its founda
 
 from __future__ import annotations
 
+import logging
+import math
+
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import GetPeriodicTable
 
-from .metal_core import TRANSITION_METALS, VACANT
+from .metal_core import COORDINATION_METALS, VACANT, ligand_valence
 
 _PT = GetPeriodicTable()
 
@@ -43,17 +46,27 @@ _SOFT_DONOR_FRAC = 0.82  # x donor covalent radius, neutral non-haptic pnictogen
 
 
 # --- the M-donor bond length -------------------------------------------------------------------------
-# A fitted periodic model plus two guards a naive fit lacks. A formal charge is a Lewis artefact that splits
-# acac's equivalent oxygens, so charge is delocalised over symmetry classes first and its contraction bounded.
-# Known residual: nothing here reads bond ORDER, so an anionic O runs short and an M=O long.
+# A fitted periodic model plus the guards a naive fit lacks. A formal charge is a Lewis artefact that splits
+# acac's equivalent oxygens, so charge is delocalised over symmetry classes first. Known residual: nothing
+# here reads bond order, so an anionic O still runs short. Terminal multiple bonds are keyed on ligand valence
+# instead (`_LIGAND_FREE_CONTRACTION`).
 
 
-_PHYS_COEF = (0.29574, 0.95161, 0.91467, -0.10418, 0.00875, -0.12043, 0.03590)
+_PHYS_COEF = (0.29574, 0.95161, 0.91467, -0.10418, 0.00875, -0.12581, 0.03590)
+logger = logging.getLogger("rxembed.metal")
+
 _METAL_GROUP = {  # Z -> group (= d-electron count); the covalent radius already carries the period, so
     **{z: z - 18 for z in range(21, 31)},  # c3*g + c4*g² is the d-electron parabola: the part of the
     **{z: z - 36 for z in range(39, 49)},  # bond length the radii alone do not capture
     **{z: z - 68 for z in range(72, 81)},
+    57: 3,  # La and Lu are group 3 and reach this fit as coordination centres, so leaving them out sent every La
+    71: 3,  # pair to the covalent-sum fallback: 3483 tmQM pairs at a median -0.250 A, a lookup gap not a fit error
 }
+# La is an extrapolation (r_cov 2.07 A against the 1.20-1.75 the fit was trained on, and no f-shell term), and
+# it is still the worst-fit metal in the census, running a median 0.117 A long: that is an f-block term's job,
+# not a relabelling's. `benchmark/ml_refit.py` measures held-out MAE 0.164 against 0.261 for the covalent sum,
+# better in every donor cell with at least 20 pairs. Lu has zero census pairs and inherits only La's group.
+_UNFITTED = set()  # elements already warned about, so a corpus run reports each gap once, not per bond
 _PAULING_EN = {
     1: 2.20, 5: 2.04, 6: 2.55, 7: 3.04, 8: 3.44, 9: 3.98, 14: 1.90, 15: 2.19, 16: 2.58, 17: 3.16,
     21: 1.36, 22: 1.54, 23: 1.63, 24: 1.66, 25: 1.55, 26: 1.83, 27: 1.88, 28: 1.91, 29: 1.90, 30: 1.65,
@@ -63,13 +76,25 @@ _PAULING_EN = {
 }  # fmt: skip
 _AGOSTIC_ELONGATION = 0.55  # Å: an agostic C-H...M is a 3c-2e sigma-complex, not a hydride, so the fit's
 # 2-centre M-H cannot describe it. The tell is a metal-bound H whose other neighbour is carbon.
-_PI_ACCEPTOR_OFFSET = 0.099  # Å: a carbonyl / isocyanide C binds shorter than the fit predicts, π-backbonding
-# pulling the metal in. The tell is a carbon donor with a C≡O or C≡N.
+_SP_CONTRACTION = 0.128  # Å: an sp donor binds shorter than the fit predicts. High s-character shortens the
+# sigma bond and the empty pi* takes back-donation, so one rule covers CO, isocyanide, nitrile, nitrosyl and acetylide.
+# One value for every metal: making it two by gating it off for a d0 metal is measured and refuted (a d0 sp
+# donor needs less, a median 0.071 Å, but less is not none, and the cell is 165 of 49410 pairs).
+# `benchmark/ml_refit.py` owns the held-out fit.
 _CARBON = 6
 _ETA2 = 2  # mutually-bonded donors at one site -> haptic. η is a count, and M-L grows monotonically with it
 # (the `c6*eta` term), so it enters the model as the island size.
-_MAX_CONTRACTION = 0.12  # Å bound on the ionic contraction: a correction, not an annihilation. Unbounded, a
-# late-TM anionic O comes out ~0.2 Å short, and nothing gates over-short. An interim guard; the fix is a refit.
+_LIGAND_FREE_CONTRACTION = {  # Z -> (constant, metal-group slope), in Å
+    1: (0.14589, 0.0),  # hydride
+    7: (0.35500, 0.0),  # nitrido: the residual refit was worse, so retain the existing held-out value
+    8: (0.67730, -0.04421),  # oxo
+}
+# These are metal-bound atoms with no ligand-side valence, not an element-class shortcut: aqua, ammine and
+# agostic H all have a ligand-side neighbour and never enter. The group slope is earned only by oxo: over
+# three structure splits it cuts held-out oxo MAE from 0.055 to 0.038-0.040 A. The hydride constant cuts
+# 0.137 to 0.032-0.034 A on those splits, but the six non-overlap local pairs oppose it; nitrido keeps its old
+# constant because refitting shifted its median and slightly worsened every split. Terminal sulfide and imido
+# remain refuted. Measured by `benchmark/ml_refit.py` over 612,774 tmQM pairs.
 
 
 def delocalised_charges(mol):
@@ -83,7 +108,7 @@ def delocalised_charges(mol):
     pair (an oxo + an acac O on one vanadium) differs in connectivity and keeps its own. Degrades to ``{}`` if the
     metal-cut graph cannot be ranked.
     """
-    metals = sorted((a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS), reverse=True)
+    metals = sorted((a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS), reverse=True)
     flat = Chem.RWMol(Chem.Mol(mol))
     for m in metals:  # cut the metal so the delocalisation is identical with or without a bonded metal present
         flat.RemoveAtom(m)
@@ -123,18 +148,20 @@ def _hapticity(mol, d, donor_set):
     return len(seen) if len(seen) >= _ETA2 else 0
 
 
-def ml_distance(mol, metal, d, real_z, donor_set, charges=None):
+def ml_distance(mol, metal, d, real_z, donor_set, charges=None, *, hyb):
     """Return the ideal metal-donor bond length: a periodic model fitted to TM crystal structures.
 
-    ``c0 + c1*r_M + c2*r_D + c3*group + c4*group^2 + c5*(q x dEN) + c6*eta``, OLS-fitted over tmQM/Kulik. Every
-    input is chemical (element, group, charge, hapticity), never an atom index, so it is order-invariant and
-    extrapolates. Beats the plain covalent-radius sum, most on anionic-O donors.
+    ``c0 + c1*r_M + c2*r_D + c3*group + c4*group^2 + c5*tanh(q x dEN) + c6*eta``, fitted over tmQM/Kulik.
+    Every input is chemical (element, group, charge, hapticity), never an atom index, so it is order-invariant
+    and extrapolates. The tanh makes the ionic contraction saturate instead of requiring an inline clamp.
 
-    Three deliberate departures from the published fit:
+    Four deliberate departures from the published fit:
 
     * charge is delocalised over the metal-CUT graph, not the raw formal charge (``delocalised_charges``);
     * a neutral, non-haptic pnictogen (P/As/Sb) contracts to ``_SOFT_DONOR_FRAC`` (the fit has no dative term);
-    * a carbonyl / isocyanide C binds ``_PI_ACCEPTOR_OFFSET`` shorter (pi-backbonding).
+    * a donor with no ligand-side valence (``metal_core.ligand_valence``) is hydride / nitrido / oxo-like and
+      takes its fitted contraction instead of a charge term;
+    * a non-haptic sp donor binds ``_SP_CONTRACTION`` shorter (s-character plus pi back-donation).
 
     Falls back to the covalent sum outside the fitted tables.
     """
@@ -144,24 +171,38 @@ def ml_distance(mol, metal, d, real_z, donor_set, charges=None):
     g = _METAL_GROUP.get(real_z)
     if g is None or z_d not in _PAULING_EN or real_z not in _PAULING_EN:
         base = r_m + r_d  # outside the fitted tables -> the covalent sum, gracefully
+        missing = real_z if g is None or real_z not in _PAULING_EN else z_d
+        if missing not in _UNFITTED:  # once per element: silence here is how the La gap survived
+            _UNFITTED.add(missing)
+            logger.warning(
+                "M-L length for %s falls back to the covalent radius sum: it is outside the fitted tables",
+                _PT.GetElementSymbol(int(missing)),
+            )
     else:
         if charges is None:  # never fall back to the raw formal charge: the twice-reverted Kekulé split
             charges = delocalised_charges(mol)
-        q = charges.get(d, a.GetFormalCharge())
+        # A ligand-valence-free donor owns its contraction and drops charge rather than adding it. The fitted
+        # rows were terminal; a bridge inherits this as an uncalibrated extrapolation because the stripped
+        # surrogate cannot retain its metal-neighbour count.
+        ligand_free = z_d in _LIGAND_FREE_CONTRACTION and not ligand_valence(a)
+        q = 0.0 if ligand_free else charges.get(d, a.GetFormalCharge())
         q = min(-q, 2.0) if q < 0 else 0.0  # anionic multiplicity, clamped; may be fractional (see docstring)
         c = _PHYS_COEF
-        ionic = c[5] * q * (_PAULING_EN[z_d] - _PAULING_EN[real_z])  # the ionic character of this bond
-        ionic = max(ionic, -_MAX_CONTRACTION)  # a bounded correction, not an annihilation
+        ionic = c[5] * math.tanh(q * (_PAULING_EN[z_d] - _PAULING_EN[real_z]))
         eta = _hapticity(mol, d, donor_set)
         base = c[0] + c[1] * r_m + c[2] * r_d + c[3] * g + c[4] * g * g + ionic + c[6] * eta
+        # Three contractions, one chain: no donor can earn two. A haptic donor has ligand-side valence and also
+        # excludes the SP correction explicitly because hybridisation is not a donation-axis descriptor for a
+        # multi-atom face.
         if z_d in _SOFT_DATIVE_DONORS and eta == 0 and q == 0:  # neutral, non-haptic pnictogen binds shorter than fit
             base = r_m + _SOFT_DONOR_FRAC * r_d
+        elif ligand_free:
+            intercept, slope = _LIGAND_FREE_CONTRACTION[z_d]
+            base -= intercept + slope * g
+        elif eta == 0 and hyb.get(d) is Chem.HybridizationType.SP:
+            base -= _SP_CONTRACTION
     if z_d == 1 and any(n.GetAtomicNum() == _CARBON for n in a.GetNeighbors()):  # agostic C-H...M, not a hydride
         return base + _AGOSTIC_ELONGATION
-    if z_d == _CARBON and any(  # carbonyl / isocyanide C (C#O or C#N): pi-backbonding pulls the metal in
-        b.GetBondType() == Chem.BondType.TRIPLE and b.GetOtherAtom(a).GetAtomicNum() in (7, 8) for b in a.GetBonds()
-    ):
-        return base - _PI_ACCEPTOR_OFFSET
     return base
 
 
