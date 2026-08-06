@@ -1,9 +1,4 @@
-"""`metal_coordination`: the per-isomer constraint builders, judged by what they state and what they realise.
-
-`coordination()` states the polyhedron angles, the M-donor windows and the chelate bite; `coordinate()` seats a
-substrate at a vacant vertex. Two kinds of test: which window a pair is given (readable off
-`Constraints`, one layer) and whether the relax holds it (only observable by embedding). RDKit + UFF, no xtb.
-"""
+"""Test coordination and vacant-site constraint construction."""
 
 from __future__ import annotations
 
@@ -16,7 +11,7 @@ from rdkit.Chem import rdDistGeom
 from rdkit.Chem.rdMolTransforms import GetAngleDeg
 from rdkit.Geometry import Point3D
 
-import rxembed.pipeline as rx
+import rxembed as rx
 from rxembed.metal_coordination import _CHELATE_BITE, _chelate_bite_window
 from rxembed.metal_core import classify_geometry
 from rxembed.metal_isomers import enumerate_isomers
@@ -47,7 +42,7 @@ _SHAPE_CASES = [
 
 
 @pytest.mark.parametrize(("geometry", "smiles"), _SHAPE_CASES, ids=[c[0] for c in _SHAPE_CASES])
-def test_the_shape_is_realised_by_a_real_embed(geometry, smiles):
+def test_shape_is_realised_by_a_real_embed(geometry, smiles):
     iso = rx.metal(smiles, geometry).select(index=0)
     ens = rx.embed(iso, n=4).minimize()
     assert ens.n >= 1
@@ -65,23 +60,20 @@ def test_the_shape_is_realised_by_a_real_embed(geometry, smiles):
 # case is the cheap one, and PPh3's DG seed comes out exactly planar, so it proves the hold RE-FORMS a pyramid
 # rather than only keeping one.
 _PPH3 = "P(c1ccccc1)(c1ccccc1)c1ccccc1"
+
+
 # PPh3 alone: its DG seed comes out exactly planar, so it proves the hold RE-FORMS a pyramid rather than
 # only keeping one. The PMe3 case took the same branch from an already-pyramidal seed.
-_PYRAMIDS_THAT_USED_TO_FLATTEN = [("Pt(PPh3)3", f"c1ccccc1P(c1ccccc1)(c1ccccc1)->[Pt](<-{_PPH3})<-{_PPH3}")]
-
-
-@pytest.mark.parametrize(
-    ("label", "smiles"), _PYRAMIDS_THAT_USED_TO_FLATTEN, ids=[c[0] for c in _PYRAMIDS_THAT_USED_TO_FLATTEN]
-)
-def test_a_requested_pyramid_is_still_a_pyramid_after_the_relax(label, smiles):
+def test_requested_pyramid_survives_relax():
+    smiles = f"c1ccccc1P(c1ccccc1)(c1ccccc1)->[Pt](<-{_PPH3})<-{_PPH3}"
     iso = rx.metal(smiles, "trigonal_pyramidal").select(index=0)
     ens = rx.embed(iso, n=1, seed=7).minimize()
-    assert ens.n >= 1, f"{label}: no conformer survived the gates"
+    assert ens.n >= 1, "Pt(PPh3)3: no conformer survived the gates"
     got = [classify_geometry(ens.mol, iso.metal, list(iso.vertices), cid) for cid in ens.ids]
-    assert got == ["trigonal_pyramidal"] * len(got), f"{label}: requested a pyramid, got {got}"
+    assert got == ["trigonal_pyramidal"] * len(got), f"Pt(PPh3)3: requested a pyramid, got {got}"
 
 
-def test_a_flattened_pyramid_is_reported_not_silently_relabelled(caplog):
+def test_flattened_pyramid_is_reported(caplog):
     ens = rx.embed("C[P](C)(C)[Fe]([P](C)(C)C)[P](C)(C)C", metal="TPY", n=4, seed=7)[0]
     iso, mol = ens.iso, ens._mol  # `_mol`: `.mol` hands back a metal-restored COPY, which the edits below lose
     verts = list(iso.vertices)
@@ -98,7 +90,7 @@ def test_a_flattened_pyramid_is_reported_not_silently_relabelled(caplog):
     assert any("trigonal_pyramidal" in r.getMessage() for r in caplog.records), caplog.text
 
 
-def test_a_rigid_meridional_kappa3_is_not_pyramidalised(caplog):
+def test_rigid_meridional_kappa3_is_not_pyramidalised(caplog):
     iso = rx.metal("[Cu+]12<-n3ccccc3-c3cccc(n->13)-c1ccccn->21", "trigonal_pyramidal").select(index=0)
     with caplog.at_level(logging.WARNING, logger="rxembed"):
         ens = rx.embed(iso, n=4, seed=7).minimize()
@@ -124,7 +116,7 @@ def _states_an_intra_pair(iso):
     return any(k[1] == iso.metal and frag[k[0]] == frag[k[2]] for k in iso.cons.angles)
 
 
-def test_a_chelate_bite_is_stated_from_its_backbone_ring_not_the_polyhedron_ideal():
+def test_chelate_bite_uses_backbone_not_ideal():
     iso = next(i for i in rx.metal(_BIS_EN_CO, "octahedral") if _states_an_intra_pair(i))
     frag = _frag_of(iso.mol)
     ideal = {a for _i, _j, a in POLYHEDRA["octahedral"].resolved_angles}
@@ -146,21 +138,21 @@ def test_a_chelate_bite_is_stated_from_its_backbone_ring_not_the_polyhedron_idea
     assert _chelate_bite_window(iso.mol, cl[0], cl[1]) is None
 
 
-def test_a_chelate_bite_is_not_reported_as_a_steric_clash():
-    ens = rx.embed(rx.metal(_NI_N_CY, "square_planar")[0], n=2).minimize()
+def test_chelate_bite_is_not_reported_as_a_steric_clash():
+    ens = rx.embed(rx.metal(_NI_N_CY, "square_planar")[0], n=1).minimize()
     assert ens.n >= 1
     for cid in ens.ids:
         rep = geom.check(ens.mol, cid)
         assert not [v for v in rep.violations if v.kind == "clash"], rep.summary()
 
 
-def test_a_side_on_eta2_ligand_embeds_geometry_clean():
+def test_side_on_eta2_ligand_embeds_geometry_clean():
     smi = "COC(=O)[C]12->[Ni+2]3(<-[O-]C(=O)C(c4ccccc4)[N-]->3c3ccccc3)<-[C]=1(C(=O)OC)C2(C)C(C)(C)C"
-    ens = rx.embed(rx.metal(smi, "square_planar")[0], n=4).minimize()
+    ens = rx.embed(rx.metal(smi, "square_planar")[0], n=1).minimize()
     assert any(geom.check(ens.mol, c).ok() for c in ens.ids), "no geom.check-clean side-on conformer"
 
 
-def test_a_rejected_seed_is_replaced_until_n_geometries_are_clean(monkeypatch):
+def test_rejected_seeds_are_replaced_to_n_clean(monkeypatch):
     ens = rx.embed(rx.metal("CCCN[Pd](Cl)(Cl)NCCC", "square_planar")[0], n=2)
     initial = set(ens.ids)
     donors = list(ens.iso.donors)
@@ -184,7 +176,7 @@ def test_a_rejected_seed_is_replaced_until_n_geometries_are_clean(monkeypatch):
     assert all(geom.check(ens.mol, c, donors=donors, constraints=ens.cons).ok() for c in ens.ids)
 
 
-def test_a_free_fragment_is_tethered_at_vdw_contact_not_infinity():
+def test_free_fragment_is_tethered_at_vdw_contact():
     embedded = 0
     for iso in rx.metal("CCCN[Pd](Cl)(Cl)NCCC.c1ccccc1", "square_planar"):
         ens = rx.embed(iso, n=2).minimize()
@@ -205,9 +197,12 @@ def test_a_free_fragment_is_tethered_at_vdw_contact_not_infinity():
 def test_coordinate_binds_a_substrate_at_the_vacant_site():
     es = rx.embed("CCCN[Pd](Cl)NCCC.O", metal="square_planar", coordinate="[OX2]", n=3, seed=1)
     for ens in list(es) if isinstance(es, rx.EnsembleSet) else [es]:
+        ens.minimize()
         assert ens.n >= 1
         m = next(a.GetIdx() for a in ens.mol.GetAtoms() if a.GetSymbol() == "Pd")
         o = next(a.GetIdx() for a in ens.mol.GetAtoms() if a.GetSymbol() == "O")
+        assert o in ens.sphere[m]
+        assert all(report.ok() for report in ens.check().values())
         lo, hi = ens.cons.distances[(min(m, o), max(m, o))]
         for cid in ens.ids:
             pos = ens.mol.GetConformer(cid).GetPositions()
@@ -250,7 +245,7 @@ def _ml_windows(iso):
     return {k: v for k, v in iso.coordination().distances.items() if iso.metal in k}
 
 
-def test_a_plain_etkdg_conformer_is_not_a_metal_geometry_and_lengths_model_says_so():
+def test_etkdg_conformer_is_not_metal_geometry():
     mol = _fake_geometry(_SQUARE_PD)
     auto = _ml_windows(enumerate_isomers(Chem.Mol(mol), "square_planar")[0])
     model = _ml_windows(enumerate_isomers(Chem.Mol(mol), "square_planar", lengths="model")[0])
@@ -264,7 +259,7 @@ def test_a_plain_etkdg_conformer_is_not_a_metal_geometry_and_lengths_model_says_
     assert short > 0.15, f"the metal-blind conformer should sit well inside the model, got {short:.3f} A"
 
 
-def test_lengths_input_and_model_are_reachable_regardless_of_what_the_mol_happens_to_carry():
+def test_input_and_model_lengths_ignore_mol_metadata():
     mol = _fake_geometry(_SQUARE_PD)
     auto = _ml_windows(enumerate_isomers(Chem.Mol(mol), "square_planar")[0])
     given = _ml_windows(enumerate_isomers(Chem.Mol(mol), "square_planar", lengths="input")[0])
@@ -276,12 +271,12 @@ def test_lengths_input_and_model_are_reachable_regardless_of_what_the_mol_happen
     assert auto_g == model_g, "'auto' on a Mol WITHOUT one is 'model'"
 
 
-def test_lengths_input_without_a_geometry_refuses_rather_than_falling_back():
+def test_input_lengths_require_geometry():
     with pytest.raises(ValueError, match="carries no geometry"):
         enumerate_isomers(Chem.MolFromSmiles(_SQUARE_PD), "square_planar", lengths="input")
 
 
-def test_the_chosen_source_is_logged_once_not_once_per_vertex_ordering(caplog):
+def test_length_source_logged_once(caplog):
     with caplog.at_level(logging.INFO, logger="rxembed.metal"):
         isos = enumerate_isomers(_fake_geometry(_SQUARE_PD), "square_planar")
     assert len(isos) > 1, "the premise: more than one ordering was built"

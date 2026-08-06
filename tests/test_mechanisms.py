@@ -1,18 +1,4 @@
-"""`mechanisms.py`: each mechanism writes the terms its own `Constraints` field claims, and nothing else.
-
-`MECHANISM_ORDER` is the whole of "how a constraint becomes DG bounds and FF terms". These drive each member
-directly, against a hand-built `Constraints` and a force field that records what it is asked for, so a
-mechanism that starts writing an unasked-for term, or stops writing one it was asked for, fails here rather
-than as a geometry difference three stages later.
-
-The load-bearing assertion is the NEGATIVE one: with its field empty, a field-driven mechanism must write
-nothing. That is what makes an organic embed bit-identical under the coordination machinery, and it is why
-every metal concern can live in the same struct as an organic one.
-
-The metal-specific mechanisms' positive contracts live with the chemistry that motivated them; `Coplanar` in
-`test_metal_donor_orient.py`, `Umbrella` in `test_metal_coordination.py`, `Haptic` in
-`test_metal_isomers.py`, `Sp2Planar` / `ConjugationCap` in `tests/pipeline/test_geom_check.py`.
-"""
+"""Test that each mechanism consumes only its own Constraints fields."""
 
 from __future__ import annotations
 
@@ -54,7 +40,7 @@ def _ctx(mol):
 
 def _ff_terms(mech, cons, mol, fc=1.0):
     ff = SpyFF()
-    mech.ff_terms(ff, cons, mol.GetConformer(0), fc)
+    mech._ff_terms(ff, cons, mol.GetConformer(0), fc)
     return ff
 
 
@@ -71,20 +57,20 @@ _FIELD_DRIVEN = [m for m in mech_mod.MECHANISM_ORDER if type(m).__name__ not in 
 
 
 @pytest.mark.parametrize("mech", _FIELD_DRIVEN, ids=lambda m: type(m).__name__)
-def test_a_field_driven_mechanism_is_silent_off_an_empty_struct(mech):
+def test_mechanism_is_silent_on_empty_constraints(mech):
     mol = _mol()
     assert _ff_terms(mech, Constraints(), mol).calls == [], f"{type(mech).__name__} wrote an FF term unasked"
 
     ctx = _ctx(mol)
     before = ctx.bm.copy()
-    for hook in (mech.dg_windows, mech.dg_relief, mech.dg_post):
+    for hook in (mech._dg_windows, mech._dg_relief, mech._dg_post):
         hook(Constraints(), ctx)
     assert ctx.pairs == {}, f"{type(mech).__name__} proposed a window off an empty struct"
     assert np.array_equal(ctx.bm, before), f"{type(mech).__name__} edited the matrix off an empty struct"
 
 
 @pytest.mark.parametrize("name", sorted(_FF_REPAIRS))
-def test_an_ff_repair_fires_on_the_molecule_not_on_a_field(name):
+def test_ff_repair_uses_molecule_state(name):
     mech = next(m for m in mech_mod.MECHANISM_ORDER if type(m).__name__ == name)
     mol = _mol()
     assert _ff_terms(mech, Constraints(), mol).calls, f"{name} must fire on a bare struct"
@@ -98,7 +84,7 @@ def test_an_ff_repair_fires_on_the_molecule_not_on_a_field(name):
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_every_constant_here_is_calibrated_against_one_penalty_law():
+def test_force_constants_share_penalty_law():
     mol = _mol("CCCC")
     conf = mol.GetConformer()
     d0 = rdMolTransforms.GetBondLength(conf, 0, 1)
@@ -117,12 +103,12 @@ def test_every_constant_here_is_calibrated_against_one_penalty_law():
             )
 
 
-def test_distance_seeds_the_pending_pairs_and_walls_the_pair_in_the_field():
+def test_distance_writes_dg_and_ff():
     mol = _mol()
     cons = Constraints(distances={(0, 3): (2.0, 2.4)})
 
     ctx = _ctx(mol)
-    mech_mod.Distance().dg_windows(cons, ctx)
+    mech_mod.Distance()._dg_windows(cons, ctx)
     assert ctx.pairs[(0, 3)] == (2.0, 2.4)
 
     ff = _ff_terms(mech_mod.Distance(), cons, mol)
@@ -131,7 +117,7 @@ def test_distance_seeds_the_pending_pairs_and_walls_the_pair_in_the_field():
     assert args[:4] == (0, 3, 2.0, 2.4)
 
 
-def test_pull_collapses_its_window_to_a_point_which_is_what_makes_it_a_spring():
+def test_pull_collapses_window_to_spring():
     mol = _mol()
     ff = _ff_terms(mech_mod.Pull(), Constraints(pulls={(0, 3): 2.1}), mol)
     _name, args, _kw = ff.calls[0]
@@ -153,12 +139,12 @@ def test_frozen_pins_points_rather_than_restraining_them():
     assert sorted(a[0] for _n, a, _k in ff.calls) == [0, 1, 2]
 
 
-def test_angle_writes_a_uff_angle_wall_and_a_matrix_diagonal():
+def test_angle_writes_dg_and_ff_terms():
     mol = _mol()
     cons = Constraints(angles={(0, 1, 3): (100.0, 120.0)})
 
     ctx = _ctx(mol)
-    mech_mod.Angle().dg_windows(cons, ctx)
+    mech_mod.Angle()._dg_windows(cons, ctx)
     assert (0, 3) in ctx.pairs, "an angle must state its end-atom diagonal in the matrix"
 
     ff = _ff_terms(mech_mod.Angle(), cons, mol)
@@ -167,7 +153,7 @@ def test_angle_writes_a_uff_angle_wall_and_a_matrix_diagonal():
     assert args[:3] == (0, 1, 3)
 
 
-def test_the_angle_wall_is_a_stated_number_the_ladder_cannot_raise():
+def test_angle_force_is_not_scaled_by_ladder():
     mol = _mol()
     cons = Constraints(angles={(0, 1, 3): (100.0, 120.0)})
     assert _ff_terms(mech_mod.Angle(), cons, mol, fc=1.0).calls[0][1][-1] == mech_mod.ANGLE_FC
@@ -177,7 +163,7 @@ def test_the_angle_wall_is_a_stated_number_the_ladder_cannot_raise():
     )
 
 
-def test_a_releasable_contact_is_walled_more_softly_than_a_stated_one():
+def test_releasable_contact_uses_softer_wall():
     mol = _mol("c1ccccc1.c1ccccc1")
     cons = Constraints(
         distances={(0, 3): (2.0, 2.4), (1, 4): (2.0, 2.4)},
@@ -195,7 +181,7 @@ def test_plane_holds_a_pi_stack_by_cross_ring_distances():
     cons = Constraints(planes=[(ra, rb, 3.6)])
 
     ctx = _ctx(mol)
-    mech_mod.Plane().dg_windows(cons, ctx)
+    mech_mod.Plane()._dg_windows(cons, ctx)
     assert ctx.pairs, "a stack must state cross-ring windows in the matrix"
     assert all(i in ra and j in rb for i, j in ctx.pairs), "a stack window must span the two rings"
 
@@ -208,7 +194,7 @@ def test_plane_holds_a_pi_stack_by_cross_ring_distances():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_distance_precedes_angle_because_angle_reads_the_windows_distance_seeds():
+def test_distance_precedes_angle_window_read():
     order = [type(m).__name__ for m in mech_mod.MECHANISM_ORDER]
     assert order.index("Distance") < order.index("Angle")
 

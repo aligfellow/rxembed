@@ -1,10 +1,4 @@
-"""The vendored TMC perceiver, at the two points rxembed departs from upstream. Everything else is Jensen's.
-
-Every bond-order search in this module returns the FIRST valence-consistent assignment it reaches, so
-without the canonical numbering boundary in `get_lig_mol` the answer moves when the .xyz line order
-does; the first test shuffles the input and demands one string back. The second pins the solution
-RANKING that replaced upstream's take-the-first, which is what stops a ligand being left undervalent.
-"""
+"""Test canonical ligand ordering and bond-order ranking in the TMC perceiver."""
 
 from __future__ import annotations
 

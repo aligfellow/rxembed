@@ -1,20 +1,4 @@
-"""`metal_smiles`: the string a complex is written as, and the string it is read back from.
-
-One module because one contract. The writer indexes its ``atomProp`` block by position in the string it just
-wrote, and the parser must keep the hydrogens the writer counted or every index addresses a different atom,
-so the two are tested against each other rather than each against a fixture.
-
-Three claims, in the order they matter:
-
-1. the string round-trips. A SMILES that cannot be read back is worse than none, so the failure is loud.
-2. the string is CANONICAL, which means it is a property of the species and not of the input that described
-   it. A perceived M-L bond order is an artefact of whoever perceived it, so a covalent `M-Cl` and an ionic
-   `[Cl-]->[M+]` must give one string; if they gave two, the word canonical would mean nothing.
-3. the arrangement survives. `atomProp` carries what the SMILES grammar cannot say, so an isomer written and
-   read back must be the same isomer, arrangement and handedness included.
-
-RDKit only, no embed and no `benchmark/corpus`.
-"""
+"""Test canonical dative SMILES and arrangement-bearing CXSMILES round trips."""
 
 from __future__ import annotations
 
@@ -31,7 +15,7 @@ from rxembed import metal_isomers as K  # noqa: N812
 from rxembed import metal_smiles as S  # noqa: N812
 from rxembed.metal_core import VACANT
 from rxembed.metal_polyhedron import rotation_group
-from rxembed.pipeline.perceive import _xyz_to_mol
+from rxembed.pipeline.perceive import read_xyz
 
 _MN_H2 = "examples/structures/mn-h2.xyz"  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
 _MA2B2_SEATS = {"cis": [1, 2, 3, 4], "trans": [1, 3, 2, 4]}  # square_planar: 0 and 2 are the trans pair
@@ -61,12 +45,11 @@ def _seated(iso):
     ]
 
 
-# The graph round trip on a base install, run in a subprocess so a meta-path block can refuse the optional
-# tier outright: an in-process `sys.modules` probe would only show that nothing HAPPENED to import it, which
-# is not the claim. The last two statements check the block is blocking, since a null result needs a control.
+# Run the graph round trip while a meta-path block refuses every optional dependency. The final import checks
+# that the block is active; an in-process ``sys.modules`` probe alone would be a null measurement.
 _BASE_INSTALL = """
 import sys
-BLOCKED = ("rxembed.pipeline", "xyzgraph", "openconf", "scipy", "sklearn", "matplotlib", "networkx", "ase")
+BLOCKED = ("xyzgraph", "openconf", "scipy", "sklearn", "matplotlib", "prism_pruner", "ase", "xyzrender")
 
 class BaseInstall:
     def find_spec(self, name, path=None, target=None):
@@ -80,14 +63,13 @@ from rdkit import Chem
 import rxembed as rx
 
 mol = Chem.AddHs(Chem.MolFromSmiles("[NH3]->[Pt](<-[NH3])(Cl)Cl"))
-text = rx.canonical_smiles(rx.enumerate_isomers(mol, "square_planar")[0])
-back = rx.enumerate_isomers(rx.parse_smiles(text))
-assert len(back) == 1, back
-assert len(rx.embed(back[0], n=2, seed=1).minimize().ids) >= 1, "nothing embedded"
-assert rx.canonical_smiles(back[0]) == text, "the string is not a fixed point"
-assert "rxembed.pipeline" not in sys.modules, "the optional tier was imported after all"
+text = rx.cxsmiles(rx.enumerate_isomers(mol, "square_planar")[0])
+embedded = rx.embed(text, n=2, seed=1)
+assert embedded.iso is not None, "the stated arrangement was not read"
+assert embedded.ids, "nothing embedded"
+assert rx.cxsmiles(embedded.iso) == text, "the string is not a fixed point"
 try:
-    import rxembed.pipeline
+    import xyzgraph
 except ImportError:
     pass
 else:
@@ -96,54 +78,62 @@ print(text)
 """
 
 
-def test_the_graph_round_trip_closes_with_the_optional_tier_uninstallable():
+def test_graph_roundtrip_needs_no_optional_deps():
     run = subprocess.run([sys.executable, "-c", _BASE_INSTALL], capture_output=True, text=True, check=False)
     assert run.returncode == 0, run.stderr
-    assert run.stdout.strip().startswith("[H][N]"), run.stdout
+    assert "[H]" not in run.stdout, run.stdout
 
 
 # --- the parse / write contract -------------------------------------------------------------------------
 
 
-def test_a_bad_smiles_raises_instead_of_returning_the_none_rdkit_gives():
+def test_bad_smiles_raises():
     assert S.parse_smiles("CCO").GetNumAtoms() == 3
     with pytest.raises(ValueError, match="could not parse SMILES"):
         S.parse_smiles("C1CC")
 
 
-def test_write_dative_reports_the_atom_order_its_own_string_was_written_in():
+def test_write_dative_returns_written_atom_order():
     mol = Chem.AddHs(Chem.MolFromSmiles("[NH3]->[Pd](<-[NH3])(Cl)Cl"))
     smi, at = S.write_dative(mol)
     assert smi == S.dative_smiles(mol), "the two doors disagree about the string"
-    assert sorted(at.values()) == list(range(mol.GetNumAtoms())), "the order is not a permutation of the atoms"
+    heavy = {a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() != 1}
+    assert set(at) == heavy, "routine hydrogens should be implicit and have no string position"
+    assert sorted(at.values()) == list(range(len(at))), "the order is not a permutation of the written atoms"
     params = Chem.SmilesParserParams()
-    params.removeHs = False  # else the parsed indices are not the written positions, which is the whole point
+    params.removeHs = False
     back = Chem.MolFromSmiles(smi, params)
-    written = [back.GetAtomWithIdx(at[a.GetIdx()]).GetAtomicNum() for a in mol.GetAtoms()]
-    assert written == [a.GetAtomicNum() for a in mol.GetAtoms()], "a position does not address its own atom"
+    written = [back.GetAtomWithIdx(at[a]).GetAtomicNum() for a in sorted(at)]
+    assert written == [mol.GetAtomWithIdx(a).GetAtomicNum() for a in sorted(at)], "a position addresses another atom"
 
 
-def test_the_parser_hands_back_the_molecule_the_writer_wrote():
-    # A fixture with explicit hydrogens, or there is nothing for `removeHs` to keep.
+def test_writer_hides_routine_h_and_keeps_hydride():
     cisplatin = Chem.AddHs(Chem.MolFromSmiles("[NH3]->[Pt](<-[NH3])(Cl)Cl"))
-    text = rx.canonical_smiles(K.Isomer(cisplatin, "square_planar", [0, 2, 3, 4]))
+    text = rx.cxsmiles(K.Isomer(cisplatin, "square_planar", [0, 2, 3, 4]))
+    assert "[H]" not in text, text
 
     mol = S.parse_smiles(text)
-    assert mol.GetNumAtoms() == cisplatin.GetNumAtoms(), "the parse did not hand back the atoms that were written"
+    assert mol.GetNumAtoms() < cisplatin.GetNumAtoms(), "routine hydrogens were written explicitly"
+    assert Chem.AddHs(mol).GetNumAtoms() == cisplatin.GetNumAtoms(), "the implicit hydrogen count changed"
     kept = K.stated_arrangement(mol)
     assert kept is not None, "the arrangement did not survive the parse at all"
     assert sorted(mol.GetAtomWithIdx(a).GetSymbol() for a in kept[1].values()) == ["Cl", "Cl", "N", "N"]
-    assert rx.canonical_smiles(rx.enumerate_isomers(mol)[0]) == text, "the string is not a fixed point"
+    assert rx.cxsmiles(rx.enumerate_isomers(mol)[0]) == text, "the string is not a fixed point"
+    expected = {rx.cxsmiles(i) for i in rx.enumerate_isomers(cisplatin, "square_planar")}
+    reordered = Chem.RenumberAtoms(cisplatin, list(reversed(range(cisplatin.GetNumAtoms()))))
+    assert {rx.cxsmiles(i) for i in rx.enumerate_isomers(reordered, "square_planar")} == expected
 
-    naive = Chem.MolFromSmiles(text)  # the default parse: same string, six hydrogens short
-    assert naive.GetNumAtoms() < cisplatin.GetNumAtoms(), "RDKit kept the Hs; this fixture cannot show the keying"
-    with pytest.raises(ValueError, match="round-tripping SMILES"):
-        rx.canonical_smiles(rx.enumerate_isomers(naive)[0])
+    params = Chem.SmilesParserParams()
+    params.removeHs = False
+    hydride = Chem.MolFromSmiles("[H-]->[Pt+2](Cl)(Cl)<-[NH3]", params)
+    hydride_text = rx.cxsmiles(rx.enumerate_isomers(hydride, "square_planar")[0])
+    assert "[H-]" in hydride_text, "the hydrogen donor lost the atom that carries its slot"
+    assert rx.cxsmiles(rx.enumerate_isomers(rx.parse_smiles(hydride_text))[0]) == hydride_text
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_dative_smiles_round_trips_a_complex_smiles_cannot_write_naively():
-    mol = _xyz_to_mol(_MN_H2)
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_dative_smiles_roundtrips_nonstandard_complex():
+    mol = read_xyz(_MN_H2)
     assert any(a.GetAtomicNum() == 1 and a.GetDegree() > 1 for a in mol.GetAtoms()), (
         "this fixture must contain an over-connected hydrogen, or it does not test the repair"
     )
@@ -159,7 +149,7 @@ def test_dative_smiles_round_trips_a_complex_smiles_cannot_write_naively():
     assert metals(back) == metals(mol) == [("Fe", 2), ("Mn", 0)]
 
 
-def test_dative_smiles_raises_rather_than_return_an_unreadable_string():
+def test_dative_smiles_rejects_unreadable_graph():
     rw = Chem.RWMol(Chem.AddHs(Chem.MolFromSmiles("[NH3]->[Pd](<-[NH3])(Cl)Cl")))
     c = rw.AddAtom(Chem.Atom(6))
     for _ in range(5):
@@ -185,15 +175,15 @@ _PARTLY_FILLED = {
 }
 
 
-@pytest.mark.parametrize(("kind", "pair"), _LEWIS_PAIRS.items(), ids=list(_LEWIS_PAIRS))
-def test_one_species_gives_one_string_whichever_lewis_form_described_it(kind, pair):
+@pytest.mark.parametrize(("kind", "pair"), _LEWIS_PAIRS.items(), ids=["halide", "phosphine"])
+def test_lewis_forms_share_species_string(kind, pair):
     mols = [Chem.AddHs(Chem.MolFromSmiles(s)) for s in pair]
     assert len({Chem.GetFormalCharge(m) for m in mols}) == 1, f"{kind}: the pair is not one species, fix the fixture"
     written = {S.dative_smiles(m) for m in mols}
     assert len(written) == 1, f"{kind}: two Lewis forms of one species gave {len(written)} strings: {written}"
 
 
-def test_a_terminal_oxo_is_written_ionically_and_a_pi_face_is_left_alone():
+def test_terminal_oxo_is_ionic_and_pi_face_unchanged():
     lewis, ionic = "O=[V](Cl)(Cl)Cl", "[O-2]->[V+5](<-[Cl-])(<-[Cl-])<-[Cl-]"
     mols = [Chem.AddHs(Chem.MolFromSmiles(s)) for s in (lewis, ionic)]
     assert len({sum(a.GetFormalCharge() for a in m.GetAtoms()) for m in mols}) == 1, "not the same total charge"
@@ -205,26 +195,26 @@ def test_a_terminal_oxo_is_written_ionically_and_a_pi_face_is_left_alone():
 
     fe = S.dative_smiles(Chem.AddHs(Chem.MolFromSmiles("[cH-]1cccc1.[cH-]1cccc1.[Fe+2]")))
     assert "[Fe+2]" in fe, f"the pi face was charged and the iron took the balance: {fe}"
-    assert fe.count("[c-]") == 2, f"a Cp carbon beyond the two anionic ones was charged: {fe}"
+    assert fe.count("[cH-]") == 2, f"a Cp carbon beyond the two anionic ones was charged: {fe}"
 
 
-def test_the_isomer_door_and_the_mol_door_write_one_constitution():
+def test_isomer_and_mol_write_same_constitution():
     for smi in (s for pair in (*_LEWIS_PAIRS.values(), *_PARTLY_FILLED.values()) for s in pair):
         mol = Chem.AddHs(Chem.MolFromSmiles(smi))
         isos = rx.enumerate_isomers(mol)
         assert isos, f"{smi} enumerated nothing"
-        core = rx.canonical_smiles(isos[0]).split(" |", 1)[0]
+        core = rx.cxsmiles(isos[0]).split(" |", 1)[0]
         assert core == S.dative_smiles(mol), f"{smi}: the Isomer door wrote a different constitution"
 
 
 # --- the arrangement the SMILES grammar cannot say -------------------------------------------------------
 
 
-def test_the_canonical_string_separates_a_chiral_centre_from_its_mirror():
+def test_cxsmiles_distinguishes_metal_hands():
     smi, flipped = "[Pt](F)(F)(Cl)(Cl)(Br)Br", [_CIS3[v] for v in (0, 1, 2, 3, 5, 4)]  # the Br pair exchanged
     hands = [_isomer(smi, "octahedral", seating) for seating in (_CIS3, flipped)]
     assert {i.chirality for i in hands} == {"delta", "lambda"}, [i.chirality for i in hands]
-    one, other = (rx.canonical_smiles(i) for i in hands)
+    one, other = (rx.cxsmiles(i) for i in hands)
     assert one.split("|")[0] == other.split("|")[0], "the constitution is the same molecule"
     assert one != other, "the two hands share a canonical string"
 
@@ -235,19 +225,20 @@ def test_the_canonical_string_separates_a_chiral_centre_from_its_mirror():
         ("[NH3]->[Pt](<-[NH3])(Cl)Cl", "square_planar"),  # cis / trans
         ("[Pt](F)(F)(Cl)(Cl)(Br)Br", "octahedral"),  # MA2B2C2: six isomers, one delta / lambda pair
         ("Br[Pd]1(Cl)NCCN1", "square_planar"),  # a chelate, so a bite edge is in the fold
+        ("[Co]123(OCCN1)(OCCN2)OCCN3", "octahedral"),  # three identical unsymmetrical chelates
         ("[CH2]=[CH2].Cl[Pt](Cl)Cl", "square_planar"),  # Zeise: an eta2 face is one vertex
     ],
-    ids=["MA2B2", "MA2B2C2", "chelate", "eta2"],
+    ids=["MA2B2", "MA2B2C2", "chelate", "tris-chelate", "eta2"],
 )
-def test_every_enumerated_isomer_reads_back_as_itself(smi, geometry):
+def test_all_enumerated_isomers_read_back(smi, geometry):
     isos = rx.enumerate_isomers(Chem.AddHs(Chem.MolFromSmiles(smi)), geometry)
     assert len(isos) >= 1
     for iso in isos:
-        text = rx.canonical_smiles(iso)
+        text = rx.cxsmiles(iso)
         back = rx.enumerate_isomers(S.parse_smiles(text))
         assert len(back) == 1, f"{iso.label}: its own string enumerated {len(back)} isomers"
         got = back[0]
-        assert rx.canonical_smiles(got) == text, f"{iso.label}: the string is not a fixed point"
+        assert rx.cxsmiles(got) == text, f"{iso.label}: the string is not a fixed point"
         assert got.geometry == iso.geometry, f"{iso.label}: came back as {got.geometry}"
         assert got.chirality == iso.chirality, f"{iso.label}: {iso.chirality!r} came back {got.chirality!r}"
         was, now = _seated(iso), _seated(got)
@@ -256,8 +247,38 @@ def test_every_enumerated_isomer_reads_back_as_itself(smi, geometry):
         )
 
 
-def test_a_stated_arrangement_refuses_an_argument_with_nothing_left_to_do():
-    text = rx.canonical_smiles(_isomer("[Pt](F)(F)(F)(Cl)(Cl)Cl", "octahedral", _MA3B3_SEATS["fac"]))
+def test_stated_arrangement_rejects_wrong_chirality():
+    chiral = next(
+        i
+        for i in rx.enumerate_isomers(Chem.AddHs(Chem.MolFromSmiles("[Pt](F)(F)(Cl)(Cl)(Br)Br")), "octahedral")
+        if i.chirality == "delta"
+    )
+    text = rx.cxsmiles(chiral)
+    with pytest.raises(ValueError, match="omits chirality"):
+        rx.enumerate_isomers(S.parse_smiles(text.replace("-delta", "")))
+    with pytest.raises(ValueError, match="seating is delta"):
+        rx.enumerate_isomers(S.parse_smiles(text.replace("-delta", "-lambda")))
+
+    square = rx.cxsmiles(_isomer("[Pt](F)(F)(Cl)Cl", "square_planar", _MA2B2_SEATS["cis"]))
+    with pytest.raises(ValueError, match="planar"):
+        rx.enumerate_isomers(S.parse_smiles(square.replace(".SPL", ".SPL-delta")))
+    with pytest.raises(NotImplementedError, match="haptic winding"):
+        rx.enumerate_isomers(S.parse_smiles(square.replace(".s0", ".s0+", 1)))
+
+    trans = next(
+        i
+        for i in rx.enumerate_isomers(
+            Chem.AddHs(Chem.MolFromSmiles("Cl[Co]12(Cl)(NCCN1)NCCN2")), "octahedral", stereo="free"
+        )
+        if not i.chirality
+    )
+    forged = rx.cxsmiles(trans).replace(".OCT:", ".OCT-delta:")
+    with pytest.raises(ValueError, match="seating is achiral"):
+        rx.enumerate_isomers(S.parse_smiles(forged), stereo="free")
+
+
+def test_stated_arrangement_rejects_redundant_arguments():
+    text = rx.cxsmiles(_isomer("[Pt](F)(F)(F)(Cl)(Cl)Cl", "octahedral", _MA3B3_SEATS["fac"]))
     mol = S.parse_smiles(text)
     assert len(rx.enumerate_isomers(mol, "OCT")) == 1, "naming the shape the string states is not a contradiction"
     for kwargs in ({"geometry": "trigonal_prismatic"}, {"fix": [1, 2]}):
@@ -265,13 +286,13 @@ def test_a_stated_arrangement_refuses_an_argument_with_nothing_left_to_do():
             rx.enumerate_isomers(mol, **kwargs)
 
 
-def test_the_canonical_string_refuses_what_it_cannot_state():
+def test_cxsmiles_rejects_multiple_metals_and_unknown_shape():
     iso = _isomer("[Pt](F)(F)(Cl)Cl", "square_planar", _MA2B2_SEATS["cis"])
     rw = Chem.RWMol(iso.mol)
     rw.AddAtom(Chem.Atom(46))  # a spectator Pd bonded to nothing: still a second centre to state
     iso.mol, iso.extra = rw.GetMol(), [(rw.GetNumAtoms() - 1, 46, 0)]
     with pytest.raises(NotImplementedError, match="one metal centre"):
-        rx.canonical_smiles(iso)
+        rx.cxsmiles(iso)
     bare = K.from_surrogate(Chem.MolFromSmiles("[Pt](F)(F)(Cl)Cl"), [(0, 78, 0)], [])
     with pytest.raises(ValueError, match="no polyhedron template"):
-        rx.canonical_smiles(bare)
+        rx.cxsmiles(bare)

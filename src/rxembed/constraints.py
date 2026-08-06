@@ -12,12 +12,12 @@ Two verbs, one resolver (`resolve_core`).
 ``constrain`` is soft: a wider window a real energy may overrule, and the home of π-stacks (a plane key
 ``(ring_a, ring_b): separation``). Held? ``fix``. A bias the search can move off? ``constrain``.
 
-A template is not a third verb: the pipeline's ``template=(reference, map)`` is dissolved into a
-coords-``fix`` before this resolver sees it.
+A template is not a third verb: ``template=(reference, map_or_smarts)`` is dissolved into a coords-``fix``
+before this resolver sees it. SMARTS is the short form when both sides have molecular graphs; an xyz or
+coordinate array needs an explicit index map.
 
-Keys are 0-based atom indices in xyz/graph order. The resolver never SMARTS-matches internally: that is
-the user's two RDKit lines, which kills the symmetric-core automorphism flip and keeps the spec
-transparent. Strictness is the fix/constrain axis, not a second force constant, since
+Keys are 0-based atom indices in xyz/graph order. Strictness is the fix/constrain axis, not a second force
+constant, since
 ``AddDistanceConstraint`` is flat-bottomed: one shared ``distance_fc`` pulls a tight window to its target
 and lets a wide one float.
 """
@@ -399,7 +399,7 @@ def _graft_core(mol, cons, coord_fix):
     cons.frozen |= set(coord_fix)
     if len(coord_fix) < _MIN_SHAPE_ATOMS:
         logger.warning(
-            "fix: %d atom(s) with coordinates; an oriented graft needs >=3 (%s)",
+            "fix: %d coordinate atom(s); orientation needs at least 3 (%s)",
             len(coord_fix),
             "one atom fixes nothing (held wherever the embed lands it)"
             if len(coord_fix) == 1
@@ -456,8 +456,8 @@ def reference_positions(reference):
     raise ValueError("a template reference must be a Mol with a conformer, an .xyz path, or an (N, 3) array")
 
 
-def template_to_fix(template, fix=None, own=None):
-    """Fold ``template=(reference, {target_i: ref_i})`` into a coordinate ``fix``; sugar, not a mechanism.
+def template_to_fix(template, fix=None, own=None, target=None):
+    """Fold ``template=(reference, map_or_smarts)`` into a coordinate ``fix``; sugar, not a mechanism.
 
     A template graft is a `fix` with coordinates read off a reference, so the resolver knows only
     `fix`/`constrain` and this is where the sugar dissolves. Every rigid spec is one question, where do these
@@ -467,14 +467,34 @@ def template_to_fix(template, fix=None, own=None):
 
     Coordinates carry handedness, which a distance/angle spec cannot: that spec is reflection-invariant, so
     it may give the mirror image silently. To embed the other diastereomer deliberately, negate one axis of
-    the reference positions.
+    the reference positions. A SMARTS must also have one ordered correspondence on each graph; a symmetric
+    query needs an explicit map rather than an atom-order-dependent automorphism.
     """
-    if not (isinstance(template, (tuple, list)) and len(template) == _TEMPLATE_LEN and isinstance(template[1], dict)):
+    if not (
+        isinstance(template, (tuple, list)) and len(template) == _TEMPLATE_LEN and isinstance(template[1], (dict, str))
+    ):
         raise ValueError(
-            "template= must be (reference, {target_index: reference_index}), an explicit atom map. "
-            "E.g. template=('ts.xyz', {0: 5, 4: 1, 5: 6})."
+            "template= must be (reference, SMARTS) or (reference, {target_index: reference_index}). "
+            "Use a SMARTS when both molecules carry the same graph; an .xyz needs an explicit map."
         )
     reference, mapping = template
+    if isinstance(mapping, str):
+        if target is None or not isinstance(reference, Chem.Mol):
+            raise ValueError(
+                "template=(reference, SMARTS) needs target and reference molecular graphs; "
+                "use an explicit index map for an .xyz or coordinate array"
+            )
+        target_match, reference_match = match(target, mapping), match(reference, mapping)
+        query = Chem.MolFromSmarts(mapping)
+        if (
+            len(target.GetSubstructMatches(query, uniquify=False, maxMatches=2)) > 1
+            or len(reference.GetSubstructMatches(query, uniquify=False, maxMatches=2)) > 1
+        ):
+            raise ValueError(
+                f"template SMARTS {mapping!r} has symmetry-equivalent atom orderings; "
+                "give an explicit {target_index: reference_index} map"
+            )
+        mapping = dict(zip(target_match, reference_match, strict=True))
     if not mapping:
         raise ValueError(
             "template= was given an empty atom map, which would graft nothing and embed as if no template "
@@ -609,4 +629,5 @@ def _echo(mol, cons, coord_fix):
         parts.append(f"soft angle({s(i)},{s(j)},{s(k)})->{lo:.1f}-{hi:.1f}deg")
     for ra, rb, sep in cons.planes:
         parts.append(f"stack {len(ra)}x{len(rb)} ring @ {sep:.1f}A")
-    logger.info("resolve: %s", "; ".join(parts))
+    for part in parts:
+        logger.info("resolve: %s", part)

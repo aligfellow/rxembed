@@ -186,7 +186,7 @@ class ASE(Calculator):
     def energy(self, mol, conf_id=-1):
         """Single-point energy in Hartree via the wrapped ASE calculator."""
         try:
-            from ase import Atoms
+            from ase import Atoms  # ty: ignore[unresolved-import]
         except ImportError as exc:
             raise ImportError("ASE.energy needs ase; pip install ase or the package providing your calculator") from exc
 

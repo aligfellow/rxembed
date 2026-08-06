@@ -97,14 +97,14 @@ def _write(mol, cons):
     """
     ctx = _mech.DGContext(mol, rdDistGeom.GetMoleculeBoundsMatrix(mol))
     for m in _mech.MECHANISM_ORDER:
-        m.dg_windows(cons, ctx)  # WINDOW   distances, angles, planes -> candidate windows
+        m._dg_windows(cons, ctx)  # WINDOW   distances, angles, planes -> candidate windows
     for m in _mech.MECHANISM_ORDER:
-        m.dg_relief(cons, ctx)  # RELIEVE  lower RDKit's phantom floors, before anything is committed
+        m._dg_relief(cons, ctx)  # RELIEVE  lower RDKit's phantom floors, before anything is committed
     for (i, j), (lo, hi) in ctx.pairs.items():
         a, b = (i, j) if i < j else (j, i)
         ctx.bm[a][b], ctx.bm[b][a] = hi, lo  # COMMIT
     for m in _mech.MECHANISM_ORDER:
-        m.dg_post(cons, ctx)  # POST     read the committed matrix (the coplanar 1,4 bound)
+        m._dg_post(cons, ctx)  # POST     read the committed matrix (the coplanar 1,4 bound)
     return ctx
 
 
@@ -350,7 +350,14 @@ def _feasible_bounds(mol, cons):
         return bm, tol  # mutually realisable, the overwhelmingly common case; say nothing
     crossed = crossings(mol, cons)
     if crossed:
-        logger.warning("embed: constraints not mutually realisable, %s", crossed[0])
+        worst = crossed[0]
+        named = str(worst.windows()[0]) if worst.windows() else f"atoms {worst.pair[0]}-{worst.pair[1]}"
+        logger.warning(
+            "embed: incompatible constraints: %s (gap %.2f A); see DEBUG",
+            named,
+            worst.gap,
+        )
+        logger.debug("embed: constraint crossing: %s", worst)
     else:  # the closure agrees with smoothing on 350 of 350 calls measured; if it ever does not, say so
         logger.warning("embed: constraints not mutually realisable (%.0f%% repaired), cause unattributed", tol * 100.0)
     return bm, tol
@@ -374,8 +381,8 @@ def _bring_real_confs(mol, work, ids):
         mol.AddConformer(conf, assignId=False)
 
 
-def embed(mol, cons, n, seed=DEFAULT_SEED, prune_rms=0.1, knowledge=True, threads=0):
-    """Embed ``n`` conformers via ETKDGv3 on the (edited) bounds matrix; return the conformer ids."""
+def seed_coordinates(mol, cons, n, seed=DEFAULT_SEED, prune_rms=0.1, knowledge=True, threads=0):
+    """Seed ``n`` conformers with ETKDGv3 using the edited bounds matrix; return their ids."""
     work = _metal.materialise_phantoms(mol, cons.haptic)  # transient centroid dummies for a haptic face; `mol` else
     p = etkdg(seed, knowledge=knowledge, threads=threads, prune_rms=prune_rms)
     if cons.distances or cons.angles or cons.planes or cons.coplanar:
@@ -395,7 +402,7 @@ def embed(mol, cons, n, seed=DEFAULT_SEED, prune_rms=0.1, knowledge=True, thread
     return ids
 
 
-def n_confs(mol, constrained=False):
+def seed_count(mol, constrained=False):
     """ETKDG seed count, scaled by rotatable-bond count rather than a flat default.
 
     A constrained run gets ~1.6x more, because openconf's pose-frozen search is rotor-only and under-samples

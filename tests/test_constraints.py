@@ -1,15 +1,4 @@
-"""`constraints.py`: the `Constraints` struct and the `fix` / `constrain` resolver.
-
-Two contracts in one module, so one test file:
-
-* the STRUCT: a field may never be silently dropped by `copy`, `relaxed` or `compose`. The tests below drive
-  them off a struct with every field populated; `_MERGE` remains the field-specific policy registry.
-* the RESOLVER; `resolve_core` turns the user's `fix`/`constrain` into that struct. Assertions are exact
-  (`== {...}`, not "at least") so a loosened resolver is caught, and the `contacts` provenance is checked
-  because it alone decides what `mc(explore=)` may release.
-
-No embedding, no force field, no optional dependency.
-"""
+"""Test the Constraints struct and fix/constrain resolution."""
 
 from dataclasses import fields
 
@@ -18,7 +7,7 @@ import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 
-from rxembed.constraints import Constraints, SphereRecipe, add_distance, compose, match, resolve_core
+from rxembed.constraints import Constraints, SphereRecipe, add_distance, compose, match, resolve_core, template_to_fix
 
 
 def _mol(smiles="CCO", seed=1):
@@ -113,7 +102,7 @@ def test_compose_distance_is_last_wins():
     assert compose(a, b).distances[(0, 1)] == (2.5, 2.7)
 
 
-def test_compose_takes_the_stricter_wall_and_the_fullest_relief():
+def test_compose_keeps_strict_wall_and_full_relief():
     a = Constraints(floors={(9, 4): 2.8}, dg_floors={(9, 4): 2.8})
     b = Constraints(floors={(9, 4): 3.1}, dg_floors={(9, 4): 3.1})
     for one, two in ((a, b), (b, a)):
@@ -124,8 +113,9 @@ def test_compose_takes_the_stricter_wall_and_the_fullest_relief():
 @pytest.mark.parametrize(
     ("field_name", "one", "two"),
     [("pulls", {(9, 0): 2.1}, {(9, 0): 2.4}), ("haptic", {12: [1, 2]}, {12: [3, 4]})],
+    ids=["pulls", "haptic"],
 )
-def test_compose_refuses_an_unresolvable_collision(field_name, one, two):
+def test_compose_rejects_constraint_collision(field_name, one, two):
     a, b = Constraints(**{field_name: one}), Constraints(**{field_name: two})
     with pytest.raises(ValueError, match=field_name):
         compose(a, b)
@@ -157,7 +147,7 @@ def test_fix_list_needs_geometry():
         resolve_core(m, fix=[0, 1, 2], has_geometry=False)
 
 
-def test_fix_explicit_coords_uses_the_given_shape_not_the_molecule_s():
+def test_explicit_fix_uses_given_coordinates():
     m = _mol()
     coords = {0: (0.0, 0.0, 0.0), 1: (1.5, 0.0, 0.0), 2: (1.5, 1.4, 0.0)}
     cons, ref = resolve_core(m, fix=coords, has_geometry=True)
@@ -168,7 +158,7 @@ def test_fix_explicit_coords_uses_the_given_shape_not_the_molecule_s():
     assert lo <= 1.5 <= hi
 
 
-def test_a_fix_number_is_a_tight_window_that_is_never_releasable():
+def test_numeric_fix_is_tight_and_nonreleasable():
     m = _mol()
     cons, ref = resolve_core(m, fix={(0, 2): 2.0, (0, 1, 2): 109.5}, has_geometry=True)
     assert cons.distances[(0, 2)] == pytest.approx((1.98, 2.02))
@@ -184,7 +174,7 @@ def test_a_fix_number_is_a_tight_window_that_is_never_releasable():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_a_constrain_number_is_a_wider_window_that_relaxed_releases():
+def test_constrain_number_creates_releasable_window():
     m = _mol()
     cons, ref = resolve_core(m, constrain={(0, 2): 2.8, (0, 1, 2): 120.0}, has_geometry=True)
     assert cons.distances[(0, 2)] == pytest.approx((2.7, 2.9))  # +/-0.1 A, five times the fix pad
@@ -195,7 +185,7 @@ def test_a_constrain_number_is_a_wider_window_that_relaxed_releases():
     assert cons.relaxed().angles == {}
 
 
-def test_an_explicit_window_is_taken_verbatim_by_either_verb():
+def test_explicit_window_is_taken_verbatim_by_either_verb():
     m = _mol()
     assert resolve_core(m, fix={(0, 2): (1.9, 2.1)}, has_geometry=True)[0].distances[(0, 2)] == pytest.approx(
         (1.9, 2.1)
@@ -229,7 +219,7 @@ def test_constrain_ring_pair_becomes_a_pi_stack_plane():
     ],
     ids=["smarts-key", "smarts-in-list", "out-of-range", "angle-too-big", "angle-negative", "same-atom"],
 )
-def test_a_nonsense_key_or_target_is_refused_at_the_spec(spec, match):
+def test_resolve_rejects_invalid_specs(spec, match):
     with pytest.raises(ValueError, match=match):
         resolve_core(_mol(), has_geometry=True, **spec)
 
@@ -239,7 +229,7 @@ def test_one_key_under_both_verbs_is_refused():
         resolve_core(_mol("CCCl"), fix={(1, 2): 2.5}, constrain={(2, 1): (1.7, 1.8)}, has_geometry=True)
 
 
-def test_a_window_inside_the_fixed_core_is_dropped_loudly(caplog):
+def test_window_inside_the_fixed_core_is_dropped_loudly(caplog):
     coords = {i: (float(i), 0.0, 0.0) for i in (0, 1, 2)}  # collinear, 1.0 A apart
     with caplog.at_level("WARNING", logger="rxembed"):
         cons, _ref = resolve_core(_mol("CCCl"), fix=coords, constrain={(1, 2): 3.4}, has_geometry=True)
@@ -253,14 +243,14 @@ def test_a_window_inside_the_fixed_core_is_dropped_loudly(caplog):
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_fewer_than_three_graft_atoms_warns(caplog):
+def test_fewer_than_three_graft_atoms_warn(caplog):
     m = _mol()
     with caplog.at_level("WARNING", logger="rxembed"):
         resolve_core(m, fix=[0, 1], has_geometry=True)
-    assert any("orientable" in r.getMessage() or ">=3" in r.getMessage() for r in caplog.records)
+    assert "orientation needs at least 3" in caplog.text
 
 
-def test_two_shared_atom_distances_over_three_atoms_warn_that_the_angle_is_free(caplog):
+def test_two_distances_warn_free_angle(caplog):
     m = _mol()
     with caplog.at_level("WARNING", logger="rxembed"):
         resolve_core(m, fix={(0, 1): 1.5, (1, 2): 1.4}, has_geometry=True)
@@ -275,14 +265,14 @@ def test_two_shared_atom_distances_over_three_atoms_warn_that_the_angle_is_free(
     ],
     ids=["angle-given", "rich-network"],
 )
-def test_a_determined_network_does_not_warn(caplog, fix, why):
+def test_determined_network_does_not_warn(caplog, fix, why):
     m = _mol("CCCC")
     with caplog.at_level("WARNING", logger="rxembed"):
         resolve_core(m, fix=fix, has_geometry=True)
     assert not any("no angle is fixed" in r.getMessage() for r in caplog.records), why
 
 
-def test_the_info_echo_names_atoms_by_element_and_index(caplog):
+def test_info_echo_names_atoms_by_element_and_index(caplog):
     m = _mol()  # ethanol: 0=C, 1=C, 2=O
     with caplog.at_level("INFO", logger="rxembed"):
         resolve_core(m, fix={(0, 2): 2.0}, has_geometry=True)
@@ -292,7 +282,7 @@ def test_the_info_echo_names_atoms_by_element_and_index(caplog):
     assert "1.98-2.02" in echo
 
 
-def test_match_refuses_an_ambiguous_pattern_rather_than_picking_one():
+def test_match_rejects_ambiguous_pattern():
     mol = Chem.AddHs(Chem.MolFromSmiles("Clc1ccccc1CCl"))
     assert len(mol.GetSubstructMatches(Chem.MolFromSmarts("[Cl]"))) == 2, "the fixture must be ambiguous"
     with pytest.raises(ValueError, match="matched 2 times"):
@@ -303,3 +293,11 @@ def test_match_refuses_an_ambiguous_pattern_rather_than_picking_one():
         match(mol, "[Br]")
     with pytest.raises(ValueError, match="did not parse"):
         match(mol, "[not a smarts")
+
+
+def test_symmetric_template_requires_atom_map():
+    reference = _mol("Cc1ccccc1")
+    target = _mol("CCc1ccccc1")
+
+    with pytest.raises(ValueError, match=r"symmetry-equivalent.*explicit"):
+        template_to_fix((reference, "c1ccccc1"), target=target)

@@ -47,7 +47,7 @@ def _perceive(mol, conf_id, charge=0, elements=None):
     try:
         import xyzgraph
     except ImportError as exc:
-        raise ImportError("_perceive needs xyzgraph; pip install 'rxembed[perceive]'") from exc
+        raise ImportError("_perceive needs xyzgraph; pip install 'rxembed[workflow]'") from exc
 
     pos = mol.GetConformer(conf_id).GetPositions()
     z = elements or {}
@@ -101,7 +101,7 @@ def connectivity(mol, conf_id, *, exclude=frozenset(), metals=frozenset(), charg
     return formed, broken
 
 
-def coordination_changed(mol, conf_id, metal, donors, factor=1.3, elements=None):
+def coordination_changed(mol, conf_id, metal, donors, factor=1.3, elements=None, exclude=frozenset()):
     """Donors that left the metal and non-donors that joined it: the metal's own connectivity check.
 
     ``connectivity`` cannot judge a dative bond, so the sphere is compared as a set: which heavy atoms sit
@@ -112,6 +112,8 @@ def coordination_changed(mol, conf_id, metal, donors, factor=1.3, elements=None)
     tighter, so an atom counts as joined only at a genuinely bonded distance. A chelate's bite apex is
     skipped, the bite legitimately dragging it to ~2.5 Å; a second-sphere atom is judged, but loosely enough
     not to flag a β-agostic contact.
+
+    A pair wholly inside ``exclude`` belongs to a reacting core and is not judged.
 
     A declared donor is judged as one whatever its element -- a hydride is a donor, and the surrogate leaves a
     monatomic one with no bonds at all, so the graph cannot be asked. Only an *undeclared* H is skipped.
@@ -150,7 +152,11 @@ def coordination_changed(mol, conf_id, metal, donors, factor=1.3, elements=None)
             limit = NEAR_REPORT_RATIO * r_sum if tier == NEAR else r_sum + OUTER_REPORT_MARGIN
         if float(np.linalg.norm(pos[i] - pos[metal])) <= limit:
             near.add(i)
-    return sorted(donors - near), sorted(near - donors)  # (left, joined)
+    left, joined = donors - near, near - donors
+    if metal in exclude:  # a pair wholly inside a reacting core is intentionally not ground-state coordination
+        left -= set(exclude)
+        joined -= set(exclude)
+    return sorted(left), sorted(joined)
 
 
 def describe(mol, formed, broken):

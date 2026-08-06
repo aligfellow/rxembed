@@ -1,9 +1,4 @@
-"""`pipeline/metrics.py`; is the conformer still the molecule we asked for?
-
-``bonding_ok`` (the relax's own arbiter, re-exported here) is heavy-atoms-only and only fires below 0.7x the
-covalent sum, so a transferred proton or a new C-C at 1.54 Å passes it. These pin the two checks that close
-that hole: the ``connectivity`` graph diff and ``coordination_changed``.
-"""
+"""Test graph and coordination-sphere changes after relaxation."""
 
 from importlib.util import find_spec
 
@@ -16,7 +11,7 @@ from rdkit.Geometry import Point3D
 from rxembed.pipeline import metrics
 
 # every check here re-perceives the graph with xyzgraph
-pytestmark = pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
+pytestmark = pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 
 
 def _bare_sphere(symbols, bonds, coords):
@@ -74,12 +69,12 @@ def _ruthenium(d_ruh=1.701, d_rucl=2.233):
 # --- connectivity: the graph diff -------------------------------------------------------------------------
 
 
-def test_a_clean_conformer_re_perceives_to_the_graph_it_came_from():
+def test_clean_conformer_reperceives_original_graph():
     m = _mol("CC(=O)Nc1ccccc1")
     assert metrics.connectivity(m, m.GetConformers()[0].GetId()) == ([], [])
 
 
-def test_a_stretched_bond_is_reported_broken_unless_the_frozen_core_holds_it():
+def test_frozen_core_exempts_stretched_bond():
     m = _mol("CCO")
     cid = m.GetConformer().GetId()
     rdMolTransforms.SetBondLength(m.GetConformer(), 1, 2, 2.40)  # ~1.7x the C-O covalent sum, fragment and all
@@ -88,7 +83,7 @@ def test_a_stretched_bond_is_reported_broken_unless_the_frozen_core_holds_it():
     assert metrics.connectivity(m, cid, exclude={1, 2}) == ([], [])
 
 
-def test_a_transferred_proton_is_seen_where_bonding_ok_is_blind():
+def test_reperception_finds_transferred_proton():
     m = _mol("[NH3+]CC(=O)[O-]")
     conf = m.GetConformer()
     n = next(a.GetIdx() for a in m.GetAtoms() if a.GetSymbol() == "N")
@@ -104,8 +99,8 @@ def test_a_transferred_proton_is_seen_where_bonding_ok_is_blind():
     assert metrics.bonding_ok(m, conf.GetId()), "bonding_ok is heavy-atom-only: it CANNOT see this"
 
 
-def test_a_metal_pair_is_left_to_coordination_changed():
-    import rxembed.pipeline as rx
+def test_connectivity_ignores_metal_pairs():
+    import rxembed as rx
 
     iso = rx.metal("Cl[Pd](Cl)(N)N", "square_planar")[0]
     ens = rx.embed(iso, n=2, seed=1).minimize()
@@ -117,20 +112,22 @@ def test_a_metal_pair_is_left_to_coordination_changed():
 # --- coordination_changed: the metal's own diff -----------------------------------------------------------
 
 
-def test_a_donor_dragged_off_the_metal_is_reported_as_having_left():
-    import rxembed.pipeline as rx
+def test_metal_donor_departure_is_reported():
+    import rxembed as rx
 
     iso = rx.metal("Cl[Pd](Cl)(N)N", "square_planar")[0]
     ens = rx.embed(iso, n=1, seed=1).minimize()
     cid = ens.ids[0]
     assert metrics.coordination_changed(ens.mol, cid, iso.metal, iso.donors) == ([], [])
 
-    _push_out(ens.mol.GetConformer(cid), iso.donors[0], iso.metal, 4.0)
-    left, _joined = metrics.coordination_changed(ens.mol, cid, iso.metal, iso.donors)
+    _push_out(ens._mol.GetConformer(cid), iso.donors[0], iso.metal, 4.0)
+    left, _joined = metrics.coordination_changed(ens._mol, cid, iso.metal, iso.donors)
     assert iso.donors[0] in left
+    frozen = {iso.metal, iso.donors[0]}
+    assert metrics.coordination_changed(ens._mol, cid, iso.metal, iso.donors, exclude=frozen)[0] == []
 
 
-def test_a_monatomic_hydride_is_exempt_from_the_covalent_diff_but_not_from_the_dative_one():
+def test_hydride_uses_dative_not_covalent_diff():
     held, _pos = _ruthenium()
     assert held.GetAtomWithIdx(1).GetDegree() == held.GetAtomWithIdx(2).GetDegree() == 0
     assert metrics.coordination_changed(held, held.GetConformer().GetId(), 0, [1, 2, 3, 4]) == ([], [])
@@ -139,7 +136,7 @@ def test_a_monatomic_hydride_is_exempt_from_the_covalent_diff_but_not_from_the_d
     assert metrics.coordination_changed(gone, gone.GetConformer().GetId(), 0, [1, 2, 3, 4]) == ([1], [])
 
 
-def test_an_undeclared_agostic_h_neither_joins_nor_leaves():
+def test_undeclared_agostic_h_neither_joins_nor_leaves():
     mol, _pos = _bare_sphere(
         ["Ru", "C", "H", "P", "P"],
         [(1, 2)],
@@ -148,7 +145,7 @@ def test_an_undeclared_agostic_h_neither_joins_nor_leaves():
     assert metrics.coordination_changed(mol, mol.GetConformer().GetId(), 0, [1, 3, 4]) == ([], [])
 
 
-def test_an_alpha_carbon_collapsed_into_the_sphere_is_reported_as_joined():
+def test_collapsed_alpha_carbon_is_reported_joined():
     mol, _pos = _bare_sphere(
         ["Pd", "N", "C", "C", "Cl", "Cl"],
         [(1, 2), (2, 3)],

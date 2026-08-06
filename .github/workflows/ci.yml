@@ -7,16 +7,9 @@ on:
   pull_request:
     branches: main
 
-# No `--all-extras`: the `dev` group in pyproject.toml already makes a bare `uv sync` the full environment.
 jobs:
-  dev:
-    strategy:
-      matrix:
-        python-version: ['3.14']
-        os: [ubuntu-latest]
-
-    name: Dev (all extras) ${{ matrix.os }} ${{ matrix.python-version }}
-    runs-on: ${{ matrix.os }}
+  check:
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v5
@@ -27,21 +20,10 @@ jobs:
           enable-cache: true
 
       - name: Install Python
-        run: uv python install ${{ matrix.python-version }}
+        run: uv python install 3.12
 
       - name: Install dependencies
-        run: uv sync
-
-      - name: A bare `uv sync` must give the FULL environment
-        run: |
-          uv run python - <<'EOF'
-          import importlib.util, sys
-          extras = ("openconf", "prism_pruner", "sklearn", "xyzgraph", "networkx", "scipy",
-                    "matplotlib", "seaborn", "ase")
-          missing = [m for m in extras if importlib.util.find_spec(m) is None]
-          if missing:
-              sys.exit(f"`uv sync` did not install the dev extras: {missing}")
-          EOF
+        run: uv sync --locked
 
       - run: uv run ruff format --check .
       - run: uv run ruff check .
@@ -52,4 +34,3 @@ jobs:
         uses: codecov/codecov-action@v5
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-

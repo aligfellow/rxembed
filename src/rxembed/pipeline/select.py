@@ -263,7 +263,7 @@ def active_feature_kinds(mol, ids, nci=True):
 
 
 def mode_kind(mol, ids, nci=True):
-    """Human label for what a 'mode' means for THIS system (ligand arrangement / contact pattern / ...).
+    """Human label for what a 'mode' means for this system (ligand arrangement / contact pattern / ...).
 
     'ligand arrangement' (metal), else 'contact pattern' (NCI), else 'relative arrangement' (multi-fragment,
     no detected contact), else 'conformer family' (a single flexible molecule).
@@ -318,13 +318,13 @@ def cluster_on(feats, *, min_cluster=3, reduce=None):
         try:
             from sklearn.decomposition import PCA
         except ImportError as exc:
-            raise ImportError("cluster_on needs scikit-learn; pip install 'rxembed[select]'") from exc
+            raise ImportError("cluster_on needs scikit-learn; pip install 'rxembed[workflow]'") from exc
 
         feats = PCA(reduce).fit_transform(feats)
     try:
         from sklearn.cluster import HDBSCAN
     except ImportError as exc:
-        raise ImportError("cluster_on needs scikit-learn; pip install 'rxembed[select]'") from exc
+        raise ImportError("cluster_on needs scikit-learn; pip install 'rxembed[workflow]'") from exc
 
     return np.asarray(
         HDBSCAN(min_cluster_size=min_cluster, cluster_selection_method="leaf", copy=True).fit_predict(feats)
@@ -344,7 +344,7 @@ def nearest_kept(mol, kept, dropped):
     try:
         from prism_pruner.rmsd import rmsd_and_max
     except ImportError as exc:
-        raise ImportError("nearest_kept needs prism_pruner; pip install 'rxembed[select]'") from exc
+        raise ImportError("nearest_kept needs prism_pruner; pip install 'rxembed[workflow]'") from exc
 
     heavy = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
     pos = {i: mol.GetConformer(i).GetPositions()[heavy] for i in list(kept) + list(dropped)}
@@ -377,14 +377,14 @@ def apply(
         try:
             from prism_pruner.pruner import prune_by_moment_of_inertia as prune_by_moi
         except ImportError as exc:
-            raise ImportError("apply needs prism_pruner; pip install 'rxembed[select]'") from exc
+            raise ImportError("apply needs prism_pruner; pip install 'rxembed[workflow]'") from exc
 
         return keep_mask(prune_by_moi(coords, atoms, moi_dev, en, energy_window)[1])
     if method == "rmsd":
         try:
             from prism_pruner.pruner import prune_by_rmsd
         except ImportError as exc:
-            raise ImportError("apply needs prism_pruner; pip install 'rxembed[select]'") from exc
+            raise ImportError("apply needs prism_pruner; pip install 'rxembed[workflow]'") from exc
 
         return keep_mask(prune_by_rmsd(coords, atoms, max_rmsd, None, en, energy_window)[1])
     if method == "descriptor":
@@ -428,7 +428,7 @@ def _descriptor_config():
     try:
         from prism_pruner.pruner import PrunerConfig
     except ImportError as exc:
-        raise ImportError("_descriptor_config needs prism_pruner; pip install 'rxembed[select]'") from exc
+        raise ImportError("_descriptor_config needs prism_pruner; pip install 'rxembed[workflow]'") from exc
 
     @dataclass
     class _DescriptorConfig(PrunerConfig):
@@ -467,6 +467,6 @@ def descriptor_prune(coords, features, energies, *, labels=None, max_dist=1.0, e
     try:
         from prism_pruner.pruner import _run
     except ImportError as exc:
-        raise ImportError("descriptor_prune needs prism_pruner; pip install 'rxembed[select]'") from exc
+        raise ImportError("descriptor_prune needs prism_pruner; pip install 'rxembed[workflow]'") from exc
 
     return np.asarray(_run(cfg)[1], bool)

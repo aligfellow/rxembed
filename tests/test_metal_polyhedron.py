@@ -1,9 +1,4 @@
-"""`metal_polyhedron`: the POLYHEDRA records, their codes/aliases, and the table-derived predicates.
-
-Table facts only: no embed, no force field. What a record can get wrong on its own: an angle row that
-disagrees with the vertex directions it indexes, a code that collides, a shape that is not distinct from its
-CN neighbours.
-"""
+"""Test polyhedron records, aliases and derived predicates."""
 
 from __future__ import annotations
 
@@ -32,7 +27,7 @@ from rxembed.metal_polyhedron import (
 # --- codes and aliases --------------------------------------------------------------------------------
 
 
-def test_every_record_resolves_from_its_code_and_agrees_on_its_vertex_count():
+def test_records_resolve_and_match_vertex_count():
     for name, p in POLYHEDRA.items():
         assert resolve_geometry(p.code) == name, f"{p.code} does not resolve to {name}"
         assert n_sites(name) == p.cn == len(p.vertex_dirs), f"{name}: cn {p.cn} is not its vertex count"
@@ -47,7 +42,7 @@ def test_every_record_resolves_from_its_code_and_agrees_on_its_vertex_count():
         assert not same, f"{name}: vertices {same} point the same way"
 
 
-def test_the_alias_table_has_no_collision_and_resolves_case_insensitively():
+def test_aliases_are_unique_and_case_insensitive():
     names, codes = [n.lower() for n in POLYHEDRA], [p.code.lower() for p in POLYHEDRA.values() if p.code]
     assert len(codes) == len(set(codes)), "two polyhedra share a 3-letter code"
     assert not set(names) & set(codes), "a polyhedron name is spelled like another's code"
@@ -64,7 +59,7 @@ def test_the_alias_table_has_no_collision_and_resolves_case_insensitively():
 # --- the records themselves ---------------------------------------------------------------------------
 
 
-def test_every_hand_authored_angle_row_is_the_angle_its_own_vertices_subtend():
+def test_angle_rows_match_vertex_geometry():
     for name, p in POLYHEDRA.items():
         if p.angles is None:  # CN7 / CN8: no hand-authored rows, `resolved_angles` derives them
             continue
@@ -72,7 +67,7 @@ def test_every_hand_authored_angle_row_is_the_angle_its_own_vertices_subtend():
             assert abs(a - _vertex_angle(p.vertex_dirs[i], p.vertex_dirs[j])) <= 0.5, f"{name} row {(i, j, a)}"
 
 
-def test_only_a_flat_based_pyramid_gets_an_umbrella_improper():
+def test_only_flat_based_pyramid_gets_umbrella():
     held = {n: p.umbrella_improper for n, p in POLYHEDRA.items() if p.umbrella_improper is not None}
     assert list(held) == ["trigonal_pyramidal"]
 
@@ -92,7 +87,7 @@ def test_only_a_flat_based_pyramid_gets_an_umbrella_improper():
         assert got == pytest.approx(held["trigonal_pyramidal"], abs=1e-6), f"r={r} Å: the record states {got}°"
 
 
-def test_every_records_angle_table_covers_the_pairs_it_claims():
+def test_angle_tables_cover_claimed_pairs():
     for name, rec in POLYHEDRA.items():
         pairs = {(i, j) for i, j, _a in rec.resolved_angles}
         assert len(pairs) == len(rec.resolved_angles), f"{name}: a vertex pair is stated twice"
@@ -101,7 +96,7 @@ def test_every_records_angle_table_covers_the_pairs_it_claims():
             assert len(pairs) == rec.cn * (rec.cn - 1) // 2, f"{name}: derived table is not all pairs"
 
 
-def test_the_new_records_are_separable_from_their_neighbours_at_the_same_cn():
+def test_new_records_separate_same_cn_neighbors():
     for cn in {p.cn for p in POLYHEDRA.values()}:
         recs = [p for p in POLYHEDRA.values() if p.cn == cn]
         for a, b in itertools.combinations(recs, 2):
@@ -115,7 +110,7 @@ def test_the_new_records_are_separable_from_their_neighbours_at_the_same_cn():
 # --- the fold group, the seating parity and the canonical slot labelling -------------------------------
 
 
-def test_every_records_full_point_group_is_its_rotations_times_one_reflection():
+def test_full_point_group_is_rotations_times_reflection():
     for name, rec in POLYHEDRA.items():
         rot, refl = point_group(tuple(map(tuple, rec.vertex_dirs)))
         assert rot == rotation_group(name), f"{name}: rotation_group is not point_group's proper half"
@@ -125,7 +120,7 @@ def test_every_records_full_point_group_is_its_rotations_times_one_reflection():
         assert (min(refl) == tuple(range(rec.cn))) == rec.planar, f"{name}: planarity disagrees with rot & refl"
 
 
-def test_seat_properly_returns_the_reflection_free_seating_and_flips_with_the_sphere():
+def test_seat_properly_excludes_reflection():
     dirs = POLYHEDRA["octahedral"].vertex_dirs
     obs = np.array(dirs, float) @ np.array([[0.8, -0.6, 0.0], [0.6, 0.8, 0.0], [0.0, 0.0, 1.0]])  # a rotation
     order = list(range(6))
@@ -136,7 +131,7 @@ def test_seat_properly_returns_the_reflection_free_seating_and_flips_with_the_sp
     assert np.linalg.det(both[0] @ both[2]) > 0, "the re-seating is still a reflection"
 
 
-def test_canonical_slots_folds_over_the_rotations_and_not_over_a_reflection():
+def test_canonical_slots_fold_rotations_not_reflection():
     dirs = POLYHEDRA["octahedral"].vertex_dirs
     rot, refl = point_group(tuple(map(tuple, dirs)))
     keys = [("a",), ("b",), ("c",), ("d",), ("e",), ("f",)]  # six distinguishable donors: a chiral labelling

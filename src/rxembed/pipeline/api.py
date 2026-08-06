@@ -22,10 +22,7 @@ from .dispatch import (
     _validate_stereo,
 )
 
-# `metal` is the pipeline's `enumerate_isomers`, exported under a second name rather than shadowing the core
-# one: `rxembed.pipeline` re-exports every core name (it is a strict superset), so both are on that namespace
-# and `pipeline.enumerate_isomers` is the core's. They differ in what they accept -- this one reads a SMILES
-# or an .xyz path and computes the `stereo_ref` fingerprint; the core one takes a Mol and now says so.
+# The workflow name accepts strings and paths; the engine name accepts a Mol.
 from .dispatch import enumerate_isomers as metal
 from .ensemble import Ensemble, EnsembleSet
 
@@ -58,8 +55,8 @@ def embed(
     A constrained embed comes back relaxed into its windows; only the geometry moves.
 
     ``fix`` / ``constrain`` are the core verbs, documented in the `constraints` module docstring. ``template``
-    is sugar for a coords-``fix``: ``(reference, {target_i: ref_i})``, the reference being an .xyz path, Mol,
-    Ensemble or (N,3) array.
+    is sugar for a coords-``fix``: ``(reference, SMARTS_or_map)``. A SMARTS matches the target and a Mol or
+    Ensemble reference; an .xyz path or (N,3) array needs ``{target_i: ref_i}``.
 
     ``stereo=`` governs undefined chirality of a coordinate-free input (point R/S + double-bond E/Z; defined
     centres held, meso dropped, chiral-at-P included, metal never enumerated):
@@ -133,7 +130,7 @@ def minimize(source, *, fix=None, constrain=None, template=None, charge=0, stiff
         )
     if template is not None:  # the same sugar `embed` dissolves: a reference core IS a coordinate fix
         # after the normalise above, so a `fix=[atoms]` list resolves against the geometry just read
-        fix = _template_to_fix(template, fix, mol.GetConformer().GetPositions())
+        fix = _template_to_fix(template, fix, mol.GetConformer().GetPositions(), mol)
     # The surrogate / sphere-hold / graft assembly is the core's (`rxembed.embed.minimize` is the same call
     # with a `Conformers` result); this only wraps it as an `Ensemble` so the pipeline verbs chain off it.
     mol, ids, cons, iso = prepare_relax(spec, fix=fix, constrain=constrain)

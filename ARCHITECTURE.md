@@ -24,19 +24,25 @@ Mol | Isomer
 graft coordinates while it drives the sequence. `bounds.py` edits RDKit's bounds matrix, `relax.py` applies
 the matching restrained-UFF terms, and the result is `Conformers`.
 
-The pipeline adapts strings, paths and external tools around that core:
+The normal API adapts strings, paths and external tools around that core:
 
 ```text
-str | path | Mol | Isomer -> perceive / dispatch -> core embed -> Ensemble | EnsembleSet -> search / select / score
+rxembed.embed(str | path | Mol | Isomer)
+    -> pipeline dispatch -> core constraint / seed / relax seam
+    -> Ensemble | EnsembleSet | list[EnsembleSet] -> search / select / score
 ```
 
 ## Tiers
 
-`src/rxembed/*.py` is core. Its modules import NumPy, RDKit and siblings with relative imports. Core never
-imports `pipeline`.
+The flat implementation modules are core. They import NumPy, RDKit and siblings with relative imports and
+never import `pipeline`. `core.py` is their public engine facade.
 
 `src/rxembed/pipeline/` owns input perception, orchestration and optional tools. It imports core absolutely.
 Optional dependencies are imported at the point of use.
+
+`__init__.py` is the user facade. It re-exports the core types and helpers, but its `embed` and `minimize` are
+the workflow versions from `pipeline.api`. The facade contains no logic; implementation dependencies remain
+one-way from pipeline to core.
 
 The base distribution also installs `networkx` for the vendored xyz2mol perceiver. No core module imports it;
 the embed engine remains NumPy and RDKit.
@@ -50,20 +56,21 @@ atoms.
 ```python
 import rxembed as rx
 
-rx.embed(mol, fix={(i, j): 2.0}).minimize()  # Mol | Isomer -> Conformers
-
-import rxembed.pipeline as rx
-
 rx.embed("cat.substrate", contacts="auto").mc().prune().score("gxtb")
+
+from rxembed import core
+
+core.embed(mol, fix={(i, j): 2.0}).minimize()  # Mol | Isomer -> Conformers
 ```
 
-The two `embed` functions have different signatures. Installing extras never changes the root function.
-`rxembed.pipeline` re-exports the core surface and adds pipeline names.
+There is one normal `rxembed.embed`. `rxembed.core.embed` is the explicit engine seam for another library that
+already owns the molecular graph. Optional backends are enabled only by calling their operation.
 
 ## Ownership
 
 | owner | responsibility |
 |---|---|
+| `__init__.py`, `core.py` | workflow and engine facades; no implementation |
 | `constraints.py`, `mechanisms.py` | constraint data and its DG/FF interpretation |
 | `bounds.py`, `embed.py`, `relax.py` | seed, orchestrate and relax conformers |
 | `metal_polyhedron.py`, `metal_isomers.py`, `metal_coordination.py` | shapes, arrangements and coordination constraints |

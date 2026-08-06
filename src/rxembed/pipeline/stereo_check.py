@@ -72,11 +72,11 @@ def signature(mol, conf_id=-1, charge=0):
     try:
         import xyzgraph
     except ImportError as exc:
-        raise ImportError("signature needs xyzgraph; pip install 'rxembed[perceive]'") from exc
+        raise ImportError("signature needs xyzgraph; pip install 'rxembed[workflow]'") from exc
     try:
         from xyzgraph.stereo import annotate_stereo
     except ImportError as exc:
-        raise ImportError("signature needs xyzgraph; pip install 'rxembed[perceive]'") from exc
+        raise ImportError("signature needs xyzgraph; pip install 'rxembed[workflow]'") from exc
 
     fd, path = tempfile.mkstemp(suffix=".xyz")
     try:

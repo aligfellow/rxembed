@@ -32,7 +32,7 @@ class _Stub(calc.Calculator):
 # --- resolve: the one place a refine spec becomes a calculator ---------------------------------------------
 
 
-def test_resolve_maps_every_kind_of_refine_spec_and_refuses_the_rest():
+def test_resolve_maps_refine_specs_and_rejects_unknown():
     assert calc.resolve(None) is None
     assert calc.resolve("ff") is None
 
@@ -47,7 +47,7 @@ def test_resolve_maps_every_kind_of_refine_spec_and_refuses_the_rest():
         calc.resolve("dft")
 
 
-def test_the_base_calculator_names_itself_when_it_has_no_optimiser():
+def test_base_calculator_names_missing_optimizer():
     with pytest.raises(NotImplementedError, match="_Stub"):
         _Stub().optimize(None)
 
@@ -55,14 +55,14 @@ def test_the_base_calculator_names_itself_when_it_has_no_optimiser():
 # --- the xtb interface: what it refuses before ever running the binary --------------------------------------
 
 
-def test_xtb_optimize_refuses_a_bad_spec_before_it_runs_the_binary():
+def test_xtb_optimize_validates_before_execution():
     with pytest.raises(ValueError, match="unknown xtb opt level"):
         calc.xtb_optimize(None, level="thorough")
     with pytest.raises(ValueError, match="no implicit solvent"):
         calc.xtb_optimize(None, method="gxtb", solvent="water")
 
 
-def test_the_thermodynamic_cycle_fires_for_solvated_gxtb_and_for_nothing_else(monkeypatch):
+def test_solvated_gxtb_uses_thermodynamic_cycle(monkeypatch):
     energies = {("gxtb", None): -10.0, ("gfn2", "water"): -5.5, ("gfn2", None): -5.0}
     seen = []
 
@@ -83,13 +83,13 @@ def test_the_thermodynamic_cycle_fires_for_solvated_gxtb_and_for_nothing_else(mo
 # --- parsing xtb's output: be loud, never return a plausible None ------------------------------------------
 
 
-def test_the_energy_parser_reads_the_total_energy_line_or_says_it_could_not():
+def test_energy_parser_reads_total_or_raises():
     assert calc._energy("random preamble\n :: total energy   -11.3990 Eh ::\ntail") == pytest.approx(-11.3990)
     with pytest.raises(RuntimeError, match="no total energy"):
         calc._energy("normal termination\n")
 
 
-def test_an_xtbopt_is_read_back_as_coords_plus_energy_or_raises(tmp_path):
+def test_xtbopt_returns_coords_and_energy_or_raises(tmp_path):
     good = tmp_path / "xtbopt.xyz"
     good.write_text("2\n energy: -11.399 gnorm: 0.0001\nC 0.0 0.0 0.0\nO 0.0 0.0 1.43\n")
     coords, e = calc._read_xtbopt(str(good))
@@ -106,7 +106,7 @@ def test_an_xtbopt_is_read_back_as_coords_plus_energy_or_raises(tmp_path):
 # --- the ASE wrapper: units are the whole job --------------------------------------------------------------
 
 
-def test_the_ase_wrapper_converts_ev_to_hartree(monkeypatch):
+def test_ase_wrapper_converts_ev_to_hartree(monkeypatch):
     ase = ModuleType("ase")
 
     class _Atoms:
@@ -130,6 +130,6 @@ def test_the_ase_wrapper_converts_ev_to_hartree(monkeypatch):
 
 
 @pytest.mark.skipif(not (shutil.which(XTB) or os.path.exists(XTB)), reason="xtb not on PATH / $XTB_EXE")
-def test_the_xtb_calculator_returns_a_real_energy():
+def test_xtb_calculator_returns_a_real_energy():
     e = calc.XTB("gfnff").energy(_reference_conformer("CCO"), 0)
     assert e < 0.0, f"a bound molecule's GFN-FF energy must be negative, got {e}"

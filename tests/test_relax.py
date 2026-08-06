@@ -1,20 +1,25 @@
-"""`relax.py`: the constraint-enforcing restrained UFF and `bonding_ok`, the arbiter every stage accepts on.
-
-A restrained UFF can satisfy a window by pulling a bond apart, and no energy says so. That is why acceptance
-is `bonding_ok` rather than convergence, and why the exemption it grants a *stated* pair is per PAIR and never
-per atom. The stiffness ladder built on top of this lives in `embed.py`; see `test_embed.py`.
-"""
+"""Test restrained UFF and geometry-based bond acceptance."""
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
-from rdkit.Chem.rdMolTransforms import GetBondLength
+from rdkit.Chem.rdMolTransforms import GetAngleDeg, GetBondLength
 
+from rxembed import relax as relax_module
 from rxembed.constraints import Constraints
-from rxembed.relax import FF_SURROGATE, UFF_GHOST, _bond_pruned, _ff_surrogate, bonding_ok, ff_energies, restrained_uff
+from rxembed.relax import (
+    FF_SURROGATE,
+    UFF_GHOST,
+    _ff_surrogate,
+    bonding_ok,
+    ff_energies,
+    restrained_uff,
+)
 
 
 def _mol(smiles="CCCl", seed=7):
@@ -33,18 +38,34 @@ def _stretch(mol, i, j, length):
     return mol
 
 
+def _sn2():
+    """Return a linear F...C-Cl core with both partial bonds drawn as single bonds."""
+    mol = Chem.AddHs(Chem.MolFromSmiles("[F-].CCl"))
+    rdDistGeom.EmbedMolecule(mol, randomSeed=7)
+    conf = mol.GetConformer()
+    c, cl = np.array(conf.GetAtomPosition(1)), np.array(conf.GetAtomPosition(2))
+    axis = (cl - c) / np.linalg.norm(cl - c)
+    conf.SetAtomPosition(0, (c - 2.0 * axis).tolist())
+    rw = Chem.RWMol(mol)
+    rw.AddBond(0, 1, Chem.BondType.SINGLE)
+    rw.GetAtomWithIdx(1).SetHybridization(Chem.HybridizationType.SP3D)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    return mol
+
+
 # ---------------------------------------------------------------------------------------------------------
 # bonding_ok: the arbiter
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_a_stated_distance_is_not_judged_as_a_bond():
+def test_stated_distance_is_not_judged_as_a_bond():
     mol = _stretch(_mol(), 1, 2, 2.4)
     assert not bonding_ok(mol, 0), "unconstrained, a 2.4 A C-Cl should read as torn"
     assert bonding_ok(mol, 0, constrained={(1, 2): (2.35, 2.45)}), "a stated pair must be exempt"
 
 
-def test_the_exemption_is_per_pair_not_per_atom():
+def test_exemption_is_per_pair_not_per_atom():
     mol = _stretch(_stretch(_mol(), 1, 2, 2.4), 0, 1, 4.0)
     assert not bonding_ok(mol, 0, constrained={(1, 2): (2.35, 2.45)}), (
         "stating C-Cl must not excuse the torn C-C that shares atom 1"
@@ -56,7 +77,7 @@ def test_the_exemption_is_per_pair_not_per_atom():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_restrained_uff_pulls_a_stated_pair_toward_its_window():
+def test_restrained_uff_pulls_pair_into_window():
     mol = _mol()
     before = GetBondLength(mol.GetConformer(0), 1, 2)
     restrained_uff(mol, Constraints(distances={(1, 2): (2.35, 2.45)}))
@@ -72,7 +93,7 @@ def test_max_iters_zero_scores_without_moving_an_atom():
     assert np.allclose(mol.GetConformer(0).GetPositions(), before), "max_iters=0 moved atoms"
 
 
-def test_ff_energies_is_unconstrained_and_so_is_not_interchangeable():
+def test_ff_energies_excludes_constraint_penalties():
     mol = _mol()
     cons = Constraints(distances={(1, 2): (2.35, 2.45)})  # unsatisfied by the seed -> a real penalty
     restrained = float(restrained_uff(Chem.Mol(mol), cons, max_iters=0)[0])
@@ -80,12 +101,91 @@ def test_ff_energies_is_unconstrained_and_so_is_not_interchangeable():
     assert restrained != pytest.approx(plain), "the restrained energy carried no constraint penalty"
 
 
+def test_force_field_minimizer_failure_rolls_back_the_batch(monkeypatch):
+    mol = _mol()
+    failed = mol.AddConformer(Chem.Conformer(mol.GetConformer()), assignId=True)
+    before = {c.GetId(): c.GetPositions().copy() for c in mol.GetConformers()}
+
+    def force_field(target, **kwargs):
+        conf_id = kwargs["confId"]
+
+        def diverge(**kwargs):
+            target.GetConformer(conf_id).SetAtomPosition(0, (99.0, 99.0, 99.0))
+            if conf_id == failed:
+                raise RuntimeError("BFGS diverged")
+
+        return SimpleNamespace(Initialize=lambda: None, Minimize=diverge, CalcEnergy=lambda: 12.5)
+
+    monkeypatch.setattr(relax_module._mech, "MECHANISM_ORDER", ())
+    monkeypatch.setattr(relax_module.rdForceFieldHelpers, "UFFHasAllMoleculeParams", lambda mol: True)
+    monkeypatch.setattr(relax_module.rdForceFieldHelpers, "UFFGetMoleculeForceField", force_field)
+
+    with pytest.raises(RuntimeError, match="UFF minimization failed: BFGS diverged"):
+        restrained_uff(mol, Constraints())
+    for cid, positions in before.items():
+        assert np.array_equal(mol.GetConformer(cid).GetPositions(), positions), (
+            "a failed batch left partial coordinates"
+        )
+
+
+def test_untypable_fixed_core_still_relaxes_periphery(caplog):
+    mol = _sn2()
+    before = mol.GetConformer().GetPositions().copy()
+
+    with caplog.at_level("WARNING", logger="rxembed.relax"):
+        energies = restrained_uff(mol, Constraints(frozen={0, 1, 2}))
+
+    after = mol.GetConformer().GetPositions()
+    assert np.isfinite(energies).all()
+    assert np.array_equal(after[[0, 1, 2]], before[[0, 1, 2]]), "the fixed TS core moved"
+    ch = [GetBondLength(mol.GetConformer(), 1, h) for h in (3, 4, 5)]
+    assert ch == pytest.approx([1.1094] * 3, abs=0.01), "the private FF graph damaged the free C-H bonds"
+    assert min(GetAngleDeg(mol.GetConformer(), h, 1, k) for h, k in ((3, 4), (3, 5), (4, 5))) > 115.0, (
+        "the private FF graph lost the trigonal-bipyramidal TS angle terms"
+    )
+    assert mol.GetNumBonds() == 5, "the public graph was replaced by the force-field copy"
+    assert all(b.GetBondType() == Chem.BondType.SINGLE for b in mol.GetBonds())
+    assert "retyped 1 fixed-core bond(s) as outward dative edges" in caplog.text
+
+
+def test_fallback_skips_untypable_candidate_bonds():
+    normal = _mol("CCCC")
+    reactive = _sn2()
+    offset = normal.GetNumAtoms()
+    mol = Chem.CombineMols(normal, reactive, Chem.rdGeometry.Point3D(8, 0, 0))
+    frozen = {0, 1, 2, 3} | {offset, offset + 1, offset + 2}
+
+    assert np.isfinite(restrained_uff(mol, Constraints(frozen=frozen))).all()
+
+
+def test_fallback_retypes_multiple_reactive_centres(caplog):
+    first = _sn2()
+    second = _sn2()
+    offset = first.GetNumAtoms()
+    mol = Chem.CombineMols(first, second, Chem.rdGeometry.Point3D(8, 0, 0))
+    frozen = {0, 1, 2, offset, offset + 1, offset + 2}
+
+    with caplog.at_level("WARNING", logger="rxembed.relax"):
+        assert np.isfinite(restrained_uff(mol, Constraints(frozen=frozen))).all()
+    assert "retyped 2 fixed-core bond(s)" in caplog.text
+
+
+def test_haptic_phantom_composes_with_core_fallback():
+    mol = _sn2()
+    cons = Constraints(frozen={0, 1, 2}, haptic={6: (3, 4, 5)}, phantoms=frozenset({6}))
+
+    energy = restrained_uff(mol, cons)
+
+    assert np.isfinite(energy).all()
+    assert [GetBondLength(mol.GetConformer(), 1, h) for h in (3, 4, 5)] == pytest.approx([1.1094] * 3, abs=0.01)
+
+
 # ---------------------------------------------------------------------------------------------------------
-# the two force-field preparations restrained_uff runs first
+# the force-field surrogate
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_the_ff_surrogate_retypes_in_place_without_changing_an_index():
+def test_ff_surrogate_preserves_atom_indices():
     organic = _mol()
     assert _ff_surrogate(organic, set(), ()) is organic, "no metal, no phantom, no copy"
 
@@ -96,15 +196,3 @@ def test_the_ff_surrogate_retypes_in_place_without_changing_an_index():
     assert out.GetAtomWithIdx(0).GetAtomicNum() == FF_SURROGATE
     assert out.GetAtomWithIdx(1).GetAtomicNum() == UFF_GHOST
     assert out.GetAtomWithIdx(0).GetDegree() == mol.GetAtomWithIdx(0).GetDegree()
-
-
-def test_the_bond_prune_drops_only_frozen_frozen_bonds_and_is_skipped_when_there_are_none():
-    mol = _mol()
-    assert _bond_pruned(mol, frozen=set()) is None
-    assert _bond_pruned(mol, frozen={0, 2}) is None, "C0 and Cl2 are two bonds apart, so nothing joins two frozen"
-
-    out = _bond_pruned(mol, frozen={0, 1})  # the C-C bond joins two frozen atoms
-    assert out is not None
-    assert out.GetBondBetweenAtoms(0, 1) is None
-    assert out.GetNumBonds() == mol.GetNumBonds() - 1
-    assert out.GetBondBetweenAtoms(1, 2) is not None, "the frozen-free C-Cl bond was dropped too"

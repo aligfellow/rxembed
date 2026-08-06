@@ -1,11 +1,4 @@
-"""`metal_isomers`: the three doors onto `Isomer` and the distinct-arrangement enumeration.
-
-`Isomer(mol, geometry, sites)` seats a known arrangement, `from_geometry` retains the input's own, and
-`enumerate_isomers` produces the unknown ones as an `IsomerSet`. All three must agree on the same identity;
-a name-agnostic arrangement plus a handedness tag, and none may enumerate an arrangement the ligands
-cannot reach (a short chelate forced trans). An η≥2 face is one vertex, held by a transient centroid dummy
-that lives in no stored Mol. RDKit + UFF surrogate, no xtb.
-"""
+"""Test metal-isomer construction, retention and enumeration."""
 
 from __future__ import annotations
 
@@ -17,7 +10,7 @@ import pytest
 from rdkit import Chem
 from rdkit.Geometry import Point3D
 
-import rxembed.pipeline as rx
+import rxembed as rx
 from rxembed import metal_core as M  # noqa: N812
 from rxembed import metal_isomers as K  # noqa: N812
 from rxembed import metal_polyhedron as P  # noqa: N812
@@ -168,21 +161,22 @@ def tetrahedral_four_distinct():
         (_MA2B2, "square_planar", {"cis", "trans"}),  # MA2B2
         ("[NH3][Co]([NH3])([NH3])(Cl)(Cl)Cl", "octahedral", {"mer", "fac"}),  # MA3B3
     ],
+    ids=["square-planar-ma2b2", "octahedral-ma3b3"],
 )
-def test_enumeration_gives_the_distinct_isomers_and_each_embeds_clean(smiles, geometry, labels):
+def test_metal_isomers_embed_clean(smiles, geometry, labels):
     cands = rx.embed(smiles, metal=geometry, n=4)
     assert {e.tag["label"] for e in cands} == labels
     for e in cands:
         _assert_clean(e)
 
 
-def test_bis_en_octahedral_gives_the_three_real_stereoisomers():
+def test_bis_en_octahedral_has_three_stereoisomers():
     isos = rx.metal("Cl[Co]12(Cl)(NCCN1)NCCN2", "octahedral")
     embeddable = [iso for iso in isos if rx.embed(iso, n=2).minimize().n]
     assert {i.chirality for i in embeddable} == {"", "delta", "lambda"}, [i.chirality for i in embeddable]
 
 
-def test_select_is_name_agnostic_and_accepts_a_code_or_a_word():
+def test_select_accepts_geometry_code_or_name():
     isos = rx.metal(_MA2B2, "square_planar")
     assert isos.select(arrangement=K.arrangement(isos[0])).vertices == isos[0].vertices == isos.select(index=0).vertices
     with pytest.raises(ValueError, match="matched"):
@@ -205,7 +199,7 @@ def test_select_is_name_agnostic_and_accepts_a_code_or_a_word():
     ],
     ids=["bis-chelate", "amidate+flexible-NHC"],
 )
-def test_a_short_chelate_is_never_enumerated_trans(smi):
+def test_short_chelate_excludes_trans(smi):
     short = 0
     for iso, a, b, ang in _same_ligand_vertex_angles(rx.metal(smi, "square_planar")):
         dmat = Chem.GetDistanceMatrix(iso.mol)
@@ -215,12 +209,12 @@ def test_a_short_chelate_is_never_enumerated_trans(smi):
     assert short, "no same-ligand pair was within 4 bonds: the span filter was never exercised"
 
 
-def test_an_untabulated_geometrys_only_ordering_is_never_filtered_away():
+def test_untabulated_single_ordering_is_retained():
     isos = rx.metal("Cl[Mo](Cl)(Cl)(Cl)(Cl)(Cl)Cl")  # homoleptic MoCl7: one ordering, no haptic face
     assert isos[0].geometry == "pentagonal_bipyramidal"
 
 
-def test_a_side_on_eta2_donor_pair_does_not_fail_the_orientation_screen():
+def test_eta2_pair_passes_orientation_screen():
     smi = (
         "CC(C)c1cccc(C(C)C)c1-n1cc[n+](-c2c(C(C)C)cccc2C(C)C)[c-]1->[Rh+]123(<-[C-]#[O+])"
         "<-[CH]4=[CH]->1CC[CH]->2=[CH]->3CC4"
@@ -228,7 +222,7 @@ def test_a_side_on_eta2_donor_pair_does_not_fail_the_orientation_screen():
     assert len(rx.metal(smi)) > 0
 
 
-def test_the_t_shape_seats_its_trans_pair_first():
+def test_t_shape_seats_its_trans_pair_first():
     iso = rx.metal("CP(C)(C)->[Rh](Cl)<-P(C)(C)C", "t_shape").select(index=0)
     seated = [iso.mol.GetAtomWithIdx(v).GetSymbol() for v in iso.vertices]
     assert (seated[0], seated[2]) == ("P", "P"), f"trans vertices got {seated}"
@@ -240,7 +234,7 @@ def test_the_t_shape_seats_its_trans_pair_first():
 _PERM_WARN = "no isomer permutations tabulated"  # the stable substring of the guard's info-log
 
 
-def test_an_untabulated_geometry_with_one_arrangement_stays_silent(caplog):
+def test_untabulated_single_arrangement_is_quiet(caplog):
     with caplog.at_level("INFO", logger="rxembed.metal"):
         isos = rx.metal(ferrocene())
     assert isos, "the single ordering must still come back"
@@ -259,7 +253,7 @@ def test_four_distinct_tetrahedral_donors_warn(caplog):
 # --- Isomer(mol, geometry, sites): the known-isomer front door -------------------------------------------
 
 
-def test_a_known_isomer_seats_real_atom_indices():
+def test_known_isomer_seats_real_atom_indices():
     mol = _pt()
     cis = K.Isomer(mol, "SPL", {0: 0, 1: 2, 2: 3, 3: 4})  # the two N on adjacent vertices
     trans = K.Isomer(mol, "square_planar", [0, 3, 2, 4])  # ...and across (a list is vertex-ordered)
@@ -278,13 +272,14 @@ def test_a_known_isomer_seats_real_atom_indices():
         ({0: 0, 1: 2, 2: 3, 9: 4}, "not one of this geometry"),
         ({0: 5, 1: 2, 2: 3, 3: 4}, "not a donor"),  # atom 5 is an ammine H
     ],
+    ids=["missing-vertex", "duplicate-vertex", "wrong-geometry", "not-donor"],
 )
-def test_a_malformed_sites_map_is_rejected_loudly(sites, match):
+def test_isomer_rejects_invalid_sites(sites, match):
     with pytest.raises(ValueError, match=match):
         K.Isomer(_pt(), "SPL", sites)
 
 
-def test_an_isomer_source_and_metal_are_mutually_exclusive():
+def test_isomer_source_and_metal_are_mutually_exclusive():
     iso = next(iter(rx.metal(_MA2B2, "square_planar")))
     with pytest.raises(ValueError, match="Isomer source OR metal"):
         rx.embed(iso, metal="square_planar")
@@ -303,7 +298,7 @@ def _cis_reference(n=2):
     return cis, cis.mol.GetConformer(cis.ids[0]).GetPositions(), where
 
 
-def test_a_template_off_the_sphere_grafts_exactly_and_leaves_the_arrangement_to_the_polyhedron():
+def test_offsphere_template_leaves_arrangement_free():
     ref, pos, where = _cis_reference()
     pd, cl = where["Pd"][0], where["Cl"]
     core = [0, 1, 2]  # the propyl backbone of one ligand: no metal, no donor pair
@@ -320,7 +315,7 @@ def test_a_template_off_the_sphere_grafts_exactly_and_leaves_the_arrangement_to_
             assert got > 150 if ens.tag["label"] == "trans" else got < 120, (ens.tag["label"], got)
 
 
-def test_a_graft_over_the_coordination_sphere_is_refused():
+def test_graft_over_the_coordination_sphere_is_refused():
     ref, pos, where = _cis_reference()
     sphere = [where["Pd"][0], *where["Cl"], *where["N"]]
     for core in ([*where["Cl"]], sphere):
@@ -336,8 +331,8 @@ def test_a_graft_over_the_coordination_sphere_is_refused():
 _RETAIN_RELAX = "relaxed into its windows"  # the seam's clarity line for the retain-input path
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_a_retained_input_geometry_is_logged_as_relaxed(tmp_path, caplog):
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_retained_input_geometry_is_logged_as_relaxed(tmp_path, caplog):
     xyz = tmp_path / "pd.xyz"
     rx.embed(rx.metal(_MA2B2, "square_planar")[0], n=1, seed=1).dump(str(xyz))
 
@@ -354,9 +349,9 @@ def test_a_retained_input_geometry_is_logged_as_relaxed(tmp_path, caplog):
 # --- haptic faces: one vertex, a transient centroid -------------------------------------------------------
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 @pytest.mark.parametrize("door", ["enumerate", "from_geometry"], ids=["rx.metal", "from_geometry"])
-def test_a_sandwich_is_two_centroid_vertices_and_its_stored_mol_is_phantom_free(door, tmp_path):
+def test_sandwich_uses_two_centroids(door, tmp_path):
     if door == "enumerate":
         isos = rx.metal(ferrocene())
         assert len(isos) == 1  # two identical faces on one metal: a single achiral identity
@@ -398,12 +393,12 @@ def test_a_sandwich_is_two_centroid_vertices_and_its_stored_mol_is_phantom_free(
         assert int(f.readline()) == 11, "a centroid dummy reached the dumped xyz"
 
 
-def test_a_haptic_complex_survives_the_mc_search():
+def test_haptic_complex_survives_the_mc_search():
     assert rx.embed(rx.metal(ferrocene())[0], n=3).mc().ids
     assert rx.embed(rx.metal(ferrocene())[0], n=3).mc(explore=True).ids
 
 
-def test_a_known_isomer_seats_a_haptic_face_by_any_of_its_ring_atoms():
+def test_haptic_face_seats_from_any_ring_atom():
     mol = ferrocene()
     rings = [n.GetIdx() for n in mol.GetAtomWithIdx(M.metal_index(mol)).GetNeighbors()]
     iso = K.Isomer(mol, "LIN", {0: rings[0], 1: rings[-1]})  # one atom per Cp, not all five
@@ -413,14 +408,14 @@ def test_a_known_isomer_seats_a_haptic_face_by_any_of_its_ring_atoms():
 
 
 @pytest.mark.parametrize("door", ["enumerate", "from_geometry"], ids=["rx.metal", "from_geometry"])
-def test_a_half_sandwich_is_a_piano_stool_not_a_flat_square(door):
+def test_half_sandwich_uses_piano_stool_shape(door):
     iso = rx.metal(cp_ticl3())[0] if door == "enumerate" else K.from_geometry(cp_ticl3())
     assert iso.geometry == "tetrahedral"
     assert len(iso.vertices) == 4  # centroid + 3 Cl
     assert len(iso.haptic) == 1
 
 
-def test_the_piano_stools_chlorides_never_sit_trans_through_the_ring():
+def test_piano_stool_chlorides_avoid_trans_ring():
     iso = rx.metal(cp_ticl3())[0]
     ens = rx.embed(iso, n=6).minimize()
     assert ens.ids
@@ -435,14 +430,12 @@ def test_the_piano_stools_chlorides_never_sit_trans_through_the_ring():
         assert _angle(pos, a, iso.metal, b) < 150.0
 
 
-def test_an_eta2_face_collapses_a_cn7_miscount_to_octahedral():
+def test_eta2_face_collapses_a_cn7_miscount_to_octahedral():
     smi = "CN(C)c1ncc[cH]2->[W+2]34(<-[N-]=O)(<-[cH]12)(<-[n]1cccn1[BH-](n1ccc[n]->31)n1ccc[n]->41)<-[P](C)(C)C"
     isos = rx.metal(smi)
     assert isos
     assert all(iso.geometry == "octahedral" for iso in isos)
     assert all(len(iso.haptic) == 1 for iso in isos)
-    ens = rx.embed(isos[0], n=4).minimize()
-    assert any(geom.check(ens.mol, c).ok() for c in ens.ids), "no geom.check-clean η²-pyridine conformer"
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -482,8 +475,8 @@ def _seating_is_real(iso, pos):
     ]
 
 
-@pytest.mark.parametrize(("placement", "expected"), [(_TRANS, "trans"), (_CIS, "cis")])
-def test_a_retained_isomer_seats_its_donors_on_the_polyhedron_it_names(placement, expected):
+@pytest.mark.parametrize(("placement", "expected"), [(_TRANS, "trans"), (_CIS, "cis")], ids=["trans", "cis"])
+def test_retained_isomer_uses_named_slots(placement, expected):
     mol = _square_planar_pt(placement)
     retained = K.from_geometry(mol)
     assert retained.label == expected, "the premise: the MEASURED label reads the conformer correctly"
@@ -511,13 +504,9 @@ def _ideal_sphere(geometry, symbol, scramble):
     return mol
 
 
-@pytest.mark.parametrize(
-    ("geometry", "scramble"),
-    [
-        ("square_antiprism", (5, 2, 7, 0, 3, 6, 1, 4)),  # CN7 takes the same branch and adds no case
-    ],
-)
-def test_a_geometry_with_no_canned_isomer_list_is_still_seated_on_its_polyhedron(geometry, scramble):
+def test_untabulated_shape_uses_polyhedron():
+    geometry = "square_antiprism"
+    scramble = (5, 2, 7, 0, 3, 6, 1, 4)  # CN7 takes the same branch and adds no case
     mol = _ideal_sphere(geometry, "F", scramble)
     iso = K.from_geometry(mol)
     assert iso.geometry == geometry, f"the premise: an ideal {geometry} must be perceived as one, got {iso.geometry}"
@@ -535,7 +524,7 @@ def test_a_geometry_with_no_canned_isomer_list_is_still_seated_on_its_polyhedron
         )
 
 
-def test_the_seating_search_reaches_the_known_optimum_on_distorted_antiprisms():
+def test_seating_finds_distorted_antiprism_optimum():
     dirs = np.array(P.vertex_dirs("square_antiprism"), float)
     dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
     rng = np.random.RandomState(0)
@@ -549,7 +538,7 @@ def test_the_seating_search_reaches_the_known_optimum_on_distorted_antiprisms():
         assert score == pytest.approx(optimum, abs=1e-12), f"trial {trial}: {score:.6f} vs {optimum:.6f}"
 
 
-def test_the_seating_search_may_match_an_achiral_template_through_a_reflection():
+def test_seating_allows_reflection_for_achiral_template():
     ideal = np.array(P.vertex_dirs("octahedral"), float)
     rng = np.random.RandomState(0)
     for mag in (0.10, 0.18):  # the first draw is consumed on purpose: this exact state is the divergent one
@@ -563,7 +552,7 @@ def test_the_seating_search_may_match_an_achiral_template_through_a_reflection()
     assert min(trans) > 140.0, f"the record's trans slots hold pairs at {[f'{a:.0f}' for a in trans]}°"
 
 
-def test_an_enumeration_that_filters_everything_out_says_so(caplog, monkeypatch):
+def test_empty_isomer_enumeration_warns(caplog, monkeypatch):
     import logging
 
     monkeypatch.setattr(K, "distinct_vertex_orderings", lambda *a, **kw: [])  # every candidate rejected

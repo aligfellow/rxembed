@@ -30,7 +30,7 @@ _PERCEIVERS = {"xyzgraph", "xyz2mol"}
 logger = logging.getLogger("rxembed")
 
 
-def _xyz_to_mol(path, charge=0, connectivity="xyzgraph", bond_orders="xyzgraph"):
+def read_xyz(path, charge=0, connectivity="xyzgraph", bond_orders="xyzgraph"):
     """Read an ``.xyz`` into a Mol with perceived bonds and a conformer; robust for metals and TSs.
 
     `connectivity` is ``"xyzgraph"`` or ``"xyz2mol"``, which uses a wider tolerance and so picks up
@@ -61,9 +61,6 @@ def _xyz_to_mol(path, charge=0, connectivity="xyzgraph", bond_orders="xyzgraph")
     with contextlib.suppress(Exception):  # a tag we cannot read is not a reason to fail the read
         assign_stereo_from_3d(mol)  # the one door, so an M-L dative sits in the basis its readers use
     return mol
-
-
-read_xyz = _xyz_to_mol  # the public name: five notebooks already import the private one
 
 
 def _from_xyz2mol(path, charge):
@@ -131,7 +128,7 @@ def _from_rdkit(path, charge):
         raise ValueError(
             f"could not perceive bonds in {path}: RDKit's perceiver is organic-only, and this is "
             f"neither a molecule it accepts nor a metal complex. For a stretched TS core, "
-            f"pip install 'rxembed[perceive]' for xyzgraph ({exc})"
+            f"pip install 'rxembed[workflow]' for xyzgraph ({exc})"
         ) from exc
     return mol
 

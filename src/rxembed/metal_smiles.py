@@ -1,16 +1,15 @@
 """Read a metal complex from a SMILES, and write one back as a canonical dative CXSMILES.
 
 Both halves of one contract, which is why they share a module. The writer indexes its ``atomProp`` block by
-POSITION in the string it has just written, and the reader has to parse with exactly the hydrogens the writer
-counted or every index in the block addresses a different atom. Two modules with two owners is how that
-agreement rots silently.
+POSITION in the string it has just written, and the reader has to preserve any explicit coordination hydrogen
+that owns a slot. Ordinary hydrogens stay implicit. Two modules with two owners is how that agreement rots.
 
 Two layers, and the split between them is the point:
 
-- `dative_smiles` / `write_dative`: the CONSTITUTION. Connectivity, charges and ligand stereocentres, with
+- `dative_smiles` / `write_dative`: the canonical constitution. Connectivity, charges and ligand stereocentres, with
   every M-donor bond normalised to the ionic dative form. cis and trans give one string here, as do fac and
   mer.
-- `canonical_smiles`: that string plus ``|atomProp:…|``, carrying the arrangement the SMILES grammar cannot
+- `cxsmiles`: canonical CXSMILES, adding ``|atomProp:…|`` to carry the arrangement the SMILES grammar cannot
   say. OpenSMILES has a chirality class for 3 of the 12 rxembed polyhedra with geometric isomerism, so the
   block is the only carrier for the other nine.
 
@@ -42,6 +41,7 @@ from .metal_core import (
     VACANT,
     _chelate_edges,
     _donor_classes,
+    _remove_routine_hydrogens,
     connect_metal,
     donated_charge,
     ligand_valence,
@@ -57,9 +57,9 @@ logger = logging.getLogger("rxembed.metal")  # spelled out, not __name__: the na
 def parse_smiles(smi):
     """Parse a SMILES to a Mol, raising a clear error instead of returning ``None`` (which crashes downstream).
 
-    A CXSMILES carrying an `atomProp` block keeps its explicit hydrogens, because a block index is a position
-    in the written atom order (`write_dative` returns exactly that order) and the default parser renumbers
-    every atom underneath it by removing them. Only that case, so a plain SMILES is read exactly as before.
+    A CXSMILES carrying an `atomProp` block keeps any explicit hydrogen the writer retained as a coordination
+    site, because a block index is a position in the written atom order. Only that case, so a plain SMILES is
+    read exactly as before.
 
     The one SMILES door for both tiers, for the same reason `utils.assign_stereo_from_3d` is the one stereo
     door: a second parser that did not know about the block would read the arrangement onto the wrong atoms.
@@ -81,7 +81,7 @@ _METAL_STEREO_TAGS = frozenset(  # the non-tetrahedral classes perception leaves
 
 
 def _donate_to_metal(rw):
-    """Rewrite every M-L bond a SMILES cannot spell covalently as a dative one, donor -> metal, in place.
+    """Normalize M-L bonds from the donor's ligand-side valence, in place.
 
     Two cases, one rule. An anionic donor held by a covalent bond is the charge counted twice: `[Cl-]` has a
     full octet, so `[Cl-][Ti+4]` will not sanitize, and donating spends the metal's valence instead. 18 of 45
@@ -94,12 +94,11 @@ def _donate_to_metal(rw):
     A donor whose ligand side is already full - an ammine, a phosphine, an aqua - moves no charge either way,
     but a covalent bond is still one valence more than it has: `[NH3][Pt]` will not parse. Perception writes
     those dative to begin with, so that third branch acts only on a sphere rebuilt from an `Isomer`, which
-    hands its sigma donors back single on purpose (`_rebuild`). A partly filled donor is left exactly as it
-    arrived, because `CN(C)[Pd]` is a legal neutral nitrogen and charging it is the Kekule artefact
-    `donated_charge` refuses; the cost is that the amide and the alkyl are the two donor classes whose two
-    Lewis forms still write two strings.
+    hands its sigma donors back single on purpose (`_rebuild`). A partly filled neutral donor is written single,
+    so a finalized dative graph returns to the same form without inventing a charge. An anionic form stays
+    distinct; amide and alkyl are therefore the two donor classes whose neutral and ionic forms write two strings.
     """
-    ionic, charged = [], {}
+    ionic, covalent, charged = [], [], {}
     for bond in rw.GetBonds():
         i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
         for m, d in ((i, j), (j, i)):
@@ -114,6 +113,16 @@ def _donate_to_metal(rw):
                 charged.setdefault(d, m)  # a bridged donor charges once, against the first metal holding it
             elif single and ligand_valence(donor) >= _PT.GetDefaultValence(donor.GetAtomicNum()) > 0:
                 ionic.append((d, m))  # a full shell: no charge to move, but no valence left to hold a bond
+            elif not single and not donor.GetFormalCharge():
+                valence = ligand_valence(donor)
+                other_donors = [
+                    n.GetIdx()
+                    for n in rw.GetAtomWithIdx(m).GetNeighbors()
+                    if n.GetIdx() != d and n.GetAtomicNum() not in COORDINATION_METALS
+                ]
+                haptic = any(rw.GetBondBetweenAtoms(d, other) is not None for other in other_donors)
+                if not haptic and 0 < valence < _PT.GetDefaultValence(donor.GetAtomicNum()):
+                    covalent.append((d, m))
             break
     for d, m in charged.items():
         q = donated_charge(rw.GetAtomWithIdx(d))
@@ -122,13 +131,16 @@ def _donate_to_metal(rw):
     for d, m in ionic:
         remove_bond(rw, d, m)  # re-seats the bond LAST at the metal, so the donor's tag moves basis with it
         rw.AddBond(d, m, Chem.BondType.DATIVE)
+    for d, m in covalent:
+        remove_bond(rw, d, m)
+        rw.AddBond(d, m, Chem.BondType.SINGLE)
 
 
 def dative_smiles(mol):
-    """Write the complex as a SMILES with dative M-donor bonds, checked to parse back to the same atoms.
+    """Write canonical SMILES with dative M-donor bonds and ordinary hydrogens implicit.
 
     The constitution layer: connectivity, charges and ligand stereocentres. The metal's arrangement is not
-    written, so cis and trans give one string, as do fac and mer; `canonical_smiles` is the layer that adds
+    written, so cis and trans give one string, as do fac and mer; `cxsmiles` is the layer that adds
     it. Not a species key on its own.
     """
     return write_dative(mol)[0]
@@ -138,7 +150,7 @@ def write_dative(mol):
     """Return ``(smiles, {atom: its position in that string's atom order})``: `dative_smiles` plus the order.
 
     The positions are what an `atomProp` block indexes, so the CXSMILES writer needs them and cannot get
-    them from the string.
+    them from the string. Only atoms that remain explicit have a position.
 
     Perception already writes M-donor bonds as dative, so this is `MolToSmiles` plus the two repairs SMILES
     needs. A hydrogen with more than one connection - a side-on H2, a bridging hydride, an H-bond relay
@@ -149,6 +161,11 @@ def write_dative(mol):
     Raises rather than hand back a string that does not round-trip, since a SMILES you cannot read back is
     worse than none.
     """
+    expected_mol = Chem.Mol(mol)
+    expected_mol.UpdatePropertyCache(strict=False)
+    expected = expected_mol.GetNumAtoms() + sum(
+        a.GetTotalNumHs() for a in expected_mol.GetAtoms() if a.GetAtomicNum() != 1
+    )
     rw = Chem.RWMol(mol)
     pos = mol.GetConformer().GetPositions() if mol.GetNumConformers() else None
     for atom in mol.GetAtoms():
@@ -179,18 +196,31 @@ def write_dative(mol):
             atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
             if atom.HasProp("_chiralPermutation"):
                 atom.ClearProp("_chiralPermutation")
-    out.UpdatePropertyCache(strict=False)
+
+    # Suppress routine AddHs output. A hydrogen bound to the metal remains explicit because it can own a slot.
+    keep_h = [
+        atom.GetIdx()
+        for atom in out.GetAtoms()
+        if atom.GetAtomicNum() == 1 and any(n.GetAtomicNum() in COORDINATION_METALS for n in atom.GetNeighbors())
+    ]
+    out, reduced = _remove_routine_hydrogens(out, keep_h)
+    original = {new: old for old, new in reduced.items()}
     smi = Chem.MolToSmiles(out)
     back = Chem.MolFromSmiles(smi)
-    if back is None or Chem.AddHs(back).GetNumAtoms() != mol.GetNumAtoms():
-        got = "does not parse" if back is None else f"parses back as {Chem.AddHs(back).GetNumAtoms()} atoms"
+    actual = (
+        None
+        if back is None
+        else back.GetNumAtoms() + sum(a.GetTotalNumHs() for a in back.GetAtoms() if a.GetAtomicNum() != 1)
+    )
+    if actual != expected:
+        got = "does not parse" if actual is None else f"parses back as {actual} atoms"
         raise ValueError(
-            f"could not write a round-tripping SMILES for this complex ({mol.GetNumAtoms()} atoms): the "
+            f"could not write a round-tripping SMILES for this complex ({expected} atoms including H): the "
             f"result {got}. The perceived graph is likely one SMILES cannot express (a hypervalent or "
             f"partial-bond centre); work from the Mol itself."
         )
     written = out.GetPropsAsDict(True, True)["_smilesAtomOutputOrder"]  # MolToSmiles sets it: position -> atom
-    return smi, {int(a): p for p, a in enumerate(written)}
+    return smi, {original[int(a)]: p for p, a in enumerate(written)}
 
 
 # --- the arrangement layer: the canonical slot note ------------------------------------------------------
@@ -281,27 +311,39 @@ def _site_keys(iso, ranks, pos):
     return keys
 
 
-def _slot_notes(iso, keys, slots, at):
-    """Return ``{atom: 's<n>'}``, pairing sorted sites with sorted slots inside each key class.
+def _slot_notes(iso, keys, slots, at, bites):
+    """Return canonical slot notes without separating donors that belong to one ligand.
 
-    The fold leaves interchangeable sites tied by construction, so which of them a tied frame numbered
-    first is arbitrary; pairing within the class makes the rendered note independent of that choice. The
-    sites are paired, not their atoms: a haptic face is several atoms holding one slot, and pairing atoms
-    would hand two rings of one class five slots each.
+    Identical chelates may swap as units. Assigning their donors independently can break a bite and flip the
+    metal hand.
     """
-    by_key = {}
-    for v, d in enumerate(iso.vertices):
-        if d == VACANT:
-            continue
-        atoms = tuple(iso.haptic[d]) if d in iso.haptic else (d,)
-        by_key.setdefault(keys[v], []).append((min(at[a] for a in atoms), atoms))
+    groups = [{v} for v, d in enumerate(iso.vertices) if d != VACANT]
+    for bite in bites:
+        joined = [group for group in groups if group & bite]
+        groups = [group for group in groups if group not in joined] + [set().union(*joined)]
+
+    by_ligand = {}
+    for group in groups:
+        sites = []
+        assigned = []
+        for v in group:
+            d = iso.vertices[v]
+            atoms = tuple(iso.haptic[d]) if d in iso.haptic else (d,)
+            sites.append((keys[v], min(at[a] for a in atoms), atoms))
+            assigned.append((keys[v], slots[v]))
+        by_ligand.setdefault(tuple(sorted(keys[v] for v in group)), []).append((sites, assigned))
+
     notes = {}
-    for key, group in by_key.items():
-        for (_p, atoms), slot in zip(
-            sorted(group), sorted(slots[v] for v, k in enumerate(keys) if k == key), strict=True
-        ):
-            for a in atoms:
-                notes[a] = slot_note(slot, key[1])
+    for ligands in by_ligand.values():
+        sites = sorted((site for site, _assigned in ligands), key=lambda group: tuple(sorted(s[1] for s in group)))
+        assigned = sorted((assigned for _site, assigned in ligands), key=lambda group: tuple(sorted(group)))
+        for ligand_sites, ligand_slots in zip(sites, assigned, strict=True):
+            for key in {site[0] for site in ligand_sites}:
+                atoms = sorted((site[1], site[2]) for site in ligand_sites if site[0] == key)
+                key_slots = sorted(slot for slot_key, slot in ligand_slots if slot_key == key)
+                for (_position, site_atoms), slot in zip(atoms, key_slots, strict=True):
+                    for atom in site_atoms:
+                        notes[atom] = slot_note(slot, key[1])
     return notes
 
 
@@ -325,7 +367,7 @@ def _rebuild(iso):
     return connect_metal(whole, [b for b in iso.donor_bonds if b[0] not in ring], order=Chem.BondType.SINGLE)
 
 
-def canonical_smiles(source):
+def cxsmiles(source):
     """Write a metal complex as a canonical CXSMILES: a dative-SMILES core plus its arrangement.
 
     ``<dative core> |atomProp:...|``. Everything before the first ``|`` is a valid canonical dative SMILES
@@ -338,6 +380,7 @@ def canonical_smiles(source):
     chiral; on each donor, ``s<n>``, its canonical slot, with a ``+``/``-`` for a planar-chiral haptic ring's
     winding. A slot is a fact about the molecule only modulo the template's proper rotations, so it is
     minimised over those and no more: the full point group is ``proper x Z2`` and that Z2 is the handedness.
+    Planar-chiral haptic winding is detected but not yet embeddable, so writing it raises.
 
     `source` is an `Isomer`, whose arrangement is already stated, or a `Mol` with a conformer, whose
     arrangement is measured off it by `from_geometry`. Reading the string back needs no second verb:
@@ -360,7 +403,7 @@ def canonical_smiles(source):
     complexed = _rebuild(iso) if given else source  # a Mol is already its own constitution
     if len(metal_indices(complexed)) != 1:
         raise NotImplementedError(
-            f"canonical_smiles writes one metal centre; this complex has {len(metal_indices(complexed))}. A "
+            f"cxsmiles writes one metal centre; this complex has {len(metal_indices(complexed))}. A "
             f"per-centre note is what the format states, but no corpus of bridged complexes has been "
             f"measured, so this raises rather than write a string whose losslessness is unchecked"
         )
@@ -369,10 +412,15 @@ def canonical_smiles(source):
     coordinating = [a for d in iso.vertices if d != VACANT for a in (iso.haptic.get(d) or (d,))]
     ranks = _donor_classes(work, coordinating)
     keys = _site_keys(iso, ranks, work.GetConformer().GetPositions() if work.GetNumConformers() else None)
-    slots = canonical_slots(dirs, keys, _chelate_edges(work, iso.vertices, iso.haptic))
+    if any(key and key[1] for key in keys):
+        raise NotImplementedError(
+            "CXSMILES haptic winding is detected but embedding it is not supported; pass the Isomer or Mol"
+        )
+    bites = _chelate_edges(work, iso.vertices, iso.haptic)
+    slots = canonical_slots(dirs, keys, bites)
     geom = record(iso.geometry).code + (f"-{iso.chirality}" if iso.chirality else "")
     notes = {iso.metal: geom}
-    notes.update(_slot_notes(iso, keys, slots, at))
+    notes.update(_slot_notes(iso, keys, slots, at, bites))
     # `atomNote` rather than a key of our own: RDKit reads, writes and DRAWS it, so the arrangement is visible
     # in a depiction and survives a round trip through `MolToCXSmiles` without special handling. Atom index
     # order is not a choice either; RDKit re-emits the block sorted by index whatever order it was built in.

@@ -803,7 +803,7 @@ wheels = [
 [[package]]
 name = "openconf"
 version = "0.0.16"
-source = { git = "https://github.com/rowansci/openconf#1fa1441096dc2d4ff662894750644b62c82a20ba" }
+source = { git = "https://github.com/rowansci/openconf?rev=1fa1441096dc2d4ff662894750644b62c82a20ba#1fa1441096dc2d4ff662894750644b62c82a20ba" }
 dependencies = [
     { name = "numpy" },
     { name = "prism-pruner" },
@@ -1327,32 +1327,14 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-all = [
-    { name = "matplotlib" },
-    { name = "openconf" },
-    { name = "prism-pruner" },
-    { name = "scikit-learn" },
-    { name = "xyzgraph" },
-    { name = "xyzrender" },
-]
-nci = [
-    { name = "xyzgraph" },
-]
-perceive = [
-    { name = "xyzgraph" },
-]
 search = [
     { name = "openconf" },
 ]
-select = [
-    { name = "prism-pruner" },
-    { name = "scikit-learn" },
-]
-viz = [
+workflow = [
     { name = "matplotlib" },
     { name = "prism-pruner" },
     { name = "scikit-learn" },
-    { name = "xyzrender" },
+    { name = "xyzgraph" },
 ]
 
 [package.dev-dependencies]
@@ -1362,26 +1344,23 @@ dev = [
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
-    { name = "rxembed", extra = ["all"] },
+    { name = "rxembed", extra = ["search", "workflow"] },
     { name = "ty" },
+    { name = "xyzrender" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "matplotlib", marker = "extra == 'viz'" },
+    { name = "matplotlib", marker = "extra == 'workflow'" },
     { name = "networkx" },
     { name = "numpy" },
-    { name = "openconf", marker = "extra == 'search'", git = "https://github.com/rowansci/openconf" },
-    { name = "prism-pruner", marker = "extra == 'select'" },
+    { name = "openconf", marker = "extra == 'search'", git = "https://github.com/rowansci/openconf?rev=1fa1441096dc2d4ff662894750644b62c82a20ba" },
+    { name = "prism-pruner", marker = "extra == 'workflow'" },
     { name = "rdkit" },
-    { name = "rxembed", extras = ["search", "select", "perceive", "nci", "viz"], marker = "extra == 'all'" },
-    { name = "rxembed", extras = ["select"], marker = "extra == 'viz'" },
-    { name = "scikit-learn", marker = "extra == 'select'" },
-    { name = "xyzgraph", marker = "extra == 'nci'", specifier = ">=1.6.14" },
-    { name = "xyzgraph", marker = "extra == 'perceive'", specifier = ">=1.6.14" },
-    { name = "xyzrender", marker = "extra == 'viz'", specifier = ">=0.3.8" },
+    { name = "scikit-learn", marker = "extra == 'workflow'" },
+    { name = "xyzgraph", marker = "extra == 'workflow'", specifier = ">=1.6.14" },
 ]
-provides-extras = ["search", "select", "perceive", "nci", "viz", "all"]
+provides-extras = ["search", "workflow"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1390,8 +1369,9 @@ dev = [
     { name = "pytest", specifier = ">=8.3.5" },
     { name = "pytest-cov", specifier = ">=5.0.0" },
     { name = "ruff", specifier = ">=0.14.14" },
-    { name = "rxembed", extras = ["all"] },
+    { name = "rxembed", extras = ["search", "workflow"] },
     { name = "ty", specifier = ">=0.0.14" },
+    { name = "xyzrender", specifier = ">=0.3.8" },
 ]
 
 [[package]]

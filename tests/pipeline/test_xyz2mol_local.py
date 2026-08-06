@@ -1,9 +1,4 @@
-"""The vendored Jensen core. Only the two departures from upstream are ours to test.
-
-Everything else in `xyz2mol_local` is upstream and is exercised through `xyz2mol_tmc`; pinning it here
-would just make the file harder to re-sync. These two are pinned because both were order-dependence
-bugs -- the kind that passes every test until the input's line order changes.
-"""
+"""Test rxembed's changes to the vendored xyz2mol core."""
 
 from __future__ import annotations
 
@@ -19,7 +14,7 @@ def test_proto_mol_atoms_carry_no_query():
     assert [a.GetAtomicNum() for a in mol.GetAtoms()] == [6, 1, 1, 1, 1]
 
 
-def test_overvalent_atom_raises_instead_of_killing_the_process():
+def test_overvalent_atom_raises():
     import numpy as np
 
     # one carbon bonded to six hydrogens: no valence the model can place

@@ -204,7 +204,7 @@ _DUMMY_M_LO, _DUMMY_M_HI = 0.8, 1.8  # Å: pin the hold-dummy D near the metal (
 
 
 def _shift_phantoms(cons, offset):
-    """Move every reserved haptic-centroid index up by ``offset``, re-keying every field that names one.
+    """Shift every reserved haptic-centroid index by ``offset`` and re-key its constraint fields.
 
     Two transients are appended from the real atom count, a haptic centroid dummy and a labile donor's D-cap,
     but `materialise_phantoms` requires the centroid keys to be the consecutive block after that count, so
@@ -288,8 +288,9 @@ def _release_donor_chirality(mol, held, cons):
     out = rw.GetMol()
     donor_tags = {d: out.GetAtomWithIdx(d).GetChiralTag() for _dm, d, _q in held}  # sanitize drops the now-degree-3
     Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
-    for d, t in donor_tags.items():  # carbanion/amine tag -> keep it so the NEXT hold (relax, re-embed, mc) fires
+    for d, t in donor_tags.items():  # carbanion/amine tag -> keep it so the next hold (relax, re-embed, mc) fires
         out.GetAtomWithIdx(d).SetChiralTag(t)
+    _shift_phantoms(cons, -len(held))
     return out
 
 
@@ -353,7 +354,7 @@ def connect_metal(mol, donor_bonds, *, order=Chem.BondType.DATIVE):
     A bond the input drew covalent comes back dative, so the metal picks up radical electrons RDKit would
     otherwise pair; element, oxidation state and total charge, which is what a calculator reads, are unaffected.
 
-    `order` exists for the one caller that needs the opposite: `metal_smiles.canonical_smiles` asks for single
+    `order` exists for the one caller that needs the opposite: `metal_smiles.cxsmiles` asks for single
     on the sigma donors, because writing a string has to re-derive the ionic form from the donor's valence,
     and a dative bond is already the answer to that question. Every other caller wants the default.
     """
@@ -451,8 +452,8 @@ def _collapse_haptic(mol, donors):
     Appends a bond-less carbon centroid per face, leaving existing indices unchanged, seated at the ring
     centroid if the mol has a conformer. Returns ``(mol, vertices, haptic)``, where `haptic` maps each dummy to
     its ring atoms. The dummy is embed scaffolding that lives in no stored Mol: `enumerate_isomers` strips it
-    before storing the real `Isomer`, and only `bounds.embed` / `restrained_uff` re-materialise it. A mol with
-    no haptic face is returned untouched.
+    before storing the real `Isomer`, and only `bounds.seed_coordinates` / `restrained_uff` re-materialise it.
+    A mol with no haptic face is returned untouched.
     """
     sites = _haptic_sites(mol, donors)
     faces = [s for s in sites if len(s) > 1]  # a face is any mutually-bonded donor group, eta2 included
@@ -553,7 +554,7 @@ def donated_charge(donor):
 def materialise_phantoms(mol, haptic):
     """Return a copy of `mol` with each haptic centroid dummy appended (bond-less carbon) at its reserved index.
 
-    A transient of the embed, living in no persistent Mol. `bounds.embed` and `restrained_uff` materialise it
+    A transient of the embed, living in no persistent Mol. `bounds.seed_coordinates` and `restrained_uff` materialise it
     from `Constraints.haptic` so a Cp/arene face embeds as one rigid vertex, then discard it. Reserved indices
     are consecutive from the real atom count, so append order reproduces them, and each dummy is seated at its
     ring centroid. A no-op when there is no haptic face.
@@ -739,35 +740,23 @@ def classify_geometry(mol, metal, sites, cid=-1):
         return None
     best_err, best = ranked[0]
     poor = best_err > _FIT_FLOOR  # no record fits; the argmin is still returned, but it is a name, not a reading
-    verdict = "no shape fits (nearest is)" if poor else "perceived"
-    advice = (
-        f"; above the {_FIT_FLOOR:.2f} fit floor, so this sphere matches no template in the registry."
-        " Pass metal=/geometry= to state the shape you mean rather than accept the nearest one"
-        if poor
-        else ""
-    )
-    logger.log(
-        logging.WARNING if poor else logging.INFO,
-        # Two lines, not one 200-char line, and the geometry is stated FIRST because that is what a caller
-        # asked for. The coplanarity numbers only earn their space when they are the reason for a poor
-        # verdict, so they are DEBUG unless `poor`; a good octahedron used to report its own RMS as if
-        # complaining about it.
-        "metal: %s %s from the conformer (shape residual %.3f); %s%s%s",
-        verdict,
-        _describe(best),
-        best_err,
-        f"runner-up {_describe(ranked[1][1])} at {ranked[1][0]:.3f}"
-        if len(ranked) > 1
-        else "the only candidate at this CN",
-        f"; a flat sphere excluded {', '.join(_describe(n) for n in dropped)}" if dropped else "",
-        advice,
-    )
+    runner = f"; next {_describe(ranked[1][1])} {ranked[1][0]:.3f}" if len(ranked) > 1 else ""
+    if poor:
+        logger.warning(
+            "geometry: no shape fits; nearest %s (residual %.3f > %.2f). Pass geometry= to state it",
+            _describe(best),
+            best_err,
+            _FIT_FLOOR,
+        )
+    else:
+        logger.debug("geometry: %s residual %.3f%s", _describe(best), best_err, runner)
     logger.debug(
-        "metal: sphere is %s, coplanarity RMS %.3f A vs %.2f tol, M-L %.2f A",
+        "sphere: %s; coplanarity RMS %.3f A vs %.2f tol; M-L %.2f A%s",
         "in-plane" if rms <= COPLANAR_TOL else "out-of-plane",
         rms,
         COPLANAR_TOL,
         r,
+        f"; flatness excluded {', '.join(_describe(n) for n in dropped)}" if dropped else "",
     )
     return best
 
@@ -875,6 +864,32 @@ def _flat_ranks(mol):
     return list(Chem.CanonicalRankAtoms(flat, breakTies=False))
 
 
+def _remove_routine_hydrogens(mol, keep=()):
+    """Return ``(Mol without routine explicit H, {old index: new index})``.
+
+    Hydrogens in `keep` remain explicit. A temporary isotope protects a neutral metal-bound or agostic H
+    from RDKit's normal suppression and is cleared before return.
+    """
+    out, keep = Chem.Mol(mol), set(keep)
+    for atom in out.GetAtoms():
+        atom.SetIntProp("_rxembedOriginalIndex", atom.GetIdx())
+        if atom.GetIdx() in keep and atom.GetAtomicNum() == 1 and not atom.GetIsotope():
+            atom.SetBoolProp("_rxembedCoordinationH", True)
+            atom.SetIsotope(1)
+    params = Chem.RemoveHsParameters()
+    params.removeDegreeZero = True  # protected donor H stays; avoid RDKit warning on a stripped terminal hydride
+    out = Chem.RemoveHs(out, params, sanitize=False)
+    at = {}
+    for atom in out.GetAtoms():
+        at[atom.GetIntProp("_rxembedOriginalIndex")] = atom.GetIdx()
+        atom.ClearProp("_rxembedOriginalIndex")
+        if atom.HasProp("_rxembedCoordinationH"):
+            atom.SetIsotope(0)
+            atom.ClearProp("_rxembedCoordinationH")
+    out.UpdatePropertyCache(strict=False)
+    return out, at
+
+
 def _donor_classes(mol, donors):
     """Map each donor atom -> its symmetry-equivalence class; interchangeable donors share one.
 
@@ -887,8 +902,9 @@ def _donor_classes(mol, donors):
     audit sees. Falls back to the element symbol if ranking is unavailable.
     """
     try:
-        ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
-        flat = _flat_ranks(mol)
+        ranked, at = _remove_routine_hydrogens(mol, donors)
+        ranks = list(Chem.CanonicalRankAtoms(ranked, breakTies=False))
+        flat = _flat_ranks(ranked)
     except Exception:  # pragma: no cover - canonical ranking is robust, but never let chirality crash embed
         return {d: mol.GetAtomWithIdx(d).GetSymbol() for d in donors}
     root = {}
@@ -899,9 +915,9 @@ def _donor_classes(mol, donors):
         return x
 
     for d in donors:  # a class is a component of "same perceived rank OR same flat rank"
-        a, b = find(("perceived", ranks[d])), find(("flat", flat[d]))
+        a, b = find(("perceived", ranks[at[d]])), find(("flat", flat[at[d]]))
         root[max(a, b)] = min(a, b)  # the representative is a reading, so it is order-invariant too
-    return {d: find(("perceived", ranks[d])) for d in donors}
+    return {d: find(("perceived", ranks[at[d]])) for d in donors}
 
 
 def _chelate_edges(mol, vertices, haptic=None):

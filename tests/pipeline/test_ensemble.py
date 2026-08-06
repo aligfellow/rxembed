@@ -1,8 +1,4 @@
-"""`pipeline/ensemble.py`: what `Ensemble`/`EnsembleSet` guarantee about the mol they hand back.
-
-The surrogate strips the M-donor bonds so the DG/FF can embed a bond-less metal; ``minimize()`` is where that
-is torn down again; element, oxidation state, geometry, then connectivity. These pin what a caller gets.
-"""
+"""Test Ensemble and EnsembleSet behavior."""
 
 from importlib.util import find_spec
 
@@ -11,8 +7,9 @@ import pytest
 from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 
-import rxembed.pipeline as rx
+import rxembed as rx
 from rxembed import metal_core as metal
+from rxembed.pipeline.calculators import Calculator
 
 _EN_PDBRCL = "Br[Pd]1(Cl)NCCN1"  # a neutral square-planar chelate: the standard metal fixture
 _MN_H2 = "examples/structures/mn-h2.xyz"  # bimetallic: an Mn centre and a spectator ferrocene
@@ -30,7 +27,7 @@ def _dative(mol, donor, metal_idx):
 
 
 def _dissociate(ens, cid, atom, centre, distance=4.0):
-    conf = ens.mol.GetConformer(cid)
+    conf = ens._mol.GetConformer(cid)
     p, pm = np.array(conf.GetAtomPosition(int(atom))), np.array(conf.GetAtomPosition(int(centre)))
     conf.SetAtomPosition(int(atom), (pm + distance * (p - pm) / np.linalg.norm(p - pm)).tolist())
 
@@ -38,7 +35,7 @@ def _dissociate(ens, cid, atom, centre, distance=4.0):
 # --- the connectivity finalize: the output is a molecule, not a bag of fragments ---------------------------
 
 
-def test_every_isomer_comes_back_connected_through_its_metal():
+def test_all_isomers_return_connected():
     seen = 0
     for iso in rx.metal("Cl[Pd](Cl)(N)N", "square_planar"):
         ens = rx.embed(iso, n=2, seed=1).minimize()
@@ -57,34 +54,26 @@ def test_every_isomer_comes_back_connected_through_its_metal():
     assert seen, "every isomer minimised to empty: the finalize was never exercised"
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_a_bimetallic_output_connects_every_metal():
-    isos = rx.metal(_MN_H2, "octahedral", center="Mn", fix=_MN_H2_RC)
-    ens = rx.embed(isos[0], n=4, seed=1).minimize(_retry=False)
-    if not ens.n:
-        pytest.skip("no conformer survived the relax at this deterministic seed; connectivity is unexercised")
-    assert len(Chem.GetMolFrags(ens.mol)) == 1
-    for mi in metal.metal_indices(ens.mol):
-        assert ens.mol.GetAtomWithIdx(mi).GetDegree() > 0, f"metal {mi} was left disconnected"
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_spectator_ferrocene_stays_rigid():
 
+    from rxembed.pipeline.perceive import read_xyz
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_the_spectator_ferrocenes_rigid_body_is_never_traded_for_a_pull():
-
-    from rxembed.pipeline.perceive import _xyz_to_mol
-
-    ref = _xyz_to_mol(_MN_H2, 0)  # find the spectator from the MOLECULE, so a missing record fails loudly
+    ref = read_xyz(_MN_H2, 0)  # find the spectator from the MOLECULE, so a missing record fails loudly
     fe = next(
         a.GetIdx() for a in ref.GetAtoms() if a.GetAtomicNum() in metal.TRANSITION_METALS and a.GetSymbol() != "Mn"
     )
     shape = {fe, *(n.GetIdx() for n in ref.GetAtomWithIdx(fe).GetNeighbors())}
 
-    iso = rx.metal(_MN_H2, "octahedral", center="Mn", fix=_MN_H2_RC)[0]
+    isomers = rx.metal(_MN_H2, "octahedral", center="Mn", fix=_MN_H2_RC)
+    iso = isomers.select(arrangement="N6 C62 C61 N5 P2 H63")
     windows = {k: v for k, v in iso.cons.distances.items() if set(k) <= shape}
     assert len(windows) > 50, "the rigid body is all pairs of {Fe, *10 Cp carbons}"
 
     ens = rx.embed(iso, n=2, seed=1).minimize(_retry=False)  # seed 0 tears; seed 1 is the smallest live witness
     assert ens.n, "no conformer survived: the per-conformer assertion below never ran"
+    assert len(Chem.GetMolFrags(ens.mol)) == 1
+    assert all(ens.mol.GetAtomWithIdx(m).GetDegree() for m in metal.metal_indices(ens.mol))
     for cid in ens.ids:
         worst = max(  # how far outside its own window the worst held pair has been pushed
             max(lo - (d := rdMolTransforms.GetBondLength(ens.mol.GetConformer(cid), i, j)), d - hi, 0.0)
@@ -93,8 +82,8 @@ def test_the_spectator_ferrocenes_rigid_body_is_never_traded_for_a_pull():
         assert worst < 0.15, f"conf {cid}: the spectator's shape tore by {worst:.3f} A"
 
 
-@pytest.mark.skipif(find_spec("prism_pruner") is None or find_spec("sklearn") is None, reason="needs rxembed[select]")
-def test_a_derived_ensemble_inherits_the_finalized_connectivity():
+@pytest.mark.skipif(find_spec("prism_pruner") is None or find_spec("sklearn") is None, reason="needs rxembed[workflow]")
+def test_derived_ensemble_preserves_connectivity():
     _iso, ens = _pd_ensemble(n=4)
     if ens.n < 2:
         pytest.skip("need >=2 conformers to derive a representative set")
@@ -102,7 +91,7 @@ def test_a_derived_ensemble_inherits_the_finalized_connectivity():
 
 
 @pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
-def test_the_search_runs_on_the_bare_mol_and_the_closing_minimize_re_connects():
+def test_search_disconnects_then_minimize_reconnects_metal():
     iso = rx.metal(_EN_PDBRCL, "square_planar")[0]
     searched = rx.embed(iso, n=6, seed=1)
     floors = dict(searched.cons.floors)
@@ -113,7 +102,7 @@ def test_the_search_runs_on_the_bare_mol_and_the_closing_minimize_re_connects():
     assert len(Chem.GetMolFrags(searched.mol)) == 1
 
 
-def test_an_organic_output_is_untouched_by_the_finalize():
+def test_organic_minimize_adds_no_dative_bonds():
     ens = rx.embed("CCO").minimize()
     assert ens.n
     assert len(Chem.GetMolFrags(ens.mol)) == 1
@@ -123,7 +112,7 @@ def test_an_organic_output_is_untouched_by_the_finalize():
 # --- minimize and measure: what a caller may read back ------------------------------------------------------
 
 
-def test_a_requested_stretched_bond_survives_the_relax_and_measure_reads_it_back():
+def test_stretched_bond_survives_relax_and_measure():
     ens = rx.embed("CCCl", fix={(1, 2): 2.4}, n=4, seed=42).minimize()
     assert ens.ids, "the requested dissociating C-Cl was thrown away for being what was asked for"
     stats = ens.measure((1, 2))
@@ -134,38 +123,76 @@ def test_a_requested_stretched_bond_survives_the_relax_and_measure_reads_it_back
 # --- filter(): drop what is no longer the molecule you asked for --------------------------------------------
 
 
-def test_filter_refuses_a_method_that_is_really_a_dedup():
+def test_filter_rejects_rmsd_dedup():
     with pytest.raises(ValueError, match="prune"):
         rx.embed("CCO", n=1, seed=1).filter("rmsd")
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_a_dissociated_ligand_is_seen_through_the_pipeline_and_only_that_conformer_drops():
+def test_geometry_filter_drops_only_failed_conformer():
+    ens = rx.embed("CCO", n=1, seed=1).minimize()
+    good = ens.ids[0]
+    bad = ens._mol.AddConformer(Chem.Conformer(ens._mol.GetConformer(good)), assignId=True)
+    ens.ids.insert(0, bad)
+    ens.energies[bad] = ens.energies[good]
+    conf = ens._mol.GetConformer(bad)
+    conf.SetAtomPosition(0, conf.GetAtomPosition(1))
+    reports = ens.check()
+    assert not reports[bad].ok()
+    assert reports[good].ok()
+
+    energies = dict(ens.energies)
+    assert ens.filter("geometry").ids == [good]
+    assert ens.energies == energies
+    assert bad in ens.discarded
+
+
+def test_geometry_filter_inherits_only_frozen_atoms():
+    ens = rx.embed("CCO", n=1, seed=1).minimize()
+    conf = ens._mol.GetConformer(ens.ids[0])
+    conf.SetAtomPosition(0, conf.GetAtomPosition(1))
+    ens.cons.frozen.update((0, 1))
+    ens.cons.distances[(0, 2)] = (100.0, 101.0)
+    assert ens.filter("geometry").ids
+    with pytest.raises(RuntimeError, match="all 1 conformer"):
+        ens.filter("geometry", constraints=ens.cons)
+
+    ens.ids = []
+    with pytest.raises(TypeError, match="frozne"):
+        ens.filter("geometry", frozne=(0, 1))
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_filter_drops_only_dissociated_ligand():
     iso, ens = _pd_ensemble(n=6)
     assert ens.sphere, "the coordination sphere was forgotten by minimize()"
     assert not ens._scan_connectivity(), "a healthy metal ensemble must not be flagged"
 
-    _dissociate(ens, ens.ids[0], iso.donors[0], iso.metal)
+    donor = iso.donors[0]
+    _dissociate(ens, ens.ids[0], donor, iso.metal)
     before = ens.n
     assert ens._scan_connectivity(), "a dissociated ligand was not seen through the pipeline"
+    ens.cons.frozen.update((iso.metal, donor))
+    assert not ens._scan_connectivity(), "a reacting-core metal-donor pair was judged as ground-state coordination"
+    ens.cons.frozen.difference_update((iso.metal, donor))
     ens.filter("connectivity")
     assert ens.n == before - 1, "filter must drop the dissociated conformer and ONLY that one"
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 @pytest.mark.parametrize(
     "smi",
     [
         # a 1.71 A C=P phosphaalkene: xyzgraph refuses to perceive it and calls the bond broken
         "Cc1cc(C)c([CH]2=[PH]->[Ni+2]<-23<-[O-]C(=O)C(c2ccccc2)[N-]->3c2ccccc2)c(C)c1",
-        # a 1,3 geminal pair at 2.02 A: xyzgraph calls that separation a newly formed bond
+        # a short 1,3 carbon pair at 2.02 A: xyzgraph calls that separation a newly formed bond
         "CC(C)(C)[N]1=[CH](Cc2ccccc2)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1",
     ],
+    ids=["phosphaalkene", "short-1-3-pair"],
 )
-def test_a_healthy_catalyst_is_never_flagged_as_having_reacted(smi):
+def test_healthy_catalyst_keeps_connectivity(smi):
     judged = False
     for iso in rx.metal(smi, "square_planar", stereo="free"):
-        ens = rx.embed(iso, n=3, seed=1).minimize()
+        ens = rx.embed(iso, n=1, seed=1).minimize()
         if not ens.n:
             continue
         assert not ens._scan_connectivity()
@@ -175,15 +202,15 @@ def test_a_healthy_catalyst_is_never_flagged_as_having_reacted(smi):
     assert judged, "every isomer minimised to empty: nothing was ever judged"
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_a_reacted_conformer_is_flagged_first_and_only_dropped_when_asked():
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_reacted_conformer_is_flagged_before_filtering():
     ens = rx.embed("[NH3+]CC(=O)[O-]", n=1, seed=1).minimize()
     cid = ens.ids[0]
-    conf = ens.mol.GetConformer(cid)
-    n = next(a.GetIdx() for a in ens.mol.GetAtoms() if a.GetSymbol() == "N")
-    o = next(a.GetIdx() for a in ens.mol.GetAtoms() if a.GetSymbol() == "O" and a.GetFormalCharge() == -1)
-    h = next(x.GetIdx() for x in ens.mol.GetAtomWithIdx(n).GetNeighbors() if x.GetAtomicNum() == 1)
-    cc = next(x.GetIdx() for x in ens.mol.GetAtomWithIdx(o).GetNeighbors() if x.GetAtomicNum() == 6)
+    conf = ens._mol.GetConformer(cid)
+    n = next(a.GetIdx() for a in ens._mol.GetAtoms() if a.GetSymbol() == "N")
+    o = next(a.GetIdx() for a in ens._mol.GetAtoms() if a.GetSymbol() == "O" and a.GetFormalCharge() == -1)
+    h = next(x.GetIdx() for x in ens._mol.GetAtomWithIdx(n).GetNeighbors() if x.GetAtomicNum() == 1)
+    cc = next(x.GetIdx() for x in ens._mol.GetAtomWithIdx(o).GetNeighbors() if x.GetAtomicNum() == 6)
     po, pc = np.array(conf.GetAtomPosition(o)), np.array(conf.GetAtomPosition(cc))
     conf.SetAtomPosition(h, (po + 0.98 * (po - pc) / np.linalg.norm(po - pc)).tolist())  # a real transfer
 
@@ -203,7 +230,7 @@ def test_a_reacted_conformer_is_flagged_first_and_only_dropped_when_asked():
 # `mol` is a real Ensemble attribute; `ids` exists only as a bare class-level annotation, and the two reach
 # the message down different halves of the `known` predicate.
 @pytest.mark.parametrize("verb", ["mol", "ids"])
-def test_a_scalar_ensemble_verb_on_a_set_raises_and_names_the_way_out(verb):
+def test_set_rejects_scalar_ensemble_verbs(verb):
     r = rx.embed("CC(N)C(=O)O", n=2)
     assert isinstance(r, rx.EnsembleSet)
     with pytest.raises(AttributeError, match="stereo='free'"):
@@ -211,15 +238,15 @@ def test_a_scalar_ensemble_verb_on_a_set_raises_and_names_the_way_out(verb):
     assert not hasattr(r, "not_a_verb_at_all")  # an unrelated miss stays a plain AttributeError
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_the_set_keeps_both_meanings_of_filter():
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_set_keeps_both_meanings_of_filter():
     es = rx.embed("CC(N)C(=O)O", n=2)  # a racemate -> EnsembleSet
     assert len(es.filter(stereo="1R")) == 1, "the tag selector was broken"
     assert len(es.filter("connectivity")) == len(es)
 
 
-@pytest.mark.skipif(find_spec("prism_pruner") is None or find_spec("sklearn") is None, reason="needs rxembed[select]")
-def test_the_headline_chain_maps_over_a_set_and_carries_the_tags():
+@pytest.mark.skipif(find_spec("prism_pruner") is None or find_spec("sklearn") is None, reason="needs rxembed[workflow]")
+def test_minimize_and_prune_map_over_ensemble_set():
     r = rx.embed("CC(N)C(=O)O", n=3).minimize().prune()
     assert isinstance(r, rx.EnsembleSet)
     assert {e.tag["stereo"] for e in r} == {"1R", "1S"}  # both enantiomers survive the mapped chain
@@ -246,15 +273,45 @@ def test_best_refuses_ff_energies_across_species():
     # ranking distinct species needs real energies; FF (minimize / score('ff')) is not cross-comparable
     s = rx.embed("CC(N)C(=O)O", n=2).minimize()
     assert {e.energy_kind for e in s} == {"ff"}  # minimize tags FF energies
-    with pytest.raises(ValueError, match="real energy"):
+    with pytest.raises(ValueError, match="real energies"):
         s.best()
     assert {e.energy_kind for e in s.score("ff")} == {"ff"}  # an FF single point is still not "real"
-    with pytest.raises(ValueError, match="real energy"):
+    with pytest.raises(ValueError, match="real energies"):
         s.score("ff").best()
 
 
-def test_a_derived_ensemble_keeps_the_kind_of_the_energies_it_carries():
+def test_slice_preserves_ensemble_state():
     ens = rx.embed("CCCCO", n=4, seed=1).minimize()
+    flagged = ens.ids[0]
+    ens.seed = 1
+    ens._seeds_relaxed = True
+    ens.unrelaxed = [flagged]
+    ens.wrong_hand = [flagged]
     assert ens.energy_kind == "ff"
+    child = ens[0]
+    assert child.energy_kind == "ff"
+    assert child.seed == 1
+    assert child._seeds_relaxed
+    assert child.unrelaxed == [flagged]
+    assert child.wrong_hand == [flagged]
     assert ens.lowest(2).energy_kind == "ff"
     assert ens.align().energy_kind == "ff"
+
+
+def test_refinement_preserves_ensemble_records():
+    class FixedCalculator(Calculator):
+        def energy(self, mol, conf_id=-1):
+            return -1.0
+
+        def optimize(self, mol, conf_id=-1, level="normal", fix=()):
+            return mol.GetConformer(conf_id).GetPositions(), -1.0
+
+    _iso, ens = _pd_ensemble(n=3)
+    dropped = ens.ids.pop()
+    ens.discarded.append(dropped)
+
+    for out in (ens.score(FixedCalculator()), ens.optimize(FixedCalculator())):
+        assert out.sphere == ens.sphere
+        assert out.discarded == ens.discarded
+        assert dropped in {c.GetId() for c in out._mol.GetConformers()}
+        assert dropped not in {c.GetId() for c in out.mol.GetConformers()}

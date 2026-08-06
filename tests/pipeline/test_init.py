@@ -9,7 +9,7 @@ import pytest
 from rxembed.pipeline.select import cluster_on
 
 
-def test_the_message_names_the_operation_and_what_pip_installs(monkeypatch):
+def test_message_names_the_operation_and_what_pip_installs(monkeypatch):
     import numpy as np
 
     real = builtins.__import__
@@ -26,5 +26,5 @@ def test_the_message_names_the_operation_and_what_pip_installs(monkeypatch):
     msg = str(exc.value)
     assert "cluster_on" in msg, "the message must name the operation, not say 'this'"
     assert "scikit-learn" in msg, "it must name the DISTRIBUTION pip installs, not the import name"
-    assert "pip install 'rxembed[select]'" in msg, msg
+    assert "pip install 'rxembed[workflow]'" in msg, msg
     assert isinstance(exc.value.__cause__, ImportError), "the upstream reason must stay reachable for a real bug"

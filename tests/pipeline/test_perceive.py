@@ -1,8 +1,4 @@
-"""`pipeline/perceive.py`: an .xyz becomes a Mol with perceived bonds, or fails loudly.
-
-Reading a SMILES needs no perception and lives in `rxembed.metal_smiles`, next to the writer whose atom order
-its ``atomProp`` handling has to agree with; it is tested there.
-"""
+"""Test XYZ graph perception and backend fallback behavior."""
 
 import logging
 import sys
@@ -13,7 +9,7 @@ import pytest
 from rdkit import Chem
 
 from rxembed.pipeline import perceive
-from rxembed.pipeline.perceive import _xyz_to_mol
+from rxembed.pipeline.perceive import read_xyz
 
 _BIMP = "examples/structures/bimp.xyz"  # a metal-free TS with a stretched reacting core
 
@@ -22,9 +18,9 @@ _CORPUS = Path(__file__).resolve().parents[2] / "benchmark/corpus"
 needs_corpus = pytest.mark.skipif(not _CORPUS.is_dir(), reason="needs the local-only benchmark/corpus")
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_an_xyz_becomes_a_molecule_with_bond_orders_not_a_bag_of_atoms():
-    mol = _xyz_to_mol(_BIMP, 0)
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_xyz_returns_bonded_molecule():
+    mol = read_xyz(_BIMP, 0)
     assert mol.GetNumConformers() == 1
     assert mol.GetConformer().GetPositions().shape == (mol.GetNumAtoms(), 3)
     assert any(b.GetBondTypeAsDouble() > 1.0 for b in mol.GetBonds())
@@ -33,26 +29,26 @@ def test_an_xyz_becomes_a_molecule_with_bond_orders_not_a_bag_of_atoms():
 def test_missing_xyzgraph_warns_and_names_each_fallback(monkeypatch, caplog, tmp_path):
     monkeypatch.setitem(sys.modules, "xyzgraph", None)
     caplog.set_level(logging.WARNING, logger="rxembed")
-    mol = _xyz_to_mol("examples/structures/ru-co.xyz", 0)
+    mol = read_xyz("examples/structures/ru-co.xyz", 0)
     assert any(a.GetSymbol() == "Ru" for a in mol.GetAtoms())
     assert "xyzgraph unavailable; using xyz2mol" in caplog.text
 
     caplog.clear()
     water = tmp_path / "water.xyz"
     water.write_text("3\nwater\nO 0 0 0\nH 0.96 0 0\nH -0.24 0.93 0\n")
-    mol = _xyz_to_mol(str(water), 0)
+    mol = read_xyz(str(water), 0)
     assert mol.GetNumBonds() == 2
     assert "xyzgraph unavailable; using RDKit" in caplog.text
 
     with pytest.raises(ValueError, match="single-metal"):
-        _xyz_to_mol("examples/structures/mn-h2.xyz", 0)
+        read_xyz("examples/structures/mn-h2.xyz", 0)
 
     monkeypatch.setattr(perceive, "_rank_orders", lambda *_args: pytest.fail("xyz2mol fallback was ranked twice"))
-    _xyz_to_mol("examples/structures/ru-co.xyz", 0, bond_orders="xyz2mol")
+    read_xyz("examples/structures/ru-co.xyz", 0, bond_orders="xyz2mol")
 
     for argument in ("connectivity", "bond_orders"):
         with pytest.raises(ValueError, match=argument):
-            _xyz_to_mol(_BIMP, 0, **{argument: "typo"})
+            read_xyz(_BIMP, 0, **{argument: "typo"})
 
 
 def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog):
@@ -65,7 +61,7 @@ def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog)
     monkeypatch.setattr(perceive, "_from_xyz2mol", fail)
     monkeypatch.setattr(perceive, "_from_xyzgraph", lambda *_args: fallback)
     caplog.set_level(logging.WARNING, logger="rxembed")
-    assert _xyz_to_mol(_BIMP, 0, connectivity="xyz2mol", bond_orders="xyz2mol") is fallback
+    assert read_xyz(_BIMP, 0, connectivity="xyz2mol", bond_orders="xyz2mol") is fallback
     assert "xyz2mol failed (no assignment); using xyzgraph" in caplog.text
 
     rw = Chem.RWMol()
@@ -104,9 +100,9 @@ def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog)
     [("xyzgraph", "xyzgraph"), ("xyzgraph", "xyz2mol"), ("xyz2mol", "xyz2mol")],
 )
 @needs_corpus
-def test_every_perceiver_combination_reads_a_complex(connectivity, bond_orders):
+def test_perceiver_pairs_read_complex(connectivity, bond_orders):
     path = _CORPUS / "CisPlatin.xyz"
-    mol = _xyz_to_mol(str(path), 0, connectivity=connectivity, bond_orders=bond_orders)
+    mol = read_xyz(str(path), 0, connectivity=connectivity, bond_orders=bond_orders)
     assert mol.GetNumAtoms() == 11
     assert mol.GetNumConformers() == 1
 
@@ -115,14 +111,14 @@ def test_every_perceiver_combination_reads_a_complex(connectivity, bond_orders):
 def test_xyzgraph_bond_orders_need_xyzgraph_connectivity():
     path = _CORPUS / "CisPlatin.xyz"
     with pytest.raises(ValueError, match="connectivity='xyzgraph'"):
-        _xyz_to_mol(str(path), 0, connectivity="xyz2mol", bond_orders="xyzgraph")
+        read_xyz(str(path), 0, connectivity="xyz2mol", bond_orders="xyzgraph")
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_xyz2mol_bond_orders_preserve_xyzgraph_connectivity():
     path = "examples/structures/ru-co.xyz"
-    before = _xyz_to_mol(path, 0)
-    after = _xyz_to_mol(path, 0, bond_orders="xyz2mol")
+    before = read_xyz(path, 0)
+    after = read_xyz(path, 0, bond_orders="xyz2mol")
 
     def bonds(mol):
         return {frozenset((b.GetBeginAtomIdx(), b.GetEndAtomIdx())) for b in mol.GetBonds()}

@@ -3,7 +3,7 @@
 The only plot that earns a place in the package: the dimensionality reduction of the per-conformer
 latent (dihedral + NCI + metal, shared with the clustering in `select`) is real reusable work.
 3D structure viewing is notebook-level: `align()`/`dump()` give the geometry, then py3Dmol or xyzrender
-directly. `pip install rxembed[viz]`.
+directly. `pip install rxembed[workflow]` provides this module's plotting dependencies.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ def _setup():
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
-        raise ImportError("_setup needs matplotlib; pip install 'rxembed[viz]'") from exc
+        raise ImportError("_setup needs matplotlib; pip install 'rxembed[workflow]'") from exc
     plt.rcParams["figure.figsize"] = (6, 5)
     return plt
 
@@ -28,14 +28,14 @@ def project(feats, method="pca", seed=42):
         try:
             from sklearn.decomposition import PCA
         except ImportError as exc:
-            raise ImportError("project needs scikit-learn; pip install 'rxembed[viz]'") from exc
+            raise ImportError("project needs scikit-learn; pip install 'rxembed[workflow]'") from exc
 
         return PCA(2).fit_transform(feats)
     if method in ("tsne", "t-sne"):
         try:
             from sklearn.manifold import TSNE
         except ImportError as exc:
-            raise ImportError("project needs scikit-learn; pip install 'rxembed[viz]'") from exc
+            raise ImportError("project needs scikit-learn; pip install 'rxembed[workflow]'") from exc
 
         perplexity = min(30, max(2, (len(feats) - 1) // 3))
         return TSNE(2, random_state=seed, perplexity=perplexity, init="random").fit_transform(feats)
@@ -54,7 +54,7 @@ def landscape(ens, color="cluster", method="pca", nci=True, reduce=None, min_clu
     plt = _setup()
     kept = list(ens.ids)
     dropped = [i for i in dict.fromkeys(ens.discarded) if i not in set(kept)] if show_dropped else []
-    feats = feature_matrix(ens.mol, kept + dropped, nci)  # project kept + dropped together (one space)
+    feats = feature_matrix(ens._mol, kept + dropped, nci)  # dropped conformers are private but visible here
     xy = project(feats, method)
     xk, xd = xy[: len(kept)], xy[len(kept) :]
     fig, ax = plt.subplots()

@@ -28,7 +28,7 @@ def _hydroxyl_hydrogens(mol):
 
 
 @pytest.mark.parametrize("kind", nci.KINDS.values(), ids=list(nci.KINDS))
-def test_every_registry_row_is_one_the_generic_enumerator_can_handle(kind):
+def test_registry_rows_are_enumerable(kind):
     anchors = {"atom": ("donor_h", "heavy"), "ring": ("ring_h", "ring_ion"), "hydride": ("hydride",)}
     assert kind.family in anchors
     assert kind.anchor in anchors[kind.family], f"anchor {kind.anchor!r} is not a {kind.family} anchor"
@@ -46,13 +46,13 @@ def test_every_registry_row_is_one_the_generic_enumerator_can_handle(kind):
         assert 90.0 < lo < hi <= 180.0, "a contact orientation is an obtuse-to-linear window"
 
 
-def test_the_sigma_hole_sets_hold_only_polarisable_heavies():
+def test_sigma_hole_sets_hold_only_polarisable_heavies():
     assert 9 not in nci._SIGMA_HOLE_Z["XB"], "organic C-F has no sigma hole"
     assert 8 not in nci._SIGMA_HOLE_Z["ChB"], "an ether O is not a donor"
     assert 7 not in nci._SIGMA_HOLE_Z["PnB"], "an amine N is a lone-pair DONOR"
 
 
-def test_acceptor_quality_ranks_a_localised_lone_pair_over_a_delocalised_one():
+def test_acceptor_quality_prefers_localised_lone_pair():
 
     def quality(smiles, symbol):
         mol = _mol(smiles)
@@ -68,8 +68,8 @@ def test_acceptor_quality_ranks_a_localised_lone_pair_over_a_delocalised_one():
 # --- enumeration ------------------------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[nci]")
-def test_the_acid_pyridine_grip_is_discovered_with_its_orientation_angle():
+@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
+def test_acid_pyridine_grip_has_orientation():
     mol = _mol(_ACID_PYRIDINE)
     assert mol.GetNumConformers() == 0, "discovery must not depend on a probe conformer's luck"
     cands = nci.candidate_contacts(mol, kinds=("HB",))
@@ -79,15 +79,15 @@ def test_the_acid_pyridine_grip_is_discovered_with_its_orientation_angle():
     assert contact.angles, "a directional grip with no orientation angle binds bent and is weakly detected"
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[nci]")
-def test_ring_contacts_are_off_by_default_but_available_on_request():
+@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
+def test_ring_contacts_are_opt_in():
     mol = _mol(_ACID_PYRIDINE)
     assert not any(k.startswith("HBPI") for k in nci.auto_binding_modes(mol))
     assert any(k.startswith("HBPI") for k in nci.candidate_contacts(mol))
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[nci]")
-def test_a_reciprocal_two_cycle_is_split_into_two_one_way_modes():
+@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
+def test_reciprocal_cycle_splits_into_one_way_modes():
     mol = _mol(_ACID_DIMER)
     (h1, o1), (h2, o2) = _hydroxyl_hydrogens(mol)
     a, b = tuple(sorted((h1, o2))), tuple(sorted((h2, o1)))
@@ -97,8 +97,8 @@ def test_a_reciprocal_two_cycle_is_split_into_two_one_way_modes():
     assert not any({a, b} <= set(m.distances) for m in modes.values()), "a reciprocal 2-cycle survived in one mode"
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[nci]")
-def test_a_multipoint_mode_ranks_above_the_single_contacts_it_contains():
+@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
+def test_multipoint_mode_outranks_single_contacts():
     modes = list(nci.auto_binding_modes(_mol(_ACID_DIMER)).values())
     assert len(modes[0].distances) >= len(modes[-1].distances)
     assert len(modes[0].distances) > 1, "the acid dimer's two-point grip was not enumerated"

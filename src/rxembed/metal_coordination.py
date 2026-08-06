@@ -100,10 +100,7 @@ def resolve_lengths(mol, lengths="auto"):
         return mol.GetConformer().GetPositions(), "the input conformer (lengths='input')"
     if not has_geometry:
         return None, ""  # the ordinary case (a SMILES, the fitted model); announcing the default is noise
-    return mol.GetConformer().GetPositions(), (
-        "the input conformer (lengths='auto' found a geometry); plain ETKDG has no M-L parameter, so pass "
-        "lengths='model' if this geometry was not measured or optimised with the metal"
-    )
+    return mol.GetConformer().GetPositions(), "the input conformer; use lengths='model' if it is not metal-aware"
 
 
 def coordination(mol, metal, donors, geometry, order, real_z, *, haptic, frozen=(), core_frozen=(), lengths="auto"):
@@ -141,7 +138,7 @@ def coordination(mol, metal, donors, geometry, order, real_z, *, haptic, frozen=
         if d in haptic:  # a centroid vertex: pin its whole ring, not a single donor (no orient/coplanar)
             _centroid_constraints(mol, metal, d, haptic[d], real_z, qdel=qdel, c=c, pos=pos, hyb=hyb)
             continue
-        if pos is not None:  # measured: the truth about THIS structure, and wider (±0.1) because it is one sample
+        if pos is not None:  # measured: this structure's value, and wider (±0.1) because it is one sample
             d_md = float(np.linalg.norm(pos[metal] - pos[d]))
             add_distance(c.distances, metal, d, d_md - 0.1, d_md + 0.1)
         else:  # the fitted periodic model (element, group, delocalised charge, hapticity)

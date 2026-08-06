@@ -4,8 +4,7 @@ Turns SMILES / .xyz / Mol / metal `Isomer` + a constraint spec into an `Ensemble
 candidates): parse -> (discover NCI -> constrain) -> the core seam -> `Ensemble`. Owns the source
 normalisation, the metal carbon-surrogate swap, and the isomer / template / auto-NCI routing; every embed
 here goes through the one core seam `rxembed.embed.seed_conformers` (encounter bounds, the Kabsch
-graft, the substrate fold). The user-facing surface (`embed`, `Ensemble`, `EnsembleSet`, `wrap`) lives in
-`rxembed.pipeline`; this module constructs those objects.
+graft, the substrate fold). The package root exports the user-facing objects constructed here.
 """
 
 from __future__ import annotations
@@ -15,11 +14,11 @@ import os
 
 from rdkit import Chem
 
-from rxembed import metal_coordination as _cbuild
-from rxembed import metal_core as _metal
-from rxembed import metal_distance as _distance
-from rxembed import metal_isomers as _kiso
-from rxembed import metal_polyhedron as _poly
+import rxembed.metal_coordination as _cbuild
+import rxembed.metal_core as _metal
+import rxembed.metal_distance as _distance
+import rxembed.metal_isomers as _kiso
+import rxembed.metal_polyhedron as _poly
 from rxembed.constraints import add_distance, compose, resolve_atom, resolve_core
 from rxembed.constraints import template_to_fix as _core_template_to_fix
 from rxembed.embed import (  # the module, not the `embed` function the package root re-exports
@@ -32,7 +31,7 @@ from rxembed.stereo import enumerate_unassigned
 from . import nci as _nci
 from . import stereo_check as _stereo
 from .ensemble import Ensemble, EnsembleSet
-from .perceive import _xyz_to_mol
+from .perceive import read_xyz
 
 logger = logging.getLogger("rxembed")
 
@@ -68,7 +67,7 @@ def _normalize(source, charge=0):
     if isinstance(source, Chem.Mol):
         mol = source
     elif isinstance(source, str) and source.lower().endswith(".xyz"):
-        mol = _xyz_to_mol(source, charge)
+        mol = read_xyz(source, charge)
         if mol is None:
             raise ValueError(f"could not read {source}")
     else:
@@ -222,14 +221,16 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
             ids = [mol.AddConformer(input_conf, assignId=True), *ids]
         logger.info(
             "embed[%s: %s%s%s]: %d seeds%s",  # name-agnostic identity: arrangement (+ chirality), not cis/trans
-            _poly.describe(iso.geometry),
+            iso.geometry,
             _kiso.arrangement(iso),
             f" {iso.chirality}" if iso.chirality else "",
             f" coord@{atoms}" if atoms else "",
             len(ids),
             " (incl. input geometry)" if input_conf else "",
         )
-        ens = Ensemble(mol, ids, cons, iso)  # the isomer IS the metal context every stage reads
+        ens = Ensemble(mol, ids, cons, iso, seed=int(seed))  # keep the seed so a stated metal hand can re-seed
+        if atoms:
+            ens.sphere[iso.metal] = [*iso.donors, *atoms]
         if ids:  # the labile-donor hand at the uniform initial embed; minimize() culls later inversions
             ens._donor_hand = {
                 d: _metal.donor_chirality_sign(mol, ids[0], d) for d in _metal._labile_donors(mol, iso.donors)
@@ -266,7 +267,7 @@ def _auto_contacts_embed(source, *, metal, fix, constrain, coordinate, charge, n
     if not modes:
         logger.info("contacts='auto': no inter-fragment NCI binding mode detected -> plain embed")
         return _embed_dispatch(source, contacts=None, **common)
-    logger.info("contacts='auto': %d binding mode(s) -> %s", len(modes), list(modes))
+    logger.info("contacts='auto': %d binding modes", len(modes))
     out = EnsembleSet()
     for label, contact in modes.items():
         try:
@@ -421,14 +422,13 @@ def _stereo_enumerated_embed(expanded, stereo, dispatch_kw):
     return flat[0] if len(flat) == 1 else flat  # a lone (all-axial-collapsed) variant stays a bare Ensemble
 
 
-def _template_to_fix(template, fix, own=None):
+def _template_to_fix(template, fix, own=None, target=None):
     """Fold ``template=`` into a coordinate ``fix``, extending the core resolver with the pipeline's `Ensemble`.
 
     The core takes a Mol, an ``.xyz`` path or an (N, 3) array; this adds an `Ensemble`, handing over the
-    positions of its first tracked conformer. That is the whole extension: a template is read for coordinates
-    and never for bonds, so it takes no `charge` and reaches no perceiver. `constraints.reference_positions`
-    reads an ``.xyz`` with `Chem.MolFromXYZFile` deliberately, which is what lets a metal or a hypervalent
-    reacting core serve as a reference at all.
+    positions of its first tracked conformer. An optional SMARTS is matched once on the target and reference;
+    an xyz or coordinate array uses an explicit index map. The template is read for coordinates and never
+    perceived, which lets a hypervalent reacting core serve as a reference.
 
     ``own`` is the source's own coordinates, which a ``fix=[atoms]`` list beside the template is resolved
     against; the caller must read them from the *normalised* source.
@@ -442,8 +442,12 @@ def _template_to_fix(template, fix, own=None):
                     "conformer was discarded"
                 )
             cid = reference.ids[0]
-            template = (reference.mol.GetConformer(cid).GetPositions(), mapping)
-    return _core_template_to_fix(template, fix, own)
+            reference = Chem.Mol(reference.mol)
+            chosen = Chem.Conformer(reference.GetConformer(cid))
+            reference.RemoveAllConformers()
+            reference.AddConformer(chosen, assignId=False)
+            template = (reference, mapping)
+    return _core_template_to_fix(template, fix, own, target)
 
 
 def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic", lengths="auto"):
@@ -461,7 +465,7 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic
         # `rx.embed`; it is needed anyway to retain a spectator metal. A SMILES goes through `parse_smiles`
         # for a clear error on a bad string rather than a cryptic `AddHs(None)`.
         if mol.lower().endswith(".xyz"):
-            mol = _xyz_to_mol(mol, 0)
+            mol = read_xyz(mol, 0)
         else:
             mol = Chem.AddHs(parse_smiles(mol))
     ref_sig = None  # chirality fingerprint of the input geometry (real metals), letting stereo='preserve'
@@ -491,14 +495,25 @@ def _dispatch_metal_source(source, *, metal, coordinate, contacts, fix, constrai
         raise ValueError("pass either a metal Isomer source OR metal=<geometry>, not both")
     if isinstance(source, str) and source.lower().endswith(".xyz"):
         source = _normalize(source, charge)[0]  # xyz -> perceived Mol (enumerate wants a Mol/SMILES)
+    stated = isinstance(source, Chem.Mol) and _kiso.stated_arrangement(source) is not None
     isos = enumerate_isomers(source, metal, stereo=stereo)
     out = EnsembleSet(e for iso in isos for e in _embed_isomer(iso, **_iso_kw))
-    logger.info(  # the resolved shapes, never the raw argument: a code request must name itself on screen
-        "metal: %s -> %d distinct isomer(s); .summary() / .select() to pick one",
-        ", ".join(_poly.describe(g) for g in (metal if isinstance(metal, (list, tuple)) else [metal])),
-        len(out),
-    )
-    return out
+    if not stated:
+        logger.info(  # the resolved shapes, never the raw argument: a code request must name itself on screen
+            "metal: %s -> %d distinct isomer(s); .summary() / .select() to pick one",
+            ", ".join(_poly.describe(g) for g in (metal if isinstance(metal, (list, tuple)) else [metal])),
+            len(out),
+        )
+    return out[0] if stated and len(out) == 1 else out
+
+
+def _load_stated_arrangement(source, normalized, metal, charge):
+    """Route a CXSMILES source through the metal geometry it states."""
+    if metal is not None or isinstance(source, _kiso.Isomer):
+        return source, normalized, metal
+    normalized = normalized or _normalize(source, charge)
+    stated = _kiso.stated_arrangement(normalized[0])
+    return source, normalized, stated[0] if stated is not None else metal
 
 
 def _embed_dispatch(
@@ -531,8 +546,9 @@ def _embed_dispatch(
             normalized = _normalize(source, charge)
             own_mol = normalized[0]
         own = own_mol.GetConformer().GetPositions() if own_mol.GetNumConformers() else None
-        fix = _template_to_fix(template, fix, own)
-    routed_source = normalized[0] if normalized is not None else source
+        fix = _template_to_fix(template, fix, own, own_mol)
+    source, normalized, metal = _load_stated_arrangement(source, normalized, metal, charge)
+    routed_source = source if isinstance(source, _kiso.Isomer) else normalized[0] if normalized else source
     if coordinate is not None and metal is None and not isinstance(source, _kiso.Isomer):
         raise ValueError(
             "coordinate= only applies to a metal (pass metal=<geometry> or a metal Isomer "

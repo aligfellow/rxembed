@@ -1,11 +1,4 @@
-"""`metal_distance`: the fitted M-L bond-length model and the anti-overbond floors, measured on real embeds.
-
-`ml_distance` is a periodic fit (element / group / delocalised charge / hapticity) with a P/As/Sb dative cap;
-`nondonor_floors` keeps everything that is not a donor out of the metal's coordination sphere, which the
-bond-less carbon surrogate cannot do on its own. Both are only observable in the relaxed geometry, so these
-embed. The tier boundaries themselves (`overbond_tier`, the report-vs-force-field floors) are pinned in
-`tests/pipeline/test_geom_check.py`. RDKit + UFF, no xtb.
-"""
+"""Test metal-ligand seed distances and anti-overbond floors."""
 
 from __future__ import annotations
 
@@ -15,7 +8,7 @@ from rdkit import Chem
 from rdkit.Chem import GetPeriodicTable
 from rdkit.Chem import rdMolTransforms as T
 
-import rxembed.pipeline as rx
+import rxembed as rx
 from rxembed import metal_core as core
 from rxembed import metal_distance as D  # noqa: N812
 from rxembed import metal_perceive as perceive
@@ -55,7 +48,7 @@ def _as_perceived(mol):
     return out
 
 
-def test_a_pnictogen_donor_takes_the_dative_cap_and_a_halide_does_not():
+def test_pnictogen_uses_dative_cap_not_halide():
     pt = GetPeriodicTable()
     iso = rx.metal(_NI_N, "square_planar")[0]
     q = D.delocalised_charges(iso.mol)
@@ -80,7 +73,7 @@ def test_a_pnictogen_donor_takes_the_dative_cap_and_a_halide_does_not():
     assert got_cl > r_pd + D._SOFT_DONOR_FRAC * r_cl, "a halide was wrongly given the soft-donor contraction"
 
 
-def test_a_vanadyl_oxo_contracts_while_its_acac_oxygens_keep_one_shared_length(monkeypatch):
+def test_vanadyl_oxo_contracts_without_splitting_acac_lengths(monkeypatch):
     iso = rx.metal(_VANADYL_ACAC, "square_pyramidal")[0]
     q, hyb = D.delocalised_charges(iso.mol), _stripped_hybridisation(iso.mol)
     dset = set(iso.donors)
@@ -105,7 +98,7 @@ def test_a_vanadyl_oxo_contracts_while_its_acac_oxygens_keep_one_shared_length(m
     assert all(off[d] == got[d] for d in acac), "the term reached a donor whose ligand side already fills it"
 
 
-def test_the_ligand_valence_separates_an_oxo_and_a_nitrido_from_an_aqua(monkeypatch):
+def test_ligand_valence_distinguishes_oxo_nitrido_and_aqua(monkeypatch):
     real = Chem.AddHs(Chem.MolFromSmiles(_NITRIDO_OXO_DIAQUA))
     m = metal_index(real)
     donors = [n.GetIdx() for n in real.GetAtomWithIdx(m).GetNeighbors()]
@@ -139,7 +132,7 @@ def test_the_ligand_valence_separates_an_oxo_and_a_nitrido_from_an_aqua(monkeypa
         assert got == pytest.approx(on[int(d)]), f"donor {d} moved when the metal was replaced by the surrogate"
 
 
-def test_one_oxo_gets_one_target_however_the_caller_spelled_it(monkeypatch):
+def test_oxo_has_one_canonical_target(monkeypatch):
     mols = [Chem.AddHs(Chem.MolFromSmiles(s)) for s in (_NITRIDO_OXO_DIAQUA, _NITRIDO_OXO_DIAQUA_IONIC)]
     mols.append(_as_perceived(mols[0]))
     before = [[a.GetFormalCharge() for a in mol.GetAtoms()] for mol in mols]
@@ -161,7 +154,7 @@ def test_one_oxo_gets_one_target_however_the_caller_spelled_it(monkeypatch):
     assert targets(mols[1]) != targets(mols[0]), "without the ligand-valence branch the spellings should NOT agree"
 
 
-def test_a_terminal_hydride_takes_its_refit_contraction(monkeypatch):
+def test_terminal_hydride_takes_its_refit_contraction(monkeypatch):
     params = Chem.SmilesParserParams()
     params.removeHs = False
     mol = Chem.MolFromSmiles("[H][Ru]([H])(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]", params)
@@ -177,7 +170,7 @@ def test_a_terminal_hydride_takes_its_refit_contraction(monkeypatch):
     assert off - on == pytest.approx(contraction)
 
 
-def test_an_sp_atom_in_a_haptic_face_does_not_take_the_sigma_contraction():
+def test_haptic_sp_atom_skips_sigma_contraction():
     rw = Chem.RWMol()
     metal, a, b = (rw.AddAtom(Chem.Atom(z)) for z in (26, 6, 6))
     rw.AddBond(a, b, Chem.BondType.TRIPLE)
@@ -196,7 +189,7 @@ def test_an_sp_atom_in_a_haptic_face_does_not_take_the_sigma_contraction():
     assert sigma_sp2 - sigma_sp == pytest.approx(D._SP_CONTRACTION)
 
 
-def test_every_m_donor_lands_inside_the_window_the_model_stated():
+def test_all_m_donors_land_in_model_windows():
     iso = rx.metal(_NI_N, "square_planar", stereo="free")[0]
     ens = rx.embed(iso, n=3).minimize()
     assert ens.n >= 1
@@ -208,7 +201,7 @@ def test_every_m_donor_lands_inside_the_window_the_model_stated():
             assert lo - 0.05 <= got <= hi + 0.05, f"donor {d}: {got:.3f} Å is outside its window ({lo:.3f}, {hi:.3f})"
 
 
-def test_a_vacant_site_is_not_filled_by_the_ligands_own_backbone():
+def test_vacant_site_excludes_ligand_backbone():
     from rxembed.pipeline import metrics
 
     pt = GetPeriodicTable()

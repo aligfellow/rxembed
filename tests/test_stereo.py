@@ -1,13 +1,4 @@
-"""`stereo.py`; expand a `Mol`'s undefined stereocentres into the distinct species to embed.
-
-The embed-side half of stereochemistry: graph-only, RDKit's `EnumerateStereoisomers` over the *unspecified*
-elements alone, so a defined centre is held. Metal-safe: the metal's own handedness is the coordination-isomer
-path's job, and a double bond the coordination locks is not enumerated as a phantom pair.
-
-The conformer-side half (the coordinate-derived chirality fingerprint that filters embedded conformers) is
-perception-driven and lives in `pipeline/stereo_check.py`; the `stereo=` argument that drives this module from
-the pipeline is `pipeline/dispatch.py`.
-"""
+"""Test graph stereoisomer enumeration before embedding."""
 
 from __future__ import annotations
 
@@ -44,7 +35,7 @@ def _labels(mol, **kw):
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_nothing_to_enumerate_hands_back_the_input_object_itself():
+def test_no_stereo_returns_input_object():
     mol = _mol("CCO")
     variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(mol)
     assert (n_unassigned, total, unresolved) == (0, 1, 0)
@@ -60,31 +51,31 @@ def test_nothing_to_enumerate_hands_back_the_input_object_itself():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_an_undefined_point_centre_expands_to_both_hands_with_index_keyed_cip_labels():
+def test_undefined_point_centre_expands_with_cip_labels():
     assert _labels(_mol("CC(N)C(=O)O")) == ["1R", "1S"]
 
 
-def test_an_undefined_double_bond_expands_e_and_z_alongside_the_point_centres():
+def test_undefined_alkene_expands_with_point_centres():
     labels = _labels(_mol("CC=CC(N)O"))
     assert len(labels) == 4
     assert sum(":E" in x for x in labels) == 2
     assert sum(":Z" in x for x in labels) == 2
 
 
-def test_a_meso_duplicate_is_dropped():
+def test_meso_duplicate_is_dropped():
     variants, n_unassigned, total, _unresolved = stereo.enumerate_unassigned(_mol("CC(O)C(O)C"))
     assert (n_unassigned, total) == (2, 4)
     assert len(variants) == 3
 
 
-def test_atom_order_is_preserved_so_index_based_specs_stay_valid():
+def test_enumeration_preserves_atom_order():
     mol = _mol("CC=CC(N)O")
     original = [a.GetAtomicNum() for a in mol.GetAtoms()]
     for variant, _label in stereo.enumerate_unassigned(mol)[0]:
         assert [a.GetAtomicNum() for a in variant.GetAtoms()] == original
 
 
-def test_the_cap_truncates_the_variants_but_reports_the_true_total():
+def test_stereo_cap_reports_uncapped_total():
     variants, n_unassigned, total, _unresolved = stereo.enumerate_unassigned(_mol("CC(N)C(=O)O"), cap=1)
     assert (n_unassigned, total) == (1, 2)
     assert len(variants) == 1
@@ -95,7 +86,7 @@ def test_the_cap_truncates_the_variants_but_reports_the_true_total():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_an_allene_axis_is_counted_as_unresolved_and_never_gets_a_question_mark_label():
+def test_allene_axis_is_unresolved_without_question_label():
     variants, n_unassigned, _total, unresolved = stereo.enumerate_unassigned(_mol("CC(F)=C=C(F)C"))
     assert n_unassigned == 2
     assert unresolved == 2
@@ -107,26 +98,26 @@ def test_an_allene_axis_is_counted_as_unresolved_and_never_gets_a_question_mark_
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_a_metal_bound_chiral_phosphorus_survives_the_sphere_strip():
+def test_metal_bound_chiral_phosphorus_survives_strip():
     mol, metals = _with_metals(_CHIRAL_P_PD)
     labels = _labels(mol, exclude=metals)
     assert len(labels) == 2
     assert len(set(labels)) == 2, "the two P-epimers must get distinct labels"
 
 
-def test_a_double_bond_the_coordination_locks_is_not_enumerated():
+def test_coordination_locked_alkene_is_not_enumerated():
     mol, metals = _with_metals(_ALPHA_DIIMINE_NI)
     assert stereo._coordination_locked_double_bonds(mol, metals), "the metal-closed imine was not detected"
     variants, _n, _total, _unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
     assert len(variants) == 2, "only the real point stereocentre should expand, not the locked imines"
 
 
-def test_a_pendant_double_bond_is_not_locked_just_because_a_metal_is_present():
+def test_pendant_alkene_remains_unlocked_by_metal():
     mol, metals = _with_metals("CC=CC[NH2]->[Ni+2](<-[O-]C(=O)C)<-[NH2]CC=CC")
     assert stereo._coordination_locked_double_bonds(mol, metals) == set()
 
 
-def test_the_metal_strip_and_the_graft_are_exact_inverses_at_a_defined_donor():
+def test_metal_strip_and_graft_are_inverse():
     for smiles in ("Cl[Pd](Cl)(Cl)<-[P@](C)(CC)C(C)(N)O", "[P@](C)(CC)(C(C)(N)O)->[Pd](Cl)(Cl)Cl"):
         mol, metals = _with_metals(smiles)
         donor = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "P")

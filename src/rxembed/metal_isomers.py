@@ -34,6 +34,7 @@ from .metal_core import (
     COORDINATION_METALS,
     VACANT,
     _collapse_haptic,
+    _donor_classes,
     _frag_map,
     _haptic_sites,
     _vertex_atom,
@@ -388,7 +389,7 @@ def from_geometry(mol):
     # fallback for a CN no template covers. An apical (eta>=3) face fills more than one site, so a CN4 piano
     # stool is a distorted tetrahedron: take the apical default, never the flat square_planar.
     apical = any(len(r) >= _APICAL_MIN for r in haptic.values())
-    measured = None if apical else classify_geometry(base, m, sites)  # logs its own perceived line
+    measured = None if apical else classify_geometry(base, m, sites)
     geom = measured or geometry_for(len(sites), has_apical=apical) or f"{len(sites)}-coordinate"
     if measured is None:  # say why the name is a default rather than a measurement
         logger.info(
@@ -625,14 +626,14 @@ def _prepare_spectators(mol, metals, center):
 
 def _select_geometries(base, m, donors, haptic, geometry, n):
     """Resolve `geometry` to the list of polyhedron names to enumerate (default from donor count, or as given)."""
+    measured = None
     if geometry is None:
         # an apical (eta>=3) face fills more than one site, so a CN4 carrying one is a piano stool, not the
         # square_planar that would seat a ligand trans through the ring. An eta2 face is a single-site vertex.
         apical = any(len(r) >= _APICAL_MIN for r in haptic.values())
-        measured = None
         if base.GetNumConformers() and not apical:  # a retained geometry names itself; an apical face is a
             sites = [haptic.get(v, v) for v in donors]  # site-count question the templates do not model
-            measured = classify_geometry(base, m, sites)  # logs its own perceived line
+            measured = classify_geometry(base, m, sites)
         geoms = [measured or geometry_for(n, has_apical=apical)]
         if geoms == [None]:
             raise ValueError(
@@ -658,8 +659,10 @@ def _select_geometries(base, m, donors, haptic, geometry, n):
                 f"unknown geometry {g!r}; available: {sorted(k for k in POLYHEDRA if k != 'None')} "
                 f"(or a code: {sorted(p.code for p in POLYHEDRA.values() if p.code)}){hint}"
             )
+    if measured is not None:
+        logger.info("geometry: input is %s", describe(measured))
     if geometry is not None:
-        logger.info("metal: requested %s", ", ".join(describe(g) for g in geoms))
+        logger.debug("geometry: requested %s", ", ".join(describe(g) for g in geoms))
     return geoms
 
 
@@ -685,7 +688,7 @@ def _frozen_permutations(base, m, padded, geom, frozen_donors, sites):
             o[v] = di
         perms.append(o)
     logger.info(
-        "metal[%s]: %d frozen donor(s) pinned at input vertices; %d free-site arrangement(s) to dedup",
+        "metal[%s]: %d frozen donors; deduplicating %d free-site arrangements",
         geom,
         len(frozen_v),
         len(perms),
@@ -787,9 +790,9 @@ def _number_shared_labels(out):
 
 
 def stated_arrangement(mol):
-    """Return the ``(geometry, {vertex: donor atom})`` a canonical string put on `mol`, or ``None``.
+    """Return the ``(geometry, {vertex: donor atom}, chirality)`` stated on `mol`, or ``None``.
 
-    The reading half of `metal_smiles.canonical_smiles`, and it lives here rather than there because what it
+    The reading half of `metal_smiles.cxsmiles`, and it lives here rather than there because what it
     reads is RDKit atom properties on a `Mol`: an arrangement, which is this module's subject, not a string,
     which is that one's. `metal_smiles.parse_smiles` has already kept the block's indices addressing the
     atoms they were written for, so a string that carries an arrangement arrives as an ordinary `Mol` wearing
@@ -803,16 +806,59 @@ def stated_arrangement(mol):
     # the metal's geometry code.
     noted = {a.GetIdx(): a.GetProp("atomNote") for a in mol.GetAtoms() if a.HasProp("atomNote")}
     slots = {i: read for i, v in noted.items() if (read := read_slot_note(v)) is not None}
-    geom = [i for i in noted if i not in slots]
+    geom = [i for i in noted if i not in slots and i in metal_indices(mol)]
     if len(geom) != 1:
         return None
-    name = resolve_geometry(noted[geom[0]].split("-")[0])
+    geometry, separator, chirality = noted[geom[0]].partition("-")
+    try:
+        name = resolve_geometry(geometry)
+    except ValueError:
+        return None  # atomNote is general CXSMILES metadata; an unrelated note on a metal is not our arrangement
+    if separator and chirality not in {"delta", "lambda"}:
+        raise ValueError(f"the arrangement on this string has unknown metal chirality {chirality!r}")
     sites = {}
-    for atom_idx, (slot, _winding) in slots.items():
+    for atom_idx, (slot, winding) in slots.items():
+        if winding:
+            raise NotImplementedError(
+                "CXSMILES haptic winding is recorded but embedding it is not supported; pass the Isomer or Mol"
+            )
         sites.setdefault(slot, atom_idx)  # a haptic face writes one slot on every ring atom; any names it
     if name not in POLYHEDRA:
         raise ValueError(f"the arrangement on this string names {name!r}, which is not a polyhedron rxembed has")
-    return name, sites
+    return name, sites, chirality
+
+
+def _validate_stated_chirality(iso, chirality):
+    """Reject a metal hand that contradicts the stated seating."""
+    derived = iso.chirality
+    if chirality and POLYHEDRA[iso.geometry].planar:
+        raise ValueError(f"{iso.geometry} is planar and cannot carry metal chirality {chirality!r}")
+    if not chirality and derived:
+        raise ValueError(f"the stated {iso.geometry} seating is chiral ({derived}) but the metal note omits chirality")
+    if chirality and derived and chirality != derived:
+        raise ValueError(f"the metal note says {chirality}, but its stated seating is {derived}")
+    if chirality and not derived and chirality not in _possible_stated_hands(iso):
+        raise ValueError(f"the metal note says {chirality}, but its stated seating is achiral")
+
+
+def _possible_stated_hands(iso):
+    """Return metal hands possible before the canonical writer's tied-site pairing."""
+    classes = _donor_classes(iso.mol, iso.donors)
+    groups = {}
+    for position, donor in enumerate(iso.vertices):
+        if donor == VACANT:
+            continue
+        key = tuple(sorted(classes[a] for a in iso.haptic[donor])) if donor in iso.haptic else (classes[donor],)
+        groups.setdefault(key, []).append(position)
+    choices = [itertools.permutations(iso.vertices[p] for p in positions) for positions in groups.values()]
+    hands = set()
+    for assignment in itertools.product(*choices):
+        vertices = list(iso.vertices)
+        for positions, donors in zip(groups.values(), assignment, strict=True):
+            for position, donor in zip(positions, donors, strict=True):
+                vertices[position] = donor
+        hands.add(chirality_of(iso.mol, iso.donors, iso.geometry, vertices, iso.haptic))
+    return hands
 
 
 def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic", stereo_ref=None, lengths="auto"):
@@ -831,20 +877,20 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic
     `stereo_ref` is the input's chirality fingerprint, computed by the caller because it needs a perception
     the engine does not carry, and passed to each `Isomer` for a ``stereo='preserve'`` gate.
 
-    A `Mol` that already states an arrangement (one read from a `canonical_smiles` string) has nothing to
+    A `Mol` that already states an arrangement (one read from a `cxsmiles` string) has nothing to
     enumerate: that one `Isomer` comes back, seated as written.
 
     `lengths` says where the M-donor windows are measured from: ``'auto'`` (the input conformer if there is
     one, else the fitted model), ``'input'``, or ``'model'``. Set it when `mol` carries a geometry that is not
     metal-aware, since a plain ETKDG conformer has no M-L parameter and ``'auto'`` would embed toward it.
 
-    Takes a `Mol`: parsing is the consumer's job (see the module docstring), and `rxembed.pipeline.metal` is
+    Takes a `Mol`: parsing is the consumer's job (see the module docstring), and `rxembed.metal` is
     the same enumeration with the SMILES / ``.xyz`` reader and the `stereo_ref` fingerprint in front of it.
     """
     if not isinstance(mol, Chem.Mol):  # else the first `mol.GetNumConformers()` below raises a bare
-        raise TypeError(  # AttributeError, on exactly the string `rxembed.pipeline.metal` accepts
+        raise TypeError(  # AttributeError, on exactly the string `rxembed.metal` accepts
             f"enumerate_isomers() takes an RDKit Mol, got {type(mol).__name__}. Perception is upstream of the "
-            f"engine: parse a SMILES with rxembed.parse_smiles, or call rxembed.pipeline.metal, which reads a "
+            f"engine: parse a SMILES with rxembed.parse_smiles, or call rxembed.metal, which reads a "
             f"SMILES or an .xyz path and computes the stereo fingerprint the 'preserve' gate compares against"
         )
     loaded = _load_in_ligand_stereo(mol, geometry, center, fix, stereo, lengths)
@@ -852,15 +898,18 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic
         return loaded  # each ligand-stereo variant recurses, so a stated arrangement is seated on every one
     stated = stated_arrangement(mol)
     if stated is not None:
-        name, sites = stated
+        name, sites, chirality = stated
         if (geometry is not None and resolve_geometry(geometry) != name) or fix:
             raise ValueError(
                 f"this input already states a {name} arrangement, so "
                 f"{'fix=' if fix else f'geometry={geometry!r}'} has nothing to act on; drop it to use what "
                 f"the input says, or strip the arrangement to enumerate"
             )
-        logger.info("metal: %s arrangement stated by the input; enumerating nothing", describe(name))
-        return IsomerSet([Isomer(mol, name, sites, lengths=lengths)])
+        logger.info("using stated %s arrangement", describe(name))
+        iso = Isomer(mol, name, sites, lengths=lengths)
+        _validate_stated_chirality(iso, chirality)
+        iso.chirality = chirality  # the metal note is the carrier; graph equivalence can erase it on chelates
+        return IsomerSet([iso])
     metals = metal_indices(mol)
     if not metals:
         raise ValueError("no transition metal found")
@@ -889,7 +938,7 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic
         fix_cons, _ = resolve_core(base, fix=fix, has_geometry=True)
         frozen_donors = fix_cons.frozen & set(donors)
         logger.info(
-            "metal: fixing %d atom(s) at the input geometry; enumerating the free coordination sites around them",
+            "metal: fixed %d input atoms; enumerating free coordination sites",
             len(fix_cons.frozen),
         )
     geoms = _select_geometries(base, m, donors, haptic, geometry, len(donors))

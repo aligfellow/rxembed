@@ -15,8 +15,6 @@ Modifications here:
 - ``get_proto_mol`` seeded atom 0 from ``Chem.MolFromSmarts``, making it a query atom while every
   other atom was plain. ``RemoveHs`` would not remove a query atom, so an explicit H could survive
   based on the index ordering of the .xyz file.
-
-Keep this file close to upstream so it can be re-synced; new behaviour belongs in `xyz2mol_tmc`.
 """
 
 import copy

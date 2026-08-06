@@ -1,56 +1,41 @@
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "rxembed"
 version = "0.1.0"
-description = "Fast, flexible molecular embedding for reactive chemistry."
+description = "Constrained conformer embedding for reactive chemistry."
 authors = [{name = "Alister S. Goodfellow"}]
 readme = "README.md"
 requires-python = ">=3.12"
-# networkx is base because the vendored perceiver is the BASE-install reader for a metal complex
-# (`pipeline/perceive.py`), and its one call is `max_weight_matching` -- Edmonds' blossom, which decides
-# which unsaturated pairs take the extra bond order. RDKit has no primitive for it (measured: greedy is
-# one edge short of maximum on 29% of calls, and scipy's bipartite matcher cannot help because 24 of
-# 1032 graphs carry odd cycles). Deliberately UNPINNED, but note the perceiver has one tie-break-
-# dependent structure (YEYSOK): shuffling networkx's own edge order changes its answer, and all the
-# candidates are chemically nonsense. A networkx upgrade could move that one case. It is a gap in the
-# perceiver, not in the pin.
+license = "MIT"
 dependencies = ["numpy", "rdkit", "networkx"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 
 [project.optional-dependencies]
-search = ["openconf"]
-select = ["prism_pruner", "scikit-learn"]
-perceive = ["xyzgraph>=1.6.14"]
-nci = ["xyzgraph>=1.6.14"]  # networkx is a base dependency now
-viz = ["rxembed[select]", "matplotlib", "xyzrender>=0.3.8"]
-all = ["rxembed[search,select,perceive,nci,viz]"]
+search = ["openconf @ git+https://github.com/rowansci/openconf@1fa1441096dc2d4ff662894750644b62c82a20ba"]
+workflow = ["xyzgraph>=1.6.14", "prism_pruner", "scikit-learn", "matplotlib"]
 
 [project.urls]
 homepage = "https://github.com/aligfellow/rxembed"
-
-# openconf's transition-metal preset is not yet on PyPI, so pull it from git.
-[tool.uv.sources]
-openconf = { git = "https://github.com/rowansci/openconf" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [dependency-groups]
 dev = [
-    "rxembed[all]",
+    "rxembed[search,workflow]",
     "pre-commit>=3.5.0",
     "pytest>=8.3.5",
     "pytest-cov>=5.0.0",
     "ruff>=0.14.14",
     "ty>=0.0.14",
     "ipykernel",
+    "xyzrender>=0.3.8",
 ]
 
 # ===== Ruff =====
@@ -94,11 +79,6 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403"]
 "tests/**" = ["D", "PLR2004"]
-"src/rxembed/mechanisms.py" = ["D102"]  # hook contracts live on the Mechanism base class, not each override
-# Vendored from jensengroup/xyz2mol_tm (MIT). Upstream's style is not ours to rewrite: AC, BO and UA
-# are the matrix names from the paper the code implements, and reformatting the file is how it stops
-# being re-syncable. These lists cover upstream's own violations; our additions to xyz2mol_tmc
-# carry none of them.
 "src/rxembed/pipeline/xyz2mol_local.py" = ["ALL"]
 "src/rxembed/pipeline/xyz2mol_tmc.py" = [
     "N802", "N806", "PLR2004", "RUF046", "RUF059", "RUF015",
@@ -113,10 +93,10 @@ convention = "numpy"
 
 [tool.ruff.format]
 docstring-code-format = true
-# `ruff format` keeps its OWN exclude list; the `[tool.ruff.lint.per-file-ignores]` entries above do NOT
-# reach it. Without this, a bare `ruff format .` rewrites the vendored perceiver, and reformatting it is
-# precisely what stops it being re-syncable against upstream.
-exclude = ["src/rxembed/pipeline/xyz2mol_local.py", "src/rxembed/pipeline/xyz2mol_tmc.py"]
+exclude = [
+    "src/rxembed/pipeline/xyz2mol_local.py",
+    "src/rxembed/pipeline/xyz2mol_tmc.py"
+]
 
 # ===== ty =====
 [tool.ty]

@@ -1,13 +1,4 @@
-"""`bounds.py`, the DG driver: build ETKDG parameters, edit RDKit's bounds matrix, smooth, embed.
-
-The design claim this file pins is that the matrix is EDITED from RDKit's knowledge-derived bounds rather than
-replaced, and that the smoothing tolerance is a SIGNAL, not a detail: 0.0 means the constraints are mutually
-realisable and anything above it means RDKit repaired a crossed bound to embed at all.
-
-The second half pins the ANGLE RULES on synthetic `Constraints`: the branches that decide how an angle meets
-the matrix. They are separated because each needs a topology chosen to force one specific path, which no
-molecule anyone would embed on purpose provides.
-"""
+"""Test ETKDG bounds editing, smoothing and coordinate seeding."""
 
 from __future__ import annotations
 
@@ -24,7 +15,7 @@ from rxembed.constraints import Constraints, add_distance
 
 
 def _graph(smiles):
-    """A Mol with explicit Hs and no conformer; all `n_confs` reads is the rotor count."""
+    """Return a Mol with explicit Hs and no conformer for seed-count tests."""
     return Chem.AddHs(Chem.MolFromSmiles(smiles))
 
 
@@ -66,7 +57,7 @@ def test_etkdg_states_every_default_it_overrides():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_a_failed_probe_returns_none_rather_than_an_empty_mol(monkeypatch):
+def test_failed_probe_returns_none_rather_than_an_empty_mol(monkeypatch):
     monkeypatch.setattr(bnd.rdDistGeom, "EmbedMolecule", lambda *_a, **_k: -1)
     assert bnd.probe_conformer(_mol(), 7) is None
 
@@ -76,7 +67,7 @@ def test_a_failed_probe_returns_none_rather_than_an_empty_mol(monkeypatch):
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_an_unrepairable_contradiction_raises_rather_than_embedding_nonsense():
+def test_unrepairable_bounds_raise():
     bm = _matrix(_mol())
     bm[0][2], bm[2][0] = 0.31, 0.30
     with pytest.raises(RuntimeError, match="triangle smoothing failed"):
@@ -92,7 +83,7 @@ def test_an_unrepairable_contradiction_raises_rather_than_embedding_nonsense():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_a_realisable_matrix_names_nothing_and_a_crossed_one_names_its_own_window():
+def test_crossed_matrix_names_violated_window():
     mol = _mol()
     assert bnd._smooth(_matrix(mol)) == 0.0, "RDKit's own bounds are realisable: the premise this rests on"
     assert bnd.crossings(mol, Constraints(distances={(0, 2): (2.5, 2.6)})) == []
@@ -106,7 +97,7 @@ def test_a_realisable_matrix_names_nothing_and_a_crossed_one_names_its_own_windo
     assert [str(w) for w in crossed[0].windows()] == ["distance 0-2"]
 
 
-def test_widening_the_named_window_by_the_reported_gap_is_what_clears_the_crossing():
+def test_reported_gap_repairs_crossing():
     mol = _mol()
     worst = bnd.crossings(mol, Constraints(distances={(0, 2): (1.0, 1.02)}))[0]
     assert bnd._bounds(mol, Constraints(distances={(0, 2): (1.0, 1.02 + worst.gap)}))[1] == 0.0
@@ -117,7 +108,7 @@ def test_widening_the_named_window_by_the_reported_gap_is_what_clears_the_crossi
     ("metal", "kind"),
     [(1, "D-M-D angle"), (0, "M-D-X fold")],
 )
-def test_an_angle_window_is_named_by_where_the_metal_sits_in_its_triple(metal, kind):
+def test_angle_crossing_names_metal_position(metal, kind):
     mol = _graph("C.C.C.C")
     cons = Constraints(metals={metal})
     for (i, j), d in {(0, 1): 4.0, (1, 2): 4.0, (2, 3): 3.9, (0, 3): 3.9}.items():
@@ -136,7 +127,7 @@ def test_an_angle_window_is_named_by_where_the_metal_sits_in_its_triple(metal, k
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_the_matrix_is_edited_not_replaced():
+def test_matrix_is_edited_not_replaced():
     mol = _mol()
     before = _matrix(mol)
     assert before[1][0] > 1.0, "the C0-C1 lower bound is RDKit's own bond window: the premise"
@@ -147,16 +138,16 @@ def test_the_matrix_is_edited_not_replaced():
     assert (after[0][1], after[1][0]) == (before[0][1], before[1][0]), "a bonded pair was rewritten"
 
 
-def test_an_unrealisable_spec_says_which_window_it_could_not_satisfy(caplog):
+def test_unrealisable_spec_names_failed_window(caplog):
     mol = _mol()
     with caplog.at_level("WARNING", logger="rxembed.bounds"):
         _bm, tol = bnd._feasible_bounds(mol, Constraints(distances={(0, 2): (1.0, 1.02)}))
     assert tol > 0.0
-    assert "not mutually realisable" in caplog.text
+    assert "incompatible constraints" in caplog.text
     assert "distance 0-2" in caplog.text, "the tolerance alone points nowhere; the window is the point"
 
 
-def test_a_realisable_spec_says_nothing(caplog):
+def test_realisable_spec_says_nothing(caplog):
     mol = _mol()
     with caplog.at_level("INFO", logger="rxembed.bounds"):
         _bm, tol = bnd._feasible_bounds(mol, Constraints(distances={(0, 2): (2.5, 2.6)}))
@@ -169,32 +160,32 @@ def test_a_realisable_spec_says_nothing(caplog):
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_an_unconstrained_embed_does_not_build_a_custom_matrix(monkeypatch):
+def test_unconstrained_embed_does_not_build_a_custom_matrix(monkeypatch):
     calls = []
     monkeypatch.setattr(bnd, "_feasible_bounds", lambda *a, **k: calls.append(a) or (_matrix(a[0]), 0.0))
 
-    bnd.embed(_mol(), Constraints(), n=2, seed=3)
+    bnd.seed_coordinates(_mol(), Constraints(), n=2, seed=3)
     assert calls == []
 
-    bnd.embed(_mol(), Constraints(distances={(0, 2): (2.5, 2.6)}), n=2, seed=3)
+    bnd.seed_coordinates(_mol(), Constraints(distances={(0, 2): (2.5, 2.6)}), n=2, seed=3)
     assert len(calls) == 1
 
 
-def test_embed_returns_reproducible_ids_that_are_really_on_the_molecule():
+def test_embed_ids_are_reproducible_and_attached():
     mol = _graph("CCO")
-    ids = bnd.embed(mol, Constraints(), n=4, seed=3, prune_rms=-1)
+    ids = bnd.seed_coordinates(mol, Constraints(), n=4, seed=3, prune_rms=-1)
     assert len(ids) == 4
     assert {int(c.GetId()) for c in mol.GetConformers()} == {int(i) for i in ids}
 
-    assert len(bnd.embed(_graph("CCO"), Constraints(), n=8, seed=3)) < 8  # one distinct heavy-atom shape
+    assert len(bnd.seed_coordinates(_graph("CCO"), Constraints(), n=8, seed=3)) < 8
 
     a, b = _graph("CCO"), _graph("CCO")
-    bnd.embed(a, Constraints(), n=2, seed=1234)
-    bnd.embed(b, Constraints(), n=2, seed=1234)
+    bnd.seed_coordinates(a, Constraints(), n=2, seed=1234)
+    bnd.seed_coordinates(b, Constraints(), n=2, seed=1234)
     assert np.allclose(a.GetConformer(0).GetPositions(), b.GetConformer(0).GetPositions())
 
 
-def test_bring_real_confs_keeps_the_ids_and_drops_the_phantom_atoms():
+def test_bring_real_confs_removes_phantoms():
     real = _mol()
     n = real.GetNumAtoms()
     work = Chem.RWMol(real)
@@ -213,18 +204,18 @@ def test_bring_real_confs_keeps_the_ids_and_drops_the_phantom_atoms():
 
 
 # ---------------------------------------------------------------------------------------------------------
-# n_confs: the seed count, scaled by flexibility rather than flat
+# seed_count: scale the seed count by flexibility rather than holding it flat
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_the_seed_count_scales_with_rotatable_bonds_and_clamps_at_both_ends():
+def test_seed_count_scales_and_clamps():
     rigid, mid, floppy = _graph("CCO"), _graph("C" * 25), _graph("C" * 60)
-    assert bnd.n_confs(rigid) > 10  # RDKit's own flat default, which this exists to replace
-    assert bnd.n_confs(rigid) < bnd.n_confs(mid) < bnd.n_confs(floppy)
-    assert bnd.n_confs(rigid) == bnd.n_confs(_graph("CC")), "the floor must clamp a rigid molecule"
-    assert bnd.n_confs(floppy) == bnd.n_confs(_graph("C" * 120)), "the ceiling must clamp a long chain"
+    assert bnd.seed_count(rigid) > 10  # RDKit's own flat default, which this exists to replace
+    assert bnd.seed_count(rigid) < bnd.seed_count(mid) < bnd.seed_count(floppy)
+    assert bnd.seed_count(rigid) == bnd.seed_count(_graph("CC")), "the floor must clamp a rigid molecule"
+    assert bnd.seed_count(floppy) == bnd.seed_count(_graph("C" * 120)), "the ceiling must clamp a long chain"
     for mol in (rigid, mid):
-        assert bnd.n_confs(mol, constrained=True) > bnd.n_confs(mol)
+        assert bnd.seed_count(mol, constrained=True) > bnd.seed_count(mol)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -275,8 +266,9 @@ def test_r1_a_stated_distance_pre_empts_the_angle():
         ((100.0, 130.0), "wider than the backbone -> the tighter REAL bound survives untouched"),
         ((109.0, 111.0), "narrower than the backbone -> the angle tightens it"),
     ],
+    ids=["wider", "narrower"],
 )
-def test_r2_a_bonded_path_intersects_rather_than_overwrites(window, note):
+def test_angle_bounds_intersect_bond_path(window, note):
     mol = _rule_mol("CCC")
     topo = Chem.GetDistanceMatrix(mol)
     assert topo[0][2] < mech._DISCONNECTED  # a real bond path: the predicate that selects INTERSECT
@@ -294,7 +286,7 @@ def test_r2_a_bonded_path_intersects_rather_than_overwrites(window, note):
     assert got == pytest.approx((max(alo, blo), min(ahi, bhi))), note
 
 
-def test_r2_prime_a_disjoint_intersection_keeps_the_backbone_and_discards_the_angle():
+def test_r2_disjoint_intersection_keeps_backbone():
     mol = _rule_mol("CCC")
     base = _edited(mol, Constraints())
     blo, bhi = _window(base, 0, 2)
@@ -333,7 +325,7 @@ def _coplanar_case(angle_window):
     return mol, cons
 
 
-def test_c1_an_unstated_m_d_x_angle_contributes_no_coplanar_bound():
+def test_unstated_mdx_angle_adds_no_coplanar_bound():
     mol, cons = _coplanar_case(None)
     with_cap = _edited(mol, cons)
 
@@ -344,7 +336,7 @@ def test_c1_an_unstated_m_d_x_angle_contributes_no_coplanar_bound():
     np.testing.assert_array_equal(with_cap, without_cap)
 
 
-def test_c2_the_1_4_edge_is_an_extremum_over_the_window_not_a_pinned_angle():
+def test_c2_14_edge_uses_window_extremum():
     mol, narrow = _coplanar_case((118.0, 122.0))
     _, wide = _coplanar_case((100.0, 180.0))
     lo_n, _ = _window(_edited(mol, narrow), 0, 3)

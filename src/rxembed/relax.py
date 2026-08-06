@@ -1,16 +1,7 @@
-"""Force-field energies, constraint-enforcing restrained UFF, and the arbiter that accepts its output.
-
-The embed only biases constraints, ETKDG torsion terms overriding soft bounds,
-so a restrained minimisation is what actually enforces them: distance/angle
-windows, and frozen atoms pinned exactly (zero DOF).
-
-`bonding_ok` lives here because it is what every relax stage accepts on: a restrained UFF can pull a bond
-apart to satisfy a window, and no energy tells you that happened.
-"""
+"""Relax conformers under constraints and reject geometrically broken results."""
 
 from __future__ import annotations
 
-import contextlib
 import logging
 
 import numpy as np
@@ -18,43 +9,29 @@ from rdkit import Chem, rdBase
 from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers
 
 from . import mechanisms as _mech
-from .metal_core import COORDINATION_METALS, materialise_phantoms
-from .utils import remove_bond
+from .metal_core import COORDINATION_METALS, materialise_phantoms, strip_phantoms
 
-FF_SURROGATE = (
-    3  # lithium: a bond-less UFF-typeable surrogate carrying only a vdW term, a soft sphere holding non-donors
-)
-# off the metal while the donors are held explicitly. Must stay bond-less: bonded, UFF types Li linear and
-# its 1/(4 sin²θ₀) angle term is singular, injecting ~1e9 kcal/mol into a CN>=3 sphere.
-UFF_GHOST = 54  # xenon: the FF type for a haptic centroid dummy, which sits ~0.8 Å inside its own ring where a real
-# element's r⁻¹² vdW is astronomical. It must carry zero terms, reached the only way RDKit allows: an
-# element the UFF typer cannot type. Only metal-side phantoms are ghosted; a D-cap keeps its terms.
+FF_SURROGATE = 3  # Bondless Li avoids the singular CN>=3 UFF angle term while retaining a soft vdW sphere.
+UFF_GHOST = 54  # Untypeable Xe gives a haptic centroid no UFF terms inside its ring.
 
-logger = logging.getLogger("rxembed.relax")  # the name `set_verbose` configures, spelled out rather than
-#   __name__ so a module rename cannot move a log line out from under it.
+logger = logging.getLogger("rxembed.relax")
 
 MAX_ITERS = 500  # the one restrained-UFF iteration cap: every relax entry point defaults from this name
 _PT = GetPeriodicTable()
 
 
+def _error_summary(error):
+    """Return the useful line from a multiline RDKit force-field error."""
+    noise = ("Pre-condition Violation", "Violation occurred", "Failed Expression", "RDKIT:", "BOOST:")
+    lines = [line.strip() for line in str(error).splitlines() if line.strip()]
+    return next((line for line in lines if not line.startswith(noise)), lines[-1] if lines else "unknown error")
+
+
 def bonding_ok(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset(), constrained=()):
-    """Return True if geometry-perceived connectivity matches the graph (heavy atoms).
+    """Return whether heavy-atom bonds and clashes match the stated graph.
 
-    Three things are skipped so *valid* geometries aren't rejected:
-
-    * pairs inside a frozen or reacting core (``exclude``): a partial forming or breaking bond is held to the
-      reference, not a ground-state bond;
-    * any pair involving a metal centre, whose dative/coordinate distances covalent radii don't describe.
-      `metal_core.COORDINATION_METALS` and not the d-block set, and it must stay the set `embed`'s guard refuses an
-      un-surrogated centre on: an atom exempted here but waved through there gets neither;
-    * pairs in ``constrained`` (pass ``Constraints.distances``): a pair whose separation the constraint
-      system *states* has no chemistry left for a radius rule to judge. ``rx.embed('CCCl', fix={(1, 2): 2.4})``
-      asks for a dissociating C-Cl; calling the result broken rejects exactly the requested geometry. Whether
-      the stated window was met is a different question, answered by ``check_constraints`` / ``.measure()``.
-
-    The exemption is per pair, not per atom: a bond that tore elsewhere in a molecule that also carries
-    constraints is still caught, and so is a genuinely broken free-periphery bond (the ensemble may
-    legitimately empty).
+    Frozen-core, metal and explicitly constrained pairs are exempt because covalent radii do not define their
+    intended distances. The exemption is per pair, so broken free-periphery bonds still fail.
     """
     pos = mol.GetConformer(conf_id).GetPositions()
     heavy = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
@@ -79,45 +56,61 @@ def bonding_ok(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset(), c
     return True
 
 
-@contextlib.contextmanager
-def _quiet_uff(active):
-    """Silence RDKit's UFF-typer log iff `active`: the haptic centroid ghost is untypeable by design.
+def _uff_core_graphs(mol, frozen):
+    """Yield private FF graphs with implicated frozen-core bonds made dative.
 
-    Being untypeable is how the ghost carries zero energy terms, so its warning is noise. Gated on a phantom
-    actually being present, so a real typing failure in a normal system is still reported.
+    RDKit excludes a dative bond from its start atom's valence, keeping a hypervalent electrophile typeable
+    without disconnecting the force-field graph. The public molecular graph is untouched.
     """
-    if active:
-        with rdBase.BlockLogs():
-            yield
-    else:
-        yield
-
-
-def _bond_pruned(mol, frozen):
-    """Copy `mol` with bonds *between two frozen atoms* removed; return None if there are none.
-
-    Frozen atoms are held exactly by ``AddFixedPoint`` (zero DOF), so a bond purely among them carries no
-    force on any relaxing atom. But a TS reacting core's partial or hypervalent bonds (a sub-Å H...H being
-    cleaved, a bridging hydride, an over-coordinated centre) make UFF's line search diverge ("bad direction
-    in linearSearch"). Dropping only frozen-frozen bonds removes those pathological terms; every
-    frozen-FREE bond (which anchors a relaxing atom to the held core) is kept, and no atom moves.
-    """
-    ff_bonds = [
+    bonds = [
         (b.GetBeginAtomIdx(), b.GetEndAtomIdx())
         for b in mol.GetBonds()
-        if b.GetBeginAtomIdx() in frozen and b.GetEndAtomIdx() in frozen
+        if b.GetBeginAtomIdx() in frozen and b.GetEndAtomIdx() in frozen and b.GetBondType() != Chem.BondType.DATIVE
     ]
-    if not ff_bonds:
-        return None
-    rw = Chem.RWMol(mol)  # copies the conformers (atom indices unchanged)
-    for a in frozen:
-        rw.GetAtomWithIdx(a).SetNoImplicit(True)  # dropping a bond must not sprout an implicit H
-    for i, j in ff_bonds:
-        remove_bond(rw, i, j)
-    out = rw.GetMol()
-    Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
-    out.UpdatePropertyCache(strict=False)
-    return out
+
+    def pressure(i):
+        atom = mol.GetAtomWithIdx(i)
+        default = max(_PT.GetDefaultValence(atom.GetAtomicNum()), 0)
+        excess = atom.GetValence(Chem.ValenceType.EXPLICIT) - default
+        return atom.HasValenceViolation(), excess, atom.GetDegree()
+
+    directed = []
+    for i, j in bonds:
+        start, end = sorted((i, j), key=pressure, reverse=True)
+        if mol.GetAtomWithIdx(start).HasValenceViolation():
+            directed.append((start, end))
+
+    # Try one edge first. If several atoms violate valence, retype only enough low-pressure neighbours at each
+    # centre to remove its excess valence; this stays linear instead of enumerating 2**N subsets.
+    choices = [[edge] for edge in directed]
+    by_start = {}
+    for edge in directed:
+        by_start.setdefault(edge[0], []).append(edge)
+    combined = []
+    for start, edges in by_start.items():
+        needed = max(1, int(pressure(start)[1]))
+        combined.extend(sorted(edges, key=lambda edge: pressure(edge[1]))[:needed])
+    if len(combined) > 1:
+        choices.append(combined)
+    for chosen in choices:
+        rw = Chem.RWMol(mol)
+        for start, end in chosen:
+            rw.RemoveBond(start, end)
+        for a in {a for edge in chosen for a in edge}:
+            atom = rw.GetAtomWithIdx(a)
+            atom.SetNoImplicit(True)
+            atom.SetHybridization(Chem.HybridizationType.UNSPECIFIED)
+        mid = rw.GetMol()
+        mid.UpdatePropertyCache(strict=False)
+        with rdBase.BlockLogs():
+            Chem.SanitizeMol(mid, Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION, catchErrors=True)
+        rw = Chem.RWMol(mid)
+        for start, end in chosen:
+            rw.AddBond(start, end, Chem.BondType.DATIVE)
+        out = rw.GetMol()
+        out.UpdatePropertyCache(strict=False)
+        Chem.FastFindRings(out)
+        yield out, len(chosen)
 
 
 def ff_energies(mol, minimize=True):
@@ -143,13 +136,7 @@ def ff_energies(mol, minimize=True):
 
 
 def _ff_surrogate(mol, metals, phantoms=()):
-    """Return a copy of ``mol`` with metals re-typed to the zero-vdW FF surrogate and phantoms Xe-ghosted.
-
-    Nothing is added or removed, so every atom index is unchanged on both sides and no restraint can be silently
-    dropped or mis-keyed. Each metal -> ``FF_SURROGATE`` (Li, a soft zero-vdW sphere); each ``phantom`` (a haptic
-    centroid dummy) -> ``UFF_GHOST`` (Xe, untypeable, so UFF omits every term: it sits inside its own ring
-    where a real vdW would explode). ``mol`` itself when there is nothing to re-type.
-    """
+    """Retype metals and haptic centroids on a private UFF graph without changing atom indices."""
     if not metals and not phantoms:
         return mol  # an organic system: the identical object, so this whole path is a strict no-op
     rw = Chem.RWMol(mol)  # copies the conformers
@@ -170,75 +157,70 @@ def _ff_surrogate(mol, metals, phantoms=()):
 
 
 def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=None):
-    """Minimise each conformer enforcing distance/angle windows + frozen atoms (pinned exactly, zero DOF).
+    """Minimise conformers with frozen atoms and flat-bottomed constraint terms.
 
-    A metal brings more fields, all empty for an organic system (so this is bit-identical there): ``cons.metals``
-    re-types the metal to the zero-vdW surrogate, ``cons.pulls`` adds the M-donor bias inside the flat-bottomed
-    distance walls, ``cons.floors`` the anti-overbond guard, ``cons.coplanar`` the coplanarity cap. They ship
-    together; each dropped alone regresses (see `FF_SURROGATE` / `distance.ff_terms`).
-
-    ``stiffness`` is dimensionless and 1.0 is the shipped setting: every restraint constant lives in
-    `mechanisms`, stated on one scale, and this is the escalation ladder's rung multiplying the walls among
-    them.
-
-    `conf_ids` restricts the settle to a subset of conformers (default: all), used to settle different seeds to
-    different in-window targets.
+    ``stiffness`` scales the restraint walls. ``conf_ids`` restricts the operation to selected conformers.
+    Metal and haptic typing changes only a private graph; relaxed real-atom coordinates return to ``mol``.
     """
     frozen = set(cons.frozen)
     work = materialise_phantoms(mol, cons.haptic)  # transient centroid dummies for a haptic face; `mol` else
     work = _ff_surrogate(work, cons.metals, cons.phantoms)  # `mol` itself when there is no metal/phantom
 
-    def build(target, conf_id):
-        """Build a restrained UFF for one conformer by walking the mechanism registry.
+    typed = {}
 
-        A flat additive loop: unlike the DG build there is no phase order here, because FF terms are
-        independent. `mechanisms.MECHANISM_ORDER` still fixes the sequence so the two writers stay in step and a
-        field's two halves are read together.
-        """
-        with _quiet_uff(bool(cons.phantoms)):  # the Xe ghost is untypeable by design, so hush that warning
+    def build(target, conf_id):
+        if target not in typed:
+            probe = strip_phantoms(target, cons.phantoms)
+            with rdBase.BlockLogs():
+                typed[target] = rdForceFieldHelpers.UFFHasAllMoleculeParams(probe)
+        if not typed[target]:
+            raise RuntimeError("UFF has unsupported atom types")
+        with rdBase.BlockLogs():
             ff = rdForceFieldHelpers.UFFGetMoleculeForceField(target, confId=conf_id, ignoreInterfragInteractions=False)
         conf = target.GetConformer(conf_id)
-        for m in _mech.MECHANISM_ORDER:
-            m.ff_terms(ff, cons, conf, stiffness)
+        for mechanism in _mech.MECHANISM_ORDER:
+            mechanism._ff_terms(ff, cons, conf, stiffness)
         ff.Initialize()
         return ff
 
-    def bring_home(src_mol, conf):  # copy the relaxed coords back off a working copy (same indices, always)
-        if src_mol is mol:
-            return
-        src = src_mol.GetConformer(conf.GetId())
-        for a in range(mol.GetNumAtoms()):
-            conf.SetAtomPosition(a, src.GetAtomPosition(a))
-
-    pruned = None  # a bond-pruned copy, built lazily only if a conformer's minimise diverges
-    energies = []
     confs = mol.GetConformers() if conf_ids is None else [mol.GetConformer(int(i)) for i in conf_ids]
-    for conf in confs:
-        cid = conf.GetId()
-        ff = build(work, cid)  # a BUILD failure (UFF can't type the graph) propagates -> caller keeps the embed
-        try:
-            ff.Minimize(maxIts=max_iters)
-            energies.append(ff.CalcEnergy())
-            bring_home(work, conf)
-        except RuntimeError:  # the UFF line search diverged on this conformer: a pathological frozen-core
-            if pruned is None:  # partial/hypervalent bond, or an RDKit BFGS "bad direction" on a hard metal core.
-                pruned = _bond_pruned(work, frozen)  # never fatal: retry pruned, else keep this conformer unrelaxed.
-            relaxed = False
-            if pruned is not None:  # retry on a copy with the frozen-frozen partial bonds dropped
-                try:
-                    pff = build(pruned, cid)
-                    pff.Minimize(maxIts=max_iters)
-                    src = pruned.GetConformer(cid)  # copy the relaxed FREE-atom positions back (frozen unmoved)
-                    for a in range(mol.GetNumAtoms()):
-                        conf.SetAtomPosition(a, src.GetAtomPosition(a))
-                    energies.append(pff.CalcEnergy())
-                    relaxed = True
-                except RuntimeError:
-                    pass
-            if not relaxed:  # keep this conformer's geometry (frozen core still pinned); bonding_ok is the arbiter
-                logger.debug("restrained_uff: conformer %d could not relax (BFGS diverged); kept unrelaxed", cid)
-                try:
-                    energies.append(float(ff.CalcEnergy()))
-                except RuntimeError:
-                    energies.append(float("nan"))  # can't even score it; a placeholder kept aligned to confs
+    original = {conf.GetId(): conf.GetPositions().copy() for conf in confs}
+    energies = []
+    fallback = None
+    retyped = 0
+    try:
+        for conf in confs:
+            cid = conf.GetId()
+            target = fallback or work
+            try:
+                ff = build(target, cid)
+            except RuntimeError as error:
+                for candidate, count in _uff_core_graphs(work, frozen):
+                    try:
+                        ff = build(candidate, cid)
+                    except RuntimeError:
+                        continue
+                    fallback = target = candidate
+                    retyped = count
+                    break
+                else:
+                    raise RuntimeError("UFF has unsupported atom types outside the fixed core") from error
+                log = logger.warning if max_iters else logger.debug
+                log("UFF: retyped %d fixed-core bond(s) as outward dative edges", retyped)
+            try:
+                ff.Minimize(maxIts=max_iters)
+                energy = ff.CalcEnergy()
+            except RuntimeError as error:
+                raise RuntimeError(f"UFF minimization failed: {_error_summary(error)}") from error
+            energies.append(energy)
+            if target is not mol:  # copy only real atoms off the metal/phantom/fixed-core FF graph
+                src = target.GetConformer(cid)
+                for atom in range(mol.GetNumAtoms()):
+                    conf.SetAtomPosition(atom, src.GetAtomPosition(atom))
+    except RuntimeError:
+        for cid, positions in original.items():
+            conf = mol.GetConformer(cid)
+            for atom, xyz in enumerate(positions):
+                conf.SetAtomPosition(atom, xyz)
+        raise
     return np.array(energies)

@@ -1,49 +1,68 @@
-"""rxembed. Fast, flexible molecular embedding for reactive chemistry."""
+"""Constrained conformer embedding and workflow tools."""
 
-import logging
-from importlib.metadata import PackageNotFoundError, version
-
-from .constraints import Constraints, compose, match, resolve_core
-from .embed import Conformers, embed, minimize
-from .metal_core import Ligand, ligands
-from .metal_isomers import Isomer, IsomerSet, enumerate_isomers
-from .metal_smiles import canonical_smiles, dative_smiles, parse_smiles
-from .relax import ff_energies, restrained_uff
-
-logger = logging.getLogger("rxembed")
-
-
-def set_verbose(level: int | str = "INFO") -> None:
-    """Turn on console logging at `level` (e.g. 'INFO', 'DEBUG', logging.DEBUG)."""
-    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
-        h = logging.StreamHandler()
-        h.setFormatter(logging.Formatter("%(name)s | %(message)s"))
-        logger.addHandler(h)
-    logger.setLevel(level)
-
+from . import core
+from .core import (
+    Conformers,
+    Constraints,
+    Isomer,
+    IsomerSet,
+    Ligand,
+    __version__,
+    compose,
+    cxsmiles,
+    dative_smiles,
+    enumerate_isomers,
+    ff_energies,
+    ligands,
+    logger,
+    match,
+    parse_smiles,
+    resolve_core,
+    restrained_uff,
+    set_verbose,
+)
+from .pipeline import (
+    Contact,
+    Ensemble,
+    EnsembleSet,
+    embed,
+    geom_check,
+    metal,
+    minimize,
+    nci_candidates,
+    nci_modes,
+    read_xyz,
+    wrap,
+)
 
 __all__ = [
     "Conformers",
     "Constraints",
+    "Contact",
+    "Ensemble",
+    "EnsembleSet",
     "Isomer",
     "IsomerSet",
     "Ligand",
-    "canonical_smiles",
+    "__version__",
     "compose",
+    "core",
+    "cxsmiles",
     "dative_smiles",
     "embed",
     "enumerate_isomers",
     "ff_energies",
+    "geom_check",
     "ligands",
     "match",
+    "metal",
     "minimize",
+    "nci_candidates",
+    "nci_modes",
     "parse_smiles",
+    "read_xyz",
     "resolve_core",
     "restrained_uff",
     "set_verbose",
+    "wrap",
 ]
-
-try:
-    __version__ = version("rxembed")
-except PackageNotFoundError:
-    __version__ = "0+unknown"

@@ -48,7 +48,7 @@ def analyzer(mol: Chem.Mol) -> NCIAnalyzer:
     try:
         from xyzgraph.nci import NCIAnalyzer
     except ImportError as exc:
-        raise ImportError("analyzer needs xyzgraph; pip install 'rxembed[nci]'") from exc
+        raise ImportError("analyzer needs xyzgraph; pip install 'rxembed[workflow]'") from exc
 
     return NCIAnalyzer(_graph(mol))
 

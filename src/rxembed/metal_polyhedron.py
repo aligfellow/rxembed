@@ -1,21 +1,8 @@
-"""The ``POLYHEDRA`` templates, plus the symmetry and chirality read off them.
+"""Coordination templates and their symmetry operations.
 
-The isomer identity rxembed selects on is geometric, not a chemistry name: cis/trans/mer/fac are fragile, and
-a tris-chelate is lambda/delta rather than mer/fac. One flat ``Polyhedron`` record per geometry, and two
-pure-numpy pieces over a record's ``vertex_dirs``:
-
-- the point-group split (`point_group`, named for callers as `rotation_group`): every vertex permutation is
-  a proper (rotation) or improper (reflection) isometry of the template. The full group is ``proper x Z2``
-  and that Z2 is the handedness, so an arrangement folds over the PROPER half and no more.
-- handedness (`handedness`): the centre's chirality as the parity of the canonicalising frame, achiral iff
-  some reflection fixes the donor-class plus chelate-bite labelling. It needs a seating that can tell the
-  two hands apart, which is what `seat_properly` guarantees.
-- the canonical slot labelling (`canonical_slots`): the same fold applied to the arrangement itself, so a
-  slot number is a fact about the molecule rather than about the order its atoms arrived in, plus the
-  `slot_note` / `read_slot_note` pair that renders one and reads it back.
-
-Parity rather than RDKit's native metal stereo because that permutation is not order-invariant for equivalent
-ligands. Attribution for the templates and the algorithm: README, "References".
+Arrangements are folded over proper template rotations; an improper frame identifies the opposite hand when
+the decorated sphere is chiral. This makes canonical slots and metal handedness independent of input atom
+order, unlike RDKit's metal stereo permutation. Template and algorithm references are listed in the README.
 """
 
 from __future__ import annotations
@@ -49,19 +36,11 @@ def _improper(p1, p2, p3, p4):
 
 @dataclass(frozen=True)
 class Polyhedron:
-    """One coordination geometry: its vertex template + the hand-authored constraint data keyed off it.
+    """Describe one coordination geometry and its hand-authored constraints.
 
-    `vertex_dirs` (unit directions) defines slot numbering; `angles` and `permutations` index those slots. At
-    CN>=5 `angles` is a minimal spanning subset (octahedral states 6 of 15 pairs): the unconstrained pairs
-    drift on the bond-less surrogate, but stating all of them is measured-refuted, with no fidelity gain. At
-    CN<=4 all pairs IS the minimal subset, no trans row meaning no pair is implied by the others.
-    ``angles=None`` derives every pair from the vectors, at CN7 and CN8 only. `permutations` is ``None`` when
-    the geometry has no canned coordination-isomer list, which is load-bearing.
-
-    `planar` is not decoration but the perception filter: a record declares whether its metal lies in its
-    vertex plane, and `classify_geometry` only considers records whose declaration matches the measured
-    coplanarity. That is what separates trigonal_planar from the CN3 pyramid without a fitted angle boundary,
-    so every record must round-trip -- construct it, re-perceive it, get it back.
+    `vertex_dirs` defines slots. `angles` may be the measured minimal subset; ``None`` derives every pair.
+    `permutations=None` means no canned isomer list. `planar` is a perception constraint that separates the
+    CN3 plane from the pyramid without a fitted angle boundary.
     """
 
     name: str
@@ -82,17 +61,10 @@ class Polyhedron:
 
     @property
     def umbrella_improper(self):
-        """Ideal |improper| of vertices 0-1-2 vs the metal (deg); ``None`` unless the record is a flat-based pyramid.
+        """Return the ideal flat-based-pyramid improper, or ``None``.
 
-        The pyramidalisation coordinate a D-M-D angle basis cannot state. An improper is scale-free, so one
-        number per record serves every bond length, where a D-M-D window would have to move with it.
-
-        Selected by geometry, not by shape name: a non-`planar` record whose own vertices are coplanar, so a
-        single improper describes the whole umbrella. Today that is `trigonal_pyramidal` alone, at 35.264°.
-
-        Exact only AT the record. For a distorted sphere the improper hinges on one base edge, so clearing the
-        wall on the seated edge does not settle the shape; what holds in practice is measured, not
-        constructional.
+        The scale-free improper states pyramidalisation without a bond-length-dependent D-M-D window. It is
+        exact only for the ideal record; a distorted sphere still needs measurement.
         """
         if self.planar or self.cn != _IMPROPER_VERTICES:
             return None
@@ -387,11 +359,7 @@ _ALIASES = {**{n.lower(): n for n in POLYHEDRA}, **{c.lower(): n for c, n in _BY
 
 
 def resolve_geometry(geometry):
-    """Return the canonical name for a geometry name or 3-letter code, case- and whitespace-insensitively.
-
-    An unrecognised string passes through unchanged, so the caller raises its own "unknown geometry" error.
-    The long name is the stored identity; a code is input only.
-    """
+    """Resolve a name or code; pass unknown values through for the caller to reject."""
     return _ALIASES.get(geometry.strip().lower(), geometry) if isinstance(geometry, str) else geometry
 
 
@@ -401,11 +369,7 @@ def record(geometry):
 
 
 def describe(geometry):
-    """Return a log-ready identity for a geometry: ``'square_planar (SPL, CN 4)'``.
-
-    The one formatter every log line names a shape through, so no message is ambiguous about which polytope it
-    means. An unknown string (the ``'N-coordinate'`` pseudo-name) is returned as-is, never invented into a record.
-    """
+    """Return a log-ready identity such as ``'square_planar (SPL, CN 4)'``."""
     p = record(geometry)
     return f"{p.name} ({p.code}, CN {p.cn})" if p else str(geometry)
 
@@ -431,29 +395,20 @@ def geometries_for_cn(n):
 
 
 def _fit_trace(h):
-    """Return the best alignment achievable from the cross-covariance `h`, reflections allowed.
+    """Return the best alignment from cross-covariance `h`, allowing reflections.
 
-    Naming a shape is not asking which enantiomer: an octahedron and its mirror are both octahedra, and most
-    templates here are achiral anyway (their point group already contains the improper operation, so the
-    "mirror" seating is the same seating). Handedness is a separate question, answered over the point group
-    by `handedness`, and it must stay separate: forbidding the reflection here was measured to seat three donors
-    of a real octahedron (DUGVUX) into TRANS slots that subtend 93 degrees.
+    Shape and handedness are separate. Forbidding reflection seated three DUGVUX donors in trans slots only
+    93° apart.
     """
     return float(np.linalg.svd(h, compute_uv=False).sum())
 
 
 def _seat_by_alignment(dd, v_ideal, rounds=3):
-    """Seat each donor at its nearest ideal vertex; return ``order`` (vertex -> index into the donor list).
+    """Seat donors on ideal vertices; return ``order`` from vertex to donor-list index.
 
-    Used two ways: to seat a real sphere on a record (`metal_isomers`), and to score how well it fits
-    one at all (`fit_residual`). Enumerating orderings is n!, or 40 320 at CN8, so
-    the rotation is seeded instead: three correspondences fix an orthogonal map, so every ordered triple of
-    donors is tried against vertices 0-1-2 (P(8,3) = 336), each is completed by assigning the remaining
-    vertices to their best-pointing donor (best pair first, so one bad vertex cannot cascade), and the best is
-    refined. Measured against a full n! search on the corpus's CN7 and CN8 structures: identical seating.
-
-    A single greedy pass from the identity is not enough: on a square antiprism it converges to a local
-    optimum scoring 5.63 where the true seating scores 7.90, because the starting alignment is meaningless.
+    Ordered triples seed the rotation, avoiding 40,320 CN8 permutations. Completing and refining those seeds
+    matched full search on measured CN7/CN8 structures; one greedy pass scored 5.63 instead of 7.90 on a
+    square antiprism.
     """
     n = len(v_ideal)
 
@@ -494,11 +449,7 @@ _TAGS = {LAMBDA: LAMBDA, DELTA: DELTA, "λ": LAMBDA, "δ": DELTA}  # what `chira
 
 
 def chirality_tag(chirality):
-    """Return the canonical handedness tag for `chirality`, accepting the Δ/Λ glyphs as input.
-
-    The stored form is the word (``'delta'`` / ``'lambda'``) so nothing downstream has to carry a glyph;
-    the glyphs are accepted here because they are what the literature and older callers use.
-    """
+    """Return the word-form handedness tag, accepting the Δ/Λ glyphs as input."""
     if not isinstance(chirality, str):
         return chirality
     return _TAGS.get(chirality.strip().lower(), chirality)  # "Δ".lower() is "δ", hence both spellings
@@ -511,12 +462,10 @@ def _perms(n):
 
 @lru_cache(maxsize=None)
 def point_group(dirs):
-    """Return ``(rotations, reflections)``: the vertex perms realisable by a proper / improper isometry.
+    """Return ``(proper, improper)`` vertex permutations realised by template isometries.
 
-    `dirs` is a hashable tuple of vertex unit directions (a geometry's ``vertex_dirs`` template). A perm is a
-    template symmetry iff the template maps onto its permuted self with ~0 residual under the best
-    orthogonal map of that parity; a planar/degenerate template (linear, square-planar) realises the same
-    perm both ways, so those are always achiral. Cached per template.
+    Planar or degenerate templates may realise the same permutation with both parities. Results are cached by
+    the hashable direction template.
     """
     t = np.array(dirs, float)
     t = t / np.linalg.norm(t, axis=1, keepdims=True)
@@ -537,36 +486,20 @@ def point_group(dirs):
 
 
 def rotation_group(geometry):
-    """Return `geometry`'s proper (rotation) vertex permutations, or ``None`` when it has no template.
+    """Return proper vertex rotations, or ``None`` when the geometry has no template.
 
-    The named accessor over `point_group`, because the proper half is the only group an arrangement may be
-    folded over: the full group is ``proper x Z2`` and that Z2 is the handedness, so anything larger deletes
-    Lambda/Delta and nothing else. Cached with the template, so a repeat call costs microseconds.
+    Folding over reflections too would erase lambda/delta.
     """
     dirs = vertex_dirs(geometry)
     return None if dirs is None else point_group(tuple(map(tuple, dirs)))[0]
 
 
 def seat_properly(dirs_obs, dirs, order):
-    """Return `order` re-seated so the template reaches the observed sphere by a ROTATION, not a reflection.
+    """Re-seat `order` so the observed sphere is reached by rotation, not reflection.
 
-    `_fit_trace` sums singular values, which a reflection leaves alone, so a structure and its mirror score
-    identically at every candidate seating and the search cannot tell them apart: measured identical on 45
-    of 45 corpus centres, including the 7 the descriptor called chiral. Composing the winner with one
-    improper template symmetry flips the fit's parity and leaves its singular values untouched, so this
-    reaches the best reflection-free seating over all n! labellings without enlarging the candidate set or
-    rescoring it. That matters: rescoring with the reflection forbidden, against a candidate list that holds
-    one representative per FULL-group orbit, is what seated three DUGVUX donors into trans slots 93 degrees
-    apart, because the enantiomeric labelling was not in the list to be found.
-
-    A planar template realises the identity permutation improperly, so `min` picks the identity there and
-    this is a no-op, which is right: a planar centre has no handedness to seat.
-
-    A re-seat is not free downstream, and the reason is `resolved_angles` naming a MINIMAL subset of the
-    vertex pairs (6 of 10 for a bipyramid). Every angle over all pairs is mirror-invariant, but that subset
-    is not, so re-seating changes which DONOR pairs are stated: 15 of the 45 corpus structures re-seat, 12
-    with an identical multiset of windows and 3 whose content moves. See `metal_coordination`'s chelate
-    branch for the one that ends up stating fewer.
+    Reflection leaves the alignment score unchanged, so one improper template symmetry flips the fitted
+    parity without another search. This distinguished all 7 chiral centres in the 45-structure corpus.
+    Re-seating changed the minimal angle subset on 3 structures; `metal_coordination` handles the chelate case.
     """
     ideal = np.array(dirs, float)
     u, _s, vt = np.linalg.svd(np.asarray(dirs_obs)[list(order)].T @ ideal)
@@ -578,18 +511,10 @@ def seat_properly(dirs_obs, dirs, order):
 
 
 def canonical_slots(dirs, keys, bites=frozenset()):
-    """Return the canonical slot per vertex: the vertex labelling minimised over the proper rotations.
+    """Return ``slots[vertex]`` minimised over proper template rotations.
 
-    `keys[v]` is an order-invariant identity for whatever sits at vertex v (``None`` for a vacant one), and
-    `bites` the chelating vertex pairs `handedness` also reads. A slot number is only a fact about the
-    molecule modulo the template's own rotations, so a raw seating still carries a ``|rot|``-fold ambiguity
-    that the input atom order breaks; this picks the orbit's representative instead.
-
-    The fold is over the PROPER rotations alone, and the key is built from slots and chemistry only, never
-    from an atom index or a position in some string, so any renderer folding this way reaches the same
-    answer. A tie means the tied vertices carry interchangeable sites, and which representative comes back
-    is then arbitrary by construction: a renderer must pair sorted sites with sorted slots within a key
-    class rather than trust the per-vertex number.
+    `keys` identifies each site and `bites` identifies chelate edges. Neither may depend on atom order. Tied
+    keys are interchangeable, so renderers must pair sorted sites with sorted slots inside each tied class.
     """
     rot = point_group(tuple(map(tuple, dirs)))[0]
     n = len(dirs)
@@ -608,36 +533,21 @@ _SLOT_NOTE = re.compile(r"^s(\d+)([+-]?)$")  # a donor's canonical slot, with an
 
 
 def slot_note(slot, winding=""):
-    """Render vertex `slot` as the note a canonical string carries on a donor: ``s<n>`` plus a winding sign.
-
-    The grammar lives with the slots it spells rather than with either end of the string: `metal_smiles`
-    writes these and `metal_isomers.stated_arrangement` reads them back, and a grammar with two owners is
-    how the two halves come to disagree. This module is the leaf both already import.
-    """
+    """Render a canonical donor slot as ``s<n>`` with an optional winding sign."""
     return f"s{slot}{winding}"
 
 
 def read_slot_note(note):
-    """Return the ``(slot, winding)`` `note` states, or ``None`` when it is not a slot note at all.
-
-    ``None`` is also the discriminator a reader needs: one `atomProp` key carries both notes a canonical
-    string writes, so anything that is not an ``s<n>`` is the metal's own geometry code.
-    """
+    """Parse a donor slot note; return ``None`` for any other note."""
     m = _SLOT_NOTE.match(note)
     return None if m is None else (int(m.group(1)), m.group(2))
 
 
 def handedness(dirs, order, donor_class, chelate_edges=frozenset()):
-    """Return a metal centre's handedness over template `dirs`: ``'delta'``, ``'lambda'``, or ``''`` (achiral).
+    """Return ``'delta'``, ``'lambda'``, or ``''`` for an achiral or incomplete centre.
 
-    `order[vertex]` is the donor atom seated at that vertex; `donor_class[donor]` its symmetry class (so
-    equivalent donors share a label); `chelate_edges` the set of ``frozenset({vertex_i, vertex_j})`` whose
-    two donors belong to one chelating ligand (a tris/bis-chelate's handedness lives in this bite graph, not the
-    per-vertex donor class). Achiral iff a reflection of the template maps the decorated labelling to
-    itself; else the sign is the parity of the frame that canonicalises it.
-
-    A vacant vertex (donor ``metal.VACANT``, i.e. < 0) leaves the centre unfixed -> achiral (``''``): a
-    parity needs every vertex occupied.
+    Donor symmetry classes and chelate edges decorate the seated template. A reflection that preserves both
+    makes it achiral; otherwise the canonical frame's parity gives the hand. A vacant vertex cannot fix parity.
     """
     n = len(dirs)
     if len(order) != n or any(d < 0 for d in order):  # a vacancy (or padding) can't fix a parity
@@ -659,18 +569,11 @@ def handedness(dirs, order, donor_class, chelate_edges=frozenset()):
 
 
 def fit_residual(dirs_obs, record):
-    """Return how badly `dirs_obs` fails to BE `record`: RMS per vertex after the best rotation.
+    """Return the per-vertex RMS after the best orthogonal seating on `record`.
 
-    Orthogonal Procrustes: seat the observed donor directions on the record's vertices, find the orthogonal map
-    best carrying one onto the other (SVD of the cross-covariance), and report what is left over. Reflections
-    are allowed (see `_fit_trace`): a shape and its mirror are the same shape.
-
-    Chosen over the sorted angle spectrum it replaced for two measured reasons. The spectrum's length is
-    C(n,2), so an RMS over it changes scale with coordination number: 0.08 deg median at CN2 against 9.10 at
-    CN5 on the corpus, which is why one global fit floor could not serve both ends; this residual is per
-    vertex and sits at 0.066-0.135 across CN 3-8. And the spectrum discards which vertex is which, so it
-    cannot tell a distorted octahedron from a trigonal prism by anything but a scalar; measured, it handed
-    the cis-dioxo Mo BESJUE to `trigonal_prismatic` the moment that record was added.
+    Unlike an angle-spectrum RMS, this stays on one scale across coordination numbers and retains vertex
+    correspondence. Measured residuals span 0.066-0.135 for CN3-CN8; the spectrum misclassified cis-dioxo Mo
+    BESJUE as trigonal prismatic.
     """
     ideal = np.array(record.vertex_dirs, float)
     ideal /= np.linalg.norm(ideal, axis=1, keepdims=True)

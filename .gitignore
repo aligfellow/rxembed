@@ -14,9 +14,6 @@ venv/
 ENV/
 env/
 
-# Claude
-.claude*
-CLAUDE*
 plan.md
 *PLAN*md
 *WORKLOG*md

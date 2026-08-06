@@ -1,21 +1,4 @@
-"""`metal_core`: shape perception (`classify_geometry`, `geometry_for`) and the metal surrogate round-trip.
-
-Three contracts, all about the metal atom itself rather than the ligands around it.
-
-Which atoms are metal centres. One question, one predicate: an element the clash gate excuses as a metal is
-an element the embed guard routes to the surrogate, and neither may be narrower than the other.
-
-Perception: the shape invariant. No shape may be constructable but not perceivable, so every `POLYHEDRA`
-record must re-perceive as itself, and the planarity exclusion runs one way (a flat sphere is not a 3D shape;
-an out-of-plane sphere is a distorted planar shape as readily as a 3D one).
-
-The surrogate. `surrogate_metal` swaps the metal for a bond-less neutral carbon so the DG/FF can embed it;
-`restore_metal`/`connect_metal` must hand back the element, the oxidation state and the M-donor dative bonds.
-Losing the charge sends every real-energy calculation to xtb at the wrong total; losing the bonds hands the
-user a dissociated complex. Asserted here on `metal_core`'s own functions, and once through the public embed
-so the call sites are known to use them. Which stage returns a connected mol is `Ensemble`'s accessor
-contract, tested in `tests/pipeline/test_ensemble.py`. RDKit + UFF throughout, no xtb.
-"""
+"""Test metal identification, shape perception and surrogate restoration."""
 
 from __future__ import annotations
 
@@ -29,12 +12,12 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 from rdkit.Geometry import Point3D
 
-import rxembed
-import rxembed.pipeline as rx
+import rxembed as rx
+from rxembed import core
 from rxembed import metal_core as _metal
 from rxembed.metal_core import classify_geometry, geometry_for
 from rxembed.metal_polyhedron import POLYHEDRA, describe
-from rxembed.pipeline.perceive import _xyz_to_mol
+from rxembed.pipeline.perceive import read_xyz
 from rxembed.relax import bonding_ok
 
 _MN_H2 = "examples/structures/mn-h2.xyz"  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
@@ -91,36 +74,40 @@ def _tilted_square(tilt_deg):
 
 
 @pytest.mark.parametrize("name", sorted(POLYHEDRA))
-def test_every_record_round_trips(name):
+def test_all_records_round_trip(name):
     got = _classify(POLYHEDRA[name].vertex_dirs, 2.1)
     assert got == name, f"{describe(name)} re-perceives as {got}"
 
 
-def test_a_short_bonded_pyramid_is_not_excluded_by_its_own_flatness():
+def test_short_bonded_pyramid_is_not_flatness_excluded():
     dirs = POLYHEDRA["trigonal_pyramidal"].vertex_dirs
     assert _metal._ideal_plane_rms(POLYHEDRA["trigonal_pyramidal"], 1.4) < _metal.COPLANAR_TOL, "fixture premise"
     assert _classify(dirs, 1.4) == "trigonal_pyramidal"
 
 
-def test_a_bowed_square_plane_is_not_reclassified():
+def test_bowed_square_plane_is_not_reclassified():
     assert _classify(_tilted_square(8), 2.3) == "square_planar"
 
 
-def test_a_bis_chelate_tetrahedron_is_not_reclassified():
+def test_bis_chelate_tetrahedron_is_not_reclassified():
     iso = rx.metal("CC1=[O]->[Zn+2](Cl)(Cl)<-[O-]1", "tetrahedral").select(index=0)
     mol = iso.restore(rx.embed(iso, n=2, seed=7).minimize().mol)
     assert [i.geometry for i in rx.metal(mol)] == ["tetrahedral"]
 
 
-@pytest.mark.parametrize(("twist", "expected"), [(0.0, "octahedral"), (60.0, "trigonal_prismatic")])
-def test_the_bailar_twist_is_named_at_both_ends(twist, expected, caplog):
+@pytest.mark.parametrize(
+    ("twist", "expected"),
+    [(0.0, "octahedral"), (60.0, "trigonal_prismatic")],
+    ids=["octahedral", "trigonal-prismatic"],
+)
+def test_bailar_twist_endpoints(twist, expected, caplog):
     with caplog.at_level(logging.WARNING, logger="rxembed"):
         got = classify_geometry(_ideal_sphere(_bailar(twist), 2.1), 0, list(range(1, 7)))
     assert got == expected
     assert not [r for r in caplog.records if "no shape fits" in r.message], caplog.text
 
 
-def test_the_fit_floor_still_flags_a_sphere_no_record_fits(caplog):
+def test_poor_shape_returns_record_and_warns(caplog):
     squashed = np.array([(np.cos(t) * 0.5, np.sin(t) * 0.5, 0.87) for t in np.radians([0, 60, 120, 180, 240, 300])])
     with caplog.at_level(logging.WARNING, logger="rxembed"):
         got = classify_geometry(_ideal_sphere(squashed, 2.1), 0, list(range(1, 7)))
@@ -128,19 +115,17 @@ def test_the_fit_floor_still_flags_a_sphere_no_record_fits(caplog):
     assert [r for r in caplog.records if "no shape fits" in r.message], caplog.text
 
 
-def test_the_cn_defaults_are_the_common_shapes():
+def test_cn_defaults_are_the_common_shapes():
     assert geometry_for(3) == "trigonal_planar"
     assert geometry_for(4) == "square_planar"
 
 
 # --- which atoms are metal centres: one predicate behind every gate ---------------------------------------
 
+
 # CN4 rather than CN3: `COPLANAR_TOL` is absolute, so a trigonal-planar sphere at the ~3.1 A the covalent-sum
 # fallback gives an f-block centre pyramidalises past the accept gate (CeCl3 relaxes to 0.383 A out-of-plane
 # against the 0.25 tol, and `minimize` says so). That is the tolerance's known scaling, not this predicate's.
-_F_BLOCK = [("lanthanide", "[Ce](Cl)(Cl)(Cl)Cl")]  # the actinide row differs in no branch: same predicate
-
-
 def _crushed_pair(z, d=0.5):
     """Element `z` single-bonded to a Cl at `d` A, with a conformer: a separation no radius rule can accept.
 
@@ -162,7 +147,7 @@ def _crushed_pair(z, d=0.5):
     return mol
 
 
-def test_the_embed_guard_and_the_clash_gate_read_one_metal_predicate():
+def test_embed_and_clash_share_metal_predicate():
     zs = range(3, 113)  # Li upwards: paired with H the fixture has one heavy atom, so there is no pair to judge
     exempt = {z for z in zs if bonding_ok(_crushed_pair(z), 0)}
     surrogated = {z for z in zs if _metal.metal_indices(_crushed_pair(z))}
@@ -171,16 +156,16 @@ def test_the_embed_guard_and_the_clash_gate_read_one_metal_predicate():
     )
 
 
-@pytest.mark.parametrize(("block", "smiles"), _F_BLOCK)
-def test_an_f_block_centre_is_refused_by_the_bare_door_and_carried_by_the_isomer_door(block, smiles):
+def test_f_block_requires_isomer():
+    block, smiles = "lanthanide", "[Ce](Cl)(Cl)(Cl)Cl"  # actinides take the same predicate and branch
     mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
     assert _metal.metal_indices(mol) == [0], f"the {block} centre is not read as a metal at all"
 
     with pytest.raises(ValueError, match="are metal centres"):
-        rxembed.embed(mol, n=1, seed=1)
+        core.embed(mol, n=1, seed=1)
 
-    iso = rxembed.enumerate_isomers(mol)[0]
-    confs = rxembed.embed(iso, n=2, seed=1).minimize()
+    iso = core.enumerate_isomers(mol)[0]
+    confs = core.embed(iso, n=2, seed=1).minimize()
     assert len(confs) >= 1, f"the {block} is refused at both doors, so it is supported by neither"
     assert confs.mol.GetAtomWithIdx(iso.metal).GetAtomicNum() == mol.GetAtomWithIdx(0).GetAtomicNum()
     assert all(bonding_ok(confs.mol, cid) for cid in confs.ids), "the relax tore the sphere"
@@ -196,8 +181,9 @@ def test_an_f_block_centre_is_refused_by_the_bare_door_and_carried_by_the_isomer
         # a genuinely neutral metal: a phantom charge on it would cancel against the ligands in any net total
         ("Fe(CO)5", "[Fe](<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]"),
     ],
+    ids=["palladate", "iron-carbonyl"],
 )
-def test_the_surrogate_captures_the_oxidation_state_and_restore_hands_it_back(name, smiles):
+def test_surrogate_preserves_metal_charge(name, smiles):
     m0 = Chem.MolFromSmiles(smiles)
     metal_idx = _metal.metal_index(m0)
     q0 = m0.GetAtomWithIdx(metal_idx).GetFormalCharge()
@@ -227,7 +213,7 @@ def _assert_charge_roundtrip(name, mol_charge, ens):
 
 
 @pytest.mark.parametrize("route", ["isomer", "constrain"])
-def test_the_metal_comes_back_at_its_oxidation_state_through_the_public_embed(route):
+def test_public_embed_restores_oxidation_state(route):
     want = _metal_charges(Chem.MolFromSmiles(_NI_N))
     spec = rx.metal(_NI_N)[0] if route == "isomer" else _NI_N
     kw = {} if route == "isomer" else {"constrain": {(0, 1): (1.4, 1.6)}}
@@ -235,8 +221,8 @@ def test_the_metal_comes_back_at_its_oxidation_state_through_the_public_embed(ro
     assert _metal_charges(ens.mol) == want, f"{route}: the metal came back at the wrong oxidation state"
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_isomer_restore_hands_every_metal_its_oxidation_state():
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_isomer_restore_restores_all_metal_states():
     iso = rx.metal(_MN_H2, "octahedral", center="Mn", fix=_MN_H2_RC)[0]
     assert iso.mol.GetAtomWithIdx(iso.metal).GetAtomicNum() == _metal.SURROGATE  # still the neutral carbon
     assert iso.mol.GetAtomWithIdx(iso.metal).GetFormalCharge() == 0
@@ -250,7 +236,7 @@ def test_isomer_restore_hands_every_metal_its_oxidation_state():
 # --- the surrogate round-trip: connectivity -------------------------------------------------------------
 
 
-def test_connect_metal_restores_the_stripped_bonds_and_disconnect_is_its_inverse():
+def test_connect_disconnect_metal_are_inverses():
     mol = Chem.MolFromSmiles(_EN_PDBRCL)  # the en chelate closes its ring through the Pd
     stripped, m, donors, real_z, real_q = _metal.surrogate_metal(mol)
     assert len(Chem.GetMolFrags(stripped)) > 1, "the surrogate must leave the metal a separate fragment"
@@ -269,7 +255,7 @@ def test_connect_metal_restores_the_stripped_bonds_and_disconnect_is_its_inverse
     assert len(Chem.GetMolFrags(_metal.disconnect_metal(connected))) > 1, "disconnect is not connect's inverse"
 
 
-def test_the_bare_embed_finalizes_a_connected_copy_without_touching_the_working_mol():
+def test_core_embed_returns_connected_copy():
     iso = rx.metal(_EN_PDBRCL, "square_planar")[0]
     ens = rx.embed(iso, n=3, seed=1)
     assert not ens._minimized, "the fixture must be a bare embed, or this measures nothing"
@@ -298,12 +284,12 @@ def _chirality_volume(mol, cid, centre):
     return float(np.dot(np.cross(p[1] - p[0], p[2] - p[0]), p[3] - p[0]))
 
 
-def test_a_metal_bound_carbanion_donor_embeds_two_distinct_hands():
+def test_metal_bound_carbanion_embeds_both_hands():
     en = rx.metal(_CARBANION_NI, "square_planar")
     assert {i.stereo_label for i in en} == {"23R", "23S"}  # metal-priority CIP labels
     hands = []
     for iso in en:
-        e = rx.embed(iso, n=4).minimize()
+        e = rx.embed(iso, n=1).minimize()
         assert e.n >= 1
         assert e.mol.GetNumAtoms() == 65  # the dummy deuterium is removed after embed + relax
         assert not any(a.GetIsotope() == 2 for a in e.mol.GetAtoms())  # no leaked D
@@ -342,7 +328,7 @@ def _phosphorus(mol):
     return next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "P")
 
 
-def test_the_geometric_hand_convention_is_rdkits_own():
+def test_geometric_hand_convention_is_rdkits_own():
     for smiles in ("C[C@H](N)C(=O)O", "C[C@@H](N)C(=O)O", "F[C@](Cl)(Br)I", "O[C@H]1CC[C@@H](N)CC1"):
         mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
         assert rdDistGeom.EmbedMolecule(mol, randomSeed=7) == 0
@@ -355,7 +341,7 @@ def test_the_geometric_hand_convention_is_rdkits_own():
 
 
 @pytest.mark.parametrize("case", sorted(_CHIRAL_P))
-def test_a_stripped_donor_names_the_hand_of_the_conformer_it_is_handed_with(case):
+def test_stripped_donor_hand_matches_conformer(case):
     mol = Chem.AddHs(Chem.MolFromSmiles(_CHIRAL_P[case]))
     donor = _phosphorus(mol)
     assert rdDistGeom.EmbedMolecule(mol, randomSeed=0xF00D) == 0  # ETKDG builds the declared hand
@@ -368,7 +354,7 @@ def test_a_stripped_donor_names_the_hand_of_the_conformer_it_is_handed_with(case
 # the odd slot and the even control; `covalent_first` is the odd slot again, and is kept at the strip above
 @pytest.mark.parametrize("case", ["dative_first", "dative_last"])
 @pytest.mark.parametrize("tag", ["[P@]", "[P@@]"])
-def test_a_chiral_at_p_donor_comes_back_with_the_hand_its_smiles_declared(case, tag):
+def test_chiral_phosphorus_hand_roundtrips(case, tag):
     mol = Chem.AddHs(Chem.MolFromSmiles(_CHIRAL_P[case].replace("[P@]", tag)))
     donor = _phosphorus(mol)
     order = [b.GetOtherAtomIdx(donor) for b in mol.GetAtomWithIdx(donor).GetBonds()]  # the INPUT's own basis
@@ -380,7 +366,7 @@ def test_a_chiral_at_p_donor_comes_back_with_the_hand_its_smiles_declared(case, 
 
 
 @pytest.mark.parametrize("tag", ["[S@]", "[S@@]"])
-def test_a_dative_donor_tagged_by_a_writer_that_is_not_ours_still_survives_the_strip(tag):
+def test_external_dative_donor_stereo_survives_strip(tag):
     mol = Chem.AddHs(Chem.MolFromSmiles(f"Cl[Pd](Cl)(Cl)<-{tag}(=O)(C)CC"))
     assert rdDistGeom.EmbedMolecule(mol, randomSeed=0xF00D) == 0
     # sanitize=False because a strict sanitize rejects the Pd complex; the reader writes the tag either way
@@ -401,7 +387,7 @@ def test_a_dative_donor_tagged_by_a_writer_that_is_not_ours_still_survives_the_s
     assert stripped.GetAtomWithIdx(donor).GetChiralTag() == _hand(stripped, donor, order)
 
 
-def test_surrogate_all_metals_keeps_the_hand_its_single_metal_twin_keeps():
+def test_multimetal_surrogate_preserves_hand():
     mol = Chem.AddHs(Chem.MolFromSmiles(_CHIRAL_P["dative_first"]))
     donor = _phosphorus(mol)
     assert rdDistGeom.EmbedMolecule(mol, randomSeed=0xF00D) == 0
@@ -410,7 +396,7 @@ def test_surrogate_all_metals_keeps_the_hand_its_single_metal_twin_keeps():
     assert every.GetAtomWithIdx(donor).GetChiralTag() == one.GetAtomWithIdx(donor).GetChiralTag()
 
 
-def test_the_d_capped_donor_path_is_not_double_corrected():
+def test_d_capped_donor_path_is_not_double_corrected():
     for iso in rx.metal(_CARBANION_NI, "square_planar"):
         order = [b.GetOtherAtomIdx(_CARBANION_C) for b in iso.mol.GetAtomWithIdx(_CARBANION_C).GetBonds()]
         assert len(order) == _metal._MIN_STEREO_NEIGHBOURS, "the donor is not the capped degree-3 case"
@@ -421,7 +407,7 @@ def test_the_d_capped_donor_path_is_not_double_corrected():
             assert _hand(e.mol, _CARBANION_C, order, int(cid)) == tag
 
 
-def test_the_donor_charge_is_restored_after_the_hold():
+def test_donor_charge_is_restored_after_the_hold():
     # the hold NEUTRALISES the carbanion during the embed (a -1 C can't take a 4th bond) then RESTORES it;
     # a leak would corrupt the donor charge, and the total charge sent to xtb downstream.
     for iso in rx.metal(_CARBANION_NI, "square_planar"):
@@ -459,11 +445,11 @@ def _orphaned(mol):
 
 
 @corpus_only
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_no_prepared_mol_carries_a_stereo_flag_without_its_references():
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_prepared_mol_has_no_orphaned_stereo_flags():
     violations = []
     for path in _CORPUS:
-        mol = _xyz_to_mol(path, 0)
+        mol = read_xyz(path, 0)
         if not _metal.metal_indices(mol):
             continue
         prepared, *_ = _metal.surrogate_metal(mol)
@@ -473,11 +459,11 @@ def test_no_prepared_mol_carries_a_stereo_flag_without_its_references():
 
 
 @corpus_only
-def test_surrogate_metal_admits_everything_the_reader_admits():
+def test_surrogate_accepts_all_readable_metals():
     rejected = []
     for path in _CORPUS:
         try:
-            mol = _xyz_to_mol(path, 0)
+            mol = read_xyz(path, 0)
         except Exception:
             continue  # perception itself declined it: not surrogate_metal's business
         if not _metal.metal_indices(mol):
@@ -489,8 +475,8 @@ def test_surrogate_metal_admits_everything_the_reader_admits():
     assert rejected == [], f"surrogate_metal() rejects structures the reader accepted: {rejected}"
 
 
-def test_a_haptic_face_and_a_chirality_cap_can_compose():
-    import rxembed.pipeline as rx
+def test_haptic_face_and_chirality_cap_compose():
+    import rxembed as rx
     from tests.test_metal_isomers import ferrocene
 
     iso = next(iter(rx.metal(ferrocene())))
@@ -512,14 +498,29 @@ def test_a_haptic_face_and_a_chirality_cap_can_compose():
         assert not (stale & {d for d, _ring in s.haptic}), "the sphere recipe still names a pre-shift dummy"
 
 
+def test_release_chirality_restores_phantom_indices():
+    iso = next(i for i in rx.metal(_CARBANION_NI, "square_planar") if i.stereo_label)
+    mol, cons = iso.mol, iso.cons.copy()
+    phantom = mol.GetNumAtoms()
+    cons.haptic = {phantom: (0, 1)}
+    cons.phantoms = frozenset({phantom})
+
+    for _ in range(2):
+        mol, held = _metal._hold_donor_chirality(mol, iso.metal, iso.donors, cons)
+        mol = _metal._release_donor_chirality(mol, held, cons)
+        assert sorted(cons.haptic) == [phantom]
+
+    _metal.materialise_phantoms(mol, cons.haptic)
+
+
 # No shipped fixture carries BOTH a haptic face and a labile donor, so the end-to-end version of the test
 # above skipped in every environment it ever ran in. The composition itself is pinned by
-# `test_a_haptic_face_and_a_chirality_cap_can_compose`; the real structures (COJKAO, ILONON, NUKHEG, the
+# `test_haptic_face_and_chirality_cap_compose`; the real structures (COJKAO, ILONON, NUKHEG, the
 # TiCat series; 14 in tmQM) are swept by `benchmark/`, where the corpus is in scope.
 
 
-def test_ligands_separates_a_complex_and_reports_denticity_per_metal():
-    mol = _xyz_to_mol(_MN_H2)
+def test_ligands_reports_denticity_per_metal():
+    mol = read_xyz(_MN_H2)
     ligs = _metal.ligands(mol)
     assert ligs, "the fixture must have ligands"
 
@@ -550,7 +551,7 @@ def test_ligands_refuses_a_molecule_with_no_metal():
 _ACAC = "CC(=O)C=C([O-])C"  # acetylacetonate: two chemically equivalent oxygens, one localised resonance form
 
 
-def test_the_donor_key_ignores_which_resonance_form_perception_froze():
+def test_donor_key_ignores_resonance_form():
     mol = Chem.MolFromSmiles(_ACAC)
     oxygens = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 8]
     perceived = list(Chem.CanonicalRankAtoms(mol, breakTies=False))

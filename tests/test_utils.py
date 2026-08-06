@@ -1,8 +1,4 @@
-"""`utils.py`; coordinate math, small RDKit facts, and the QA result type: the core's shared leaf.
-
-Nothing here knows what a metal, a donor or a constraint is, which is what lets the coordination perception
-and the pipeline's QA gate measure an angle the same way, with no second definition.
-"""
+"""Test shared coordinate, RDKit and QA helpers."""
 
 from __future__ import annotations
 
@@ -45,7 +41,7 @@ def _without(mol, atom):
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_the_angle_is_degrees_at_the_middle_atom_and_the_dihedral_is_signed():
+def test_angle_and_signed_dihedral_conventions():
     o, x, y = np.zeros(3), np.array([1.0, 0, 0]), np.array([0, 1.0, 0])
     assert _angle(x, o, y) == pytest.approx(90.0)
     assert _angle(x, o, -x) == pytest.approx(180.0)
@@ -61,7 +57,7 @@ def test_the_angle_is_degrees_at_the_middle_atom_and_the_dihedral_is_signed():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_a_conjugation_plane_is_perceived_on_an_amide_and_not_on_a_saturated_chain():
+def test_conjugation_detects_amide_not_saturated_chain():
     quartets = list(conjugated_quartets(_mol("CC(=O)NC")))
     assert quartets, "the amide plane was not perceived"
     for a, c, x, s in quartets:
@@ -80,7 +76,7 @@ def test_exclude_drops_a_quartet_naming_an_excluded_atom():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_a_stereo_flag_orphaned_by_bond_removal_is_dropped_and_a_clean_molecule_is_left_alone():
+def test_bond_removal_drops_orphaned_stereo_flag():
     work = _without(Chem.MolFromSmiles(r"C/C=C/Cl"), 3)  # no conformer: nothing to re-perceive from
     assert repair_bond_stereo(work) == 1
     for b in work.GetBonds():
@@ -93,7 +89,7 @@ def test_a_stereo_flag_orphaned_by_bond_removal_is_dropped_and_a_clean_molecule_
     assert [(b.GetIdx(), b.GetStereo()) for b in clean.GetBonds()] == before
 
 
-def test_a_geometry_re_references_an_orphaned_flag_rather_than_discarding_the_e_z():
+def test_geometry_rebases_orphaned_ez_flag():
     work = _without(_mol(r"C/C=C/Cl", seed=1), 3)  # the Cl was one of the two reference atoms
     assert repair_bond_stereo(work) == 1
     bond = work.GetBondBetweenAtoms(1, 2)
@@ -125,7 +121,7 @@ def _names_the_hand(mol, centre):
 
 
 @pytest.mark.parametrize("slot", [0, 1, 2, 3])
-def test_a_bond_removal_leaves_the_tag_naming_the_same_geometry(slot):
+def test_bond_removal_preserves_geometry_tag(slot):
     mol = _mol(_HALIDE_C, seed=11)
     Chem.AssignStereochemistryFrom3D(mol)  # calibrate: RDKit's own writer, on this very conformer
     assert _names_the_hand(mol, 1), "the sign convention this test refereeds by is wrong"
@@ -152,8 +148,9 @@ def test_adding_a_bond_back_needs_no_counterpart():
         ("F[P@](Cl)(Br)(I)F", 1, False),  # degree 5: the arithmetic would say odd, and is refuted there
         ("F[C@](Cl)Br", 1, False),  # degree 3: no representable tag survives, so the caller clears it
     ],
+    ids=["tetra-slot0", "tetra-slot1", "hypervalent", "trigonal"],
 )
-def test_the_parity_rule_is_bounded_to_degree_four(smiles, slot, mirrors):
+def test_parity_rule_is_bounded_to_degree_four(smiles, slot, mirrors):
     mol = Chem.MolFromSmiles(smiles, sanitize=False)
     mol.UpdatePropertyCache(strict=False)
     centre = mol.GetAtomWithIdx(1)
@@ -176,7 +173,7 @@ def _sulfur(mol):
     return next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "S")
 
 
-def test_rdkits_3d_writer_reads_a_bond_order_none_of_its_readers_read():
+def test_rdkit_3d_writer_emits_unreadable_bond_order():
     mol = _mol(_DATIVE_S, seed=0xF00D)
     centre = _sulfur(mol)
     Chem.AssignStereochemistryFrom3D(mol)  # deliberately the RAW call: this test is about what it does
@@ -184,8 +181,10 @@ def test_rdkits_3d_writer_reads_a_bond_order_none_of_its_readers_read():
     assert not _names_the_hand(mol, centre), "the writer already agrees with its readers; the premise is gone"
 
 
-@pytest.mark.parametrize("smiles", [_DATIVE_S, _DATIVE_S_LAST, _COVALENT_S])
-def test_a_tag_written_from_3d_names_its_own_geometry_in_the_readers_bond_order(smiles):
+@pytest.mark.parametrize(
+    "smiles", [_DATIVE_S, _DATIVE_S_LAST, _COVALENT_S], ids=["dative-first", "dative-last", "covalent"]
+)
+def test_3d_stereo_matches_reader_bond_order(smiles):
     mol = _mol(smiles, seed=0xF00D)
     centre = _sulfur(mol)
     assign_stereo_from_3d(mol)
@@ -193,7 +192,7 @@ def test_a_tag_written_from_3d_names_its_own_geometry_in_the_readers_bond_order(
     assert _names_the_hand(mol, centre), "the tag names the mirror of the geometry it was written from"
 
 
-def test_the_re_base_leaves_a_hypervalent_perception_alone():
+def test_stereo_assignment_preserves_hypervalent_tag():
     mol = Chem.MolFromSmiles("F[C@](Cl)(Br)(I)->[Pd]", sanitize=False)
     mol.UpdatePropertyCache(strict=False)
     Chem.SanitizeMol(mol, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
@@ -215,7 +214,7 @@ def test_the_re_base_leaves_a_hypervalent_perception_alone():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_a_violation_formats_the_atoms_the_value_and_the_limit():
+def test_violation_formats_atoms_value_and_limit():
     v = Violation("clash", (3, 7), value=1.234, limit=2.5, detail="H...H")
     assert str(v) == "[clash] atoms 3-7: 1.234 vs 2.500 H...H"
     v2 = Violation("clash", (3, 7), value=1.234, limit=2.5)

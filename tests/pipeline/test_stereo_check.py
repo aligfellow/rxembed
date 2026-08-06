@@ -29,24 +29,25 @@ def _reference_conformer(smiles, seed=1, optimize=True):
 @pytest.mark.parametrize(
     ("mode", "kept", "flipped"),
     [("preserve", True, False), ("free", True, True), ("invert", False, True), ("all", True, False)],
+    ids=["preserve", "free", "invert", "all"],
 )
-def test_each_mode_accepts_the_handedness_it_names(mode, kept, flipped):
+def test_stereo_modes_accept_expected_hands(mode, kept, flipped):
     assert satisfies_spec(_PLANAR, _PLANAR, mode) is kept
     assert satisfies_spec(_FLIPPED_PLANAR, _PLANAR, mode) is flipped
 
 
-def test_preserve_holds_only_the_nongraph_kinds_where_all_holds_every_kind():
+def test_preserve_holds_only_nongraph_stereo():
     flipped = {"point": Counter({"S": 1})}
     assert satisfies_spec(flipped, _POINT, "preserve")
     assert not satisfies_spec(flipped, _POINT, "all")
 
 
-def test_handedness_is_the_judgement_and_the_count_is_not():
+def test_preserve_ignores_fingerprint_multiplicity():
     for sig in ({}, {"planar": Counter({"Rₚ": 1})}, {"planar": Counter({"Rₚ": 2})}):
         assert satisfies_spec(sig, _PLANAR, "preserve")
 
 
-def test_every_reference_kind_must_pass_and_a_dict_spec_sets_them_one_at_a_time():
+def test_all_reference_kinds_must_pass():
     ref = {"planar": Counter({"Rₚ": 1}), "axial": Counter({"Rₐ": 1})}
     assert not satisfies_spec({"planar": Counter({"Rₚ": 1}), "axial": Counter({"Sₐ": 1})}, ref, "preserve")
 
@@ -59,8 +60,8 @@ def test_every_reference_kind_must_pass_and_a_dict_spec_sets_them_one_at_a_time(
 # --- signature: read the handedness back out of the coordinates -------------------------------------------
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_the_two_enantiomers_get_opposite_point_labels():
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_two_enantiomers_get_opposite_point_labels():
     left = signature(_reference_conformer("C[C@H](N)C(=O)O", optimize=False), 0)
     right = signature(_reference_conformer("C[C@@H](N)C(=O)O", optimize=False), 0)
     assert set(left.get("point", ())), f"no point label read from the R conformer: {left}"

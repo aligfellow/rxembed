@@ -1,9 +1,4 @@
-"""`pipeline/geom_check.py`, the TS-aware geometry gate: every violation kind, and what it must not flag.
-
-The gate is the pipeline's; the rulers it reads for a metal (``metal_perceive.metal_overbond``, the
-``metal_distance`` floors and tier boundaries) are the core's, and are pinned here because that is where they
-are observable; building their subject needs ``rx.metal`` / xyz perception, i.e. the optional tier.
-"""
+"""Test the TS-aware and metal-aware geometry gate."""
 
 from importlib.util import find_spec
 
@@ -13,6 +8,7 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom, rdForceFieldHelpers, rdMolTransforms
 from rdkit.Geometry import Point3D
 
+import rxembed as rx
 from rxembed import metal_distance as mdist
 from rxembed import metal_perceive as perceive
 from rxembed.pipeline import geom_check as geom
@@ -72,10 +68,18 @@ def _kinds(report):
         "CCO",
         _ACID_ARENE,  # close polar contacts that must not read as clashes
     ],
+    ids=["ethanol", "acid-arene"],
 )
-def test_a_clean_conformer_passes_the_whole_gate(smiles):
+def test_clean_conformer_passes_geometry_check(smiles):
     rep = geom.check(_reference_conformer(smiles), 0)
     assert rep.ok(), rep.summary()
+
+
+def test_ensemble_checks_every_tracked_conformer():
+    ens = rx.embed("CCO", n=2, seed=1).minimize()
+    reports = ens.check()
+    assert set(reports) == set(ens.ids)
+    assert all(report.ok() for report in reports.values())
 
 
 # --- one deliberate break per violation kind --------------------------------------------------------------
@@ -130,12 +134,12 @@ _BREAKS = {
 
 
 @pytest.mark.parametrize("kind", list(_BREAKS), ids=list(_BREAKS))
-def test_each_violation_kind_fires_on_its_own_deliberate_break(kind):
+def test_each_violation_kind_fires(kind):
     mol, kw = _BREAKS[kind]()
     assert kind in _kinds(geom.check(mol, 0, **kw))
 
 
-def test_the_two_kwarg_driven_checks_are_silent_when_the_geometry_agrees_with_what_was_stated():
+def test_kwarg_checks_accept_matching_geometry():
     ref = _reference_conformer(_ACID_ARENE)
     d = float(np.linalg.norm(ref.GetConformer(0).GetPositions()[1] - ref.GetConformer(0).GetPositions()[9]))
     assert geom.check(ref, 0, frozen=list(range(6)), reference=ref).ok(), "an identical geometry moved the core"
@@ -145,7 +149,7 @@ def test_the_two_kwarg_driven_checks_are_silent_when_the_geometry_agrees_with_wh
 # --- TS-awareness: a held core is not judged by ground-state rules ----------------------------------------
 
 
-def test_a_frozen_core_is_exempt_from_the_ground_state_checks():
+def test_frozen_core_skips_ground_state_checks():
     mol, _kw = _conjugation()
     a, b, c, d = mol.GetSubstructMatch(Chem.MolFromSmarts("[O]=[C]-[N]-[C]"))
     assert "conjugation" in _kinds(geom.check(mol, 0))
@@ -155,8 +159,8 @@ def test_a_frozen_core_is_exempt_from_the_ground_state_checks():
 # --- the 1-3 fusion gate, and the strained rings it must not eat -------------------------------------------
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_a_collapsed_ester_o_c_o_fusion_is_caught_where_every_prior_gate_was_blind():
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_gate_catches_collapsed_ester_fusion():
     from rxembed.pipeline import metrics
 
     mol = _reference_conformer("CC(=O)OC")
@@ -182,8 +186,8 @@ def test_a_collapsed_ester_o_c_o_fusion_is_caught_where_every_prior_gate_was_bli
     assert {o_term, o_est} not in [set(p) for p in formed], "connectivity skips a topo-2 pair"
 
 
-@pytest.mark.parametrize("smiles", ["C1CO1", "CC(=O)OC", "C[N+](=O)[O-]"])
-def test_a_real_tight_1_3_pair_is_never_a_fusion(smiles):
+@pytest.mark.parametrize("smiles", ["C1CO1", "CC(=O)OC", "C[N+](=O)[O-]"], ids=["epoxide", "ester", "nitro"])
+def test_tight_1_3_pair_is_not_fusion(smiles):
     rep = geom.check(_reference_conformer(smiles), 0)
     assert "fusion" not in _kinds(rep)
     assert rep.ok(), rep.summary()
@@ -192,9 +196,9 @@ def test_a_real_tight_1_3_pair_is_never_a_fusion(smiles):
 # --- the metal arm: the over-bond ruler the gate reads ------------------------------------------------------
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_the_over_bond_gate_is_silent_on_every_isomer_of_a_clean_complex():
-    import rxembed.pipeline as rx
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_overbond_gate_accepts_clean_isomers():
+    import rxembed as rx
 
     seen = 0
     for iso in rx.metal("Cl[Pd](Cl)(N)N", "square_planar"):
@@ -205,9 +209,9 @@ def test_the_over_bond_gate_is_silent_on_every_isomer_of_a_clean_complex():
     assert seen, "no conformer was judged: the gate was never asked anything"
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_donor_sets_are_per_metal_so_a_spectator_ferrocene_is_not_an_over_bond():
-    import rxembed.pipeline as rx
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_donor_sets_are_per_metal():
+    import rxembed as rx
 
     isos = rx.metal("examples/structures/mn-h2.xyz", "octahedral", center="Mn", fix=[1, 5, 63, 64, 65, 66])
     ens = rx.embed(isos[0], n=1, seed=1)
@@ -216,9 +220,9 @@ def test_donor_sets_are_per_metal_so_a_spectator_ferrocene_is_not_an_over_bond()
         assert not perceive.metal_overbond(ens.mol, ens.mol.GetConformer(cid).GetPositions(), isos[0].donors)
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
-def test_a_third_sphere_atom_crushed_onto_the_metal_is_an_over_bond():
-    import rxembed.pipeline as rx
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_gate_catches_third_sphere_overbond():
+    import rxembed as rx
 
     smi = "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1"
     iso = rx.metal(smi, "square_planar")[0]
@@ -251,7 +255,7 @@ def test_a_third_sphere_atom_crushed_onto_the_metal_is_an_over_bond():
     assert [x.kind for x in perceive.metal_overbond(mol, buried, None)] == ["metal_collapse"]
 
 
-def test_the_over_bond_tier_is_decided_by_how_many_donors_the_atom_is_bonded_to():
+def test_overbond_tier_counts_bonded_donors():
     ac, pos = _bare_sphere(  # Pd | O O (donors) | C carboxyl | C methyl: the CMD/AMLA motif
         ["Pd", "O", "O", "C", "C"],
         [(1, 3), (2, 3), (3, 4)],
@@ -269,7 +273,7 @@ def test_the_over_bond_tier_is_decided_by_how_many_donors_the_atom_is_bonded_to(
     assert mdist.overbond_tier(ac, [1], 3) == mdist.NEAR  # bonded to one: second sphere, floored
 
 
-def test_the_second_sphere_floor_rejects_a_collapse_but_clears_a_real_agostic():
+def test_second_sphere_floor_rejects_collapse_not_agostic():
     from rxembed.constraints import Constraints
 
     col, pos = _bare_sphere(
@@ -293,17 +297,17 @@ def test_the_second_sphere_floor_rejects_a_collapse_but_clears_a_real_agostic():
     assert not perceive.metal_overbond(ti, pos, [1, 3, 4, 5])
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[perceive]")
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 @pytest.mark.parametrize("name", _DFT)
-def test_every_floor_accepts_the_real_dft_geometry_it_exists_to_reproduce(name):
+def test_floors_accept_reference_geometries(name):
     from rdkit.Chem import GetPeriodicTable
 
     from rxembed.constraints import Constraints
     from rxembed.metal_core import TRANSITION_METALS
-    from rxembed.pipeline.perceive import _xyz_to_mol
+    from rxembed.pipeline.perceive import read_xyz
 
     pt = GetPeriodicTable()
-    mol = _xyz_to_mol(f"examples/structures/{name}.xyz", 0)
+    mol = read_xyz(f"examples/structures/{name}.xyz", 0)
     pos = mol.GetConformer().GetPositions()
     metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS]
     assert metals, f"{name} carries no transition metal: the fixture exercises no floor at all"
@@ -337,7 +341,7 @@ def _ruthenium(d_ruh=1.701, d_rucl=2.233):
     )
 
 
-def test_a_declared_hydride_passes_the_gate_that_has_no_covalent_ruler_for_it():
+def test_declared_hydride_passes_without_covalent_ruler():
     mol, pos = _ruthenium()
     donors = [1, 2, 3, 4]
     assert 1 in perceive._spheres(mol, pos, donors)[0]
@@ -345,7 +349,7 @@ def test_a_declared_hydride_passes_the_gate_that_has_no_covalent_ruler_for_it():
     assert geom.check(mol, mol.GetConformer().GetId(), donors=donors).ok()
 
 
-def test_an_undeclared_agostic_h_is_not_promoted_to_a_donor():
+def test_undeclared_agostic_h_is_not_promoted_to_a_donor():
     mol, pos = _bare_sphere(
         ["Ru", "C", "H", "P", "P"],
         [(1, 2)],
@@ -357,7 +361,7 @@ def test_an_undeclared_agostic_h_is_not_promoted_to_a_donor():
 
 
 @pytest.mark.parametrize("kind", ["hydride", "chloride"])
-def test_a_declared_donor_buried_in_the_metal_is_still_caught(kind):
+def test_buried_donor_triggers_metal_collapse(kind):
     at = 1 if kind == "hydride" else 2
     mol, pos = _ruthenium(**{"d_ruh" if kind == "hydride" else "d_rucl": 0.100})
     v = perceive.metal_overbond(mol, pos, [1, 2, 3, 4])
@@ -374,7 +378,7 @@ _CHB = "C1CSC2=NC(CN12)c1ccccc1.CC(=O)OC(C)=O"  # tetramisole isothiourea + acet
 
 def _seeded(smi, seed=1, pick=None):
     """Embed an NCI complex on its first (or `pick`-matched) discovered mode -> the ensembles to check."""
-    import rxembed.pipeline as rx
+    import rxembed as rx
 
     mol = Chem.AddHs(Chem.MolFromSmiles(smi))
     if pick is None:
@@ -386,8 +390,8 @@ def _seeded(smi, seed=1, pick=None):
     return list(res) if isinstance(res, rx.EnsembleSet) else [res]
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[nci]")
-def test_the_conjugation_cap_holds_the_thiourea_c_s_n_plane_through_the_relax():
+@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
+def test_conjugation_cap_holds_thiourea_plane():
     seen = 0
     for ens in _seeded(_SCHREINER):
         frozen = [int(f) for f in ens.cons.frozen] or None
@@ -397,8 +401,8 @@ def test_the_conjugation_cap_holds_the_thiourea_c_s_n_plane_through_the_relax():
     assert seen, "no conformer was produced: the gate assertion never ran"
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[nci]")
-def test_both_caps_active_leave_the_chb_complexes_sp2_carbons_planar():
+@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
+def test_chb_caps_keep_sp2_carbons_planar():
     seen = 0
     for ens in _seeded(_CHB, pick="ChB"):
         frozen = [int(f) for f in ens.cons.frozen] or None
@@ -408,7 +412,7 @@ def test_both_caps_active_leave_the_chb_complexes_sp2_carbons_planar():
     assert seen, "no conformer was produced: the gate assertion never ran"
 
 
-def test_the_sp2_hold_rides_its_window_rather_than_pinning_flat_or_freeing_the_bowl():
+def test_sp2_hold_preserves_window_not_flatness():
     from rdkit.Chem import rdDistGeom
 
     from rxembed import mechanisms

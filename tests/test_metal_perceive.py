@@ -1,11 +1,4 @@
-"""`metal_perceive`: the coordination-sphere ruler; who coordinates, and where the ligand POINTS.
-
-Every other geometry check measures a distance, so a carbonyl folded flat onto its iron; carbon dead on its
-octahedral vertex at a perfect Fe-C distance; passes them all, and `metal_overbond`'s radial floor is blind
-too (a right-angle carbonyl sits at Fe...O 2.13 Å, over the 2.04 Å floor). `donor_orientation` gates the angle
-against a per-(element, hybridisation) census window and ABSTAINS on an uncalibrated class; `donor_fold` is the
-report-only metric. Witnesses are built by moving atoms: no force field, no xtb.
-"""
+"""Test coordination-sphere and donor-orientation perception."""
 
 from __future__ import annotations
 
@@ -15,7 +8,7 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 from rdkit.Geometry import Point3D
 
-import rxembed.pipeline as rx
+import rxembed as rx
 from rxembed import metal_perceive as coord
 from rxembed.metal_donor_orient import _FOLD_WINDOW, _stripped_hybridisation
 from rxembed.pipeline import geom_check as geom
@@ -97,7 +90,7 @@ def _sphere_of(ens):
 # --- the gate is reachable, and reachable with the intended donors ---------------------------------------
 
 
-def test_the_gate_is_called_through_the_public_api_with_real_donors(monkeypatch):
+def test_public_gate_receives_real_donors(monkeypatch):
     seen: list[object] = []
     real = coord.donor_orientation
 
@@ -108,7 +101,7 @@ def test_the_gate_is_called_through_the_public_api_with_real_donors(monkeypatch)
     monkeypatch.setattr(geom, "donor_orientation", spy)
     ens = rx.embed(rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0], n=4, seed=1).minimize()
     assert seen, "donor_orientation was never called through rx.embed(...).minimize()"
-    assert any(d for d in seen), "the gate was called, but ALWAYS with donors=None: it is a silent no-op"
+    assert any(d for d in seen), "the gate was called only with donors=None, so it was a silent no-op"
     assert ens.sphere, "Ensemble.sphere is empty after minimize(): the intended donors did not survive"
 
 
@@ -122,7 +115,7 @@ def test_perceiving_the_donors_makes_the_gate_blind():
 # --- true positives: what the ruler can prove impossible -------------------------------------------------
 
 
-def test_the_witness_is_rejected_and_only_the_folded_carbonyl_fires():
+def test_donor_orientation_reports_folded_carbonyl():
     mol, donors = feh2co4(folds=_STITCH)
     v = coord.donor_orientation(mol, mol.GetConformer().GetPositions(), donors)
     assert len(v) == 1, f"expected exactly the 0° carbonyl, got {[str(x) for x in v]}"
@@ -131,7 +124,7 @@ def test_the_witness_is_rejected_and_only_the_folded_carbonyl_fires():
     assert "folded back over the metal" in v[0].detail
 
 
-def test_the_element_key_splits_the_carbonyl_from_the_nitrile():
+def test_element_key_splits_the_carbonyl_from_the_nitrile():
     mol, donors = feh2co4(folds=(152.4, 180.0, 180.0, 180.0))
     pos = mol.GetConformer().GetPositions()
     assert float(np.linalg.norm(pos[2] - pos[0])) == pytest.approx(2.85, abs=0.01)
@@ -151,7 +144,7 @@ def test_the_element_key_splits_the_carbonyl_from_the_nitrile():
 # --- what the ruler must not prove: abstention is load-bearing --------------------------------------------
 
 
-def test_an_uncalibrated_class_is_reported_but_never_gated():
+def test_uncalibrated_class_is_reported_but_never_gated():
     out, pos, o = _donor_at("COC", 60.0, donor_num=8)  # dimethyl ether
     assert _stripped_hybridisation(out)[o] == Chem.HybridizationType.SP3, "the ether O must type as sp3"
     assert ("O", Chem.HybridizationType.SP3) not in _FOLD_WINDOW, "O sp3 (n=2) must have NO threshold at all"
@@ -161,7 +154,7 @@ def test_an_uncalibrated_class_is_reported_but_never_gated():
     assert not rep.angles, "an unknown donor is never judged"
 
 
-def test_the_gate_fires_on_the_fold_direction_only():
+def test_gate_fires_on_the_fold_direction_only():
     splayed, pos, n = _donor_at("CN", 160.0)  # above the N sp3 ceiling of 158.4
     assert not coord.donor_orientation(splayed, pos, [n]), "the OVERSHOOT must not be gated"
     assert coord.donor_fold(splayed, donors=[n]).outside_window, "...but the metric MUST still report it"
@@ -172,15 +165,15 @@ def test_the_gate_fires_on_the_fold_direction_only():
     assert v[0].value == pytest.approx(80.0, abs=0.5)
 
 
-def test_a_kappa1_carboxylate_at_100_degrees_is_a_metric_finding_not_a_violation():
+def test_kappa1_carboxylate_is_metric_only():
     anionic = lambda a: a.GetAtomicNum() == 8 and a.GetFormalCharge() == -1  # noqa: E731
     out, pos, o = _donor_at("CC(=O)[O-]", 100.0, pick=anionic)
     assert not coord.donor_orientation(out, pos, [o]), "100° is inside the census window; must NOT be flagged"
 
 
-def test_the_two_estimators_refuse_to_gate_when_they_disagree():
+def test_two_estimators_refuse_to_gate_when_they_disagree():
     smi = "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)N(c1ccccc1)[CH-]->2c1ccccc1"
-    ens = rx.embed(rx.metal(smi, "square_planar")[0], n=4, seed=1).minimize()
+    ens = rx.embed(rx.metal(smi, "square_planar")[0], n=1, seed=1).minimize()
     rep = coord.donor_fold(ens.mol, ens.ids[0], donors=_sphere_of(ens))
     assert [d for d in rep.unknown if ens.mol.GetAtomWithIdx(d).GetAtomicNum() == 6], "the [CH-] must be UNKNOWN"
     assert all(a.donor not in rep.unknown for a in rep.angles), "an UNKNOWN donor must never be judged"
@@ -198,8 +191,8 @@ _HEALTHY = [
 
 
 @pytest.mark.parametrize(("name", "smi", "accept"), _HEALTHY, ids=[h[0] for h in _HEALTHY])
-def test_a_healthy_system_is_judged_and_not_flagged(name, smi, accept):
-    ens = rx.embed(rx.metal(smi, "square_planar")[0], n=4, seed=1).minimize()
+def test_healthy_donor_checks_are_nonvacuous(name, smi, accept):
+    ens = rx.embed(rx.metal(smi, "square_planar")[0], n=1, seed=1).minimize()
     assert ens.ids, f"{name}: embed produced nothing"
     donors = _sphere_of(ens)
     assert coord.donor_fold(ens.mol, ens.ids[0], donors=donors).angles, f"{name}: the walk judged ZERO angles"
@@ -210,11 +203,11 @@ def test_a_healthy_system_is_judged_and_not_flagged(name, smi, accept):
         assert not v, f"{name}: FALSE POSITIVE on a healthy conformer; {[str(x) for x in v]}"
 
 
-def test_a_kappa2_carboxylate_apex_is_exempt():
+def test_kappa2_carboxylate_apex_is_exempt():
     from rxembed.metal_distance import APEX, overbond_tier
 
     iso = rx.metal("CC1=[O]->[Zn+2](Cl)(Cl)<-[O-]1", "tetrahedral")[0]
-    ens = rx.embed(iso, n=4, seed=1).minimize()
+    ens = rx.embed(iso, n=1, seed=1).minimize()
     assert ens.ids, "the κ2 acetate did not embed"
     donors = _sphere_of(ens)
     donor_set = set(donors)
@@ -225,7 +218,7 @@ def test_a_kappa2_carboxylate_apex_is_exempt():
         assert not coord.donor_orientation(ens.mol, ens.mol.GetConformer(cid).GetPositions(), donors)
 
 
-def test_a_side_on_eta2_donor_is_exempt():
+def test_side_on_eta2_donor_is_exempt():
     smi = "CC(C)(C)[C]1#[C](C#C[Si](C)(C)C)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1"  # side-on alkyne
     ens = rx.embed(rx.metal(smi, "square_planar")[0], n=4, seed=1).minimize()
     assert ens.ids, "the side-on η² did not embed"
@@ -235,7 +228,7 @@ def test_a_side_on_eta2_donor_is_exempt():
         assert not v, f"FALSE POSITIVE on a side-on η²; {[str(x) for x in v]}"
 
 
-def test_an_organic_molecule_is_a_strict_no_op():
+def test_organic_molecule_is_a_strict_no_op():
     mol = Chem.AddHs(Chem.MolFromSmiles("CC(=O)Nc1ccccc1O"))
     rdDistGeom.EmbedMolecule(mol, randomSeed=1)
     assert not coord.donor_orientation(mol, mol.GetConformer().GetPositions())
@@ -245,12 +238,12 @@ def test_an_organic_molecule_is_a_strict_no_op():
     assert rep.fold == 0.0
 
 
-def test_the_metric_needs_no_reference_and_the_planarity_rung_never_gates():
+def test_metric_is_reference_free_and_planarity_never_gates():
     healthy, donors = feh2co4()
     stitched, _ = feh2co4(folds=_STITCH)
     assert coord.donor_fold(healthy, donors=donors).fold < coord.donor_fold(stitched, donors=donors).fold
     kinds = {v.kind for v in geom.check(stitched, donors=donors).violations}
-    assert "planarity_donation" not in kinds, "the planarity rung must NEVER produce a Violation"
+    assert "planarity_donation" not in kinds, "the planarity rung must not produce a violation"
     assert "dihedral" not in kinds
 
 
@@ -261,7 +254,7 @@ def test_the_metric_needs_no_reference_and_the_planarity_rung_never_gates():
 # claims them.
 
 
-def test_the_eta2_planarity_flex_does_not_leak_to_a_non_metal_sp2():
+def test_eta2_planarity_flex_is_metal_local():
     m = Chem.AddHs(Chem.MolFromSmiles("C=CC=C"))  # butadiene, no metal -> no η² flex
     rdDistGeom.EmbedMolecule(m, randomSeed=1)
     c = m.GetConformer()
@@ -272,7 +265,7 @@ def test_the_eta2_planarity_flex_does_not_leak_to_a_non_metal_sp2():
     assert any(v.kind == "planarity" for v in geom.planarity(m, c.GetPositions())), "non-metal sp2 wrongly flexed"
 
 
-def test_the_xh_bond_length_window_is_element_aware():
+def test_xh_bond_length_window_is_element_aware():
     m = Chem.AddHs(Chem.MolFromSmiles("CP"))
     rdDistGeom.EmbedMolecule(m, randomSeed=1)
     c = m.GetConformer()

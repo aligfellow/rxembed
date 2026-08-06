@@ -13,22 +13,22 @@ satisfy it. It is a library, not a CLI.
 
 > Flat is core. Pipeline owns batteries.
 
-`ls src/rxembed/` is the documentation. The flat modules at the root are the embedder (`numpy + rdkit`,
-nothing else); the one subdirectory, `pipeline/`, owns input adaptation and downstream capabilities, including
-the optional tools. `metal/` was flattened to `metal_*.py` so the asymmetry remains the tier signal. Do not
-create a second directory to mark a tier.
+`ls src/rxembed/` is the documentation. The flat implementation modules are the embedder (`numpy + rdkit`,
+nothing else); `core.py` is its public engine facade. The one subdirectory, `pipeline/`, owns input adaptation
+and downstream capabilities. `__init__.py` exposes the normal workflow by composing those two facades; it owns
+no logic. `metal/` was flattened to `metal_*.py` so the asymmetry remains the tier signal.
 
 ```python
-import rxembed as rx                     # core:      Mol | Isomer -> Conformers      numpy + rdkit
-rx.embed(mol, fix={(i, j): 2.0}).minimize()
-
-import rxembed.pipeline as rx            # batteries: str | path | Mol | Isomer -> Ensemble | EnsembleSet
+import rxembed as rx                     # normal API: str | path | Mol | Isomer -> Ensemble result(s)
 rx.embed("cat.substrate", contacts="auto").mc().prune().score("gxtb")
+
+from rxembed import core                 # engine API: Mol | Isomer -> Conformers
+core.embed(mol, fix={(i, j): 2.0}).minimize()
 ```
 
-They are different functions with different signatures, not one call growing powers. The root verb must
-never change behaviour with which extras are installed: a same-call-different-result install is the worst
-option available. `rxembed.pipeline` re-exports every core name, so it is a strict superset.
+There is one normal `rxembed.embed`; it normalizes input, uses the core constraint, embedding and relaxation
+machinery, and wraps the result. Optional operations import their backend at the point of use and fail naming
+the required extra. Core behavior never changes with installed extras.
 
 **If a change needs a new directory, the abstraction is probably wrong.**
 
@@ -46,9 +46,9 @@ nothing passes, no tiers with one member.
 split moves code between files without deleting any, say so plainly: moving is not simplifying, and
 sometimes it is still right.
 
-**Separation of concerns.** The core knows nothing about `pipeline/`; perception belongs upstream (xyzgraph,
-RDKit), not here. If you need a pipeline import inside a core module, that is a design error: fix the seam,
-do not add a lazy import.
+**Separation of concerns.** Core implementation modules know nothing about `pipeline/`; perception belongs
+upstream (xyzgraph, RDKit), not there. Only the package facade imports both tiers. If another core module needs
+a pipeline import, that is a design error: fix the seam, do not add a lazy import.
 
 **Clarity over cleverness.** A name a newcomer reads correctly beats a name plus a paragraph explaining it.
 Rename first, then delete the docstring that was compensating.
@@ -215,8 +215,7 @@ into the core.
 
 **No AI attribution, ever.** No `Co-Authored-By` naming an assistant, no "generated with" line, no session
 URL, no tool name in the message or the trailer. The history is the maintainer's. If your harness adds one by
-default, strip it — and check a cherry-pick or rebase has not carried one in from the commit it copied, which
-is how one slipped through on 2026-08-03.
+default, strip it, and check a cherry-pick or rebase has not carried one in from the commit it copied.
 
 Squash before landing. `main` is a linear history of self-contained changes, not a development log: state
 what changed and why it is right, and put the number next to the code rather than in the message.
@@ -229,10 +228,10 @@ uv / ruff / ty / pytest / pre-commit / just. `just check` = lint + type + test; 
 `pre-commit install`.
 
 **A bare `uv sync` is the full dev environment.** `uv sync` never installs an extra, so the `dev` dependency
-group self-references `rxembed[all]`; that one line is what stops the habitual command leaving you with a
-suite full of ImportErrors. Nothing passes `--all-extras`: the flag would mask a regression in the default.
+group self-references `rxembed[search,workflow]`; that one line is what stops the habitual command leaving you
+with a suite full of ImportErrors. Nothing passes `--all-extras`: the flag would mask a regression in the default.
 (`[tool.uv] default-extras` is not a key uv accepts, measured on uv 0.11.32.) The base tier is
 `uv pip install .`, or `uv sync --no-default-groups`; neither reads the group.
 
-Extras: `search select perceive nci viz all`. Version is single-sourced from `pyproject.toml`
-via `importlib.metadata`; never hardcode a second copy.
+Extras: `search workflow`. `xyzrender` is a development dependency used only by notebooks. Version is
+single-sourced from `pyproject.toml` via `importlib.metadata`; never hardcode a second copy.
