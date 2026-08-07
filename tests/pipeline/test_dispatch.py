@@ -32,6 +32,27 @@ def _max_core_drift(mol, ids, core, ref_pos):
     )
 
 
+def test_threads_reach_both_seed_dispatches(monkeypatch):
+    from rxembed.pipeline import dispatch
+
+    seen = []
+
+    def capture(mol, _cons, _iso, _n, **kwargs):
+        seen.append(kwargs["threads"])
+        return mol, []
+
+    iso = rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0]
+    monkeypatch.setattr(dispatch, "seed_conformers", capture)
+    monkeypatch.setattr(dispatch._nci, "auto_binding_modes", lambda _mol, seed: {})
+
+    rx.embed(_embedded("CCO"), fix=[0, 1], n=1)
+    rx.embed(_embedded("CCO"), fix=[0, 1], n=1, threads=3)
+    rx.embed("CCO", contacts="auto", n=1, threads=3)
+    rx.embed(iso, n=1, threads=3)
+
+    assert seen == [0, 3, 3, 3]
+
+
 # --- fix: the rigid graft, in each of the three forms the resolver accepts ---------------------------------
 
 

@@ -43,6 +43,7 @@ def embed(
     charge=0,
     n=None,
     seed=0xF00D,
+    threads=0,
     knowledge=True,
     stereo="racemic",
 ):
@@ -82,6 +83,7 @@ def embed(
         "charge": charge,
         "n": n,
         "seed": seed,
+        "threads": threads,
         "knowledge": knowledge,
         "stereo": stereo,  # the metal load-in (enumerate_isomers) reads it; the organic path uses _stereo_expand
     }

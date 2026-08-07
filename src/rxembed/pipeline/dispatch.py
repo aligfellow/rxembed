@@ -171,7 +171,7 @@ def _coordination_choices(iso, coordinate, nvac):
     return [[resolve_atom(iso.mol, coordinate)]]  # an int index
 
 
-def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowledge, keep_input=False):
+def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, threads, knowledge, keep_input=False):
     """Embed a metal `Isomer`, optionally binding a substrate; yield one `Ensemble` per binding candidate.
 
     Usually one, but several when ``coordinate=`` is a SMARTS matching several donor atoms (one candidate per
@@ -208,7 +208,9 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
             if len(choices) > 1:
                 tag["coordinate"] = atoms[0]
         try:  # the core seam: free fragments tethered, donor hand held, embed, exact core grafted back
-            mol, ids = seed_conformers(mol, cons, iso, n, seed=seed, knowledge=knowledge, graft_ref=graft_ref)
+            mol, ids = seed_conformers(
+                mol, cons, iso, n, seed=seed, threads=threads, knowledge=knowledge, graft_ref=graft_ref
+            )
         except RuntimeError as e:  # triangle smoothing -> infeasible bounds
             raise ValueError(
                 f"could not embed {iso.geometry} {_kiso.arrangement(iso)}"
@@ -239,7 +241,7 @@ def _embed_isomer(iso, *, coordinate, contacts, fix, constrain, n, seed, knowled
         yield ens
 
 
-def _auto_contacts_embed(source, *, metal, fix, constrain, coordinate, charge, n, seed, knowledge):
+def _auto_contacts_embed(source, *, metal, fix, constrain, coordinate, charge, n, seed, threads, knowledge):
     """Resolve ``contacts='auto'``: discover the inter-fragment NCI binding modes and conf-search each.
 
     One `Ensemble` if there is a single mode, else an `EnsembleSet` (`.tag['nci']` = the mode).
@@ -262,6 +264,7 @@ def _auto_contacts_embed(source, *, metal, fix, constrain, coordinate, charge, n
         "charge": charge,
         "n": n,
         "seed": seed,
+        "threads": threads,
         "knowledge": knowledge,
     }
     if not modes:
@@ -477,7 +480,9 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic
     return _kiso.enumerate_isomers(mol, geometry, center, fix, stereo, stereo_ref=ref_sig, lengths=lengths)
 
 
-def _dispatch_metal_source(source, *, metal, coordinate, contacts, fix, constrain, n, seed, knowledge, charge, stereo):
+def _dispatch_metal_source(
+    source, *, metal, coordinate, contacts, fix, constrain, n, seed, threads, knowledge, charge, stereo
+):
     """Route a ``metal=<geometry>`` / metal `Isomer` source: enumerate isomers, or embed the one chosen isomer."""
     _iso_kw = {
         "coordinate": coordinate,
@@ -486,6 +491,7 @@ def _dispatch_metal_source(source, *, metal, coordinate, contacts, fix, constrai
         "constrain": constrain,
         "n": n,
         "seed": seed,
+        "threads": threads,
         "knowledge": knowledge,
     }
     if metal is None:
@@ -528,6 +534,7 @@ def _embed_dispatch(
     charge=0,
     n=None,
     seed=0xF00D,
+    threads=0,
     knowledge=True,
     stereo="racemic",
 ):
@@ -564,6 +571,7 @@ def _embed_dispatch(
             charge=charge,
             n=n,
             seed=seed,
+            threads=threads,
             knowledge=knowledge,
         )
     if metal is not None or isinstance(source, _kiso.Isomer):  # the metal enumerate / isomer paths
@@ -576,6 +584,7 @@ def _embed_dispatch(
             constrain=constrain,
             n=n,
             seed=seed,
+            threads=threads,
             knowledge=knowledge,
             charge=charge,
             stereo=stereo,
@@ -605,6 +614,7 @@ def _embed_dispatch(
                 constrain=None,
                 n=n,
                 seed=seed,
+                threads=threads,
                 knowledge=knowledge,
                 keep_input=True,
             )
@@ -678,7 +688,7 @@ def _embed_dispatch(
     # the core seam: free fragments tethered, donor hand held, embed, exact core grafted back. `iso` here has
     # no polyhedron (the sphere is held by `hold_shape` above) and no donor list, so the hand-hold is a no-op:
     # passed anyway, so it starts working the day this path learns its donors, rather than silently not.
-    mol, ids = seed_conformers(mol, cons, iso, n, seed=seed, knowledge=knowledge, graft_ref=user_graft)
+    mol, ids = seed_conformers(mol, cons, iso, n, seed=seed, threads=threads, knowledge=knowledge, graft_ref=user_graft)
     n_frag = len(Chem.GetMolFrags(mol))
     logger.info(
         "embed: %d seeds (%d atoms, %d fragment%s, %d constraints)",
