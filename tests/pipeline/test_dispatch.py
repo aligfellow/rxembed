@@ -247,6 +247,11 @@ def test_auto_contacts_form_hydrogen_bonds():
 # --- rx.metal: what spec the isomer enumerator hands down ---------------------------------------------------
 
 
+def test_numeric_metal_fix_needs_no_input_geometry():
+    iso = rx.metal("P->[Pd](Cl)Cl", "square_planar", fix={(0, 1): 2.1})[0]
+    assert iso.cons.fixed[(0, 1)] == (2.1, 2.1)
+
+
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_shape_holds_replace_only_spectator_pulls():
     iso = rx.metal("examples/structures/mn-h2.xyz", "octahedral", center="Mn", fix=[1, 5, 63, 64, 65, 66])[0]

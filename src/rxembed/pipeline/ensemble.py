@@ -15,7 +15,7 @@ from rxembed.constraints import match, resolve_atom
 from rxembed.embed import BASE_STIFFNESS as _BASE_STIFFNESS
 from rxembed.embed import BOND_TOL as _BOND_TOL
 from rxembed.embed import METAL_BOND_TOL as _METAL_BOND_TOL
-from rxembed.embed import Conformers, seed_conformers
+from rxembed.embed import Conformers, _periodic_near, seed_conformers
 from rxembed.relax import MAX_ITERS as _MAX_ITERS
 from rxembed.relax import _error_summary
 
@@ -325,13 +325,18 @@ class Ensemble(Conformers):
         cons = self.cons
         seeded_d = [(k, v) for k, v in cons.distances.items() if not (k[0] in cons.frozen and k[1] in cons.frozen)]
         shape_d = {k: v for k, v in cons.distances.items() if k[0] in cons.frozen and k[1] in cons.frozen}
-        if not (seeded_d or cons.angles) or not self.ids:
+        if not (seeded_d or cons.angles or cons.dihedrals) or not self.ids:
             return
         for b, group in enumerate(g for g in np.array_split(list(self.ids), min(len(self.ids), bins)) if len(g)):
             frac = (b + 0.5) / min(len(self.ids), bins)  # this bin's fraction across every window
-            # A partial rebuild: `distances`/`angles` are re-derived per bin, everything else carried. Critically
-            # `coplanar`, without which the stiff relax drives the metal out of the donor plane.
-            tgt = cons.copy(distances={}, angles={}, contacts=(frozenset(), frozenset()), dg_floors={})
+            # A partial rebuild: coordinate windows are re-derived per bin, everything else is carried.
+            tgt = cons.copy(
+                distances={},
+                angles={},
+                dihedrals={},
+                contacts=(frozenset(), frozenset()),
+                dg_floors={},
+            )
             tgt.distances.update(shape_d)  # keep the frozen-core shape exact
             for k, (lo, hi) in seeded_d:
                 m = lo + frac * (hi - lo)
@@ -339,6 +344,9 @@ class Ensemble(Conformers):
             for k, (lo, hi) in cons.angles.items():
                 m = lo + frac * (hi - lo)
                 tgt.angles[k] = (max(lo, m - 2.0), min(hi, m + 2.0))
+            for k, (lo, hi) in cons.dihedrals.items():
+                m = lo + frac * (hi - lo)
+                tgt.dihedrals[k] = (max(lo, m - 2.0), min(hi, m + 2.0))
             try:  # settling is best-effort pre-conditioning; an RDKit BFGS divergence must not sink mc()
                 _refine.restrained_uff(self._mol, tgt, stiffness=_BASE_STIFFNESS, conf_ids=[int(i) for i in group])
             except RuntimeError:  # keep the raw ETKDG seeds for this group (openconf still searches around them)
@@ -368,9 +376,10 @@ class Ensemble(Conformers):
             return self
         seed_pos = {c: self._mol.GetConformer(c).GetPositions() for c in self.ids}
         e = self._relax_constrained(_BASE_STIFFNESS, operation="embed")
-        # The relax can tear a seed; `embed` must not spend the caller's `n` re-embedding (that is `minimize`'s
-        # job), so a torn conformer keeps its seed coordinates: output is never worse than the seed.
+        # The relax can tear a seed or miss a numeric fix. Retry from the seed, then reject any off-fix result;
+        # unlike a torn free bond, an off-fix seed is not a valid fallback for `fix`.
         self._rescue_torn(seed_pos, _BASE_STIFFNESS, operation="embed")
+        self.discarded += self._reject_missed_fixes("embed")
         self._hold_metal_hand(_BASE_STIFFNESS, _MAX_ITERS, operation="embed")
         self.energies = {}  # embed publishes geometry; minimize owns the FF score
         self._seeds_relaxed = e is not None
@@ -474,12 +483,14 @@ class Ensemble(Conformers):
         oop = "out-of-plane coordination sphere"
         if iso is not None and _poly.is_planar(iso.geometry):
             oop = f"{oop} ({_poly.describe(iso.geometry)} is declared planar; RMS > {_metal.COPLANAR_TOL} A)"
-        kept, drops = [], {"broken bond": 0, oop: 0, "torn rigid body": 0}
+        kept, drops = [], {"broken bond": 0, "missed numeric fix": 0, oop: 0, "torn rigid body": 0}
         for i in self.ids:  # one pass; record which gate rejected each so the log can name it
             if not _metrics.bonding_ok(
                 self._mol, i, bond_tol=bt, exclude=self.cons.frozen, constrained=self.cons.distances
             ):
                 drops["broken bond"] += 1
+            elif not self._fixed_geometry_ok(i):
+                drops["missed numeric fix"] += 1
             elif not self._coordination_ok(i, iso):
                 drops[oop] += 1
             elif not self._shape_intact(i):
@@ -645,6 +656,16 @@ class Ensemble(Conformers):
                 logger.debug("metal/frozen angle(%d,%d,%d) = %.1f (target %.1f-%.1f)", i, j, k, a, lo, hi)
             else:
                 logger.warning("constraint not held: angle(%d,%d,%d) = %.1f, target %.1f-%.1f", i, j, k, a, lo, hi)
+        for atoms, (lo, hi) in self.cons.dihedrals.items():
+            if any(i >= n for i in atoms):
+                continue
+            values = [
+                _periodic_near(rdMolTransforms.GetDihedralDeg(self._mol.GetConformer(c), *atoms), lo, hi)
+                for c in self.ids
+            ]
+            phi = float(np.mean(values))
+            if not all(lo - ang_slack <= value <= hi + ang_slack for value in values):
+                logger.warning("constraint not held: dihedral%s = %.1f, target %.1f-%.1f", atoms, phi, lo, hi)
 
     def score(self, refine="gxtb", solvent=None, charge=None):
         """Re-rank by a real single-point energy (g-xTB by default), returning a new Ensemble.
@@ -701,7 +722,8 @@ class Ensemble(Conformers):
         """Geometry-optimise each conformer with xtb at `level`, returning a new ensemble.
 
         ``level`` accepts ``'loose'``, ``'normal'``, ``'tight'`` or ``'vtight'``. Frozen atoms stay fixed;
-        optimised coordinates and kcal/mol energies are stored on a copy. Use GFN2 for solvent.
+        numeric fixes are validated afterward. Optimised coordinates and kcal/mol energies are stored on a
+        copy. Use GFN2 for solvent.
         """
         self.minimize()
         if not self.ids:
@@ -734,14 +756,18 @@ class Ensemble(Conformers):
             raise RuntimeError(
                 f"optimize: {refine} --opt produced nothing. Is the xtb binary on PATH ($XTB_EXE, or ~/bin/xtb)?"
             )
+        out = self._derive(kept, new_mol)
+        out.energies = energies
+        out._reject_missed_fixes(f"optimize[{refine}]")
+        kept = out.ids
+        if not kept:
+            raise RuntimeError(f"optimize: {refine} moved every numeric fix outside its accepted tolerance")
         logger.info(
             "optimize: %s --opt %s on %d conformer(s); %d core atom(s) held fixed", refine, level, len(kept), len(fix)
         )
         # The opt moved every free atom, so it may have returned a different molecule; check here since the
         # output's _minimized=True makes every downstream minimize() (incl. prune's) a no-op.
         changed = self._flag_connectivity(new_mol, kept, f"optimize[{refine}]", charge)
-        out = self._derive(kept, new_mol)
-        out.energies = energies
         out._minimized = True
         out.discarded += [i for i in self.ids if i not in set(kept)]
         out.energy_kind = "real"  # geometry-optimised xtb/g-xTB energies, comparable across species

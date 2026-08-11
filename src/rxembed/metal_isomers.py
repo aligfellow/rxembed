@@ -744,9 +744,7 @@ def _isomers_for_geometry(
         )
         # Hold any spectator metal's shape and give it the same field. Field-driven, so a floor can never
         # arrive without its `dg_floors` twin, which would leave RDKit's phantom ~3.4 Å floor standing.
-        cons = compose(cons, retain)
-        cons.distances.update(fix_cons.distances)  # hold the frozen reacting core (relative pairwise)
-        cons.frozen |= fix_cons.frozen  # and pin it in the relax
+        cons = compose(cons, retain, fix_cons)  # carry the complete reacting core, including numeric fix pulls
         od = [padded[k] for k in order]  # vertex -> donor atom (or VACANT); a centroid dummy for an eta>=3 face
         # The stored Isomer is real: the centroid is transient scaffolding the embed materialises from
         # `cons.haptic`, so strip it and report the real coordinating atoms. `vertices` keeps the centroid index.
@@ -927,19 +925,14 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic
     _say_length_source(base, lengths)  # once per molecule, not per ordering
     fix_cons = Constraints()
     frozen_donors = set()
-    # Hold a reacting TS core at the input geometry while the rest of the coordination sphere is enumerated:
-    # the mer/fac of a tridentate, say, while the reacting donor and substrate stay put.
+    # Hold a reacting TS core while the rest of the coordination sphere is enumerated: coordinate forms need
+    # an input geometry, while numeric distances and angles are complete on a coordinate-free graph.
     if fix:
-        if base.GetNumConformers() == 0:
-            raise ValueError(
-                "fix= needs an input geometry (an .xyz / a Mol with a conformer) to hold "
-                "the reacting core; got a coordinate-free input (e.g. a SMILES)"
-            )
-        fix_cons, _ = resolve_core(base, fix=fix, has_geometry=True)
+        fix_cons, _ = resolve_core(base, fix=fix, has_geometry=base.GetNumConformers() > 0)
         frozen_donors = fix_cons.frozen & set(donors)
         logger.info(
             "metal: fixed %d input atoms; enumerating free coordination sites",
-            len(fix_cons.frozen),
+            len(fix_cons.constrained_atoms()),
         )
     geoms = _select_geometries(base, m, donors, haptic, geometry, len(donors))
     out = IsomerSet()

@@ -104,4 +104,4 @@ def test_explore_pools_released_grip_and_clears_provenance():
     before = ens.n
     ens.mc(preset="rapid", explore=True)
     assert ens.n > before
-    assert ens.cons.contacts == (frozenset(), frozenset()), "nothing is left to release after an explore pass"
+    assert ens.cons.contacts == (frozenset(), frozenset()), "nothing is left to release after explore"

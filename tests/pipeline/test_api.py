@@ -8,6 +8,7 @@ from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 
 import rxembed as rx
+from rxembed.constraints import FIX_ANGLE_TOL, FIX_DISTANCE_TOL
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.dispatch import _embed_dispatch
 
@@ -35,6 +36,70 @@ def test_free_embed_is_clean(smiles):
 
 
 # --- constrain: soft windows realised ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fix",
+    [
+        {(1, 2): 2.026, (2, 0): 1.557},
+        {(1, 2): (2.006, 2.046), (2, 0): (1.537, 1.577)},
+    ],
+    ids=["scalar", "window"],
+)
+def test_numeric_pair_fix_survives_cleanup_without_fixing_angle(fix):
+    ens = rx.embed(
+        "[O-].ClCCCCBr",
+        fix=fix,
+        n=6,
+        seed=1,
+        stereo="free",
+    ).minimize()
+
+    assert ens.ids
+    for pair, (lo, hi) in ens.cons.fixed.items():
+        measured = ens.measure(pair)
+        if lo == hi:
+            assert measured["min"] == pytest.approx(lo, abs=FIX_DISTANCE_TOL)
+            assert measured["max"] == pytest.approx(lo, abs=FIX_DISTANCE_TOL)
+        else:
+            assert lo <= measured["min"] <= measured["max"] <= hi
+    angle = ens.measure((1, 2, 0))
+    assert angle["max"] - angle["min"] > 30.0, "pair fixing became a rigid three-atom graft"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [60.0, -180.0, (170.0, 190.0), (-190.0, -170.0)],
+    ids=["scalar", "half-turn-alias", "periodic-window", "periodic-window-alias"],
+)
+def test_numeric_dihedral_fix_survives_cleanup(target):
+    ens = rx.embed("CCCC", fix={(0, 1, 2, 3): target}, n=4, seed=1, stereo="free").minimize()
+    assert ens.ids
+    lo, hi = ens.cons.fixed[(0, 1, 2, 3)]
+    middle = 0.5 * (lo + hi)
+    for cid in ens.ids:
+        actual = rdMolTransforms.GetDihedralDeg(ens.mol.GetConformer(cid), 0, 1, 2, 3)
+        actual = middle + (actual - middle + 180.0) % 360.0 - 180.0
+        if lo == hi:
+            assert actual == pytest.approx(lo, abs=FIX_ANGLE_TOL)
+        else:
+            assert lo <= actual <= hi
+    measured = ens.measure((0, 1, 2, 3))
+    assert lo - FIX_ANGLE_TOL <= measured["min"] <= measured["max"] <= hi + FIX_ANGLE_TOL
+
+
+@pytest.mark.parametrize("target", [0.0, 60.0, (-5.0, 5.0)], ids=["antipodal", "twisted", "narrow-window"])
+def test_numeric_dihedral_overrides_internal_torsion_repair(target):
+    atoms = (0, 1, 3, 4)
+    ens = rx.embed("CC(=O)NC", fix={atoms: target}, n=2, seed=2, stereo="free").minimize()
+    assert ens.ids
+    lo, hi = ens.cons.fixed[atoms]
+    for cid in ens.ids:
+        actual = rdMolTransforms.GetDihedralDeg(ens.mol.GetConformer(cid), *atoms)
+        if lo == hi:
+            assert actual == pytest.approx(lo, abs=FIX_ANGLE_TOL)
+        else:
+            assert lo <= actual <= hi
 
 
 def test_constrain_distance_realised_in_window():

@@ -17,6 +17,7 @@ from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 
 from . import metal_donor_orient as _donor  # module import keeps the gate and caps on the same functions
+from .constraints import _DIST_ATOMS, FIX_ANGLE_TOL, FIX_DISTANCE_TOL
 from .metal_core import VACANT, _frag_map
 from .metal_polyhedron import _IMPROPER_VERTICES, POLYHEDRA, resolve_geometry
 from .utils import _CARBON_Z, _DISCONNECTED, _SP2_DEGREE, conjugated_quartets
@@ -35,7 +36,9 @@ RELEASABLE_FC_SCALE = 0.3  # NCI wall scale; measured p90 overshoot 0.014 Å
 CONTACT_PUSH = 320.0  # kcal/mol/Å at either wall; measured knee for contact centring
 ANGLE_FC = 30.0  # kcal/mol/deg²; flat measured fidelity, while 1000 broke 12% of windows
 PI_STACK_FC = 2e3  # kcal/mol/Å²: softer than a stated distance because the seed already formed the stack
-ML_TARGET_FC = 1e4  # kcal/mol/Å²: holds the fitted target to 0.004 Å against a measured 43 kcal/mol/Å pull
+TARGET_FC = 1e4  # kcal/mol/Å²: holds an M-L target to 0.004 Å against a measured 43 kcal/mol/Å pull
+FIX_DISTANCE_FC = 3e7  # kcal/mol/Å²: measured 1.557 -> 1.55760 Å against the reactive-pair LJ repulsion
+FIX_ANGLE_FC = 1e3  # kcal/mol/deg²: measured 123.456 -> 123.45543 degrees before the acceptance gate
 _COPLANAR_FC = 10.0  # kcal/mol/deg²: below 5 tears a diphosphine on a rigid diene
 _UMBRELLA_FC = 3.0  # kcal/mol/deg²: shortest M-L systems need 2-3 to retain the declared side of the plane
 # Planar crystals have p95 9.83°; 15° gives RMS 0.063r and is 43% of the 35.264° pyramid improper.
@@ -44,6 +47,30 @@ _STRAIGHT = 180.0
 _SP2_HOLD_FC = 10.0  # kcal/mol/deg²: thiourea stays clean down to 3; the window, not k, preserves bowls
 _SP2_HOLD_WIN = 5.0  # deg around the seed improper: preserve existing curvature, never create it
 _CONJ_CAP = 20.0  # deg: inside the 30° conjugation gate, measured on BIMP, Takemoto and Schreiner
+
+
+def _inside(window, margin):
+    """Inset a flat wall so its finite-force equilibrium remains inside the public fixed range."""
+    lo, hi = window
+    mid = 0.5 * (lo + hi)
+    return min(lo + margin, mid), max(hi - margin, mid)
+
+
+def _angular_wall(atoms, window, cons, stiffness, releasable):
+    """Select the shared soft or strict angular wall and force constant."""
+    fixed = cons.fixed.get(atoms)
+    if fixed is not None:
+        bounds = fixed if fixed[0] == fixed[1] else _inside(fixed, FIX_ANGLE_TOL)
+        return *bounds, stiffness * FIX_ANGLE_FC
+    # Never escalate a soft angular wall: a stiffer one displaced one measured structure by 0.67 Å.
+    scale = RELEASABLE_FC_SCALE if atoms in releasable else 1.0
+    return *window, min(stiffness, 1.0) * ANGLE_FC * scale
+
+
+def _stated_dihedral(cons, *atoms):
+    """Return whether the user states any torsion around this central bond."""
+    bond = frozenset(atoms[1:3])
+    return any(frozenset(key[1:3]) == bond for key in cons.dihedrals)
 
 
 @dataclass
@@ -90,7 +117,7 @@ class Mechanism:
         """POST: read the committed matrix and tighten it."""
 
     def _ff_terms(self, ff, cons, conf, stiffness):
-        """FF: add terms for this field; scale walls, not target biases, by ``stiffness``."""
+        """FF: add terms for this field at the requested stiffness rung."""
 
 
 class Frozen(Mechanism):
@@ -110,16 +137,27 @@ class Distance(Mechanism):
     def _ff_terms(self, ff, cons, conf, stiffness):
         releasable, _ = cons.contacts
         for (i, j), (lo, hi) in cons.distances.items():
-            fc = PIN_FC * (RELEASABLE_FC_SCALE if (i, j) in releasable else 1.0)
-            ff.AddDistanceConstraint(i, j, lo, hi, stiffness * fc)
+            fixed = cons.fixed.get((i, j))
+            if fixed is not None and fixed[0] != fixed[1]:
+                used_lo, used_hi = _inside(fixed, FIX_DISTANCE_TOL)
+                fc = FIX_DISTANCE_FC
+            else:
+                used_lo, used_hi = lo, hi
+                fc = PIN_FC * (RELEASABLE_FC_SCALE if (i, j) in releasable else 1.0)
+            ff.AddDistanceConstraint(i, j, used_lo, used_hi, stiffness * fc)
 
 
 class Pull(Mechanism):
-    """Bias a pair to a target inside its flat-bottomed distance wall; FF-only and unscaled."""
+    """Bias a pair to a target inside its flat-bottomed distance wall; FF-only."""
 
     def _ff_terms(self, ff, cons, conf, stiffness):
         for (i, j), target in cons.pulls.items():
-            ff.AddDistanceConstraint(i, j, target, target, ML_TARGET_FC)
+            if (i, j) in cons.fixed:
+                continue
+            ff.AddDistanceConstraint(i, j, target, target, TARGET_FC)
+        for atoms, (lo, hi) in cons.fixed.items():
+            if len(atoms) == _DIST_ATOMS and lo == hi:  # scalar distance fix; ranges use the strict wall above
+                ff.AddDistanceConstraint(*atoms, lo, hi, stiffness * FIX_DISTANCE_FC)
         # A contact has no UFF bond keeping it inside its window, so bias it to the midpoint without storing
         # that derived target a second time.
         releasable, _ = cons.contacts
@@ -174,20 +212,29 @@ class Angle(Mechanism):
                 ctx.pairs[(a, b)] = (ang_lo, ang_hi)
 
     def _ff_terms(self, ff, cons, conf, stiffness):
-        # Soften with the caller, but never escalate angles: a stiffer wall displaced one structure by 0.67 Å.
-        # Clamp the dimensionless rung, not force constants with different units.
-        afc = min(stiffness, 1.0) * ANGLE_FC
         _, releasable = cons.contacts
-        for (i, j, k), (lo, hi) in cons.angles.items():
+        for atoms, window in cons.angles.items():
+            i, j, k = atoms
+            used_lo, used_hi, fc = _angular_wall(atoms, window, cons, stiffness, releasable)
             ff.UFFAddAngleConstraint(
                 i,
                 j,
                 k,
                 False,
-                max(0.0, lo),
-                min(180.0, hi),
-                afc * (RELEASABLE_FC_SCALE if (i, j, k) in releasable else 1.0),
+                max(0.0, used_lo),
+                min(180.0, used_hi),
+                fc,
             )
+
+
+class Dihedral(Mechanism):
+    """Write periodic dihedral windows to UFF; distance geometry cannot encode their signed hand."""
+
+    def _ff_terms(self, ff, cons, conf, stiffness):
+        _, releasable = cons.contacts
+        for atoms, window in cons.dihedrals.items():
+            used_lo, used_hi, fc = _angular_wall(atoms, window, cons, stiffness, releasable)
+            ff.UFFAddTorsionConstraint(*atoms, False, used_lo, used_hi, fc)
 
 
 class Coplanar(Mechanism):
@@ -234,6 +281,8 @@ class Coplanar(Mechanism):
             b if a in cons.metals else a for a, b in cons.distances if a in cons.metals or b in cons.metals
         } or {e[1] for e in cons.coplanar}
         for i, j, k, w, _anchor, cap in cons.coplanar:
+            if _stated_dihedral(cons, i, j, k, w):
+                continue
             if _donor.codonor_in_plane(mol, j, donors, hyb):
                 continue  # a redundant restatement of the bite-pinned plane; see above
             phi = rdMolTransforms.GetDihedralDeg(conf, i, j, k, w)
@@ -293,10 +342,11 @@ class Sp2Planar(Mechanism):
             nbrs = [n.GetIdx() for n in atom.GetNeighbors()]
             if len(nbrs) != _SP2_DEGREE:
                 continue
-            phi = rdMolTransforms.GetDihedralDeg(conf, nbrs[0], nbrs[1], nbrs[2], atom.GetIdx())
-            ff.UFFAddTorsionConstraint(
-                nbrs[0], nbrs[1], nbrs[2], atom.GetIdx(), False, phi - _SP2_HOLD_WIN, phi + _SP2_HOLD_WIN, _SP2_HOLD_FC
-            )
+            key = (nbrs[0], nbrs[1], nbrs[2], atom.GetIdx())
+            if _stated_dihedral(cons, *key):
+                continue
+            phi = rdMolTransforms.GetDihedralDeg(conf, *key)
+            ff.UFFAddTorsionConstraint(*key, False, phi - _SP2_HOLD_WIN, phi + _SP2_HOLD_WIN, _SP2_HOLD_FC)
 
 
 class ConjugationCap(Mechanism):
@@ -310,11 +360,12 @@ class ConjugationCap(Mechanism):
         if cons.metals:  # see class docstring: the Li surrogate defeats gate-matching on a metal system
             return
         for a, c, x, s in conjugated_quartets(conf.GetOwningMol()):
-            if cons.frozen.intersection((a, c, x, s)):  # frozen core held with zero DOF; never double-restrain it
+            key = (a, c, x, s)
+            if _stated_dihedral(cons, *key) or cons.frozen.intersection(key):
                 continue
-            phi = rdMolTransforms.GetDihedralDeg(conf, a, c, x, s)
+            phi = rdMolTransforms.GetDihedralDeg(conf, *key)
             lo, hi = _coplanar_window(phi, _CONJ_CAP)
-            ff.UFFAddTorsionConstraint(a, c, x, s, False, lo, hi, _COPLANAR_FC)
+            ff.UFFAddTorsionConstraint(*key, False, lo, hi, _COPLANAR_FC)
 
 
 class Umbrella(Mechanism):
@@ -347,7 +398,10 @@ class Umbrella(Mechanism):
                 # own plane. A bipy+Cl base has two fragments, a real inter-ligand pair, and stays held.
                 continue
             d0, d1, d2 = base[0], base[1], base[2]  # the same three vertices `umbrella_improper` measures
-            phi = rdMolTransforms.GetDihedralDeg(conf, d0, d1, d2, recipe.metal)
+            key = (d0, d1, d2, recipe.metal)
+            if _stated_dihedral(cons, *key):
+                continue
+            phi = rdMolTransforms.GetDihedralDeg(conf, *key)
             lo, hi = (
                 (-_PLANAR_CAP, _PLANAR_CAP)  # a plane has one ideal (zero) and no hand, so the cap is symmetric
                 if ideal is None
@@ -355,7 +409,7 @@ class Umbrella(Mechanism):
                 if phi >= 0
                 else (-_RIGHT_ANGLE, -ideal)  # keep the seed's own hand
             )
-            ff.UFFAddTorsionConstraint(d0, d1, d2, recipe.metal, False, lo, hi, _UMBRELLA_FC)
+            ff.UFFAddTorsionConstraint(*key, False, lo, hi, _UMBRELLA_FC)
 
 
 # One order for both drivers. DG needs distance before angle and coplanar after COMMIT; later FF-only repairs
@@ -366,6 +420,7 @@ MECHANISM_ORDER = (
     Pull(),
     Floor(),
     Angle(),
+    Dihedral(),
     Coplanar(),
     Plane(),
     Haptic(),

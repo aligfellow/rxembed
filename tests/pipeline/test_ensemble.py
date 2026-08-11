@@ -315,3 +315,15 @@ def test_refinement_preserves_ensemble_records():
         assert out.discarded == ens.discarded
         assert dropped in {c.GetId() for c in out._mol.GetConformers()}
         assert dropped not in {c.GetId() for c in out.mol.GetConformers()}
+
+
+def test_optimize_rejects_numeric_fix_drift():
+    class MovingCalculator(Calculator):
+        def optimize(self, mol, conf_id=-1, level="normal", fix=()):
+            pos = mol.GetConformer(conf_id).GetPositions()
+            pos[0] += [1.0, 0.0, 0.0]
+            return pos, -1.0
+
+    ens = rx.embed("[O-].ClCCCCBr", fix={(2, 0): 1.557}, n=1, seed=1, stereo="free")
+    with pytest.raises(RuntimeError, match="moved every numeric fix"):
+        ens.optimize(MovingCalculator())

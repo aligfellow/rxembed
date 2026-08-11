@@ -123,6 +123,14 @@ def test_pull_collapses_window_to_spring():
     _name, args, _kw = ff.calls[0]
     assert args[2] == args[3] == 2.1
 
+    fixed = _ff_terms(
+        mech_mod.Pull(),
+        Constraints(fixed={(0, 3): (2.1, 2.1)}),
+        mol,
+    )
+    assert fixed.calls[0][1][2:4] == (2.1, 2.1)
+    assert fixed.calls[0][1][-1] > args[-1]
+
 
 def test_floor_is_one_sided():
     mol = _mol()
@@ -152,6 +160,14 @@ def test_angle_writes_dg_and_ff_terms():
     _name, args, _kw = ff.calls[0]
     assert args[:3] == (0, 1, 3)
 
+    fixed = _ff_terms(
+        mech_mod.Angle(),
+        Constraints(angles={(0, 1, 3): (108.0, 112.0)}, fixed={(0, 1, 3): (110.0, 110.0)}),
+        mol,
+    )
+    assert fixed.calls[0][1][4:6] == (110.0, 110.0)
+    assert fixed.calls[0][1][-1] > args[-1]
+
 
 def test_angle_force_is_not_scaled_by_ladder():
     mol = _mol()
@@ -161,6 +177,14 @@ def test_angle_force_is_not_scaled_by_ladder():
     assert _ff_terms(mech_mod.Angle(), cons, mol, fc=100.0).calls[0][1][-1] == mech_mod.ANGLE_FC, (
         "the ladder must not be able to escalate the angle wall"
     )
+
+
+def test_dihedral_writes_periodic_uff_term():
+    mol = _mol("CCCC")
+    cons = Constraints(dihedrals={(0, 1, 2, 3): (170.0, 190.0)})
+    ff = _ff_terms(mech_mod.Dihedral(), cons, mol)
+    assert ff.kinds() == ["UFFAddTorsionConstraint"]
+    assert ff.calls[0][1][:7] == (0, 1, 2, 3, False, 170.0, 190.0)
 
 
 def test_releasable_contact_uses_softer_wall():

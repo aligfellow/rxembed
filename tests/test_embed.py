@@ -14,7 +14,7 @@ from rdkit.Chem import rdDistGeom
 from rdkit.Chem.rdMolTransforms import GetAngleDeg, GetBondLength
 
 from rxembed import bounds as bnd
-from rxembed.constraints import Constraints, resolve_core
+from rxembed.constraints import FIX_ANGLE_TOL, FIX_DISTANCE_TOL, Constraints, resolve_core
 from rxembed.embed import BASE_STIFFNESS, Conformers, embed, fold_substrate, minimize
 from rxembed.metal_core import TRANSITION_METALS, coplanar
 from rxembed.metal_isomers import Isomer, enumerate_isomers, from_geometry
@@ -86,9 +86,40 @@ def test_numeric_fix_delivers_a_linear_three_centre_core():
     assert confs
     for cid in confs.ids:
         conf = confs.mol.GetConformer(int(cid))
-        assert GetBondLength(conf, 0, 1) == pytest.approx(2.0, abs=0.1)
-        assert GetBondLength(conf, 1, 2) == pytest.approx(2.2, abs=0.1)
-        assert GetAngleDeg(conf, 0, 1, 2) == pytest.approx(178.0, abs=8.0)
+        assert GetBondLength(conf, 0, 1) == pytest.approx(2.0, abs=FIX_DISTANCE_TOL)
+        assert GetBondLength(conf, 1, 2) == pytest.approx(2.2, abs=FIX_DISTANCE_TOL)
+        assert GetAngleDeg(conf, 0, 1, 2) == pytest.approx(178.0, abs=FIX_ANGLE_TOL)
+
+
+def test_numeric_fix_rejects_when_cleanup_cannot_hold_it(monkeypatch, caplog):
+    fix = {(1, 2): 2.026, (2, 0): 1.557}
+    confs = embed(_mol("[O-].ClCCCCBr"), fix=fix, n=1, seed=1, prune_rms=-1)
+    assert not confs._fixed_geometry_ok(confs.ids[0]), "the raw seed must miss for this test to exercise rejection"
+
+    monkeypatch.setattr(
+        emb,
+        "restrained_uff",
+        lambda mol, cons, conf_ids=None, **kw: np.zeros(len(conf_ids if conf_ids is not None else mol.GetConformers())),
+    )
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        confs.minimize()
+
+    assert not confs.ids, "an off-target numeric fix was returned after cleanup"
+    assert not confs.unrelaxed, "rejected conformer ids leaked into tracked state"
+    assert "requested" in caplog.text
+    assert "+/- 0.001" in caplog.text
+    assert "got" in caplog.text
+
+
+def test_undefined_dihedral_fails_numeric_fix_gate():
+    mol = _with_geometry("CCCC")
+    conf = mol.GetConformer()
+    for atom, xyz in enumerate(((0, 0, 0), (1, 0, 0), (2, 0, 0), (2, 1, 0))):
+        conf.SetAtomPosition(atom, xyz)
+    cons = resolve_core(mol, fix={(0, 1, 2, 3): 60.0}, has_geometry=True)[0]
+    misses = Conformers(mol, [0], cons)._fixed_geometry_misses(0)
+    assert len(misses) == 1
+    assert np.isinf(misses[0][0])
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -182,7 +213,9 @@ def test_fix_landing_on_a_sphere_hold_overrides_it():
     key = _sphere_key(iso)
     alone, _ref = resolve_core(iso.mol, fix={key: 2.42}, has_geometry=False)
     assert alone.distances[key] != iso.coordination().distances[key], "premise: the two windows must differ"
-    assert _fold(iso, fix={key: 2.42}).distances[key] == alone.distances[key], "the sphere hold clipped the fix"
+    folded = _fold(iso, fix={key: 2.42})
+    assert folded.distances[key] == alone.distances[key], "the sphere hold clipped the fix"
+    assert key not in folded.pulls, "the sphere's approximate pull still competes with the numeric fix"
 
 
 def test_sphere_hold_remains_nonreleasable():
