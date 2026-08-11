@@ -19,7 +19,7 @@ import rxembed.metal_core as _metal
 import rxembed.metal_distance as _distance
 import rxembed.metal_isomers as _kiso
 import rxembed.metal_polyhedron as _poly
-from rxembed.constraints import add_distance, compose, resolve_atom, resolve_core
+from rxembed.constraints import Constraints, add_distance, compose, resolve_atom, resolve_core
 from rxembed.constraints import template_to_fix as _core_template_to_fix
 from rxembed.embed import (  # the module, not the `embed` function the package root re-exports
     fold_substrate,
@@ -666,24 +666,25 @@ def _embed_dispatch(
         logger.debug("metal complex: %d metal(s) swapped to carbon surrogate for the FF", len(metals))
 
     cons, ref = resolve_core(mol, fix=fix, constrain=constrain, has_geometry=has_geom)
-    _add_soft(
-        cons, *_nci_windows(contacts)
-    )  # NCI grips are soft and released by mc(explore=); fix numbers, the frozen-core shape and the sphere/M-H/
-    # encounter holds are structural and never released
     user_graft = dict(ref)  # atoms to Kabsch-graft onto their exact coords (own / explicit / template)
+    metal_cons = Constraints()
     # a spectator metal's sphere is held intact-but-achiral: a relative all-pairs shape, deliberately not in
     # cons.frozen, because a graft would pin its handedness, which the stereo filter owns
     for mi, dons in metals_donors.items():
-        _metal.hold_shape(mol, [mi, *dons], cons)
+        _metal.hold_shape(mol, [mi, *dons], metal_cons)
     if metals_donors and iso is not None:
         # A frozen metal has no DOF, but its bond-less carbon still fires fictitious FF terms, so it gets the
         # zero-vdW type and its floors but no pulls -- pulling a rigid shape's members tears the body. `hold_shape`
         # must run first: ff_terms reads the `cons.shapes` record it writes.
         real_z = {iso.metal: iso.real_z, **{mi: rz for mi, rz, _rq in iso.extra}}
-        _distance.ff_terms(mol, cons, {mi: (real_z[mi], list(dons)) for mi, dons in metals_donors.items()})
+        _distance.ff_terms(mol, metal_cons, {mi: (real_z[mi], list(dons)) for mi, dons in metals_donors.items()})
     for mi, h, target in hydrides:
         half = _cbuild._ML_SEED_HALF_WIDTH
-        add_distance(cons.distances, mi, h, target - half, target + half)
+        add_distance(metal_cons.distances, mi, h, target - half, target + half)
+    cons = compose(metal_cons, cons)  # user constraints stack on, and fixed windows win by contract
+    _add_soft(
+        cons, *_nci_windows(contacts)
+    )  # NCI grips are soft and released by mc(explore=); fixed/shape/M-H holds are structural
 
     # the core seam: free fragments tethered, donor hand held, embed, exact core grafted back. `iso` here has
     # no polyhedron (the sphere is held by `hold_shape` above) and no donor list, so the hand-hold is a no-op:
@@ -696,6 +697,6 @@ def _embed_dispatch(
         mol.GetNumAtoms(),
         n_frag,
         "s" if n_frag != 1 else "",
-        len(cons.distances) + len(cons.angles),
+        len(cons.distances) + len(cons.angles) + len(cons.dihedrals),
     )
     return Ensemble(mol, list(ids), cons, iso)

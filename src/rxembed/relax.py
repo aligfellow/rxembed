@@ -6,7 +6,7 @@ import logging
 
 import numpy as np
 from rdkit import Chem, rdBase
-from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers
+from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers, rdMolTransforms
 
 from . import mechanisms as _mech
 from .metal_core import COORDINATION_METALS, materialise_phantoms, strip_phantoms
@@ -17,6 +17,7 @@ UFF_GHOST = 54  # Untypeable Xe gives a haptic centroid no UFF terms inside its 
 logger = logging.getLogger("rxembed.relax")
 
 MAX_ITERS = 500  # the one restrained-UFF iteration cap: every relax entry point defaults from this name
+_DIHEDRAL_ATOMS = 4
 _PT = GetPeriodicTable()
 
 
@@ -156,6 +157,43 @@ def _ff_surrogate(mol, metals, phantoms=()):
     return out
 
 
+def _restore_positions(conf, positions):
+    """Restore one conformer's Cartesian coordinates."""
+    for atom, xyz in enumerate(positions):
+        conf.SetAtomPosition(atom, xyz)
+
+
+def _seat_fixed_dihedrals(confs, fixed, frozen):
+    """Rotate connected fixed dihedrals near target without disturbing a rigid graft."""
+    frozen = sorted(frozen)
+    for atoms, (lo, hi) in fixed.items():
+        if len(atoms) != _DIHEDRAL_ATOMS:
+            continue
+        i, j, k, w = atoms
+        for conf in confs:
+            before = conf.GetPositions().copy() if frozen else None
+            try:
+                rdMolTransforms.SetDihedralDeg(conf, i, j, k, w, 0.5 * (lo + hi))
+            except (RuntimeError, ValueError):
+                pass  # rings may not rotate; the strict post-UFF gate remains authoritative
+            if before is not None and not np.array_equal(conf.GetPositions()[frozen], before[frozen]):
+                _restore_positions(conf, before)  # a coordinate graft is stricter than a numeric torsion
+
+
+def _prepare_uff_work(mol, cons, confs, frozen, max_iters):
+    """Seat torsions and build private FF graphs atomically, returning the original coordinates."""
+    original = {conf.GetId(): conf.GetPositions().copy() for conf in confs}
+    try:
+        _seat_fixed_dihedrals(confs, cons.fixed if max_iters else {}, frozen)
+        work = materialise_phantoms(mol, cons.haptic)  # private FF graphs inherit the seated coordinates
+        work = _ff_surrogate(work, cons.metals, cons.phantoms)  # `mol` itself for an organic system
+    except Exception:
+        for cid, positions in original.items():
+            _restore_positions(mol.GetConformer(cid), positions)
+        raise
+    return work, original
+
+
 def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=None):
     """Minimise conformers with frozen atoms and flat-bottomed constraint terms.
 
@@ -163,8 +201,8 @@ def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=No
     Metal and haptic typing changes only a private graph; relaxed real-atom coordinates return to ``mol``.
     """
     frozen = set(cons.frozen)
-    work = materialise_phantoms(mol, cons.haptic)  # transient centroid dummies for a haptic face; `mol` else
-    work = _ff_surrogate(work, cons.metals, cons.phantoms)  # `mol` itself when there is no metal/phantom
+    confs = list(mol.GetConformers()) if conf_ids is None else [mol.GetConformer(int(i)) for i in conf_ids]
+    work, original = _prepare_uff_work(mol, cons, confs, frozen, max_iters)
 
     typed = {}
 
@@ -183,8 +221,6 @@ def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=No
         ff.Initialize()
         return ff
 
-    confs = mol.GetConformers() if conf_ids is None else [mol.GetConformer(int(i)) for i in conf_ids]
-    original = {conf.GetId(): conf.GetPositions().copy() for conf in confs}
     energies = []
     fallback = None
     retyped = 0
@@ -219,8 +255,6 @@ def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=No
                     conf.SetAtomPosition(atom, src.GetAtomPosition(atom))
     except RuntimeError:
         for cid, positions in original.items():
-            conf = mol.GetConformer(cid)
-            for atom, xyz in enumerate(positions):
-                conf.SetAtomPosition(atom, xyz)
+            _restore_positions(mol.GetConformer(cid), positions)
         raise
     return np.array(energies)

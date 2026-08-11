@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
-from rdkit.Chem.rdMolTransforms import GetAngleDeg, GetBondLength
+from rdkit.Chem.rdMolTransforms import GetAngleDeg, GetBondLength, GetDihedralDeg, SetDihedralDeg
 
 from rxembed import relax as relax_module
 from rxembed.constraints import Constraints
@@ -91,6 +91,29 @@ def test_max_iters_zero_scores_without_moving_an_atom():
     before = mol.GetConformer(0).GetPositions().copy()
     restrained_uff(mol, cons, max_iters=0)
     assert np.allclose(mol.GetConformer(0).GetPositions(), before), "max_iters=0 moved atoms"
+
+
+def test_restrained_uff_seats_an_antipodal_fixed_dihedral():
+    mol = _mol("CCCC")
+    atoms = (0, 1, 2, 3)
+    SetDihedralDeg(mol.GetConformer(), *atoms, 180.0)
+    cons = Constraints(dihedrals={atoms: (-0.02, 0.02)}, fixed={atoms: (0.0, 0.0)})
+
+    restrained_uff(mol, cons)
+
+    assert GetDihedralDeg(mol.GetConformer(), *atoms) == pytest.approx(0.0, abs=0.005)
+
+
+def test_fixed_dihedral_seating_does_not_move_a_frozen_atom():
+    mol = _mol("CCCC")
+    atoms = (0, 1, 2, 3)
+    SetDihedralDeg(mol.GetConformer(), *atoms, 180.0)
+    before = mol.GetConformer().GetAtomPosition(3)
+    cons = Constraints(dihedrals={atoms: (-0.02, 0.02)}, fixed={atoms: (0.0, 0.0)}, frozen={3})
+
+    restrained_uff(mol, cons)
+
+    assert mol.GetConformer().GetAtomPosition(3).Distance(before) < 1e-12
 
 
 def test_ff_energies_excludes_constraint_penalties():

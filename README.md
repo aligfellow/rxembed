@@ -177,7 +177,8 @@ from rxembed CXSMILES, its atom properties select the one stated arrangement.
 
 | constraint | call |
 |---|---|
-| a distance or angle | `fix={(i, j): 2.05}`, or `constrain=` for a soft one |
+| a numeric distance, angle or dihedral | `fix={(i, j): 2.05, (i, j, k): 170.0, (i, j, k, l): 180.0}` |
+| a soft numeric window | `constrain={(i, j): (2.0, 2.2), (i, j, k, l): (170.0, 190.0)}` |
 | a rigid reacting core | `fix=[i, j, k]`, or `template=(ref, SMARTS_or_map)` |
 | a coordination polyhedron | `rx.metal(smiles, "octahedral")` |
 | a stated NCI grip or π stack | `constrain={(ring_a, ring_b): 3.5}` |
@@ -200,8 +201,17 @@ rx.embed(mol, template=(ref, "CC(=O)N"))        # shared substructure on two mol
 rx.embed(mol, template=(xyz, {3: 11}))          # explicit map for coordinates without a graph
 ```
 
-A distance or angle given instead of coordinates is a pull, not a graft, and is reflection-invariant, so it
-may give the mirror image. Read it back with `.measure()`.
+A scalar distance, angle or dihedral given instead of coordinates is a point restraint, not a graft. Distances
+and angles are reflection-invariant; a signed dihedral is not. Scalar fixes are accepted within 0.001 A or 0.005
+degrees, and explicit fixed windows anywhere inside their range. A periodic window may cross the boundary as
+`(170.0, 190.0)`, where 190 degrees is equivalent to -170 degrees. Equivalent stated dihedrals are normalized
+around the same midpoint, with -180 degrees reported as 180 degrees. Read the result with `.measure()`.
+
+```python
+geometry = {(0, 1): 1.54, (0, 1, 2): 112.0, (0, 1, 2, 3): 60.0}
+held = rx.embed("CCCC", fix=geometry, n=4).minimize()
+held.measure((0, 1, 2, 3))
+```
 
 ### A TS core on a fresh molecule
 
@@ -299,7 +309,7 @@ Current limitations:
 | exact cores | grafted, not embedded. Distance geometry approximates a rigid core to ~0.2–0.4 Å, fine for a molecule and wrong for a TS |
 | `n=N` | up to N seeds; `Ensemble.minimize()` drops failed geometries and retries metal seeds |
 | g-xTB solvent | `E_gxtb(gas) + [E_gfn2(solv) − E_gfn2(gas)]`, never a silent gas-phase energy |
-| `mc()` pose-freeze | soft, ~0.1 Å drift. A constraint that must hold across `mc()` has to be a distance or angle the relax also reads |
+| `mc()` pose-freeze | soft, ~0.1 Å drift. A constraint that must hold across `mc()` has to be a distance, angle or dihedral the relax also reads |
 
 ---
 

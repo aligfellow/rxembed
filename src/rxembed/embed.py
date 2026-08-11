@@ -16,7 +16,15 @@ from rdkit.Chem import rdMolTransforms
 from . import metal_core as _metal
 from . import metal_polyhedron as _poly
 from .bounds import DEFAULT_SEED, probe_conformer, seed_coordinates, seed_count
-from .constraints import Constraints, compose, resolve_atom, resolve_core, template_to_fix
+from .constraints import (
+    FIX_ANGLE_TOL,
+    FIX_DISTANCE_TOL,
+    Constraints,
+    compose,
+    resolve_atom,
+    resolve_core,
+    template_to_fix,
+)
 from .metal_isomers import Isomer, from_geometry
 from .relax import MAX_ITERS, _error_summary, bonding_ok, restrained_uff
 
@@ -25,6 +33,16 @@ logger = logging.getLogger("rxembed")  # configured by rxembed.set_verbose
 
 _EPS = 1e-6  # near-zero norm floor for the graft axis
 _BOND_ATOMS = 2  # a two-atom frozen core is a bond: fix its length, not an orientation
+_ANGLE_ATOMS = 3
+_DIHEDRAL_ATOMS = 4
+
+
+def _periodic_near(value, lo, hi):
+    """Return the periodic image of an angle nearest a stated interval's midpoint."""
+    middle = 0.5 * (lo + hi)
+    return middle + (value - middle + 180.0) % 360.0 - 180.0
+
+
 _MIN_FRAGS = 2  # below this there is no inter-fragment separation to enforce
 # Half-order steps find the lowest restraint stiffness that keeps the sphere intact.
 BASE_STIFFNESS = 1.0
@@ -144,13 +162,15 @@ def fold_substrate(base, sub, graft_ref):
             f"under this isomer's label. Graft at most one sphere atom (a core over ligand backbone atoms "
             f"composes fine), or embed the reference geometry itself as the source."
         )
-    sphere_d, sphere_a = set(base.distances), set(base.angles)
-    soft_d, soft_a = sub.contacts
-    return compose(base, sub).copy(
+    sphere_d = set(base.distances)
+    sphere_angular = set(base.angles) | set(base.dihedrals)
+    soft_d, soft_angular = sub.contacts
+    merged = compose(base, sub)
+    return merged.copy(
         contacts=(
             frozenset(k for k in soft_d if k not in sphere_d),
-            frozenset(k for k in soft_a if k not in sphere_a),
-        )
+            frozenset(k for k in soft_angular if k not in sphere_angular),
+        ),
     )
 
 
@@ -238,7 +258,7 @@ class Conformers:
     iso: Isomer | None = None
     energies: dict = field(default_factory=dict)  # conformer id -> restrained-UFF or downstream score
     unrelaxed: list = field(default_factory=list, kw_only=True)
-    # ids restored to their embed seed because no stiffness relaxed them without tearing
+    # ids restored to their embed seed because no stiffness relaxed them without tearing or missing a fix
     seed: int | None = field(default=None, kw_only=True)
     # ETKDG seed for metal-hand retries; None keeps minimize(spec) search-free
     wrong_hand: list = field(default_factory=list, kw_only=True)
@@ -263,10 +283,63 @@ class Conformers:
         return METAL_BOND_TOL if self.iso is not None else BOND_TOL
 
     def _intact(self, cid):
-        """Return True if conformer `cid` still has every bond the graph says it has."""
-        return bonding_ok(
+        """Return True if `cid` retains its graph and every numeric fix."""
+        return self._fixed_geometry_ok(cid) and bonding_ok(
             self._mol, cid, bond_tol=self._bond_tol, exclude=self.cons.frozen, constrained=self.cons.distances
         )
+
+    def _fixed_geometry_misses(self, cid):
+        """Return numeric fixes missed by `cid`, including their excess over the public tolerance."""
+        conf = self._mol.GetConformer(cid)
+        pos = conf.GetPositions()
+        misses = []
+        for atoms, (lo, hi) in self.cons.fixed.items():
+            if len(atoms) == _BOND_ATOMS:
+                i, j = atoms
+                actual, tol, unit = float(np.linalg.norm(pos[i] - pos[j])), FIX_DISTANCE_TOL, "A"
+            elif len(atoms) == _ANGLE_ATOMS:
+                actual, tol, unit = rdMolTransforms.GetAngleDeg(conf, *atoms), FIX_ANGLE_TOL, "deg"
+            else:
+                actual = _periodic_near(rdMolTransforms.GetDihedralDeg(conf, *atoms), lo, hi)
+                tol, unit = FIX_ANGLE_TOL, "deg"
+            excess = abs(actual - lo) - tol if lo == hi else max(lo - actual, actual - hi)
+            if not np.isfinite(actual):
+                excess = float("inf")
+            if excess > 0.0:
+                misses.append((excess, atoms, actual, lo, hi, tol, unit))
+        return misses
+
+    def _fixed_geometry_ok(self, cid):
+        """Return whether every scalar target or explicit fixed window meets its contract."""
+        return not self._fixed_geometry_misses(cid)
+
+    def _reject_missed_fixes(self, operation):
+        """Reject and report conformers that could not retain a numeric fix."""
+        failures = {cid: miss for cid in self.ids if (miss := self._fixed_geometry_misses(cid))}
+        bad = list(failures)
+        if bad:
+            rejected = set(bad)
+            self.ids = [cid for cid in self.ids if cid not in rejected]
+            self.unrelaxed = [cid for cid in self.unrelaxed if cid not in rejected]
+            for cid in bad:
+                self.energies.pop(cid, None)
+            _excess, atoms, actual, lo, hi, tol, unit = max(
+                (miss for misses in failures.values() for miss in misses), key=lambda miss: miss[0]
+            )
+            requested = f"{lo:.6f} +/- {tol:g}" if lo == hi else f"[{lo:.6f}, {hi:.6f}]"
+            kind = {2: "distance", 3: "angle", 4: "dihedral"}[len(atoms)]
+            logger.warning(
+                "%s: dropped %d conformer(s) missing numeric fix; worst %s %s requested %s %s, got %.6f %s",
+                operation,
+                len(bad),
+                kind,
+                atoms,
+                requested,
+                unit,
+                actual,
+                unit,
+            )
+        return bad
 
     def _coordination_ok(self, cid, iso=None):
         """Reject a puckered result for a declared planar polyhedron."""
@@ -324,7 +397,9 @@ class Conformers:
                 kept = [i for i in self.ids if self._intact(i) and self._coordination_ok(i)]
                 if kept or step == len(FC_ESCALATION) - 1:  # some survived (accept), or out of steps (caller drops)
                     if step and kept:
-                        logger.info("%s: relax tore the sphere; escalated restraint stiffness to %gx", operation, fc)
+                        logger.info(
+                            "%s: relax missed the accept gate; escalated restraint stiffness to %gx", operation, fc
+                        )
                     elif step:  # exhausted: what comes back is the %gx relax, not the stiffness that was asked
                         logger.warning(  # for, and nothing else says so. Fail loud.
                             "%s: no stiffness up to %gx satisfied the accept gate; returning the ungated relax",
@@ -338,7 +413,7 @@ class Conformers:
         return e
 
     def _rescue_torn(self, seed_pos, stiffness, operation="minimize"):
-        """Retry each torn conformer separately; restore its seed if every stiffness fails.
+        """Retry each torn or off-fix conformer separately; restore its seed if every stiffness fails.
 
         Returns the number tried. The pipeline separately rejects a donor hand that changes during rescue.
         """
@@ -372,7 +447,7 @@ class Conformers:
                     self.unrelaxed.append(cid)
         if torn:
             logger.warning(  # a geometry that never completed a relax is not what `minimize` promises: say so
-                "%s: %d/%d torn; %d rescued, %d restored to their seeds",
+                "%s: %d/%d torn or off-fix; %d rescued, %d restored to their seeds",
                 operation,
                 len(torn),
                 len(self.ids),
@@ -432,8 +507,8 @@ class Conformers:
     def _hold_metal_hand(self, stiffness, max_iters, operation="minimize"):
         """Correct the selected metal hand where possible and record any failures.
 
-        Distance and angle constraints cannot choose a mirror. The hand is read after relaxation, when the
-        sphere is classifiable, then corrected by reflection or a fresh seed. Achiral centres are untouched.
+        Distance and angle constraints cannot choose a mirror; a signed dihedral can. The hand is read after
+        relaxation, then corrected by reflection only when no stated geometry distinguishes the mirror.
         """
         iso = self.iso
         self.wrong_hand = []
@@ -448,7 +523,7 @@ class Conformers:
         # (`_mirror_is_free`), no grafted core (its contract is the caller's exact geometry, and a chiral
         # core's mirror is a different core -- re-seeding re-grafts it instead), and no haptic face, which can
         # be planar-chiral in a way this tier cannot perceive (`pipeline.select_stereo` owns that).
-        if _mirror_is_free(self._mol) and not self.cons.frozen and not iso.haptic:
+        if _mirror_is_free(self._mol) and not self.cons.frozen and not self.cons.dihedrals and not iso.haptic:
             reflectable = [cid for cid in wrong if hands[cid]]
             for cid in reflectable:
                 _reflect(self._mol, cid)
@@ -478,11 +553,12 @@ class Conformers:
     def minimize(self, stiffness=BASE_STIFFNESS, max_iters=MAX_ITERS, _retry=True):
         """Relax every conformer in place with restrained UFF; return ``self``.
 
-        `stiffness` scales flat-bottomed walls, not target biases. A constrained run escalates walls only when
-        the relaxed geometries tear, then retries each torn seed separately. A seed no rung can relax is
+        `stiffness` scales flat-bottomed walls and strict scalar fixes; approximate target pulls stay fixed.
+        A constrained run escalates restraints only when the relaxed geometries miss the accept gate, then retries
+        each failed seed separately. A seed no rung can relax is
         restored and listed in `.unrelaxed`; an untypeable graph keeps its embedded geometry without an energy.
-        This core verb never drops a conformer. A stated metal hand is corrected where possible and any remainder
-        is listed in `.wrong_hand`.
+        A conformer that cannot retain a numeric fix is rejected; other failures remain flagged in
+        `.unrelaxed` or `.wrong_hand`.
 
         `.energies` holds restrained-UFF values for ranking this result, not comparison across species.
         `pipeline.Ensemble.minimize()` adds acceptance gates and may drop failures.
@@ -500,6 +576,7 @@ class Conformers:
         self._rescue_torn(seed_pos, stiffness)
         if e is not None:
             self.energies = {i: float(v) for i, v in zip(self.ids, e, strict=False)}
+        self._reject_missed_fixes("minimize")
         if _retry:
             self._hold_metal_hand(stiffness, max_iters)
         if e is not None or self.energies:
@@ -523,6 +600,10 @@ class Conformers:
             raise ValueError("measure() takes 2 (distance), 3 (angle) or 4 (dihedral) atoms")
         f = fns[len(idx)]
         v = [f(self._mol.GetConformer(c), *idx) for c in self.ids]
+        if len(idx) == _DIHEDRAL_ATOMS:
+            key = min(tuple(idx), tuple(reversed(idx)))
+            if window := self.cons.dihedrals.get(key):
+                v = [_periodic_near(value, *window) for value in v]
         return {"mean": float(np.mean(v)), "min": float(np.min(v)), "max": float(np.max(v)), "n": len(v)}
 
     def xyz(self, conf_id=None):
@@ -607,14 +688,16 @@ def embed(
         polyhedron is composed with the spec so a substrate binds a named coordination sphere.
     fix : list | dict, optional
         Rigid, and the kinds may mix: a list of indices grafts them at `spec`'s own coordinates (needs a
-        conformer), ``{i: (x, y, z)}`` at coordinates you supply, ``{(i, j): d, (i, j, k): angle}`` at stated
-        numbers the relax is pulled toward -- a pull, not a snap, so read it back with `Conformers.measure`::
+        conformer), ``{i: (x, y, z)}`` at coordinates you supply, or tuple keys of 2 (distance), 3 (angle) or
+        4 (dihedral) atoms at scalar numbers reproduced within 0.001 A or 0.005 degrees. Explicit numeric
+        windows stay inside their stated range. These are restraints, not coordinate grafts::
 
             embed(ts_mol, fix=[3, 7, 11, 12])   # graft a reacting core at its own coords, 0.000 Å
             embed(mol, fix={(3, 11): 2.05})     # state the forming bond; the rest is free
     constrain : dict, optional
         Soft: a window on the seed a real energy may overrule. ``{(i, j): (lo, hi)}`` distance,
-        ``{(i, j, k): (lo, hi)}`` angle, ``{(ring_a, ring_b): separation}`` π-stack.
+        ``{(i, j, k): (lo, hi)}`` angle, ``{(i, j, k, l): (lo, hi)}`` dihedral, or
+        ``{(ring_a, ring_b): separation}`` π-stack.
     template : tuple, optional
         ``(reference, SMARTS_or_map)``. A SMARTS must have one ordered match on both molecular graphs; use an
         explicit ``{target_index: reference_index}`` map for a symmetric core or coordinate array.
@@ -653,7 +736,7 @@ def embed(
     if not ids:  # ETKDG met no constraint set it could realise; silence reads as "embedded, then pruned"
         logger.warning(
             "embed: no conformer under %d constraint(s); the spec may not be realisable",
-            len(cons.distances) + len(cons.angles),
+            len(cons.distances) + len(cons.angles) + len(cons.dihedrals),
         )
     logger.info(
         "embed[%s]: %d seeds (%d atoms, %d fragment%s, %d constraints)",
@@ -662,7 +745,7 @@ def embed(
         mol.GetNumAtoms(),
         n_frag,
         "s" if n_frag != 1 else "",
-        len(cons.distances) + len(cons.angles),
+        len(cons.distances) + len(cons.angles) + len(cons.dihedrals),
     )
     return Conformers(mol, ids, cons, iso, seed=int(seed))  # `minimize`'s handedness gate re-seeds off this
 
@@ -689,9 +772,11 @@ def prepare_relax(spec, *, fix=None, constrain=None):
     cons, ref = resolve_core(mol, fix=fix, constrain=constrain, has_geometry=True)
     if spheres:  # perceived from a plain Mol: hold what the input realises
         rz = {mi: z for mi, z, _q in metals}
+        sphere_cons = Constraints()
         for mi, dons in spheres.items():
-            _metal.hold_shape(mol, [mi, *dons], cons)
-        ff_terms(mol, cons, {mi: (rz[mi], dons) for mi, dons in spheres.items()})
+            _metal.hold_shape(mol, [mi, *dons], sphere_cons)
+        ff_terms(mol, sphere_cons, {mi: (rz[mi], dons) for mi, dons in spheres.items()})
+        cons = compose(sphere_cons, cons)
     elif iso is not None:  # an Isomer arrives with its polyhedron built: the same fold `embed` does
         base = iso.coordination().copy()  # copy: the relax edits cons in place, the Isomer keeps its record
         cons = fold_substrate(base, cons, ref) if (fix or constrain) else base
