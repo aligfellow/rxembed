@@ -353,7 +353,8 @@ def _feasible_bounds(mol, cons):
         worst = crossed[0]
         named = str(worst.windows()[0]) if worst.windows() else f"atoms {worst.pair[0]}-{worst.pair[1]}"
         logger.warning(
-            "embed: incompatible constraints: %s (gap %.2f A); see DEBUG",
+            "ETKDG bounds needed smoothing for %s (gap %.2f A); continuing with the repaired seed bounds "
+            "before constrained relaxation; see DEBUG",
             named,
             worst.gap,
         )

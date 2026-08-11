@@ -143,7 +143,7 @@ def test_unrealisable_spec_names_failed_window(caplog):
     with caplog.at_level("WARNING", logger="rxembed.bounds"):
         _bm, tol = bnd._feasible_bounds(mol, Constraints(distances={(0, 2): (1.0, 1.02)}))
     assert tol > 0.0
-    assert "incompatible constraints" in caplog.text
+    assert "bounds needed smoothing" in caplog.text
     assert "distance 0-2" in caplog.text, "the tolerance alone points nowhere; the window is the point"
 
 

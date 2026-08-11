@@ -670,7 +670,7 @@ def _warn_underdetermined(cons, coord_fix, n_fix_d):
     shares = any(len(set(a) & set(b)) == 1 for i, a in enumerate(keys) for b in keys[i + 1 :])
     if len(atoms) <= _MIN_SHAPE_ATOMS and shares:
         logger.warning(
-            "fix: two distances share an atom over %d atom(s) and no angle is fixed, so the angle is free",
+            "fix has two distances sharing an atom over %d atom(s); no angle is fixed, so the angle is free",
             len(atoms),
         )
 
