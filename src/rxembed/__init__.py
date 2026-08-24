@@ -22,6 +22,7 @@ from .core import (
     set_verbose,
 )
 from .pipeline import (
+    ASE,
     Contact,
     Ensemble,
     EnsembleSet,
@@ -36,6 +37,7 @@ from .pipeline import (
 )
 
 __all__ = [
+    "ASE",
     "Conformers",
     "Constraints",
     "Contact",

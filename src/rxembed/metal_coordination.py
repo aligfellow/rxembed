@@ -79,8 +79,8 @@ def resolve_lengths(mol, lengths="auto"):
       M-L length is the truth about *that* structure, and beats any fit.
     * ``model``: `metal_distance.ml_distance`, the fitted periodic model (element, group, delocalised charge
       / hapticity). Right when there is no geometry, and when the one present is not a metal-aware geometry:
-      plain ETKDG has no M-L parameter, so a conformer it produced puts chemically EQUIVALENT donors at
-      different lengths (Cl[Pd](Cl)(N)N: the two chlorides 0.34 Å apart) and the sphere ~0.25 Å short.
+      plain ETKDG has no M-L parameter, so a conformer it produced puts chemically equivalent donors at
+      different lengths (the paired chlorides differed by 0.34 Å) and the sphere ~0.25 Å short.
 
     ``'auto'`` (the default, and what this always did) picks input when there is a conformer. That reads a
     property of the Mol, not a statement of intent, so `'input'` / `'model'` are there to say which you meant.

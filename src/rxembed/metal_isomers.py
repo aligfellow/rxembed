@@ -448,7 +448,8 @@ class IsomerSet(list):
     `chirality` (``'delta'``/``'lambda'``/``''``), the `geometry`, or the plain index. The cis/trans/mer/fac
     `label` is a coarse, sometimes-wrong tag, never required to select:
 
-        isos = rx.metal('CCCN[Pd](Cl)(Cl)NCCC', ['square_planar', 'tetrahedral']); isos.summary()
+        isos = rx.metal('CCCN->[Pd+2](<-[Cl-])(<-[Cl-])<-NCCC',
+                         ['square_planar', 'tetrahedral']); isos.summary()
         ens  = rx.embed(isos.select(arrangement='N3 Cl6 N7 Cl5')).mc().prune()
         ens  = rx.embed(isos[0]).mc().prune()
 

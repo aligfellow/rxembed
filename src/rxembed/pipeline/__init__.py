@@ -2,12 +2,14 @@
 
 from . import geom_check
 from .api import Ensemble, EnsembleSet, embed, metal, minimize, wrap
+from .calculators import ASE
 from .nci import Contact
 from .nci import auto_binding_modes as nci_modes
 from .nci import candidate_contacts as nci_candidates
 from .perceive import read_xyz
 
 __all__ = [
+    "ASE",
     "Contact",
     "Ensemble",
     "EnsembleSet",
