@@ -18,6 +18,7 @@ from rxembed.pipeline import geom_check as geom
 
 _MA2B2 = "CCCN[Pd](Cl)(Cl)NCCC"  # square-planar MA2B2 -> the cis / trans pair
 _PT_A2B2 = "[NH3]->[Pt](<-[NH3])(Cl)Cl"  # donors, in atom order: N0 N2 Cl3 Cl4
+_ASYMMETRIC_NN_NI = "O=C1[O-]->[Ni+2]2(<-[CH-](c3ccccc3)N1c1ccccc1)<-[N](O)=C(c1ccccn1)c1cccc[n]->21"
 S, D, DAT = Chem.BondType.SINGLE, Chem.BondType.DOUBLE, Chem.BondType.DATIVE
 
 
@@ -174,6 +175,28 @@ def test_bis_en_octahedral_has_three_stereoisomers():
     isos = rx.metal("Cl[Co]12(Cl)(NCCN1)NCCN2", "octahedral")
     embeddable = [iso for iso in isos if rx.embed(iso, n=2).minimize().n]
     assert {i.chirality for i in embeddable} == {"", "delta", "lambda"}, [i.chirality for i in embeddable]
+
+
+@pytest.mark.parametrize(
+    ("ligands", "donors", "expected"),
+    [
+        ("NCCN.C[O-]", [0, 3, 4, 5], 1),
+        ("NCCN(C).C[O-]", [0, 3, 5, 6], 2),
+    ],
+    ids=["symmetric-nn", "asymmetric-nn"],
+)
+def test_ordering_dedup_respects_donor_symmetry(ligands, donors, expected):
+    mol = Chem.MolFromSmiles(ligands)
+    assert len(K.distinct_vertex_orderings(mol, donors, "square_planar")) == expected
+
+
+def test_asymmetric_nn_complex_keeps_both_substrate_orientations_per_stereoisomer():
+    mol = Chem.AddHs(Chem.MolFromSmiles(_ASYMMETRIC_NN_NI))
+    by_stereo = {}
+    for iso in rx.enumerate_isomers(mol, "square_planar", stereo="racemic"):
+        by_stereo.setdefault(iso.stereo_label, set()).add(tuple(iso.vertices))
+    assert len(by_stereo) == 2
+    assert {len(arrangements) for arrangements in by_stereo.values()} == {2}
 
 
 def test_select_accepts_geometry_code_or_name():

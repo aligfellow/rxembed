@@ -1117,15 +1117,15 @@ def _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, *, 
     (`_central_trans`), and a chelate placed trans whose backbone can't reach or, stretched, can't donate
     inward (`_chelate_span_ok`). A cis chelate is always kept; any residual is dropped by `bonding_ok`.
 
-    The dedup signature carries, per donor pair, the elements, the vertex angle and a same-ligand pair's
-    intra-ligand bond distance, plus the centre's handedness, so enantiomers and a tridentate's mer vs
-    central-trans stay distinct. `limit` short-circuits at the k-th distinct arrangement, which is all the
-    warning caller needs.
+    The dedup signature carries, per donor pair, the donor symmetry classes, the vertex angle and a
+    same-ligand pair's intra-ligand bond distance, plus the centre's handedness, so enantiomers, asymmetric
+    ligand ends and a tridentate's mer vs central-trans stay distinct. `limit` short-circuits at the k-th
+    distinct arrangement, which is all the warning caller needs.
     """
-    elem = {d: (mol.GetAtomWithIdx(d).GetSymbol() if d != VACANT else "X") for d in donors}  # vacancy = "X"
     frag = _frag_map(mol)  # same ligand = same fragment
     dmat = Chem.GetDistanceMatrix(mol)  # topological (bond-count) distances
     real_donors = [d for d in donors if d != VACANT]
+    classes = _donor_classes(mol, real_donors)
     bm = _span_bounds(mol)
     hyb = _stripped_hybridisation(mol)  # the fold ruler's own (element, hyb) class: graph-only, no coords
     pairs = [(p, q) for p in range(len(dirs)) for q in range(p + 1, len(dirs))]
@@ -1137,6 +1137,9 @@ def _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, *, 
             return -1  # terminal donor; -1 for different ligands or a vacancy
         return int(dmat[a][b])
 
+    def donor_class(d):
+        return ("vacant",) if d == VACANT else ("donor", classes[d])
+
     seen, out = set(), []
     for order in perms:
         od = [donors[k] for k in order]  # od[position] = donor atom (or VACANT) at that polyhedron vertex
@@ -1147,7 +1150,10 @@ def _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, *, 
         ):  # can't span/donate trans
             continue
         sig = tuple(
-            sorted((tuple(sorted((elem[od[p]], elem[od[q]]))), link(od, p, q), angle[(p, q)]) for p, q in pairs)
+            sorted(
+                (tuple(sorted((donor_class(od[p]), donor_class(od[q])))), link(od, p, q), angle[(p, q)])
+                for p, q in pairs
+            )
         )
         sig = (sig, chirality_of(mol, real_donors, geometry, od, haptic))  # keep enantiomers distinct (else merged)
         if sig not in seen:
