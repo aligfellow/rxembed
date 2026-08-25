@@ -950,6 +950,27 @@ def chirality_of(mol, donors, geometry, vertices, haptic=None):
     return _poly.handedness(dirs, list(vertices), _donor_classes(mol, donors), _chelate_edges(mol, vertices, haptic))
 
 
+def realised_chirality(mol, cid, geometry, vertices, metal, chirality, haptic=None):
+    """Read ``delta``/``lambda`` from one raw 3D frame, or return empty when no hand is defined."""
+    dirs = vertex_dirs(geometry) if chirality else None
+    if dirs is None or len(vertices) != len(dirs) or any(atom < 0 for atom in vertices):
+        return ""
+    pos = mol.GetConformer(int(cid)).GetPositions()
+    haptic = haptic or {}
+
+    def point(atom):
+        ring = haptic.get(atom)
+        return np.mean(pos[list(ring)], axis=0) if ring else pos[atom]
+
+    observed = np.asarray([point(atom) - pos[metal] for atom in vertices])
+    lengths = np.linalg.norm(observed, axis=1, keepdims=True)
+    if not np.all(np.isfinite(observed)) or not np.all(lengths > _EPS_LEN):
+        return ""
+    if _poly.orientation_parity(observed / lengths, dirs) > 0:
+        return chirality
+    return _poly.LAMBDA if chirality == _poly.DELTA else _poly.DELTA
+
+
 _LONE_PAIR_Z = {7, 8, 15, 16, 33, 34, 51, 52}  # N O P S As Se Sb Te: p-block groups 15 and 16
 
 

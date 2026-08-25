@@ -18,6 +18,7 @@ from rxembed.metal_polyhedron import (
     canonical_slots,
     describe,
     geometries_for_cn,
+    isomer_permutations,
     point_group,
     resolve_geometry,
     rotation_group,
@@ -118,6 +119,16 @@ def test_full_point_group_is_rotations_times_reflection():
         g = min(refl)
         assert {tuple(g[q[v]] for v in range(rec.cn)) for q in rot} == refl, f"{name}: refl is not g o rot"
         assert (min(refl) == tuple(range(rec.cn))) == rec.planar, f"{name}: planarity disagrees with rot & refl"
+
+
+def test_isomer_permutations_are_complete_proper_orbit_representatives():
+    for name, rec in POLYHEDRA.items():
+        if rec.permutations is None:
+            continue
+        rotations = rotation_group(name)
+        orbits = [{tuple(order[q[v]] for v in range(rec.cn)) for q in rotations} for order in isomer_permutations(name)]
+        assert len(set().union(*orbits)) == sum(map(len, orbits)), f"{name}: duplicate proper-rotation orbit"
+        assert set().union(*orbits) == set(itertools.permutations(range(rec.cn))), f"{name}: incomplete pool"
 
 
 def test_seat_properly_excludes_reflection():

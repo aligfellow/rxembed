@@ -974,9 +974,8 @@ def _input_ordering(mol, metal, donors, geometry):
     free sites are enumerated; otherwise the enumeration permutes a frozen donor into a vertex it cannot
     occupy, producing isomers that contradict the frozen core, such as a hydride forced off its TS site.
 
-    The candidate list holds one representative per FULL-group orbit, so the winner is only a seating up to
-    a reflection and a mirror image scores identically at every candidate; `seat_properly` turns it into the
-    reflection-free one, without which `chirality_of` hands both hands the same tag.
+    The fit deliberately allows reflection, so a mirror pair scores identically; `seat_properly` turns the
+    winner into the proper seating, without which `chirality_of` hands both input geometries the same tag.
     """
     dirs_ref = vertex_dirs(geometry)
     if dirs_ref is None or mol.GetNumConformers() == 0 or len(donors) != len(dirs_ref):

@@ -379,9 +379,23 @@ def vertex_dirs(geometry):
     return getattr(record(geometry), "vertex_dirs", None)
 
 
+@lru_cache(maxsize=None)
 def isomer_permutations(geometry):
-    """Return `geometry`'s canned coordination-isomer vertex orderings, or ``None`` if it has none."""
-    return getattr(record(geometry), "permutations", None)
+    """Return one candidate per proper-rotation orbit, or ``None`` if the geometry has no canned pool.
+
+    The compact tables contain one representative per full point-group orbit. A nonplanar decorated sphere
+    can be chiral, so reflect each representative once and retain it only when its proper-rotation orbit is
+    absent. Planar reflections are already proper-equivalent and add nothing.
+    """
+    polyhedron = record(geometry)
+    base = getattr(polyhedron, "permutations", None)
+    if base is None:
+        return None
+    proper, improper = point_group(polyhedron.vertex_dirs)
+    reflection = min(improper - proper, default=None)
+    if reflection is None:
+        return base
+    return base + tuple(tuple(order[reflection[v]] for v in range(len(order))) for order in base)
 
 
 def is_planar(geometry):
@@ -501,13 +515,17 @@ def seat_properly(dirs_obs, dirs, order):
     parity without another search. This distinguished all 7 chiral centres in the 45-structure corpus.
     Re-seating changed the minimal angle subset on 3 structures; `metal_coordination` handles the chelate case.
     """
-    ideal = np.array(dirs, float)
-    u, _s, vt = np.linalg.svd(np.asarray(dirs_obs)[list(order)].T @ ideal)
     refl = point_group(tuple(map(tuple, dirs)))[1]
-    if not refl or np.linalg.det(u @ vt) >= 0:
+    if not refl or orientation_parity(np.asarray(dirs_obs)[list(order)], dirs) >= 0:
         return list(order)
     q = min(refl)  # any one improper element; which one only moves the result within its proper orbit
     return [order[q[v]] for v in range(len(order))]
+
+
+def orientation_parity(dirs_obs, dirs):
+    """Return +1 for a proper best fit of observed directions to an ideal shape, otherwise -1."""
+    u, _s, vt = np.linalg.svd(np.asarray(dirs_obs).T @ np.asarray(dirs))
+    return 1 if np.linalg.det(u @ vt) >= 0 else -1
 
 
 def canonical_slots(dirs, keys, bites=frozenset()):
