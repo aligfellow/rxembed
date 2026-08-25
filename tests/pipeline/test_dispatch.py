@@ -317,12 +317,13 @@ def _configs(es):
 def test_hands_return_as_tagged_ensemble_set():
     es = rx.embed("CC(N)C(=O)O", n=3)  # undefined alpha-carbon
     assert isinstance(es, rx.EnsembleSet)
-    assert _configs(es) == ["1R", "1S"]  # index-keyed CIP tags
+    assert _configs(es) == ["C1:R", "C1:S"]  # atom-qualified, index-keyed CIP tags
     for e in es:
         em = e.minimize()  # the raw ETKDG seed can carry a conjugation twist; minimise, then read the hand
         Chem.AssignStereochemistryFrom3D(em.mol, confId=em.ids[0])
         ((idx, code),) = Chem.FindMolChiralCenters(em.mol, useLegacyImplementation=False)
-        assert e.tag["stereo"] == f"{idx}{code}"
+        symbol = em.mol.GetAtomWithIdx(idx).GetSymbol()
+        assert e.tag["stereo"] == f"{symbol}{idx}:{code}"
 
 
 @pytest.mark.parametrize(
@@ -359,7 +360,7 @@ def test_stereo_axis_composes_with_metal_axis():
     # an aminoacidate on Pd: 2 ligand enantiomers x the square-planar coordination isomers
     r = rx.embed("CC(N)C(=O)[O-]->[Pd]([Cl])[Cl]", metal="square_planar", n=2)
     assert isinstance(r, rx.EnsembleSet)
-    assert {"1R", "1S"} == {e.tag["stereo"] for e in r}
+    assert {"C1:R", "C1:S"} == {e.tag["stereo"] for e in r}
     assert {"cis", "trans"} <= {e.tag["label"] for e in r}
     for e in r:  # every candidate carries both axes
         assert e.tag.get("stereo")
@@ -383,4 +384,4 @@ def test_unembeddable_stereoisomer_is_skipped():
     assert isinstance(r, rx.Ensemble), "one surviving candidate must collapse to a bare Ensemble, not a set"
     assert r.n >= 1, "the embeddable Z was dropped too"
     stereo = {e.tag.get("stereo") for e in r}
-    assert stereo == {"3=4:Z"}, f"the unembeddable E was kept as a dead candidate: {stereo}"
+    assert stereo == {"C3=C4:Z"}, f"the unembeddable E was kept as a dead candidate: {stereo}"

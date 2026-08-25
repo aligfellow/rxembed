@@ -18,6 +18,7 @@ from rxembed.embed import METAL_BOND_TOL as _METAL_BOND_TOL
 from rxembed.embed import Conformers, _periodic_near, seed_conformers
 from rxembed.relax import MAX_ITERS as _MAX_ITERS
 from rxembed.relax import _error_summary
+from rxembed.stereo import matches_stereo
 
 from . import calculators as _refine
 from . import geom_check as _geometry
@@ -52,7 +53,7 @@ class EnsembleSet(list):
 
     def __repr__(self):
         """Summarise the candidates and their tags on one line."""
-        labels = [e.tag.get("label", e.tag) for e in self]
+        labels = [e.tag.get("label") or e.tag.get("stereo") or e.tag.get("arrangement") or e.tag for e in self]
         return f"<EnsembleSet: {len(self)} candidate{'s' if len(self) != 1 else ''} {labels}>"
 
     def select(self, **tag):
@@ -76,7 +77,12 @@ class EnsembleSet(list):
         # a geometry is nameable by its 3-letter code everywhere else (`rx.metal`, `IsomerSet.filter`), so it
         # must be here too, or filter(geometry='SPL') silently returns nothing
         tag = {k: (_poly.resolve_geometry(v) if k == "geometry" else v) for k, v in tag.items()}
-        return EnsembleSet(e for e in self if all(e.tag.get(k) == v for k, v in tag.items()))
+
+        def matches(ensemble, key, value):
+            stored = ensemble.tag.get(key)
+            return stored == value or (key == "stereo" and matches_stereo(stored or "", value))
+
+        return EnsembleSet(e for e in self if all(matches(e, k, v) for k, v in tag.items()))
 
     def summary(self):
         """Print each candidate (index, identity, #seeds) so you can pick one. Returns self (chainable).
@@ -174,7 +180,7 @@ class EnsembleSet(list):
     def _slug(tag, k):
         """Filename-safe identifier for a candidate from its tag (geometry / stereo / label / nci …), else its index."""
         # `geometry` leads: two candidates of different shapes otherwise slug identically and dump as c0/c1
-        keys = ("geometry", "stereo", "label", "nci", "chirality")
+        keys = ("geometry", "arrangement", "stereo", "label", "nci", "chirality", "coordinate")
         s = "_".join(str(tag[key]) for key in keys if tag.get(key)) or f"c{k}"
         return "".join(ch if ch.isalnum() or ch in "-." else "_" for ch in s)
 

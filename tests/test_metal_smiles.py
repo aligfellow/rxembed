@@ -227,8 +227,22 @@ def test_cxsmiles_distinguishes_metal_hands():
         ("Br[Pd]1(Cl)NCCN1", "square_planar"),  # a chelate, so a bite edge is in the fold
         ("[Co]123(OCCN1)(OCCN2)OCCN3", "octahedral"),  # three identical unsymmetrical chelates
         ("[CH2]=[CH2].Cl[Pt](Cl)Cl", "square_planar"),  # Zeise: an eta2 face is one vertex
+        ("[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])<-N", "seesaw"),
+        ("[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])(<-N)<-O", "trigonal_bipyramidal"),
+        ("[O+]#[C-]->[Co+3](<-[F-])(<-[Cl-])(<-[Br-])(<-N)<-O", "octahedral"),
+        ("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "octahedral"),
     ],
-    ids=["MA2B2", "MA2B2C2", "chelate", "tris-chelate", "eta2"],
+    ids=[
+        "MA2B2",
+        "MA2B2C2",
+        "chelate",
+        "tris-chelate",
+        "eta2",
+        "SEE-all-distinct",
+        "TBP-all-distinct",
+        "OH-all-distinct",
+        "OH-all-distinct-PH3",
+    ],
 )
 def test_all_enumerated_isomers_read_back(smi, geometry):
     isos = rx.enumerate_isomers(Chem.AddHs(Chem.MolFromSmiles(smi)), geometry)
@@ -245,6 +259,16 @@ def test_all_enumerated_isomers_read_back(smi, geometry):
         assert any([was[q[v]] for v in range(len(was))] == now for q in rotation_group(iso.geometry)), (
             f"{iso.label}: {was} and {now} are not the same arrangement under any rotation of the template"
         )
+
+
+def test_each_chiral_octahedral_key_is_atom_order_invariant():
+    source = Chem.MolFromSmiles("[O+]#[C-]->[Co+3](<-[F-])(<-[Cl-])(<-[Br-])(<-N)<-O")
+    order = list(reversed(range(source.GetNumAtoms())))  # new index -> old index
+    old_to_new = {old: new for new, old in enumerate(order)}
+    renumbered = Chem.RenumberAtoms(source, order)
+    for iso in rx.metal(source, "octahedral", stereo="free"):
+        remapped = rx.Isomer(renumbered, iso.geometry, [old_to_new[donor] for donor in iso.vertices])
+        assert rx.cxsmiles(remapped) == rx.cxsmiles(iso)
 
 
 def test_stated_arrangement_rejects_wrong_chirality():

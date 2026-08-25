@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from rdkit import Chem
 
 from rxembed import stereo
@@ -52,7 +53,25 @@ def test_no_stereo_returns_input_object():
 
 
 def test_undefined_point_centre_expands_with_cip_labels():
-    assert _labels(_mol("CC(N)C(=O)O")) == ["1R", "1S"]
+    assert _labels(_mol("CC(N)C(=O)O")) == ["C1:R", "C1:S"]
+
+
+def test_stereo_selectors_are_concise_only_when_unambiguous():
+    assert stereo.matches_stereo("C1:R", "C1:R")
+    assert stereo.matches_stereo("C1:R", "1R")
+    assert stereo.matches_stereo("C1:R", "C:R")
+    assert stereo.matches_stereo("C1:R", "R")
+    assert stereo.matches_stereo("C1:R,N3:S", "C:R")
+    assert stereo.matches_stereo("C1:R,N3:S", "N:S")
+    assert stereo.matches_stereo("C1:R,N3:S", "1R")
+    assert stereo.matches_stereo("C3=C4:E", "C=C:E")
+    assert stereo.matches_stereo("C3=C4:E", "E")
+    with pytest.raises(ValueError, match=r"use one of.*C1:R.*C3:S"):
+        stereo.matches_stereo("C1:R,C3:S", "C:R")
+    with pytest.raises(ValueError, match=r"use one of.*C1:R.*N3:S"):
+        stereo.matches_stereo("C1:R,N3:S", "R")
+    with pytest.raises(ValueError, match=r"use one of.*C1=C2:E.*C3=C4:Z"):
+        stereo.matches_stereo("C1=C2:E,C3=C4:Z", "E")
 
 
 def test_undefined_alkene_expands_with_point_centres():
@@ -103,6 +122,12 @@ def test_metal_bound_chiral_phosphorus_survives_strip():
     labels = _labels(mol, exclude=metals)
     assert len(labels) == 2
     assert len(set(labels)) == 2, "the two P-epimers must get distinct labels"
+
+
+def test_ph3_donor_is_not_made_stereogenic_by_the_metal_cap():
+    mol, metals = _with_metals("[PH3]->[Pt](Cl)(Cl)Cl")
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
+    assert (len(variants), n_unassigned, total, unresolved) == (1, 0, 1, 0)
 
 
 def test_coordination_locked_alkene_is_not_enumerated():
