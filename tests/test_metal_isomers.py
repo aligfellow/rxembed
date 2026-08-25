@@ -177,6 +177,29 @@ def test_bis_en_octahedral_has_three_stereoisomers():
     assert {i.chirality for i in embeddable} == {"", "delta", "lambda"}, [i.chirality for i in embeddable]
 
 
+def test_isomer_summary_uses_compact_selectable_stereo(capsys):
+    isos = rx.metal("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "OCT", stereo="free")
+    assert isos.summary() is isos
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "  idx  geometry  slots (vertex order)           metal  ligand"
+    assert all("OCT" in line and ("Δ" in line or "Λ" in line) for line in lines[1:])
+
+    point = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-[NH2]C(C)O", "SPL")
+    alkene = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-NCC=CC", "SPL")
+    point.summary()
+    alkene.summary()
+    shown = capsys.readouterr().out
+    assert {i.stereo_label for i in point} == {"C5:R", "C5:S"}
+    assert point.filter(stereo="C5:R") == point.filter(stereo="5R")
+    assert point.filter(stereo="R") == point.filter(stereo="C5:R")
+    assert {i.stereo_label for i in alkene.filter(stereo="C6=C7:E")} == {"C6=C7:E"}
+    assert alkene.filter(stereo="E") == alkene.filter(stereo="C6=C7:E")
+    assert "C5:R" in shown
+    assert "C5:S" in shown
+    assert "C6=C7:E" in shown
+    assert "C6=C7:Z" in shown
+
+
 @pytest.mark.parametrize(
     ("ligands", "donors", "expected"),
     [

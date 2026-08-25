@@ -133,7 +133,7 @@ def _order_label(mol, donors, geometry, order):
             by_elem.setdefault(mol.GetAtomWithIdx(od[p]).GetSymbol(), []).append(p)
     pairs = {e: ps for e, ps in by_elem.items() if len(ps) >= _PAIR}
     if not pairs:
-        return "cis"  # all donors distinct: nothing to be cis/trans about
+        return ""  # all donors distinct: nothing to be cis/trans about
     e = min(pairs, key=lambda e: (len(pairs[e]), e))  # the minority same-element set defines cis/trans
     ps = pairs[e]
     trans = any(
@@ -223,7 +223,7 @@ class Isomer:
     extra: list  # ty: ignore[dataclass-field-order]  # spectator metals (idx, real_z, real_q), restored with
     # `metal`
     stereo_ref: object = None  # input-geometry chirality fingerprint (for stereo='preserve')
-    stereo_label: str = ""  # ligand stereoisomer tag ('16R'), distinct from the metal-centre `chirality`
+    stereo_label: str = ""  # ligand stereoisomer tag ('C16:R'), distinct from the metal-centre `chirality`
     haptic: dict  # ty: ignore[dataclass-field-order]  # {centroid vertex -> its face's atoms}. A vertex is not
     # always an atom of `mol` -- an η² alkene, Cp or arene is one vertex -- so resolve it through here first.
     donor_bonds: list  # ty: ignore[dataclass-field-order]  # stripped M-donor bonds, re-added dative by
@@ -334,13 +334,14 @@ class Isomer:
     def summary(self):
         """Return this isomer's geometric identity string: ``geometry | per-vertex arrangement | chirality``.
 
-        The one-liner for a single isomer, in the name-agnostic keys you would ``select`` on, e.g.
-        ``'square_planar | C25 C44 O27 N37 | achiral'``. Mirrors what `IsomerSet.summary` prints per row.
-        A `from_surrogate` record has no polyhedron to name, and says so rather than printing empty fields.
+        The geometric fields match the name-agnostic keys you would ``select`` on, e.g.
+        ``'square_planar | C25 C44 O27 N37 | achiral'``. Ligand stereo is displayed as ``C5:R`` and can be
+        selected as either ``C5:R`` or ``5R``. A `from_surrogate` record has no polyhedron to name, and says
+        so rather than printing empty fields.
         """
         if not self.geometry:
             return f"{_PT.GetElementSymbol(self.real_z)}{self.metal} (surrogated, no polyhedron)"
-        stereo = f" | stereo {self.stereo_label}" if self.stereo_label else ""
+        stereo = f" | ligand {self.stereo_label}" if self.stereo_label else ""
         return f"{self.geometry} | {arrangement(self)} | {self.chirality or 'achiral'}{stereo}"
 
 
@@ -460,8 +461,8 @@ class IsomerSet(list):
         """Return the single `Isomer` matching the given keys.
 
         Key on `arrangement` (the unambiguous per-vertex slot map), `chirality`, `geometry`, `index`, the
-        ligand `stereo` tag (e.g. ``'16R'``), or the coarse `label`. Raises if zero or several match, listing
-        every isomer so you can narrow it.
+        ligand `stereo` tag (e.g. ``'C16:R'``, ``'16R'``, or unambiguous ``'C:R'``/``'R'``), or the coarse
+        `label`. Raises if zero or several match, listing every isomer so you can narrow it.
         """
         hits = self.filter(
             geometry=geometry, label=label, arrangement=arrangement, chirality=chirality, index=index, stereo=stereo
@@ -479,9 +480,10 @@ class IsomerSet(list):
         """Return the subset matching the given keys, as an `IsomerSet` (keep several / pick by index).
 
         `label` matches the base tag, so ``'fac'`` also matches auto-numbered ``fac1``/``fac2``.
-        `arrangement`, `chirality`, `geometry` and `stereo` (the ligand stereoisomer tag) match exactly, and
-        `index` selects positionally. `geometry` also takes a 3-letter code, and `chirality` accepts the Δ/Λ
-        glyphs as well as the stored words.
+        `arrangement`, `chirality` and `geometry` match exactly. `stereo` accepts ``C5:R`` or ``5R``; ``C:R``
+        and ``R`` are available when they identify one point centre, and E/Z work the same way for one double
+        bond. Ambiguous shorthand raises with the indexed choices. `index` selects positionally. `geometry`
+        also takes a 3-letter code, and `chirality` accepts the Δ/Λ glyphs as well as the stored words.
         """
         geometry, chirality = resolve_geometry(geometry), chirality_tag(chirality)
 
@@ -491,22 +493,26 @@ class IsomerSet(list):
                 and (index is None or index == k)
                 and (arrangement is None or arrange(i) == arrangement)
                 and (chirality is None or i.chirality == chirality)
-                and (stereo is None or i.stereo_label == stereo)
+                and (stereo is None or _stereo.matches_stereo(i.stereo_label, stereo))
                 and (label is None or i.label == label or i.label.rstrip("0123456789") == label)
             )
 
         return IsomerSet(i for k, i in enumerate(self) if ok(k, i))
 
     def summary(self):
-        """Print each isomer (index, geometry, per-vertex arrangement, metal chirality) so you can pick one.
+        """Print each isomer (index, geometry, vertex slots, metal and ligand stereo) so you can pick one.
 
         The arrangement (which donor sits at which vertex) is the unambiguous identity; chirality is
-        ``'delta'``/``'lambda'`` or ``'(achiral)'``. The coarse cis/trans/mer/fac name is not shown, because
-        selecting on it is unreliable: use ``arrangement=`` / ``chirality=`` / index. Returns self.
+        displayed as ``Δ``/``Λ``/``-``. Stored values remain ``'delta'``/``'lambda'``/``''``. The coarse
+        cis/trans/mer/fac name is not shown, because selecting on it is unreliable: use ``arrangement=`` /
+        ``chirality=`` / index. Ligand stereo is displayed as ``C5:R`` or ``C6=C7:E``; indexed forms and
+        unambiguous element/configuration shorthand are selectable. Returns self.
         """
+        print("  idx  geometry  slots (vertex order)           metal  ligand")
         for k, i in enumerate(self):
-            stereo = f"  stereo {i.stereo_label}" if i.stereo_label else ""
-            print(f"  [{k}] {i.geometry:16s} {arrange(i):26s} {i.chirality or '(achiral)'}{stereo}")
+            code = POLYHEDRA[i.geometry].code
+            hand = {"delta": "Δ", "lambda": "Λ"}.get(i.chirality, "-")
+            print(f"  [{k:>2}] {code:8s}  {arrange(i):29s} {hand:^5s}  {i.stereo_label or '-'}")
         return self
 
 
@@ -778,12 +784,12 @@ def _isomers_for_geometry(
 
 
 def _number_shared_labels(out):
-    """Disambiguate isomers sharing a (geometry, label) as cis1, cis2… so each stays selectable."""
+    """Disambiguate isomers sharing a named label as cis1, cis2… so each stays selectable."""
     counts = Counter((i.geometry, i.label) for i in out)  # several heteroleptic isomers can share a label
     nth = Counter()
     for i in out:
         key = (i.geometry, i.label)
-        if counts[key] > 1:
+        if i.label and counts[key] > 1:
             nth[key] += 1
             i.label = f"{i.label}{nth[key]}"
 

@@ -1,6 +1,7 @@
 """Test Ensemble and EnsembleSet behavior."""
 
 from importlib.util import find_spec
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -241,15 +242,20 @@ def test_set_rejects_scalar_ensemble_verbs(verb):
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_set_keeps_both_meanings_of_filter():
     es = rx.embed("CC(N)C(=O)O", n=2)  # a racemate -> EnsembleSet
-    assert len(es.filter(stereo="1R")) == 1, "the tag selector was broken"
+    assert es.filter(stereo="R") == es.filter(stereo="C:R") == es.filter(stereo="C1:R") == es.filter(stereo="1R")
     assert len(es.filter("connectivity")) == len(es)
+
+
+def test_set_empty_stereo_matches_an_untagged_candidate():
+    es = rx.EnsembleSet([rx.embed("CCO", n=1)])
+    assert es.filter(stereo="") == es
 
 
 @pytest.mark.skipif(find_spec("prism_pruner") is None or find_spec("sklearn") is None, reason="needs rxembed[workflow]")
 def test_minimize_and_prune_map_over_ensemble_set():
     r = rx.embed("CC(N)C(=O)O", n=3).minimize().prune()
     assert isinstance(r, rx.EnsembleSet)
-    assert {e.tag["stereo"] for e in r} == {"1R", "1S"}  # both enantiomers survive the mapped chain
+    assert {e.tag["stereo"] for e in r} == {"C1:R", "C1:S"}  # both enantiomers survive the mapped chain
     for e in r:
         assert e.n >= 1
     assert isinstance(rx.embed("CCO", n=2).minimize().prune(), rx.Ensemble)  # a stereo-free SMILES stays single
@@ -257,9 +263,18 @@ def test_minimize_and_prune_map_over_ensemble_set():
 
 def test_dump_writes_one_tagged_xyz_per_candidate(tmp_path):
     paths = rx.embed("CC(N)C(=O)O", n=2).minimize().dump(str(tmp_path / "amac.xyz"))
-    assert sorted(p.rsplit("_", 1)[1] for p in paths) == ["1R.xyz", "1S.xyz"]  # tag folded into each filename
+    assert sorted(Path(p).name for p in paths) == ["amac_C1_R.xyz", "amac_C1_S.xyz"]
     for p in paths:
         assert int(open(p).readline().strip()) == 13  # a valid .xyz (atom count header)
+
+
+def test_dump_paths_distinguish_unlabelled_metal_arrangements(tmp_path):
+    isos = rx.metal("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "OCT", stereo="free")
+    same_hand = rx.IsomerSet(isos.filter(chirality="delta")[:2])
+    ensembles = rx.EnsembleSet(rx.embed(iso, n=1, seed=1) for iso in same_hand)
+    assert all(e.tag["arrangement"] in repr(ensembles) for e in ensembles)
+    paths = ensembles.dump(str(tmp_path / "oct.xyz"))
+    assert len(paths) == len(set(paths)) == 2
 
 
 def test_dump_refuses_an_empty_ensemble(tmp_path):

@@ -8,6 +8,8 @@ is perception-driven and stays with the consumer (`rxembed.stereo`).
 
 from __future__ import annotations
 
+import re
+
 from rdkit import Chem
 from rdkit.Chem.EnumerateStereoisomers import (
     EnumerateStereoisomers,
@@ -19,7 +21,7 @@ from .utils import bond_removal_mirrors, mirror_tag, remove_bond, repair_bond_st
 
 
 def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
-    """Build a readable, index-keyed configuration tag over the enumerated centres, e.g. ``'1S'`` or ``'1R,3S,5=6:E'``.
+    """Build an atom-qualified configuration tag, e.g. ``'C1:S'`` or ``'C1:R,C3:S,C5=C6:E'``.
 
     CIP R/S where RDKit assigns it (falls back to the raw CW/CCW tag for a centre it won't CIP-rank, e.g. some
     P), plus E/Z for each enumerated double bond. Keyed only on the *enumerated* atoms/bonds so distinct
@@ -49,7 +51,7 @@ def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
             Chem.ChiralType.CHI_TETRAHEDRAL_CCW: "CCW",
         }.get(a.GetChiralTag())
         if code:  # an unresolved centre (an allene axis RDKit can't set) is dropped, never given a '?' tag
-            parts.append(f"{idx}{code}")
+            parts.append(f"{a.GetSymbol()}{idx}:{code}")
     for bidx in bond_centers:
         b = mol.GetBondWithIdx(bidx)
         tag = {
@@ -59,8 +61,47 @@ def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
             Chem.BondStereo.STEREOCIS: "Z",
         }.get(b.GetStereo())
         if tag:
-            parts.append(f"{b.GetBeginAtomIdx()}={b.GetEndAtomIdx()}:{tag}")
+            begin, end = b.GetBeginAtom(), b.GetEndAtom()
+            parts.append(f"{begin.GetSymbol()}{begin.GetIdx()}={end.GetSymbol()}{end.GetIdx()}:{tag}")
     return ",".join(parts)
+
+
+def matches_stereo(label, selector):
+    """Match an indexed stereo selector or an unambiguous configuration shorthand."""
+    if selector == label:
+        return True
+    items = []
+    for part in label.split(",") if label else ():
+        point = re.fullmatch(r"([A-Z][a-z]?)(\d+):(R|S|CW|CCW)", part)
+        bond = re.fullmatch(r"([A-Z][a-z]?)(\d+)=([A-Z][a-z]?)(\d+):(E|Z)", part)
+        if point:
+            symbol, index, code = point.groups()
+            items.append(("point", (symbol,), code, part, f"{index}{code}"))
+        elif bond:
+            left, i, right, j, code = bond.groups()
+            items.append(("bond", tuple(sorted((left, right))), code, part, f"{i}={j}:{code}"))
+    if selector in {item[3] for item in items} | {item[4] for item in items}:
+        return True
+    if selector == ",".join(item[4] for item in items):
+        return True
+
+    kind = symbols = wanted = None
+    if selector in {"R", "S", "CW", "CCW"}:
+        kind, wanted = "point", selector
+    elif selector in {"E", "Z"}:
+        kind, wanted = "bond", selector
+    elif match := re.fullmatch(r"([A-Z][a-z]?):(R|S|CW|CCW)", selector):
+        kind, symbols, wanted = "point", (match.group(1),), match.group(2)
+    elif match := re.fullmatch(r"([A-Z][a-z]?)=([A-Z][a-z]?):(E|Z)", selector):
+        kind, symbols, wanted = "bond", tuple(sorted(match.group(1, 2))), match.group(3)
+    if kind is None:
+        return False
+    candidates = [item for item in items if item[0] == kind and (symbols is None or item[1] == symbols)]
+    if len(candidates) > 1:
+        raise ValueError(
+            f"stereo={selector!r} is ambiguous for {label!r}; use one of {[item[3] for item in candidates]}"
+        )
+    return len(candidates) == 1 and candidates[0][2] == wanted
 
 
 def _coordination_locked_double_bonds(mol, metals):
@@ -146,7 +187,9 @@ def _build_enumeration_graph(mol, exclude):
         z_metal = mol.GetAtomWithIdx(mi).GetAtomicNum()
         for nb in [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()]:
             remove_bond(work, mi, nb)  # re-base the donor's tag onto the stripped order; `graft` inverts it
-            if mol.GetAtomWithIdx(nb).GetHybridization() == Chem.HybridizationType.SP3:
+            donor = mol.GetAtomWithIdx(nb)
+            # Two identical H rule out tetrahedral chirality; a D cap makes RDKit misclassify bracket `[PH3]`.
+            if donor.GetHybridization() == Chem.HybridizationType.SP3 and donor.GetTotalNumHs() <= 1:
                 d = work.AddAtom(Chem.Atom(1))
                 work.GetAtomWithIdx(d).SetIsotope(2)  # deuterium
                 work.AddBond(nb, d, Chem.BondType.SINGLE)

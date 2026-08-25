@@ -286,7 +286,7 @@ def _chirality_volume(mol, cid, centre):
 
 def test_metal_bound_carbanion_embeds_both_hands():
     en = rx.metal(_CARBANION_NI, "square_planar")
-    assert {i.stereo_label for i in en} == {"23R", "23S"}  # metal-priority CIP labels
+    assert {i.stereo_label for i in en} == {"C23:R", "C23:S"}  # metal-priority CIP labels
     hands = []
     for iso in en:
         e = rx.embed(iso, n=1).minimize()
