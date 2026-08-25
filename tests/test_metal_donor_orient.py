@@ -27,6 +27,7 @@ _ARYL_CARBANION_SMI = "[c-]1ccccc1[Pd]2(Cl)<-[NH2]CC[NH2]->2"
 # an isolated acetone O donor: sp2 with an in-plane lone pair, but RDKit marks its C=O not conjugated. The
 # pyridine co-donor is conjugated and capped either way, so any drop is the ketone O's alone.
 _KETONE_SMI = "CC(C)=O->[Pd](Cl)(Cl)<-n1ccccc1"
+_ETA1_CH_SMI = "CC(C)(C)[P](->[Pd]<-[CH]1=C(N2CCOCC2)C=CC=C1)(C(C)(C)C)C(C)(C)C"
 _TWO = 2
 _WALL_SLACK = 1.0  # deg: a UFF torsion constraint is a penalty, not a hard wall, so a minimum riding the cap
 # edge settles a hair outside it. Wide enough for that, far narrower than any fold the cap exists to stop.
@@ -104,6 +105,15 @@ def test_sp3_amine_does_not_fold_proton_to_metal():
             angs += [T.GetAngleDeg(conf, int(iso0.metal), int(n5), int(h)) for h in hs]
     assert angs, "no amine protons measured: the embed produced nothing"
     assert min(angs) >= 90.0, f"an sp3 amine proton folded onto the metal (min M-N-H {min(angs):.1f}°)"
+
+
+def test_eta1_arene_ch_does_not_fold_hydrogen_to_metal():
+    iso = rx.metal(_ETA1_CH_SMI)[0]
+    ens = rx.embed(iso, n=1, seed=7).minimize()
+    carbon = next(d for d in iso.donors if iso.mol.GetAtomWithIdx(d).GetAtomicNum() == 6)
+    hydrogen = next(n.GetIdx() for n in iso.mol.GetAtomWithIdx(carbon).GetNeighbors() if n.GetAtomicNum() == 1)
+    pos = ens.mol.GetConformer(ens.ids[0]).GetPositions()
+    assert np.linalg.norm(pos[iso.metal] - pos[hydrogen]) > 2.4, "the eta1 C-H folded its hydrogen onto the metal"
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
