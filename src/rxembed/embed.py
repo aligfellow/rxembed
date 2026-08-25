@@ -175,7 +175,7 @@ def fold_substrate(base, sub, graft_ref):
 
 
 def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, prune_rms=0.1, threads=0, graft_ref=None):
-    """Seed `n` conformers, preserving donor hand and grafting the frozen core exactly."""
+    """Seed `n` conformers, selecting metal and donor hands before cleanup and grafting a fixed core exactly."""
     if int(seed) < 0:  # every embed route validates here, not just the front door: RDKit's -1 draws from the
         raise ValueError(  # global RNG, so the result silently depends on prior consumption (measured: two
             f"seed={seed}: a negative seed draws from RDKit's global RNG and is not reproducible"
@@ -184,24 +184,70 @@ def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, pru
         raise ValueError(f"n={n}: give a positive conformer count, or None for the flexibility-scaled default")
     cons.distances.update(float_encounter_bounds(mol, cons))  # keep free/stray fragments from drifting off
     frozen, ref_core = _frozen_core_ref(mol, cons.frozen, graft_ref or {})
+    target = n or seed_count(mol, constrained=cons.is_constrained)
+    reflectable = iso is not None and _mirror_is_free(mol) and not cons.frozen and not cons.dihedrals and not iso.haptic
     held = []
     if iso is not None:  # hold a carbanion/amine donor's hand: a degree-3 centre with no M-C bond would
         mol, held = _metal._hold_donor_chirality(mol, iso.metal, iso.donors, cons)  # else invert freely
-    ids = list(
-        seed_coordinates(
-            mol,
-            cons,
-            n or seed_count(mol, constrained=cons.is_constrained),
-            seed=seed,
-            prune_rms=prune_rms,
-            knowledge=knowledge,
-            threads=threads,
+    expected = iso.chirality if iso is not None else ""
+    if not expected:
+        ids = list(
+            seed_coordinates(
+                mol,
+                cons,
+                target,
+                seed=seed,
+                prune_rms=prune_rms,
+                knowledge=knowledge,
+                threads=threads,
+            )
         )
-    )
+        if ref_core is not None:
+            graft_frozen(mol, ids, frozen, ref_core)  # restore the exact frozen core
+    else:
+        kept = Chem.Mol(mol)
+        kept.RemoveAllConformers()
+        for attempt in range(_MAX_HAND_ROUNDS):
+            need = target - kept.GetNumConformers()
+            if need <= 0:
+                break
+            batch_n = need if reflectable else 2 * need + _HAND_BUFFER
+            ids = list(
+                seed_coordinates(
+                    mol,
+                    cons,
+                    batch_n,
+                    seed=seed + attempt,
+                    prune_rms=prune_rms,
+                    knowledge=knowledge,
+                    threads=threads,
+                )
+            )
+            if ref_core is not None:
+                graft_frozen(mol, ids, frozen, ref_core)
+            for cid in ids:
+                realised = _metal.realised_chirality(
+                    mol, cid, iso.geometry, iso.vertices, iso.metal, iso.chirality, iso.haptic
+                )
+                if realised and realised != expected and reflectable:
+                    _reflect(mol, cid)  # an exact isometry: no distance, angle or conformer diversity changes
+                    realised = expected
+                if realised == expected:
+                    kept.AddConformer(Chem.Conformer(mol.GetConformer(cid)), assignId=True)
+                    if kept.GetNumConformers() == target:
+                        break
+        mol = kept
+        ids = [conf.GetId() for conf in mol.GetConformers()]
+        if len(ids) < target:
+            logger.warning(
+                "embed: kept %d/%d seeds with the requested %s metal hand after %d DG batch(es)",
+                len(ids),
+                target,
+                iso.chirality,
+                _MAX_HAND_ROUNDS,
+            )
     if iso is not None:
         mol = _metal._release_donor_chirality(mol, held, cons)  # drop the dummy D's + cons keys, restore charges
-    if ref_core is not None:
-        graft_frozen(mol, ids, frozen, ref_core)  # restore the exact frozen core
     return mol, ids
 
 

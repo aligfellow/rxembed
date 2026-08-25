@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+from collections import Counter
 from importlib.util import find_spec
 
 import numpy as np
@@ -14,6 +15,7 @@ import rxembed as rx
 from rxembed import metal_core as M  # noqa: N812
 from rxembed import metal_isomers as K  # noqa: N812
 from rxembed import metal_polyhedron as P  # noqa: N812
+from rxembed.embed import embed as core_embed
 from rxembed.pipeline import geom_check as geom
 
 _MA2B2 = "CCCN[Pd](Cl)(Cl)NCCC"  # square-planar MA2B2 -> the cis / trans pair
@@ -175,6 +177,22 @@ def test_bis_en_octahedral_has_three_stereoisomers():
     isos = rx.metal("Cl[Co]12(Cl)(NCCN1)NCCN2", "octahedral")
     embeddable = [iso for iso in isos if rx.embed(iso, n=2).minimize().n]
     assert {i.chirality for i in embeddable} == {"", "delta", "lambda"}, [i.chirality for i in embeddable]
+
+
+@pytest.mark.parametrize(
+    ("geometry", "smiles", "per_hand"),
+    [
+        ("seesaw", "[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])<-N", 6),
+        ("trigonal_bipyramidal", "[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])(<-N)<-O", 10),
+        ("square_pyramidal", "[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])(<-N)<-O", 15),
+        ("octahedral", "[O+]#[C-]->[Co+3](<-[F-])(<-[Cl-])(<-[Br-])(<-N)<-O", 15),
+    ],
+    ids=["seesaw", "TBP", "square-pyramidal", "octahedral"],
+)
+def test_chiral_polyhedra_enumerate_both_hands(geometry, smiles, per_hand):
+    isos = rx.metal(smiles, geometry, stereo="free")
+    assert Counter(i.chirality for i in isos) == {"delta": per_hand, "lambda": per_hand}
+    assert {i.label for i in isos} == {""}  # all donors differ, so cis/trans has no meaning
 
 
 def test_isomer_summary_uses_compact_selectable_stereo(capsys):
@@ -459,6 +477,22 @@ def test_half_sandwich_uses_piano_stool_shape(door):
     assert iso.geometry == "tetrahedral"
     assert len(iso.vertices) == 4  # centroid + 3 Cl
     assert len(iso.haptic) == 1
+
+
+def test_haptic_centroid_participates_in_post_dg_metal_hand_selection():
+    mol = cp_ticl3()
+    sigma = [atom for atom in mol.GetAtoms() if atom.GetAtomicNum() == 17]
+    sigma[0].SetAtomicNum(9)
+    sigma[2].SetAtomicNum(35)
+    iso = rx.metal(mol, "tetrahedral")[0]
+    assert iso.chirality
+    assert len(iso.haptic) == 1
+    conformers = core_embed(iso, n=8, seed=7, prune_rms=-1)
+    assert len(conformers) == 8
+    assert {
+        M.realised_chirality(conformers._mol, cid, iso.geometry, iso.vertices, iso.metal, iso.chirality, iso.haptic)
+        for cid in conformers.ids
+    } == {iso.chirality}
 
 
 def test_piano_stool_chlorides_avoid_trans_ring():
