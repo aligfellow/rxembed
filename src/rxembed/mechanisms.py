@@ -387,7 +387,7 @@ class Umbrella(Mechanism):
             base = [recipe.donors[k] for k in recipe.order]
             if len(base) < _IMPROPER_VERTICES:  # `linear`: two vertices state no improper at all
                 continue
-            haptic = {d for d, _ring in recipe.haptic}
+            haptic = set(cons.sphere_haptic(recipe))
             if any(d == VACANT or d in haptic for d in base):  # an empty vertex or centroid face: no case
                 continue
             if cons.frozen.intersection((*base, recipe.metal)):  # a fix= core already pins this geometry exactly

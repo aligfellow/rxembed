@@ -51,6 +51,7 @@ class Polyhedron:
     planar: bool = False  # metal and vertices coplanar by definition, and the `classify_geometry` filter
     geometric_isomerism: bool = True  # False -> one arrangement only, no cis/trans label
     code: str = ""  # 3-letter spelling, accepted wherever a geometry name is (`resolve_geometry`).
+    site_groups: tuple = ()  # optional conventional display groups: ((name, vertex indices), ...)
     # Not the IUPAC polyhedral symbol, which differs for most rows: TPY here is the CN3 pyramid, and other
     # conventions spell a CN4 one the same way, so anything translating must key on the coordination number.
 
@@ -164,6 +165,7 @@ POLYHEDRA: dict[str, Polyhedron] = {
             angles=((0, 1, 90), (1, 2, 90), (0, 2, 180)),
             permutations=((0, 1, 2), (1, 0, 2), (0, 2, 1)),
             planar=True,
+            site_groups=(("axial", (0, 2)), ("equatorial", (1,))),
         ),
         # the IUPAC TPY-3 pyramid: three donors as a base, the metal at the apex, at the vacant tetrahedron's
         # 109.47 deg. Ammonia's 107 is refused, being a lone-pair number this does not model. Angle cannot
@@ -220,6 +222,7 @@ POLYHEDRA: dict[str, Polyhedron] = {
             ),  # 0,1 axial; 2,3 equatorial 120°
             angles=((0, 1, 180), (2, 3, 120), (0, 3, 90), (1, 2, 90)),
             permutations=((0, 1, 2, 3), (0, 2, 1, 3), (0, 3, 1, 2), (1, 2, 0, 3), (1, 3, 0, 2), (2, 3, 0, 1)),
+            site_groups=(("axial", (0, 1)), ("equatorial", (2, 3))),
         ),
         Polyhedron(
             name="trigonal_bipyramidal",
@@ -228,6 +231,7 @@ POLYHEDRA: dict[str, Polyhedron] = {
             vertex_dirs=((0, 0, 1), (0, 0, -1), (1, 0, 0), (-0.5, math.sqrt(3) / 2, 0), (-0.5, -math.sqrt(3) / 2, 0)),
             angles=((0, 1, 180), (1, 2, 90), (0, 3, 90), (2, 3, 120), (3, 4, 120), (2, 4, 120)),
             permutations=_TBP_ISOMERS,
+            site_groups=(("axial", (0, 1)), ("equatorial", (2, 3, 4))),
         ),
         # basal donors sit below the metal's equatorial plane (apex-basal ~105°, trans-basal ~150°): a real
         # pyramid, not an octahedron minus a vertex, and a flat 90/180 template misclassifies VOacac2 as tbp.
@@ -245,6 +249,7 @@ POLYHEDRA: dict[str, Polyhedron] = {
             ),
             angles=((0, 1, 105), (0, 3, 105), (1, 3, 150), (2, 4, 150), (1, 4, 86), (2, 3, 86)),
             permutations=_SPY_ISOMERS,
+            site_groups=(("apical", (0,)), ("basal", (1, 2, 3, 4))),
         ),
         Polyhedron(
             name="octahedral",
@@ -285,6 +290,7 @@ POLYHEDRA: dict[str, Polyhedron] = {
                 (0.309017, -0.951057, 0),
             ),
             angles=None,  # angles derived; no canned permutation list
+            site_groups=(("axial", (0, 1)), ("equatorial", (2, 3, 4, 5, 6))),
         ),
         Polyhedron(
             name="capped_octahedral",
@@ -459,11 +465,11 @@ def _seat_by_alignment(dd, v_ideal, rounds=3):
 
 _SYM_TOL = 1e-6  # residual below which a vertex permutation is an exact template isometry
 LAMBDA, DELTA = "lambda", "delta"  # the two metal-centre handedness tags: typeable, not glyphs
-_TAGS = {LAMBDA: LAMBDA, DELTA: DELTA, "λ": LAMBDA, "δ": DELTA}  # what `chirality_tag` accepts as input
+_TAGS = {LAMBDA: LAMBDA, DELTA: DELTA, "λ": LAMBDA, "δ": DELTA, "achiral": "", "-": ""}
 
 
 def chirality_tag(chirality):
-    """Return the word-form handedness tag, accepting the Δ/Λ glyphs as input."""
+    """Return the word-form hand, accepting Δ/Λ glyphs and ``achiral``."""
     if not isinstance(chirality, str):
         return chirality
     return _TAGS.get(chirality.strip().lower(), chirality)  # "Δ".lower() is "δ", hence both spellings
@@ -548,6 +554,7 @@ def canonical_slots(dirs, keys, bites=frozenset()):
 
 
 _SLOT_NOTE = re.compile(r"^s(\d+)([+-]?)$")  # a donor's canonical slot, with an optional haptic winding sign
+SLOT_BOND_PROP = "_rxSlot"  # parsed bridge assignment; bond-local so atom renumbering cannot swap two centres
 
 
 def slot_note(slot, winding=""):
@@ -559,6 +566,12 @@ def read_slot_note(note):
     """Parse a donor slot note; return ``None`` for any other note."""
     m = _SLOT_NOTE.match(note)
     return None if m is None else (int(m.group(1)), m.group(2))
+
+
+def read_slot_notes(note):
+    """Parse one slot per adjacent metal from a semicolon-separated donor note."""
+    values = [read_slot_note(part) for part in note.split(";")]
+    return None if any(value is None for value in values) else values
 
 
 def handedness(dirs, order, donor_class, chelate_edges=frozenset()):

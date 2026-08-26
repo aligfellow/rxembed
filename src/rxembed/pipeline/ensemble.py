@@ -416,8 +416,11 @@ class Ensemble(Conformers):
         if not self._seeds_relaxed:
             self._hold_metal_hand(stiffness, max_iters)
         if iso is not None:
-            if iso.donors:  # remember the sphere: `iso` goes, but who coordinates whom is durable
-                self.sphere.setdefault(iso.metal, list(iso.donors))
+            spheres = {}
+            for donor, metal in iso.donor_bonds:
+                spheres.setdefault(metal, []).append(donor)
+            for metal, donors in spheres.items():  # `iso` goes, but every coordination sphere is durable
+                self.sphere.setdefault(metal, donors)
             iso.restore(self._mol)
             self.iso = None
         before = list(self.ids)  # ids, not a count: what minimize drops is recorded in `discarded` like prune's
@@ -426,7 +429,7 @@ class Ensemble(Conformers):
             self.ids = [i for i in self.ids if i not in wrong_hand]
             self.wrong_hand = []
         drops = self._drop_bad_geometries(iso)  # torn bond / puckered sphere / torn rigid body
-        drops["wrong metal hand"] = len(wrong_hand)
+        drops["wrong metal state"] = len(wrong_hand)
         self._drop_unconverged(drops)  # non-physical relax energy
         if _retry and len(self.ids) < len(before):
             logger.info(  # name the gate(s) that fired, with counts

@@ -67,7 +67,7 @@ def test_spectator_ferrocene_stays_rigid():
     shape = {fe, *(n.GetIdx() for n in ref.GetAtomWithIdx(fe).GetNeighbors())}
 
     isomers = rx.metal(_MN_H2, "octahedral", center="Mn", fix=_MN_H2_RC)
-    iso = isomers.select(arrangement="N6 C62 C61 N5 P2 H63")
+    iso = isomers.select(arrangement="C62 N6 C61 N5 P2 H63")
     windows = {k: v for k, v in iso.cons.distances.items() if set(k) <= shape}
     assert len(windows) > 50, "the rigid body is all pairs of {Fe, *10 Cp carbons}"
 
@@ -270,7 +270,7 @@ def test_dump_writes_one_tagged_xyz_per_candidate(tmp_path):
 
 def test_dump_paths_distinguish_unlabelled_metal_arrangements(tmp_path):
     isos = rx.metal("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "OCT", stereo="free")
-    same_hand = rx.IsomerSet(isos.filter(chirality="delta")[:2])
+    same_hand = rx.IsomerSet(isos.filter(hand="delta")[:2])
     ensembles = rx.EnsembleSet(rx.embed(iso, n=1, seed=1) for iso in same_hand)
     assert all(e.tag["arrangement"] in repr(ensembles) for e in ensembles)
     paths = ensembles.dump(str(tmp_path / "oct.xyz"))

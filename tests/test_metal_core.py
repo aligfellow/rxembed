@@ -483,6 +483,9 @@ def test_haptic_face_and_chirality_cap_compose():
     cons = iso.cons
     assert cons.haptic, "fixture must carry a haptic face"
     before = sorted(cons.haptic)
+    cons.spheres = tuple(
+        sphere._replace(winding=tuple((dummy, "+") for dummy in cons.sphere_haptic(sphere))) for sphere in cons.spheres
+    )
 
     _metal._shift_phantoms(cons, 2)  # as if two D-caps had been appended ahead of the centroids
     after = sorted(cons.haptic)
@@ -495,7 +498,8 @@ def test_haptic_face_and_chirality_cap_compose():
         for k in getattr(cons, name):
             assert not (stale & set(k)), f"{name} still names a pre-shift dummy index {k}"
     for s in cons.spheres:
-        assert not (stale & {d for d, _ring in s.haptic}), "the sphere recipe still names a pre-shift dummy"
+        assert not (stale & set(s.donors)), "the sphere recipe's donor list still names a pre-shift dummy"
+        assert not (stale & {d for d, _sign in s.winding}), "the winding still names a pre-shift dummy"
 
 
 def test_release_chirality_restores_phantom_indices():

@@ -176,6 +176,21 @@ def repair_bond_stereo(mol) -> int:
     This is the bond-stereo counterpart of the atom-level cleanups `surrogate_metal` already does (it clears the
     surrogate's chiral tag for exactly this reason, and `_clear_labile_donor_stereo` clears a donor's).
     """
+    # Metal-ring SMILES can make RDKit choose the metal as both E/Z references. Once bond surgery removes
+    # the metal, the original slash bonds are still the least ambiguous source of the ligand's E/Z. Preserve
+    # already-valid E/Z verbatim: SetBondStereoFromDirections otherwise rewrites E/Z as TRANS/CIS.
+    stated = {
+        b.GetIdx(): (b.GetStereo(), tuple(b.GetStereoAtoms()))
+        for b in mol.GetBonds()
+        if b.GetStereo() != Chem.BondStereo.STEREONONE
+        and len(b.GetStereoAtoms()) == _STEREO_REFS
+        and len(set(b.GetStereoAtoms())) == _STEREO_REFS
+    }
+    Chem.SetBondStereoFromDirections(mol)
+    for idx, (tag, refs) in stated.items():
+        bond = mol.GetBondWithIdx(idx)
+        bond.SetStereoAtoms(*refs)
+        bond.SetStereo(tag)
     orphaned = [
         b
         for b in mol.GetBonds()

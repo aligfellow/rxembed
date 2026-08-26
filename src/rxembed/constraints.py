@@ -48,7 +48,8 @@ class SphereRecipe(NamedTuple):
     donors: tuple
     geometry: str
     order: tuple
-    haptic: tuple  # ((centroid-dummy, ring atoms), ...), sorted so the recipe stays hashable and comparable
+    chirality: str = ""
+    winding: tuple = ()  # ((centroid-dummy, canonical sign), ...)
 
 
 @dataclass
@@ -80,7 +81,7 @@ class Constraints:
     #   standing in as the one vertex a Cp/arene presents. Transient: materialised inside the embed and the
     #   relax, never in a stored Mol, so nothing downstream (gate, metrics, dump, calculator) sees one.
     spheres: tuple = field(default_factory=tuple)  # one `SphereRecipe` per metal centre: which donor sits at
-    #   which vertex of which polytope, which no pairwise window records. Read by `Umbrella`, never by a writer.
+    #   which vertex of which polytope, which no pairwise window records. Read by the stereo gate and `Umbrella`.
     haptic: dict = field(default_factory=dict)  # {centroid dummy -> its ring atoms}; the source of truth for
     #   eta>=3 faces. The stored mol and donor list stay real: the ring atoms are the donors.
     dihedrals: dict = field(default_factory=dict)  # (i, j, k, l) -> periodic (lo, hi) degrees
@@ -95,6 +96,10 @@ class Constraints:
     def copy(self, **overrides) -> "Constraints":
         """Return a field-complete deep copy, with any keyword replacing that field outright."""
         return replace(deepcopy(self), **overrides)
+
+    def sphere_haptic(self, recipe: SphereRecipe) -> dict:
+        """Return this constraint set's haptic faces used by one sphere recipe."""
+        return {donor: self.haptic[donor] for donor in recipe.donors if donor in self.haptic}
 
     def relaxed(self) -> "Constraints":
         """Return a copy with the seeded NCI/user contacts released, for the exploratory search.

@@ -14,6 +14,7 @@ _CHIRAL_P_PD = "C[P](CC)(c1ccccc1)[Pd](Cl)(Cl)Cl"
 _ALPHA_DIIMINE_NI = (
     "O=C1[O-]->[Ni+2]2(<-[N](=C3C(=[N]->2c2cccc4ccccc24)c2cccc4cccc3c24)c2cccc3ccccc23)<-[N-](c2ccccc2)C1c1ccccc1"
 )
+_ETA2_PT = "C[CH]1=[CH](F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1"
 
 
 def _mol(smiles):
@@ -64,6 +65,7 @@ def test_stereo_selectors_are_concise_only_when_unambiguous():
     assert stereo.matches_stereo("C1:R", "R")
     assert stereo.matches_stereo("C1:R,N3:S", "C:R")
     assert stereo.matches_stereo("C1:R,N3:S", "N:S")
+    assert stereo.matches_stereo("C1:R,N3:S", "C:R,N:S")
     assert stereo.matches_stereo("C1:R,N3:S", "1R")
     assert stereo.matches_stereo("C3=C4:E", "C=C:E")
     assert stereo.matches_stereo("C3=C4:E", "E")
@@ -150,6 +152,24 @@ def test_coordination_locked_alkene_is_not_enumerated():
     assert stereo._coordination_locked_double_bonds(mol, metals), "the metal-closed imine was not detected"
     variants, _n, _total, _unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
     assert len(variants) == 2, "only the real point stereocentre should expand, not the locked imines"
+
+
+def test_eta2_alkene_is_not_coordination_locked():
+    mol, metals = _with_metals(_ETA2_PT)
+    assert stereo._coordination_locked_double_bonds(mol, metals) == set()
+    assert set(_labels(mol, exclude=metals)) == {"C1=C2:E", "C1=C2:Z"}
+
+
+@pytest.mark.parametrize(
+    ("smiles", "expected"),
+    [
+        (r"C/[CH]1=[CH](\F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1", "C1=C2:Z"),
+        (r"C/[CH]1=[CH](/F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1", "C1=C2:E"),
+    ],
+)
+def test_eta2_alkene_keeps_explicit_ez_after_metal_strip(smiles, expected):
+    mol, metals = _with_metals(smiles)
+    assert stereo.defined_stereo_label(mol, metals) == expected
 
 
 def test_pendant_alkene_remains_unlocked_by_metal():

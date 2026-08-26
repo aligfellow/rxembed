@@ -24,6 +24,11 @@ Mol | Isomer
 graft coordinates while it drives the sequence. `bounds.py` edits RDKit's bounds matrix, `relax.py` applies
 the matching restrained-UFF terms, and the result is `Conformers`.
 
+Each metal centre contributes one `SphereRecipe`. `metal_isomers.py` either retains the unselected recipes or
+forms their Cartesian product, then uses ordinary `compose()` to make one `Constraints` payload.
+`Isomer` stores only that payload, the metal restore identities and the stripped donor bonds. Its geometry,
+vertices and handedness are views of the primary recipe, not a second copy of the same state.
+
 The normal API adapts strings, paths and external tools around that core:
 
 ```text

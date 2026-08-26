@@ -162,13 +162,29 @@ need an explicit `{target_index: reference_index}` map.
 ```python
 import rxembed as rx
 
-isomers = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-[Cl-]", "SPL")
+isomers = rx.metal("CCCN->[Pd+2](<-[Cl-])(<-[Cl-])<-NCCC", "SPL")
 isomers.summary()
-ens = rx.embed(isomers.select(index=0))
+ens = rx.embed(isomers.select(label="trans"))
 ```
 
 `rx.metal` accepts SMILES, `.xyz`, or `Mol` and returns distinct arrangements. Write ionic dative SMILES with
 donor-to-metal arrows and charged anionic ligands; neutral/covalent SMILES are also accepted as input.
+
+For a geometry containing several metals, all centres are handled by default. The measured ligand and haptic
+stereo is retained while the coordination arrangements are enumerated. Scope a choice with `center=`, or ask
+for selected stereo to vary:
+
+```python
+isomers = rx.metal("examples/structures/mnh.xyz")
+mer = isomers.filter(center="Mn", label="mer")
+chosen = mer.select(hand="lambda")
+
+n_hands = rx.metal("examples/structures/mnh.xyz", stereo={"N5": "racemic"})
+all_hands = rx.metal("examples/structures/mnh.xyz", stereo="racemic")
+```
+
+`.summary(details=True)` adds trans pairs or axial/equatorial sites and distinguishes graph-non-equivalent
+same-element donors. `center="Mn"` enumerates only Mn and retains the other spheres.
 
 Ordinary donor hydrogens may be implicit. Hydrides, H₂, and bridging hydrogen donors must be explicit.
 
@@ -212,8 +228,9 @@ back to original complex indices.
 `dative_smiles` preserves normalized constitution but not the metal arrangement, so cis and trans share a
 string. `cxsmiles` also stores geometry, canonical donor slots, and Λ/Δ chirality in atom properties that
 `rx.embed` reads back. Both outputs are canonical; CX positions follow output order, not input atom indices.
-Planar-chiral haptic winding enumerates as `ηn+`/`ηn-`, is stored on the face slot, and is selected immediately
-after distance geometry. Use `stereo="free"` to leave it unspecified.
+An η² alkene's `re`/`si` face and an η³ or higher ligand's planar-chiral winding are stored as canonical
+`+`/`-` signs on the face slot and selected immediately after distance geometry. Standard CX `c:`/`t:` fields
+retain the alkene's E/Z identity. Use `stereo="free"` to leave haptic orientation unspecified.
 
 ## Approximations
 
@@ -225,7 +242,7 @@ Current limitations:
 | exact cores | grafted, not embedded. Distance geometry approximates a rigid core to ~0.2–0.4 Å, fine for a molecule and wrong for a TS |
 | `n=N` | up to N seeds; `Ensemble.minimize()` drops failed geometries and retries metal seeds |
 | g-xTB solvent | `E_gxtb(gas) + [E_gfn2(solv) − E_gfn2(gas)]`, never a silent gas-phase energy |
-| haptic-face orientation | `rx.metal` does not enumerate rotation about the metal-centroid axis for η² alkenes, Cp or arenes. ETKDG seeds may sample it incidentally; `mc()` pose-freezes each seeded face |
+| haptic axial pose | after face or winding identity is selected, `rx.metal` does not enumerate continuous rotation about the metal-centroid axis. ETKDG seeds may sample it incidentally; `mc()` pose-freezes each seeded face |
 | `mc()` pose-freeze | soft, ~0.1 Å drift. A constraint that must hold across `mc()` has to be a distance, angle or dihedral the relax also reads |
 
 ## Development

@@ -18,7 +18,14 @@ from rdkit.Chem.EnumerateStereoisomers import (
 )
 
 from .metal_core import _haptic_sites
-from .utils import bond_removal_mirrors, bond_replacement_mirrors, mirror_tag, remove_bond, repair_bond_stereo
+from .utils import (
+    _STEREO_REFS,
+    bond_removal_mirrors,
+    bond_replacement_mirrors,
+    mirror_tag,
+    remove_bond,
+    repair_bond_stereo,
+)
 
 _MIN_POINT_BRANCHES = 3
 
@@ -60,7 +67,20 @@ def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
         Chem.SanitizeMol(
             mol, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True
         )
+    # A standard CX c:/t: field directly sets a valid CIS/TRANS tag but no slash bond directions. RDKit's
+    # clean assignment erases that tag, so retain stated bond geometry while assigning point-centre CIP.
+    stated_bonds = {
+        b.GetIdx(): (b.GetStereo(), tuple(b.GetStereoAtoms()))
+        for b in mol.GetBonds()
+        if b.GetStereo() != Chem.BondStereo.STEREONONE
+        and len(b.GetStereoAtoms()) == _STEREO_REFS
+        and len(set(b.GetStereoAtoms())) == _STEREO_REFS
+    }
     Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
+    for idx, (tag, refs) in stated_bonds.items():
+        bond = mol.GetBondWithIdx(idx)
+        bond.SetStereoAtoms(*refs)
+        bond.SetStereo(tag)
     parts = []
     for idx in atom_centers:
         a = mol.GetAtomWithIdx(idx)
@@ -88,6 +108,8 @@ def matches_stereo(label, selector):
     """Match an indexed stereo selector or an unambiguous configuration shorthand."""
     if selector == label:
         return True
+    if "," in selector:
+        return all(matches_stereo(label, part.strip()) for part in selector.split(","))
     items = []
     for part in label.split(",") if label else ():
         point = re.fullmatch(r"([A-Z][a-z]?)(\d+):(R|S|CW|CCW)", part)
@@ -138,6 +160,14 @@ def _coordination_locked_double_bonds(mol, metals):
     metals = set(metals)
     if not metals:
         return set()
+    haptic = {
+        frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))
+        for metal in metals
+        for site in _haptic_sites(mol, [a.GetIdx() for a in mol.GetAtomWithIdx(metal).GetNeighbors()])
+        if len(site) > 1
+        for bond in mol.GetBonds()
+        if bond.GetBeginAtomIdx() in site and bond.GetEndAtomIdx() in site
+    }
     up = Chem.RWMol(mol)  # dative -> single so RDKit sees the metal ring; FastFindRings avoids a valence sanitize
     for b in up.GetBonds():
         if b.GetBondType() == Chem.BondType.DATIVE:
@@ -156,6 +186,8 @@ def _coordination_locked_double_bonds(mol, metals):
         if b.GetBondType() != Chem.BondType.DOUBLE:
             continue
         a, c = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
+        if frozenset((a, c)) in haptic:
+            continue  # an eta2 C=C keeps its ligand E/Z; coordination chooses a face, not a bond geometry
         in_metal_ring = any({a, c} <= r for r in metal_rings)
         fb = free.GetBondBetweenAtoms(a, c)
         if in_metal_ring and not (fb is not None and fb.IsInRing()):  # cyclic only because of the metal
@@ -244,10 +276,15 @@ def _build_enumeration_graph(mol, exclude):
     return work, cap_to_metal
 
 
-def _unassigned_elements(mol, exclude=()):
+def _unassigned_elements(mol, exclude=(), include=(), skip_points=(), skip_bonds=False):
     """Return ``(work, cap_to_metal, locked, elements)``: the enumeration graph and its unspecified elements."""
     exclude = set(exclude)
     work, cap_to_metal = _build_enumeration_graph(mol, exclude)
+    if include == "all":
+        Chem.RemoveStereochemistry(work)
+    else:
+        for atom in include:
+            work.GetAtomWithIdx(atom).SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
 
     # A C=N / C=C whose E/Z the coordination fixes must not be enumerated: the metal closes the ring, so only
     # one geometry exists and the other embeds as a strained impossibility.
@@ -258,13 +295,23 @@ def _unassigned_elements(mol, exclude=()):
         if e.specified != Chem.StereoSpecified.Unspecified:
             return False
         if e.type == Chem.StereoType.Atom_Tetrahedral:
-            return True
+            return e.centeredOn not in skip_points
         if e.type == Chem.StereoType.Bond_Double:  # skip a double bond the coordination has already locked
             wb = work.GetBondWithIdx(e.centeredOn)
-            return frozenset((wb.GetBeginAtomIdx(), wb.GetEndAtomIdx())) not in locked
+            return not skip_bonds and frozenset((wb.GetBeginAtomIdx(), wb.GetEndAtomIdx())) not in locked
         return False
 
     return work, cap_to_metal, locked, [e for e in Chem.FindPotentialStereo(work) if enumerable(e)]
+
+
+def point_centres(mol, exclude=()):
+    """Return atom indices that can carry tetrahedral ligand stereo on the metal-free enumeration graph."""
+    work, _caps = _build_enumeration_graph(mol, set(exclude))
+    return {
+        element.centeredOn
+        for element in Chem.FindPotentialStereo(work)
+        if element.type == Chem.StereoType.Atom_Tetrahedral and element.centeredOn < mol.GetNumAtoms()
+    }
 
 
 def unassigned_centres(mol, exclude=()):
@@ -323,7 +370,7 @@ def stereo_from_3d(mol, exclude=()):
     return _stereo_label(work, atom_centers, bond_centers, cap_to_metal)
 
 
-def enumerate_unassigned(mol, cap=32, exclude=()):
+def enumerate_unassigned(mol, cap=32, exclude=(), include=(), skip_points=(), skip_bonds=False):
     """Enumerate stereoisomers over only the *unspecified* stereo elements (point R/S + double-bond E/Z).
 
     Returns ``(variants, n_unassigned, total, unresolved)``: ``variants`` a list of ``(variant_mol, label)``
@@ -337,7 +384,7 @@ def enumerate_unassigned(mol, cap=32, exclude=()):
     a chiral-at-P or carbanion donor that drops to degree 3 after the strip. `exclude` is the metal indices.
     """
     n_real = mol.GetNumAtoms()
-    work, cap_to_metal, locked, unassigned = _unassigned_elements(mol, exclude)
+    work, cap_to_metal, locked, unassigned = _unassigned_elements(mol, exclude, include, set(skip_points), skip_bonds)
     if not unassigned:
         return [(mol, "")], 0, 1, 0
     atom_centers = [e.centeredOn for e in unassigned if e.type == Chem.StereoType.Atom_Tetrahedral]

@@ -195,11 +195,93 @@ def test_chiral_polyhedra_enumerate_both_hands(geometry, smiles, per_hand):
     assert {i.label for i in isos} == {""}  # all donors differ, so cis/trans has no meaning
 
 
+def test_distinct_eta2_faces_define_both_octahedral_hands():
+    smiles = (
+        r"C/[CH]1=[CH](/F)->[Co+3]2(<-[CH](Cl)=[CH](Br)->2)(<-[NH3])"
+        r"(<-[Cl-])(<-[Br-])(<-[F-])<-1"
+    )
+    isomers = rx.metal(smiles, "OCT", stereo="free")
+    assert Counter(iso.chirality for iso in isomers) == {"delta": 15, "lambda": 15}
+    assert len({K.arrangement(iso) for iso in isomers}) == len(isomers) == 30
+
+
+def test_haptic_face_classes_follow_set_orbits_not_atom_orbits():
+    rw = Chem.RWMol()
+    prisms = []
+    for _ in range(2):
+        ring = [rw.AddAtom(Chem.Atom(6)) for _ in range(10)]
+        for offset in (0, 5):
+            for i in range(5):
+                rw.AddBond(ring[offset + i], ring[offset + (i + 1) % 5], S)
+        for i in range(5):
+            rw.AddBond(ring[i], ring[i + 5], S)
+        prisms.append(ring)
+    metal = rw.AddAtom(Chem.Atom(27))
+    rw.GetAtomWithIdx(metal).SetFormalCharge(3)
+    for donor in (prisms[0][0], prisms[0][1], prisms[1][3], prisms[1][8]):
+        rw.AddBond(donor, metal, DAT)
+    for z in (7, 9, 17, 35):
+        donor = rw.AddAtom(Chem.Atom(z))
+        rw.AddBond(donor, metal, DAT)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+
+    isomers = rx.enumerate_isomers(mol, "OCT", stereo="free")
+    assert Counter(iso.chirality for iso in isomers) == {"delta": 15, "lambda": 15}
+    assert len({K.arrangement(iso) for iso in isomers}) == 30
+    assert len({rx.cxsmiles(iso) for iso in isomers}) == 30
+
+
+def test_bridging_donor_role_distinguishes_otherwise_identical_sites():
+    rw = Chem.RWMol()
+    co, pt = rw.AddAtom(Chem.Atom(27)), rw.AddAtom(Chem.Atom(78))
+    donors = [rw.AddAtom(Chem.Atom(z)) for z in (7, 7, 9, 17, 35, 8, 53, 16, 15)]
+    for donor in donors[:2]:
+        rw.GetAtomWithIdx(donor).SetNumExplicitHs(3)
+        rw.GetAtomWithIdx(donor).SetNoImplicit(True)
+    for donor in donors[:6]:
+        rw.AddBond(donor, co, DAT)
+    for donor in (donors[0], *donors[6:]):
+        rw.AddBond(donor, pt, DAT)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    positions = [
+        (0, 0, 0),
+        (4, 0, 0),
+        (2, 0, 0),
+        (-2, 0, 0),
+        (0, 2, 0),
+        (0, -2, 0),
+        (0, 0, 2),
+        (0, 0, -2),
+        (6, 0, 0),
+        (4, 2, 0),
+        (4, -2, 0),
+    ]
+    for atom, position in enumerate(positions):
+        conf.SetAtomPosition(atom, Point3D(*position))
+    mol.AddConformer(conf)
+
+    isomers = rx.enumerate_isomers(mol, "OCT", center="Co", stereo="free")
+    assert Counter(iso.chirality for iso in isomers) == {"delta": 15, "lambda": 15}
+    strings = {rx.cxsmiles(iso) for iso in isomers}
+    assert len(strings) == 30
+    reversed_mol = Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))
+    reversed_isomers = rx.enumerate_isomers(reversed_mol, "OCT", center="Co", stereo="free")
+    assert strings == {rx.cxsmiles(iso) for iso in reversed_isomers}
+
+
+def test_square_pyramidal_150_degree_pair_is_trans():
+    isomers = rx.metal("[V](F)(F)(Cl)(Cl)Cl", "SPY", stereo="free")
+    assert Counter(iso.label for iso in isomers) == {"cis": 2, "trans": 1}
+
+
 def test_isomer_summary_uses_compact_selectable_stereo(capsys):
     isos = rx.metal("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "OCT", stereo="free")
     assert isos.summary() is None
     lines = capsys.readouterr().out.splitlines()
-    assert lines[0] == "  idx  geometry  slots (vertex order)           metal  haptic  ligand"
+    assert lines[0] == "  idx  centres (geometry label [slots] Δ/Λ/-)  ligand"
     assert all("OCT" in line and ("Δ" in line or "Λ" in line) for line in lines[1:])
 
     point = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-[NH2]C(C)O", "SPL")
@@ -216,6 +298,34 @@ def test_isomer_summary_uses_compact_selectable_stereo(capsys):
     assert "C5:S" in shown
     assert "C6=C7:E" in shown
     assert "C6=C7:Z" in shown
+
+
+def test_three_plus_one_square_planar_has_no_false_cis_trans_label():
+    isomers = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-[Cl-]", "SPL", stereo="free")
+    assert len(isomers) == 1
+    assert isomers[0].label == ""
+
+
+def test_center_selector_rejects_bool_and_float():
+    isomers = rx.metal(_MA2B2, "SPL")
+    for center in (True, 1.5):
+        with pytest.raises(TypeError, match="center must be"):
+            isomers.filter(center=center)
+
+
+def test_summary_details_show_site_relations_and_non_equivalent_same_element_donors(capsys):
+    octahedral = rx.metal("[O+]#[C-]->[Co+3](<-[CH3-])(<-[Cl-])(<-N)(<-[F-])<-P", "OCT", stereo="free")[0]
+    octahedral.summary(details=True)
+    shown = capsys.readouterr().out
+    assert "Co2 trans:" in shown
+    assert "Co2 C1: [C-]#[O+]" in shown
+    assert "Co2 C3: [CH3-]" in shown
+
+    tbp = rx.metal("[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])(<-N)<-O", "TBP", stereo="free")[0]
+    tbp.summary(details=True)
+    shown = capsys.readouterr().out
+    assert "Fe2 axial:" in shown
+    assert "equatorial:" in shown
 
 
 def test_defined_and_enumerated_ligand_stereo_share_one_label():
@@ -252,7 +362,25 @@ def test_select_accepts_geometry_code_or_name():
         isos.select(arrangement="does not exist")
     tet = rx.metal("[Zn](F)(Cl)(Br)I", "TET")  # the code is an input alias, not the identity
     assert {i.geometry for i in tet} == {"tetrahedral"}
-    assert tet.select(chirality="delta") is tet.select(chirality="Δ")
+    assert tet.select(hand="delta") is tet.select(hand="Δ")
+
+
+def test_isomer_repr_is_the_compact_summary_row():
+    isomers = rx.metal("O[Co](Cl)(C)(N)(F)P", "OCT")
+    assert "Constraints(" not in repr(isomers)
+    assert "Co1 OCT" in repr(isomers)
+
+
+def test_shape_only_summary_lists_every_restored_metal(capsys):
+    iso = K.from_surrogate(Chem.MolFromSmiles("[C].[C]"), [(0, 26, 2), (1, 25, 0)], [])
+    isomers = K.IsomerSet([iso])
+    assert isomers.filter() == [iso]
+    assert isomers.select() is iso
+    iso.summary(details=True)
+    shown = capsys.readouterr().out
+    assert "Fe0 [surrogated]" in shown
+    assert "Mn1 [surrogated]" in shown
+    assert "Constraints(" not in repr(iso)
 
 
 # --- enumeration: arrangements the ligands cannot reach -------------------------------------------------
@@ -465,6 +593,17 @@ def test_sandwich_uses_two_centroids(door, tmp_path):
 def test_haptic_complex_survives_the_mc_search():
     assert rx.embed(rx.metal(ferrocene())[0], n=3).mc().ids
     assert rx.embed(rx.metal(ferrocene())[0], n=3).mc(explore=True).ids
+
+
+def test_spectator_haptic_centroids_share_one_index_space():
+    combined = Chem.CombineMols(ferrocene(), ferrocene(), Point3D(6, 0, 0))
+    iso = rx.metal(combined, center=0, stereo="free")[0]
+    expected = list(range(iso.mol.GetNumAtoms(), iso.mol.GetNumAtoms() + 4))
+    assert sorted(iso.cons.phantoms) == sorted(iso.cons.haptic) == expected
+    assert {dummy for recipe in iso.cons.spheres for dummy in recipe.donors if dummy in iso.cons.haptic} == set(
+        expected
+    )
+    assert core_embed(iso, n=1, seed=1).ids
 
 
 def test_haptic_face_seats_from_any_ring_atom():

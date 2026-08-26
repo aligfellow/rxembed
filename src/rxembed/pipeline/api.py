@@ -14,6 +14,7 @@ from rxembed.metal_isomers import Isomer
 from . import calculators as _refine
 from .dispatch import (
     _attach_stereo,
+    _default_stereo,
     _embed_dispatch,
     _normalize,
     _stereo_enumerated_embed,
@@ -45,7 +46,7 @@ def embed(
     seed=0xF00D,
     threads=0,
     knowledge=True,
-    stereo="racemic",
+    stereo=None,
     trajectory=False,
 ):
     """Embed conformers (optionally constrained), returning an `Ensemble`, an `EnsembleSet`, or a `list`.
@@ -61,18 +62,19 @@ def embed(
     is sugar for a coords-``fix``: ``(reference, SMARTS_or_map)``. A SMARTS matches the target and a Mol or
     Ensemble reference; an .xyz path or (N,3) array needs ``{target_i: ref_i}``.
 
-    ``stereo=`` governs undefined chirality of a coordinate-free input (point R/S + double-bond E/Z; defined
-    centres held, meso dropped, chiral-at-P included, metal never enumerated):
+    ``stereo=`` governs point R/S and double-bond E/Z (meso dropped, chiral-at-P included, metal never
+    enumerated):
 
-    - ``'racemic'`` (default): every stereoisomer embedded with equal effort, folded into one `EnsembleSet`
-      and never energy-pruned against the others. A fully-defined input is untouched.
-    - ``'separate'``: a ``list[EnsembleSet]``, one per configuration.
+    - omitted: enumerate only stereo left undefined in a graph; preserve the measured state of a geometry.
+    - ``'racemic'``: enumerate every configurable graph element, including defined ones.
+    - ``'separate'``: enumerate undefined elements as a ``list[EnsembleSet]``, one per configuration.
     - ``'free'``: one embed, stereocentres left to the ETKDG seed.
 
     For a geometry input stereo is already 3D-defined, so ``stereo=`` instead tunes the preservation filter
     for chirality the embed cannot keep. ``contacts=`` reaches `nci_modes`; ``metal=`` / ``coordinate=`` reach
     `rx.metal`.
     """
+    stereo = _default_stereo(source, stereo)
     _validate_stereo(stereo)
     if not isinstance(trajectory, bool):
         raise TypeError("trajectory must be True or False")

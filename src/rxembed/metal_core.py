@@ -224,8 +224,12 @@ def _shift_phantoms(cons, offset):
     for name in ("distances", "pulls", "floors", "dg_floors"):
         setattr(cons, name, {key(k): v for k, v in getattr(cons, name).items()})
     cons.angles = {key(k): v for k, v in cons.angles.items()}
-    cons.spheres = tuple(  # the re-solve recipe names the dummies too; donors/order index real atoms only
-        s._replace(haptic=tuple((bump[d], ring) for d, ring in s.haptic)) for s in cons.spheres
+    cons.spheres = tuple(
+        s._replace(
+            donors=tuple(bump.get(d, d) for d in s.donors),
+            winding=tuple((bump[d], sign) for d, sign in s.winding),
+        )
+        for s in cons.spheres
     )
 
 
@@ -464,7 +468,9 @@ def _collapse_haptic(mol, donors):
     haptic = {}
     for site in faces:
         idx = em.AddAtom(Chem.Atom(SURROGATE))  # a bond-less carbon: excluded volume in the DG, Xe-ghosted in the FF
-        em.GetAtomWithIdx(idx).SetNoImplicit(True)  # a point, not a valence: no implicit H, as for the metal
+        dummy = em.GetAtomWithIdx(idx)
+        dummy.SetNoImplicit(True)  # a point, not a valence: no implicit H, as for the metal
+        dummy.SetHybridization(Chem.HybridizationType.SP3)  # keep the transient point typable by UFF
         if conf is not None:
             conf.SetAtomPosition(idx, Point3D(*np.mean([list(conf.GetAtomPosition(a)) for a in site], axis=0)))
         vertices.append(idx)
@@ -618,6 +624,20 @@ def _site_radius(mol, site, cid=-1):
     return float(np.sqrt(tot)) / len(site)
 
 
+def _reject_metal_bonds(mol):
+    """Reject direct metal-metal bonds until their bond type can be restored losslessly."""
+    metals = set(metal_indices(mol))
+    direct = [
+        (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+        for bond in mol.GetBonds()
+        if bond.GetBeginAtomIdx() in metals and bond.GetEndAtomIdx() in metals
+    ]
+    if direct:
+        raise ValueError(
+            f"direct metal-metal bonds {direct} are not supported because their bond type cannot be restored"
+        )
+
+
 def surrogate_all_metals(mol):
     """Surrogate every metal centre (bonds removed, carbon) for a multi-metal complex.
 
@@ -628,6 +648,7 @@ def surrogate_all_metals(mol):
     idxs = metal_indices(mol)
     if not idxs:
         raise ValueError("no metal centre found")
+    _reject_metal_bonds(mol)
     em = Chem.RWMol(mol)
     metals, hands, ambiguous = [], {}, set()
     for m in idxs:
@@ -828,7 +849,7 @@ def label(mol, metal, donors, cid, geometry=None):
     for a in range(len(donors)):
         for b in range(a + 1, len(donors)):
             same = mol.GetAtomWithIdx(donors[a]).GetSymbol() == mol.GetAtomWithIdx(donors[b]).GetSymbol()
-            if same and _vertex_angle(pos[donors[a]] - pos[metal], pos[donors[b]] - pos[metal]) > _TRANS_ANGLE:
+            if same and _vertex_angle(pos[donors[a]] - pos[metal], pos[donors[b]] - pos[metal]) >= _TRANS_ANGLE:
                 return "trans"
     return "cis"
 
@@ -919,12 +940,64 @@ def _donor_classes(mol, donors):
     return {d: find(("perceived", ranks[at[d]])) for d in donors}
 
 
-_FACE_MIN = 3  # an eta2 bond is its own mirror: it has no winding
+def _site_classes(mol, sites, haptic=None, coordination=()):
+    """Map each occupied coordination site to the symmetry class of its atom or complete haptic face.
+
+    A face marker joined to every constituent atom ranks the rooted atom set itself. A multiset of individual
+    atom ranks is insufficient: a vertex-transitive ligand can still have constitutionally distinct edge orbits.
+    `coordination` temporarily restores stripped donor roles, so bridging and terminal donors cannot tie.
+    """
+    haptic = haptic or {}
+    occupied = [site for site in sites if site != VACANT]
+    atoms = {atom for site in occupied for atom in (haptic.get(site) or (site,))}
+    atoms.update(donor for donor, _metal, _atomic_num, _charge in coordination)
+    ranked, at = _remove_routine_hydrogens(mol, atoms)
+    rw = Chem.RWMol(ranked)
+    for donor, metal, atomic_num, charge in coordination:
+        if donor not in at or metal not in at:
+            continue
+        atom = rw.GetAtomWithIdx(at[metal])
+        atom.SetAtomicNum(atomic_num)
+        atom.SetFormalCharge(charge)
+        atom.SetIsotope(1000 + charge)  # retain oxidation state through the resonance-flat ranking
+        if rw.GetBondBetweenAtoms(at[donor], at[metal]) is None:
+            rw.AddBond(at[donor], at[metal], Chem.BondType.ZERO)
+    markers = {}
+    for site in occupied:
+        marker = rw.AddAtom(Chem.Atom(0))
+        rw.GetAtomWithIdx(marker).SetNoImplicit(True)
+        for atom in haptic.get(site) or (site,):
+            rw.AddBond(marker, at[atom], Chem.BondType.ZERO)
+        markers[site] = marker
+    marked = rw.GetMol()
+    marked.UpdatePropertyCache(strict=False)
+    Chem.FastFindRings(marked)
+    perceived = list(Chem.CanonicalRankAtoms(marked, breakTies=False))
+    flat = _flat_ranks(marked)
+    root = {}
+
+    def find(x):
+        while root.setdefault(x, x) != x:
+            x = root[x] = root[root[x]]
+        return x
+
+    for marker in markers.values():
+        a, b = find(("perceived", perceived[marker])), find(("flat", flat[marker]))
+        root[max(a, b)] = min(a, b)
+    return {site: (find(("perceived", perceived[marker])),) for site, marker in markers.items()}
+
+
+_ETA2 = 2
+_FACE_MIN = 3
 _PATH_ENDS = 2  # an open haptic face (an allyl) has two atoms with one face-neighbour
+_FACE_EPS = 1e-8
+_HALF_TURN = 180
+_CIS_STEREO = {Chem.BondStereo.STEREOCIS, Chem.BondStereo.STEREOZ}
+_TRANS_STEREO = {Chem.BondStereo.STEREOTRANS, Chem.BondStereo.STEREOE}
 
 
 def _face_walk(mol, face):
-    """Return ``(atoms in bond order, closed)`` for an unbranched haptic face, else ``None``."""
+    """Order a haptic face that is a simple path or cycle; otherwise return ``None``."""
     inside = set(face)
     nbrs = {a: sorted(n.GetIdx() for n in mol.GetAtomWithIdx(a).GetNeighbors() if n.GetIdx() in inside) for a in face}
     ends = [a for a in face if len(nbrs[a]) == 1]
@@ -957,8 +1030,107 @@ def _canonical_face_walk(mol, face, ranks):
     return (order if forward < reverse else order[::-1]), closed
 
 
-def _face_winding(mol, pos, metal, face, ranks):
-    """Return ``'+'``/``'-'`` for a planar-chiral haptic face, else ``''``."""
+def _eta2_centres(mol, face, ranks, metal=None):
+    """Return CIP-orderable trigonal centres on an eta2 face."""
+    if len(face) != _ETA2 or mol.GetBondBetweenAtoms(*face) is None:
+        return []
+    out = []
+    for atom in face:
+        neighbours = [n.GetIdx() for n in mol.GetAtomWithIdx(atom).GetNeighbors() if n.GetIdx() != metal]
+        ordered = sorted(neighbours, key=ranks.__getitem__, reverse=True)
+        if len(ordered) == _MIN_STEREO_NEIGHBOURS and len({ranks[n] for n in ordered}) == len(ordered):
+            key = (ranks[atom], tuple(sorted((ranks[n] for n in ordered), reverse=True)))
+            out.append((atom, key, ordered))
+    return out
+
+
+def _eta2_signatures(mol, face, ranks=None):
+    """Return the two mirror-related re/si signatures available to an eta2 face."""
+    try:
+        ranks = list(Chem.ComputeAtomCIPRanks(mol)) if ranks is None else ranks
+    except (RuntimeError, ValueError):
+        return (), ()
+    centres = _eta2_centres(mol, face, ranks)
+    if not centres:
+        return (), ()
+    if len(centres) == 1:
+        signature = ((centres[0][1], "re"),)
+    else:
+        a, b = face
+        bond = mol.GetBondBetweenAtoms(a, b)
+        refs = list(bond.GetStereoAtoms())
+        if len(centres) != _ETA2:
+            return (), ()
+        if bond.GetStereo() in _CIS_STEREO | _TRANS_STEREO and len(refs) == _ETA2:
+            cis = bond.GetStereo() in _CIS_STEREO
+        elif (
+            bond.GetStereo() == Chem.BondStereo.STEREONONE
+            and bond.IsInRing()
+            and not any(
+                info.type == Chem.StereoType.Bond_Double and info.centeredOn == bond.GetIdx()
+                for info in Chem.FindPotentialStereo(mol)
+            )
+        ):
+            cis = True  # the graph fixes the small-ring alkene; there is no independent E/Z element
+            ring = min((set(r) for r in mol.GetRingInfo().AtomRings() if {a, b} <= set(r)), key=len)
+            refs = [
+                next(
+                    n.GetIdx()
+                    for n in mol.GetAtomWithIdx(atom).GetNeighbors()
+                    if n.GetIdx() != other and n.GetIdx() in ring
+                )
+                for atom, other in ((a, b), (b, a))
+            ]
+        else:
+            return (), ()  # includes STEREOANY and an undefined large-ring E/Z element
+        if bond.GetBeginAtomIdx() != a:
+            refs.reverse()
+        ra, rb = refs
+        try:
+            other_a = next(n.GetIdx() for n in mol.GetAtomWithIdx(a).GetNeighbors() if n.GetIdx() not in {b, ra})
+            other_b = next(n.GetIdx() for n in mol.GetAtomWithIdx(b).GetNeighbors() if n.GetIdx() not in {a, rb})
+        except StopIteration:
+            return (), ()
+        angle = {b: 0, ra: 120, other_a: 240, a: 180}
+        angle[rb], angle[other_b] = (60, -60) if cis else (-60, 60)
+        signature = tuple(
+            sorted(
+                (
+                    key,
+                    "si" if 0 < (angle[ordered[1]] - angle[ordered[0]]) % 360 < _HALF_TURN else "re",
+                )
+                for _atom, key, ordered in centres
+            )
+        )
+    mirror = tuple(sorted((key, "si" if name == "re" else "re") for key, name in signature))
+    return signature, mirror
+
+
+def _face_has_orientation(mol, face, ranks):
+    """Return whether a haptic face has two distinguishable mirror orientations."""
+    if len(face) == _ETA2:
+        signature, mirror = _eta2_signatures(mol, face)
+        return bool(signature and signature != mirror)
+    return _canonical_face_walk(mol, face, ranks) is not None
+
+
+def _face_winding(mol, pos, metal, face, ranks, eta2_ranks=None):
+    """Return the canonical ``'+'``/``'-'`` orientation of a haptic face, else ``''``."""
+    if len(face) == _ETA2:
+        try:
+            eta2_ranks = list(Chem.ComputeAtomCIPRanks(mol)) if eta2_ranks is None else eta2_ranks
+        except (RuntimeError, ValueError):
+            return ""
+        signature = []
+        for atom, key, ordered in _eta2_centres(mol, face, eta2_ranks, metal):
+            centre = pos[atom]
+            volume = float(np.cross(pos[ordered[0]] - centre, pos[ordered[1]] - centre) @ (pos[metal] - centre))
+            if abs(volume) <= _FACE_EPS:
+                return ""
+            signature.append((key, "si" if volume > 0 else "re"))
+        signature = tuple(sorted(signature))
+        mirror = tuple(sorted((key, "si" if name == "re" else "re") for key, name in signature))
+        return "+" if signature < mirror else "-" if signature > mirror else ""
     canonical = _canonical_face_walk(mol, face, ranks)
     if canonical is None:
         return ""
@@ -973,7 +1145,7 @@ def _face_winding(mol, pos, metal, face, ranks):
 
 
 def _face_descriptors(mol, donors, haptic, windings):
-    """Return ``Rₚ``/``Sₚ`` labels for uniquely RDKit-priority-orderable closed haptic faces.
+    """Return re/si or ``Rₚ``/``Sₚ`` labels for uniquely priority-orderable haptic faces.
 
     Schlögl's metallocene convention views the face from opposite the metal: descending CIP priority
     clockwise is ``Rₚ``. The stored ``+`` winding means the canonical face walk is counterclockwise in
@@ -1008,7 +1180,14 @@ def _face_descriptors(mol, donors, haptic, windings):
     classes = _donor_classes(mol, donors)
     out = {}
     for dummy, winding in windings.items():
-        canonical = _canonical_face_walk(mol, haptic.get(dummy, ()), classes)
+        face = haptic.get(dummy, ())
+        if len(face) == _ETA2:
+            signature, mirror = _eta2_signatures(mol, face, priorities)
+            if winding in "+-" and signature and signature != mirror:
+                selected = min(signature, mirror) if winding == "+" else max(signature, mirror)
+                out[dummy] = f"({','.join(name for _key, name in selected)})"
+            continue
+        canonical = _canonical_face_walk(mol, face, classes)
         if winding not in "+-" or canonical is None or not canonical[1]:
             continue
         sequence = canonical[0]
@@ -1039,7 +1218,7 @@ def _chelate_edges(mol, vertices, haptic=None):
     )
 
 
-def chirality_of(mol, donors, geometry, vertices, haptic=None):
+def chirality_of(mol, donors, geometry, vertices, haptic=None, coordination=()):
     """Return the metal centre's chirality tag (``'D'`` / ``'L'``, or ``''`` when achiral or undecidable).
 
     `vertices[v]` is the donor seated at polyhedron vertex `v`, or ``VACANT``. Name-agnostic and
@@ -1049,7 +1228,12 @@ def chirality_of(mol, donors, geometry, vertices, haptic=None):
     dirs = vertex_dirs(geometry)
     if dirs is None:
         return ""
-    return _poly.handedness(dirs, list(vertices), _donor_classes(mol, donors), _chelate_edges(mol, vertices, haptic))
+    return _poly.handedness(
+        dirs,
+        list(vertices),
+        _site_classes(mol, vertices, haptic, coordination),
+        _chelate_edges(mol, vertices, haptic),
+    )
 
 
 def realised_chirality(mol, cid, geometry, vertices, metal, chirality, haptic=None):
