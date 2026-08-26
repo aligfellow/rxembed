@@ -372,21 +372,26 @@ class Ensemble(Conformers):
                         return False
         return True
 
-    def _relax_into_windows(self):
+    def _relax_into_windows(self, trajectory=False):
         """Relax constrained seeds into their windows without finalizing the result.
 
         The metal context remains live for later acceptance and retry gates. Embed publishes geometry, not an
         energy, and unconstrained seeds receive no unrequested force-field pass.
         """
+        if trajectory and not self.cons.is_constrained:
+            raise ValueError("trajectory records restrained-UFF cleanup; this embed has no constraints to clean up")
+        self.trajectory = None
         if not self.ids or not self.cons.is_constrained:
             return self
+        frames = [] if trajectory else None
         seed_pos = {c: self._mol.GetConformer(c).GetPositions() for c in self.ids}
-        e = self._relax_constrained(_BASE_STIFFNESS, operation="embed")
+        e = self._relax_constrained(_BASE_STIFFNESS, operation="embed", _frames=frames)
         # The relax can tear a seed or miss a numeric fix. Retry from the seed, then reject any off-fix result;
         # unlike a torn free bond, an off-fix seed is not a valid fallback for `fix`.
-        self._rescue_torn(seed_pos, _BASE_STIFFNESS, operation="embed")
+        self._rescue_torn(seed_pos, _BASE_STIFFNESS, operation="embed", _frames=frames)
         self.discarded += self._reject_missed_fixes("embed")
         self._hold_metal_hand(_BASE_STIFFNESS, _MAX_ITERS, operation="embed")
+        self._store_trajectory(frames)
         self.energies = {}  # embed publishes geometry; minimize owns the FF score
         self._seeds_relaxed = e is not None
         return self
@@ -396,8 +401,7 @@ class Ensemble(Conformers):
 
         Constrained systems use restrained UFF; others use MMFF where typeable, then UFF. Failed geometries
         leave `ids` but remain available to `duplicates()` and are listed in `discarded`. Metal failures may be
-        replaced with fresh
-        seeds. The call is idempotent until a search changes the geometries.
+        replaced with fresh seeds. The call is idempotent until a search changes the geometries.
         """
         if self._minimized:
             return self
@@ -453,6 +457,9 @@ class Ensemble(Conformers):
         if self.metal_bonds:  # connectivity finalize, last: geometry/element/charge now settled, so re-add the
             # surrogate-stripped M-donor bonds as dative. Every gate above saw the bond-less surrogate.
             self._mol = _metal.connect_metal(self._mol, self.metal_bonds)
+        if self.trajectory is not None:
+            frames = [conf.GetPositions().copy() for conf in self.trajectory.GetConformers()]
+            self._store_trajectory(frames)  # clear it if a later acceptance gate replaced the endpoint
         self.unrelaxed = [i for i in self.unrelaxed if i in self.ids]
         self._minimized = True
         return self
@@ -473,8 +480,10 @@ class Ensemble(Conformers):
                         _error_summary(err),
                     )
             else:
+                self.trajectory = None
                 e = self._relax_constrained(stiffness, max_iters)  # escalates if the soft relax tears every bond
         else:
+            self.trajectory = None
             e = _refine.ff_energies(self._mol, minimize=True)
         if e is not None:
             self.energies = {c.GetId(): float(e[k]) for k, c in enumerate(self._mol.GetConformers())}
@@ -1035,6 +1044,7 @@ class Ensemble(Conformers):
             reacted={i: v for i, v in self.reacted.items() if i in selected},
             sphere=dict(self.sphere),
             metal_bonds=list(self.metal_bonds),
+            trajectory=Chem.Mol(self.trajectory) if self.trajectory is not None and ids == self.ids else None,
         )
 
     def select_stereo(self, like, spec="preserve"):

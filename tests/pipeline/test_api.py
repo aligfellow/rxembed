@@ -421,6 +421,33 @@ def test_failed_embed_relax_is_not_marked_settled(monkeypatch):
         assert np.array_equal(ens.mol.GetConformer(cid).GetPositions(), seed[cid])
 
 
+def test_embed_records_the_real_restrained_uff_cleanup():
+    smiles = "C[P]1(C)CC[P](C)(C)->[Ni+2]<-12<-[O-]C(=O)C[N-]->2C"
+    iso = rx.metal(smiles, "SPL")[0]
+    ens = rx.embed(iso, n=1, seed=19, trajectory=True)
+    trail = ens.trajectory
+
+    assert trail.GetNumConformers() > 2
+    assert trail.GetAtomWithIdx(iso.metal).GetSymbol() == "Ni"
+    assert not np.allclose(trail.GetConformer(0).GetPositions(), trail.GetConformer(1).GetPositions())
+    assert np.allclose(
+        trail.GetConformer(trail.GetNumConformers() - 1).GetPositions(), ens.mol.GetConformer().GetPositions()
+    )
+    assert all(report.ok() for report in ens.check().values())
+
+    ens.minimize()
+    assert ens.trajectory.GetNumConformers() == trail.GetNumConformers()
+    assert ens[:0].trajectory is None
+
+
+def test_trajectory_is_an_explicit_single_path_request():
+    spec = {"constrain": {(0, 4): (2.5, 3.0)}}
+    with pytest.raises(TypeError, match="True or False"):
+        rx.embed("OCCCO", n=1, trajectory=10, **spec)
+    with pytest.raises(ValueError, match="requires n=1"):
+        rx.embed("OCCCO", n=2, trajectory=True, **spec)
+
+
 # ---------------------------------------------------------------------------------------------------------
 # Seed vs relax: which stage puts the geometry in the window (was test_seed_windows.py)
 #

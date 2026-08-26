@@ -470,6 +470,38 @@ def test_restored_donor_hand_is_rescored(monkeypatch):
     assert np.array_equal(energies, calls[-1][1])
 
 
+def test_trajectory_keeps_only_the_accepted_stiffness(monkeypatch):
+    mol = _with_geometry("CCO")
+    confs = Conformers(mol, [0], Constraints(distances={(0, 2): (2.0, 3.0)}))
+    seed = mol.GetConformer(0).GetPositions().copy()
+    attempts = []
+
+    def marked_uff(mol, cons, *, stiffness, max_iters, conf_ids=None, _snapshots=None, **_kw):
+        if max_iters == 0:
+            return np.array([0.0])
+        attempts.append(stiffness)
+        cid = int(conf_ids[0]) if conf_ids else 0
+        positions = mol.GetConformer(cid).GetPositions().copy()
+        positions[0, 0] = len(attempts)
+        for atom, xyz in enumerate(positions):
+            mol.GetConformer(cid).SetAtomPosition(atom, xyz.tolist())
+        if _snapshots is not None:
+            _snapshots[cid] = [positions.copy()]
+        return np.array([float(stiffness)])
+
+    monkeypatch.setattr(emb, "restrained_uff", marked_uff)
+    monkeypatch.setattr(Conformers, "_intact", lambda self, cid: len(attempts) >= 2)
+    frames = []
+    confs._relax_constrained(BASE_STIFFNESS, _frames=frames)
+    confs._store_trajectory(frames)
+
+    assert confs.trajectory is not None
+    xs = [conf.GetPositions()[0, 0] for conf in confs.trajectory.GetConformers()]
+    assert attempts[:2] == [BASE_STIFFNESS, 3 * BASE_STIFFNESS]
+    assert xs == pytest.approx([seed[0, 0], 2.0]), "the rejected first-attempt frame leaked into the trajectory"
+    assert confs[:0].trajectory is None
+
+
 # ---------------------------------------------------------------------------------------------------------
 # the metal-centre handedness gate
 # ---------------------------------------------------------------------------------------------------------

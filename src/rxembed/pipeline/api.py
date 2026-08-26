@@ -46,6 +46,7 @@ def embed(
     threads=0,
     knowledge=True,
     stereo="racemic",
+    trajectory=False,
 ):
     """Embed conformers (optionally constrained), returning an `Ensemble`, an `EnsembleSet`, or a `list`.
 
@@ -53,7 +54,8 @@ def embed(
     the input is inherently several poses (metal isomers, NCI modes, ambiguous ``coordinate=``, a racemate);
     a ``list[EnsembleSet]`` for ``stereo='separate'``, one per configuration, which does not chain.
 
-    A constrained embed comes back relaxed into its windows; only the geometry moves.
+    A constrained embed comes back relaxed into its windows; only the geometry moves. ``trajectory=True``
+    requires one conformer and stores the accepted restrained-UFF cleanup in ``result.trajectory``.
 
     ``fix`` / ``constrain`` are the core verbs, documented in the `constraints` module docstring. ``template``
     is sugar for a coords-``fix``: ``(reference, SMARTS_or_map)``. A SMARTS matches the target and a Mol or
@@ -72,6 +74,10 @@ def embed(
     `rx.metal`.
     """
     _validate_stereo(stereo)
+    if not isinstance(trajectory, bool):
+        raise TypeError("trajectory must be True or False")
+    if trajectory and n != 1:
+        raise ValueError("trajectory=True requires n=1")
 
     dispatch_kw = {
         "metal": metal,
@@ -93,20 +99,22 @@ def embed(
     else:
         result = _embed_dispatch(source, **dispatch_kw)
         _attach_stereo(result, source, charge, stereo)
-    return _relax_embedded(result)
+    return _relax_embedded(result, trajectory)
 
 
-def _relax_embedded(result):
+def _relax_embedded(result, trajectory=False):
     """Relax every embedded candidate into its windows: the one seam `embed` returns through.
 
     `EnsembleSet` subclasses `list`, so the plain-list branch must come last: an earlier
     ``isinstance(…, list)`` would downgrade an EnsembleSet to a bare list.
     """
     if isinstance(result, EnsembleSet):
-        return result._map("_relax_into_windows")
+        return result._map("_relax_into_windows", trajectory=trajectory)
     if isinstance(result, Ensemble):
-        return result._relax_into_windows()
-    return [r._map("_relax_into_windows") for r in result]  # stereo='separate' -> a plain list of EnsembleSet
+        return result._relax_into_windows(trajectory=trajectory)
+    return [
+        r._map("_relax_into_windows", trajectory=trajectory) for r in result
+    ]  # stereo='separate' -> a plain list of EnsembleSet
 
 
 def minimize(source, *, fix=None, constrain=None, template=None, charge=0, stiffness=_BASE_STIFFNESS):

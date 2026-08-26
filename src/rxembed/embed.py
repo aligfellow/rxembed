@@ -347,9 +347,10 @@ class Conformers:
     unrelaxed: list = field(default_factory=list, kw_only=True)
     # ids restored to their embed seed because no stiffness relaxed them without tearing or missing a fix
     seed: int | None = field(default=None, kw_only=True)
-    # ETKDG seed for metal-hand retries; None keeps minimize(spec) search-free
-    wrong_hand: list = field(default_factory=list, kw_only=True)
     # ids whose metal centre does not realise the selected hand
+    wrong_hand: list = field(default_factory=list, kw_only=True)
+    # seed plus snapshots from the accepted restrained-UFF attempt; recorded only when explicitly requested
+    trajectory: Chem.Mol | None = field(default=None, kw_only=True)
 
     @property
     def mol(self):
@@ -368,6 +369,27 @@ class Conformers:
     def _bond_tol(self):
         """The break threshold the accept gate uses; looser for a metal (see `METAL_BOND_TOL`)."""
         return METAL_BOND_TOL if self.iso is not None else BOND_TOL
+
+    def _store_trajectory(self, frames):
+        """Store accepted cleanup frames on the restored public graph."""
+        if frames is None:
+            return
+        if len(self.ids) != 1 or not frames:
+            self.trajectory = None
+            return
+        final = self._mol.GetConformer(int(self.ids[0])).GetPositions()
+        if not np.allclose(frames[-1], final):
+            self.trajectory = None
+            logger.warning("trajectory: final geometry was replaced after UFF; no continuous path was retained")
+            return
+        mol = self.mol
+        mol.RemoveAllConformers()
+        for positions in frames:
+            conf = Chem.Conformer(mol.GetNumAtoms())
+            for atom, xyz in enumerate(positions):
+                conf.SetAtomPosition(atom, xyz.tolist())
+            mol.AddConformer(conf, assignId=True)
+        self.trajectory = mol
 
     def _intact(self, cid):
         """Return True if `cid` retains its graph and every numeric fix."""
@@ -437,20 +459,23 @@ class Conformers:
         # a haptic face is one vertex
         return _metal.coplanar(pos, iso.metal, iso.donors, haptic=self.cons.haptic)
 
-    def _relax_constrained(self, stiffness, max_iters=MAX_ITERS, conf_ids=None, operation="minimize"):
+    def _relax_constrained(self, stiffness, max_iters=MAX_ITERS, conf_ids=None, operation="minimize", _frames=None):
         """Relax with restrained UFF, escalating only when no conformer passes the accept gate.
 
         Returns the accepted energies, or ``None`` when UFF cannot type the graph. `conf_ids` limits the batch.
         """
         # Hold a labile (carbanion/amine) donor's hand through the relax: the surrogate's bare degree-3 centre
         # inverts under UFF. Cap it with a dummy D, release when done.
+        n_atoms = self._mol.GetNumAtoms()
+        all_ids = [c.GetId() for c in self._mol.GetConformers()]
+        relaxing = all_ids if conf_ids is None else [int(c) for c in conf_ids]
+        initial = self._mol.GetConformer(relaxing[0]).GetPositions().copy() if _frames is not None else None
+        recorded, trajectory_done = [], False
         iso = self.iso
         held = _metal._hold_donor_chirality(self._mol, iso.metal, iso.donors, self.cons) if iso else (self._mol, [])
         self._mol, hold = held
         e, fc = None, stiffness
         try:
-            all_ids = [c.GetId() for c in self._mol.GetConformers()]
-            relaxing = all_ids if conf_ids is None else [int(c) for c in conf_ids]
             retrying = set(relaxing)
             self.unrelaxed = [i for i in self.unrelaxed if i not in retrying]
             embed_pos = {
@@ -472,10 +497,19 @@ class Conformers:
                 if step:  # restore the embed geometry before a stiffer retry (a big jump over-stiffens it)
                     restore()
                 fc = stiffness * mult
+                snapshots = {} if _frames is not None else None
                 try:
-                    e = restrained_uff(self._mol, self.cons, stiffness=fc, max_iters=max_iters, conf_ids=conf_ids)
+                    e = restrained_uff(
+                        self._mol,
+                        self.cons,
+                        stiffness=fc,
+                        max_iters=max_iters,
+                        conf_ids=conf_ids,
+                        _snapshots=snapshots,
+                    )
                 except RuntimeError as err:  # UFF can't build a force field for this graph, so keep the embed
                     restore()
+                    trajectory_done = True
                     self.unrelaxed.extend(i for i in relaxing if i not in self.unrelaxed)
                     logger.warning(
                         "%s: UFF could not relax this system (%s); keeping the embedded geometry",
@@ -487,6 +521,8 @@ class Conformers:
                 # so escalation never forces a phantom through as an out-of-plane pucker.
                 kept = [i for i in self.ids if self._intact(i) and self._coordination_ok(i)]
                 if kept or step == len(FC_ESCALATION) - 1:  # some survived (accept), or out of steps (caller drops)
+                    if snapshots is not None:
+                        recorded = snapshots.get(relaxing[0], [])
                     if step and kept:
                         logger.info(
                             "%s: relax missed the accept gate; escalated restraint stiffness to %gx", operation, fc
@@ -508,6 +544,7 @@ class Conformers:
             ]
             if inverted:
                 restore(inverted)
+                recorded = []  # the UFF path inverted the centre; the accepted result is the restored seed
                 self.unrelaxed.extend(c for c in inverted if c not in self.unrelaxed)
                 e = restrained_uff(self._mol, self.cons, stiffness=fc, max_iters=0, conf_ids=conf_ids)
                 logger.warning(
@@ -515,12 +552,20 @@ class Conformers:
                     operation,
                     len(inverted),
                 )
+            trajectory_done = True
         finally:  # release the hold on every exit path, including the early UFF-failure return; the dummy D
             if hold:  # is scaffolding for this relax alone
                 self._mol = _metal._release_donor_chirality(self._mol, hold, self.cons)
+            if _frames is not None and trajectory_done:
+                assert initial is not None
+                final = self._mol.GetConformer(relaxing[0]).GetPositions().copy()
+                path = [initial, *(frame[:n_atoms] for frame in recorded)]
+                if not np.allclose(path[-1], final):
+                    path.append(final)
+                _frames[:] = path
         return e
 
-    def _rescue_torn(self, seed_pos, stiffness, operation="minimize"):
+    def _rescue_torn(self, seed_pos, stiffness, operation="minimize", _frames=None):
         """Retry each torn or off-fix conformer separately; restore its seed if every stiffness fails.
 
         Returns the number tried. The pipeline separately rejects a donor hand that changes during rescue.
@@ -536,21 +581,39 @@ class Conformers:
         for cid in torn:
             for mult in FC_ESCALATION[1:]:  # rung 0 is the pass that already tore it
                 place(cid, seed_pos[cid])
+                snapshots = {} if _frames is not None else None
                 try:
-                    restrained_uff(self._mol, self.cons, stiffness=stiffness * mult, conf_ids=[int(cid)])
+                    restrained_uff(
+                        self._mol,
+                        self.cons,
+                        stiffness=stiffness * mult,
+                        conf_ids=[int(cid)],
+                        _snapshots=snapshots,
+                    )
                 except RuntimeError:  # UFF cannot build for this graph, so the seed is the best available
                     break
                 if self._intact(cid):
+                    if _frames is not None:
+                        assert snapshots is not None
+                        final = self._mol.GetConformer(cid).GetPositions().copy()
+                        path = [seed_pos[cid], *snapshots.get(cid, [])]
+                        if not np.allclose(path[-1], final):
+                            path.append(final)
+                        _frames[:] = path
                     rescued += 1
                     self.unrelaxed = [i for i in self.unrelaxed if i != cid]
                     break
             else:
                 place(cid, seed_pos[cid])
+                if _frames is not None:
+                    _frames[:] = [seed_pos[cid]]
                 if cid not in self.unrelaxed:
                     self.unrelaxed.append(cid)  # never relaxed: say so, or nothing downstream can tell
                 continue
             if not self._intact(cid):
                 place(cid, seed_pos[cid])
+                if _frames is not None:
+                    _frames[:] = [seed_pos[cid]]
                 if cid not in self.unrelaxed:
                     self.unrelaxed.append(cid)
         if torn:
@@ -671,6 +734,7 @@ class Conformers:
         `.energies` holds restrained-UFF values for ranking this result, not comparison across species.
         `pipeline.Ensemble.minimize()` adds acceptance gates and may drop failures.
         """
+        self.trajectory = None
         if not self.ids:
             return self
         if not self.cons.is_constrained:  # no window to tear against, so no ladder to climb
@@ -746,6 +810,7 @@ class Conformers:
             unrelaxed=[i for i in self.unrelaxed if i in sel],  # a slice must not silently lose these flags
             seed=self.seed,
             wrong_hand=[i for i in self.wrong_hand if i in sel],
+            trajectory=Chem.Mol(self.trajectory) if self.trajectory is not None and sel == self.ids else None,
         )
 
     def __len__(self):

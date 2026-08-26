@@ -84,6 +84,16 @@ optimized = best.optimize("gfn2")
 - `representatives()` keeps the lowest-energy member of each sampled mode.
 - `score("ff")` and `minimize()` use UFF; xTB scoring and optimization need the xTB executable.
 
+Record the restrained-UFF cleanup for one constrained conformer directly from `embed`:
+
+```python
+walk = rx.embed(selected_isomer, n=1, trajectory=True)
+cleanup = walk.trajectory  # RDKit Mol: DG seed, accepted UFF snapshots, final geometry
+```
+
+Only the accepted restraint attempt is retained; rejected retries are discarded. Recording requires one
+conformer because one `Mol` trajectory represents one path.
+
 Caller-supplied ASE calculators attach without adding ASE to rxembed. With `xtb` on `PATH`,
 [`xtb_ase`](https://github.com/Andrew-S-Rosen/xtb_ase) runs GFN2-xTB by default:
 

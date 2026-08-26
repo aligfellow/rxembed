@@ -7,6 +7,7 @@ import logging
 import numpy as np
 from rdkit import Chem, rdBase
 from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers, rdMolTransforms
+from rdkit.Chem import rdtrajectory as _rdtrajectory
 
 from . import mechanisms as _mech
 from .metal_core import COORDINATION_METALS, materialise_phantoms, strip_phantoms
@@ -217,7 +218,7 @@ def _prepare_uff_work(mol, cons, confs, frozen, max_iters):
     return work, original
 
 
-def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=None):
+def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=None, _snapshots=None):
     """Minimise conformers with frozen atoms and flat-bottomed constraint terms.
 
     ``stiffness`` scales the restraint walls. ``conf_ids`` restricts the operation to selected conformers.
@@ -267,7 +268,20 @@ def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=No
                 log = logger.warning if max_iters else logger.debug
                 log("UFF: retyped %d fixed-core bond(s) as outward dative edges", retyped)
             try:
-                ff.Minimize(maxIts=max_iters)
+                if _snapshots is None:
+                    ff.Minimize(maxIts=max_iters)
+                else:
+                    _status, snapshots = ff.MinimizeTrajectory(1, maxIts=max_iters)
+                    trajectory = _rdtrajectory.Trajectory(3, target.GetNumAtoms(), snapshots)
+                    _snapshots[cid] = [
+                        np.array(
+                            [
+                                [snapshot.GetPoint3D(i).x, snapshot.GetPoint3D(i).y, snapshot.GetPoint3D(i).z]
+                                for i in range(mol.GetNumAtoms())
+                            ]
+                        )
+                        for snapshot in (trajectory.GetSnapshot(i) for i in range(len(trajectory)))
+                    ]
                 energy = ff.CalcEnergy()
             except RuntimeError as error:
                 raise RuntimeError(f"UFF minimization failed: {_error_summary(error)}") from error
