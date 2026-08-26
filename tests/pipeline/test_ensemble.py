@@ -313,6 +313,15 @@ def test_slice_preserves_ensemble_state():
     assert ens.align().energy_kind == "ff"
 
 
+def test_reembedded_conformer_drops_stale_unrelaxed_id():
+    iso = rx.metal("[Pd](Cl)(Cl)(Cl)([N@H](C)O)", "square_planar")[0]
+    ens = rx.embed(iso, n=1, seed=2)
+    assert ens.unrelaxed == [0]
+    ens.minimize()
+    assert ens.ids == [1]
+    assert not ens.unrelaxed
+
+
 def test_refinement_preserves_ensemble_records():
     class FixedCalculator(Calculator):
         def energy(self, mol, conf_id=-1):

@@ -453,6 +453,7 @@ class Ensemble(Conformers):
         if self.metal_bonds:  # connectivity finalize, last: geometry/element/charge now settled, so re-add the
             # surrogate-stripped M-donor bonds as dative. Every gate above saw the bond-less surrogate.
             self._mol = _metal.connect_metal(self._mol, self.metal_bonds)
+        self.unrelaxed = [i for i in self.unrelaxed if i in self.ids]
         self._minimized = True
         return self
 
@@ -813,8 +814,8 @@ class Ensemble(Conformers):
         iso = self.iso
         metals, elements, spheres = frozenset(), None, dict(self.sphere)
         if iso is not None:  # pre-minimize: the mol still carries the surrogate, so name the real elements
-            metals = {iso.metal, *(mi for mi, _rz, _rq in iso.extra)}
-            elements = {iso.metal: iso.real_z, **{mi: rz for mi, rz, _rq in iso.extra}}
+            metals = {iso.metal, *(mi for mi, _rz, _rq in iso.spectator_metals)}
+            elements = {iso.metal: iso.real_z, **{mi: rz for mi, rz, _rq in iso.spectator_metals}}
             if iso.donors:
                 spheres.setdefault(iso.metal, list(iso.donors))
         else:  # post-minimize: the real elements are back, and `sphere` is what remembers the coordination
@@ -1163,7 +1164,7 @@ class Ensemble(Conformers):
                 "dropped them all); check the log for what was discarded"
             )
         mol = Chem.Mol(self._mol)  # the ensemble mol is already real (no haptic centroid dummy); work on a copy
-        if self.iso is not None:  # show the real metal(s) with their oxidation state, not the C surrogate
+        if self.iso is not None:  # show the real metal(s) with their formal charge, not the C surrogate
             self.iso.restore(mol)
         if align and len(self.ids) > 1:  # overlay frames on the rigid core
             try:

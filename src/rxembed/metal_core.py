@@ -209,8 +209,7 @@ def _shift_phantoms(cons, offset):
     Two transients are appended from the real atom count, a haptic centroid dummy and a labile donor's D-cap,
     but `materialise_phantoms` requires the centroid keys to be the consecutive block after that count, so
     whichever is appended second collides. This makes the caps take the low indices and the centroid block
-    slide above them. The combination is 31% of the tmQM haptic corpus: a Cp face whose atoms are also anionic
-    sp3 stereocentres.
+    slide above them, so haptic centroids and donor-chirality caps can coexist.
     """
     if not cons.haptic or not offset:
         return
@@ -313,7 +312,7 @@ def surrogate_metal(mol):
         hands[d] = a.GetChiralTag()
     real_z = em.GetAtomWithIdx(m).GetAtomicNum()
     a = em.GetAtomWithIdx(m)
-    real_q = a.GetFormalCharge()  # the oxidation state: zeroed here, handed back by `restore_metal`
+    real_q = a.GetFormalCharge()  # zeroed here, handed back by `restore_metal`
     a.SetAtomicNum(SURROGATE)
     a.SetNoImplicit(True)
     a.SetFormalCharge(0)
@@ -331,7 +330,7 @@ def surrogate_metal(mol):
 
 
 def restore_metal(mol, metal, real_z, real_q):
-    """Swap `metal` back from the surrogate to its real element and oxidation state.
+    """Swap `metal` back from the surrogate to its real element and formal charge.
 
     The charge is what reaches the calculator, so restoring only the element leaves an M(0) among anionic
     ligands and every real energy runs at the wrong total charge. The surrogate itself must stay neutral: a
@@ -352,7 +351,7 @@ def connect_metal(mol, donor_bonds, *, order=Chem.BondType.DATIVE):
     Dative rather than covalent: it counts toward the metal's valence, never the donor's, so it restores
     connectivity without touching any ligand's valence, H-count or charge. Coordinates untouched, idempotent.
     A bond the input drew covalent comes back dative, so the metal picks up radical electrons RDKit would
-    otherwise pair; element, oxidation state and total charge, which is what a calculator reads, are unaffected.
+    otherwise pair; element, formal charge and total charge, which is what a calculator reads, are unaffected.
 
     `order` exists for the one caller that needs the opposite: `metal_smiles.cxsmiles` asks for single
     on the sigma donors, because writing a string has to re-derive the ionic form from the donor's valence,
@@ -623,8 +622,8 @@ def surrogate_all_metals(mol):
     """Surrogate every metal centre (bonds removed, carbon) for a multi-metal complex.
 
     UFF must type the whole complex of a bimetallic TS, and `surrogate_metal` only does the first metal.
-    Returns ``(mol, metals)`` where ``metals`` is ``[(idx, real_z, real_q), ...]``, the element and oxidation
-    state `restore_metal` needs. Sanitised leniently, since a stripped η⁵-Cp is a radical fragment.
+    Returns ``(mol, metals)`` where ``metals`` is ``[(idx, real_z, real_q), ...]``, the element and formal
+    charge `restore_metal` needs. Sanitised leniently, since a stripped η⁵-Cp is a radical fragment.
     """
     idxs = metal_indices(mol)
     if not idxs:
@@ -918,6 +917,109 @@ def _donor_classes(mol, donors):
         a, b = find(("perceived", ranks[at[d]])), find(("flat", flat[at[d]]))
         root[max(a, b)] = min(a, b)  # the representative is a reading, so it is order-invariant too
     return {d: find(("perceived", ranks[at[d]])) for d in donors}
+
+
+_FACE_MIN = 3  # an eta2 bond is its own mirror: it has no winding
+_PATH_ENDS = 2  # an open haptic face (an allyl) has two atoms with one face-neighbour
+
+
+def _face_walk(mol, face):
+    """Return ``(atoms in bond order, closed)`` for an unbranched haptic face, else ``None``."""
+    inside = set(face)
+    nbrs = {a: sorted(n.GetIdx() for n in mol.GetAtomWithIdx(a).GetNeighbors() if n.GetIdx() in inside) for a in face}
+    ends = [a for a in face if len(nbrs[a]) == 1]
+    if any(len(nbrs[a]) > _PATH_ENDS for a in face) or len(ends) not in (0, _PATH_ENDS):
+        return None
+    walk = [min(ends) if ends else min(face)]
+    while len(walk) < len(face):
+        prev = walk[-2] if len(walk) > 1 else None
+        step = [a for a in nbrs[walk[-1]] if a != prev]
+        if not step:
+            return None
+        walk.append(min(step))
+    return walk, not ends
+
+
+def _canonical_face_walk(mol, face, ranks):
+    """Return the canonical direction around a planar-chiral haptic face, else ``None``."""
+    if len(face) < _FACE_MIN or (walked := _face_walk(mol, face)) is None:
+        return None
+    order, closed = walked
+    n = len(order)
+    classes = [ranks[a] for a in order]
+    if closed:
+        forward = min(tuple(classes[(start + i) % n] for i in range(n)) for start in range(n))
+        reverse = min(tuple(classes[(start - i) % n] for i in range(n)) for start in range(n))
+    else:
+        forward, reverse = tuple(classes), tuple(reversed(classes))
+    if forward == reverse:
+        return None
+    return (order if forward < reverse else order[::-1]), closed
+
+
+def _face_winding(mol, pos, metal, face, ranks):
+    """Return ``'+'``/``'-'`` for a planar-chiral haptic face, else ``''``."""
+    canonical = _canonical_face_walk(mol, face, ranks)
+    if canonical is None:
+        return ""
+    sequence, closed = canonical
+    centre = np.mean([pos[a] for a in sequence], axis=0)
+    following = sequence[1:] + sequence[:1] if closed else sequence[1:]
+    circulation = sum(
+        (np.cross(pos[a] - centre, pos[b] - centre) for a, b in zip(sequence, following, strict=False)),
+        start=np.zeros(3),
+    )
+    return "+" if float(circulation @ (centre - pos[metal])) > 0 else "-"
+
+
+def _face_descriptors(mol, donors, haptic, windings):
+    """Return ``Rₚ``/``Sₚ`` labels for uniquely RDKit-priority-orderable closed haptic faces.
+
+    Schlögl's metallocene convention views the face from opposite the metal: descending CIP priority
+    clockwise is ``Rₚ``. The stored ``+`` winding means the canonical face walk is counterclockwise in
+    that view. RDKit supplies its legacy CIP atom ranks; a tied pilot atom or tied direction keeps the exact
+    ``+``/``-`` parity unnamed instead of inventing an absolute descriptor. The stored sign remains the
+    authoritative general representation because RDKit does not implement planar CIP assignment. A choice
+    that disappears when other stereo is removed also stays unnamed rather than risk an uppercase descriptor
+    on a pseudoasymmetric plane.
+    """
+    if not windings:
+        return {}
+
+    def reference(ranks, sequence):
+        highest = max(ranks[a] for a in sequence)
+        pilots = [a for a in sequence if ranks[a] == highest]
+        if len(pilots) != 1:
+            return None
+        pilot = pilots[0]
+        i = sequence.index(pilot)
+        previous, following = sequence[i - 1], sequence[(i + 1) % len(sequence)]
+        if ranks[previous] == ranks[following]:
+            return None
+        return pilot, following if ranks[following] > ranks[previous] else previous
+
+    try:
+        priorities = Chem.ComputeAtomCIPRanks(mol)
+        unmarked = Chem.Mol(mol)
+        Chem.RemoveStereochemistry(unmarked)
+        constitutional = Chem.ComputeAtomCIPRanks(unmarked)
+    except (RuntimeError, ValueError):
+        return {}
+    classes = _donor_classes(mol, donors)
+    out = {}
+    for dummy, winding in windings.items():
+        canonical = _canonical_face_walk(mol, haptic.get(dummy, ()), classes)
+        if winding not in "+-" or canonical is None or not canonical[1]:
+            continue
+        sequence = canonical[0]
+        choice = reference(priorities, sequence)
+        if choice is None or choice != reference(constitutional, sequence):
+            continue
+        pilot, toward_second = choice
+        following = sequence[(sequence.index(pilot) + 1) % len(sequence)]
+        sense = (1 if winding == "+" else -1) * (1 if toward_second == following else -1)
+        out[dummy] = "Rₚ" if sense < 0 else "Sₚ"
+    return out
 
 
 def _chelate_edges(mol, vertices, haptic=None):

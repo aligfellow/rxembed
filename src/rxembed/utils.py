@@ -115,6 +115,14 @@ def bond_removal_mirrors(atom, partner) -> bool:
     return (len(partners) - 1 - partners.index(partner)) % 2 == 1
 
 
+def bond_replacement_mirrors(atom, partner) -> bool:
+    """Return whether replacing a tetrahedral neighbour by an appended one changes tag parity."""
+    partners = [b.GetOtherAtomIdx(atom.GetIdx()) for b in atom.GetBonds()]
+    if len(partners) not in (3, 4) or partner not in partners:
+        return False
+    return (len(partners) - 1 - partners.index(partner)) % 2 == 1
+
+
 def remove_bond(rw, i, j) -> None:
     """Remove a bond while preserving the geometry named by degree-four tetrahedral tags.
 

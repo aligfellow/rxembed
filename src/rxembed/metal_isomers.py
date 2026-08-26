@@ -14,6 +14,7 @@ from __future__ import annotations
 import itertools
 import math
 from collections import Counter
+from copy import copy
 from dataclasses import dataclass
 
 import numpy as np
@@ -33,8 +34,12 @@ from .metal_core import (
     _TRIAD,
     COORDINATION_METALS,
     VACANT,
+    _canonical_face_walk,
+    _chelate_edges,
     _collapse_haptic,
     _donor_classes,
+    _face_descriptors,
+    _face_winding,
     _frag_map,
     _haptic_sites,
     _vertex_atom,
@@ -58,6 +63,7 @@ from .metal_polyhedron import (
     _fit_trace,
     _seat_by_alignment,
     _vertex_angle,
+    canonical_slots,
     chirality_tag,
     describe,
     geometries_for_cn,
@@ -213,19 +219,19 @@ class Isomer:
     metal: int
     donors: list
     real_z: int
-    real_q: int  # the metal's oxidation state; the surrogate is neutral and `restore_metal` hands it back
+    real_q: int  # the metal's formal charge; the surrogate is neutral and `restore_metal` hands it back
     label: str
     geometry: str
     # No field has a dataclass default: `init=False` generates no __init__, so both builders set every field,
     # and the dataclass-field-order ignores are false positives -- there is no argument list to shadow.
     vertices: list
     chirality: str = ""  # metal-centre handedness, 'delta'/'lambda'/'': the name-agnostic stereo identity
-    extra: list  # ty: ignore[dataclass-field-order]  # spectator metals (idx, real_z, real_q), restored with
-    # `metal`
+    spectator_metals: list  # ty: ignore[dataclass-field-order]  # (idx, real_z, real_q), restored with `metal`
     stereo_ref: object = None  # input-geometry chirality fingerprint (for stereo='preserve')
     stereo_label: str = ""  # ligand stereoisomer tag ('C16:R'), distinct from the metal-centre `chirality`
     haptic: dict  # ty: ignore[dataclass-field-order]  # {centroid vertex -> its face's atoms}. A vertex is not
     # always an atom of `mol` -- an η² alkene, Cp or arene is one vertex -- so resolve it through here first.
+    haptic_winding: dict  # ty: ignore[dataclass-field-order]  # {centroid vertex -> '+'/'-'} when stated/measured
     donor_bonds: list  # ty: ignore[dataclass-field-order]  # stripped M-donor bonds, re-added dative by
     # `connect_metal`
 
@@ -279,8 +285,9 @@ class Isomer:
         self.label = _order_label(base, padded, geom, order)
         self.geometry, self.vertices = geom, vertices
         self.chirality = chirality_of(base, donors, geom, vertices, haptic)
-        self.extra, self.stereo_ref, self.stereo_label = [], None, ""
+        self.spectator_metals, self.stereo_ref, self.stereo_label = [], None, ""
         self.haptic = dict(haptic)
+        self.haptic_winding = _measured_haptic_windings(base, m, real_donors, haptic)
         self.donor_bonds = [(d, m) for d in real_donors]
 
     @classmethod
@@ -297,10 +304,11 @@ class Isomer:
         vertices,
         *,
         chirality="",
-        extra=(),
+        spectator_metals=(),
         stereo_ref=None,
         stereo_label="",
         haptic=(),
+        haptic_winding=(),
         donor_bonds=(),
     ):
         """Build an Isomer from already-derived parts, for a builder that surrogated the Mol itself.
@@ -311,9 +319,11 @@ class Isomer:
         iso = cls.__new__(cls)
         iso.mol, iso.cons, iso.metal, iso.donors = mol, cons, metal, donors
         iso.real_z, iso.real_q, iso.label, iso.geometry = real_z, real_q, label, geometry
-        iso.vertices, iso.chirality, iso.extra = list(vertices), chirality, list(extra)
+        iso.vertices, iso.chirality = list(vertices), chirality
+        iso.spectator_metals = list(spectator_metals)
         iso.stereo_ref, iso.stereo_label = stereo_ref, stereo_label
-        iso.haptic, iso.donor_bonds = dict(haptic), list(donor_bonds)
+        iso.haptic, iso.haptic_winding = dict(haptic), dict(haptic_winding)
+        iso.donor_bonds = list(donor_bonds)
         return iso
 
     def coordination(self):
@@ -321,15 +331,32 @@ class Isomer:
         return self.cons
 
     def restore(self, mol=None):
-        """Swap this isomer's surrogated metal(s) back to their real element and oxidation state; return `mol`.
+        """Swap this isomer's surrogated metal(s) back to their real element and formal charge; return `mol`.
 
         Acts on any molecule sharing this isomer's atom indexing, defaulting to its own. The charge matters:
         restoring only Z leaves an M(0) among anionic ligands and every real energy runs at the wrong total.
         """
         mol = self.mol if mol is None else mol
-        for mi, rz, rq in [(self.metal, self.real_z, self.real_q), *self.extra]:
+        for mi, rz, rq in [(self.metal, self.real_z, self.real_q), *self.spectator_metals]:
             restore_metal(mol, mi, rz, rq)
         return mol
+
+    @property
+    def haptic_configuration(self):
+        """Return ``'rac'``/``'meso'`` for an interchangeable pair of named haptic faces, else ``''``."""
+        descriptors = _face_descriptors(self.mol, self.donors, self.haptic, self.haptic_winding)
+        faces = list(descriptors)
+        if len(faces) != _PAIR or set(faces) != set(self.haptic_winding):
+            return ""
+        left, right = faces
+        ranks = _donor_classes(self.mol, self.donors)
+        forward = _winding_signature(self, {left: "+", right: "-"}, ranks)
+        reverse = _winding_signature(self, {left: "-", right: "+"}, ranks)
+        if forward != reverse:
+            return ""
+        mirror = {face: "-" if winding == "+" else "+" for face, winding in self.haptic_winding.items()}
+        current = _winding_signature(self, self.haptic_winding, ranks)
+        return "meso" if current == _winding_signature(self, mirror, ranks) else "rac"
 
     def summary(self):
         """Return this isomer's geometric identity string: ``geometry | per-vertex arrangement | chirality``.
@@ -342,7 +369,9 @@ class Isomer:
         if not self.geometry:
             return f"{_PT.GetElementSymbol(self.real_z)}{self.metal} (surrogated, no polyhedron)"
         stereo = f" | ligand {self.stereo_label}" if self.stereo_label else ""
-        return f"{self.geometry} | {arrangement(self)} | {self.chirality or 'achiral'}{stereo}"
+        configuration = self.haptic_configuration
+        haptic = f" | haptic {configuration}" if configuration else ""
+        return f"{self.geometry} | {arrangement(self)} | {self.chirality or 'achiral'}{haptic}{stereo}"
 
 
 def arrangement(iso):
@@ -351,19 +380,46 @@ def arrangement(iso):
     The unambiguous identity of an isomer, since the cis/trans label only describes a same-element pair and
     says nothing about where a vacancy sits. Order follows the polyhedron's `vertex_dirs`.
     """
+    descriptors = _face_descriptors(iso.mol, iso.donors, iso.haptic, iso.haptic_winding)
 
     def sym(d):
         if d == VACANT:
             return "·"
         if d in iso.haptic:  # a haptic face's centroid vertex: the ring, not a real atom index
             ring = iso.haptic[d]
-            return f"η{len(ring)}({min(ring)})"  # e.g. 'η5(1)': hapticity + the lowest-index ring atom, unambiguous
+            hand = descriptors.get(d, iso.haptic_winding.get(d, ""))
+            return f"η{len(ring)}{hand}({min(ring)})"
         return f"{iso.mol.GetAtomWithIdx(d).GetSymbol()}{d}"
 
     return " ".join(sym(d) for d in iso.vertices)
 
 
 arrange = arrangement  # alias so IsomerSet.filter(arrangement=…) can still call the formatter (param shadows it)
+
+
+def _winding_signature(iso, winding, ranks):
+    """Return the existing canonical-slot identity for one haptic winding assignment."""
+    keys = [
+        None
+        if donor == VACANT
+        else (
+            (tuple(sorted(ranks[a] for a in iso.haptic[donor])), winding.get(donor, ""))
+            if donor in iso.haptic
+            else ((ranks[donor],), "")
+        )
+        for donor in iso.vertices
+    ]
+    slots = canonical_slots(vertex_dirs(iso.geometry), keys, _chelate_edges(iso.mol, iso.vertices, iso.haptic))
+    return tuple(key for _slot, key in sorted(zip(slots, keys, strict=True)))
+
+
+def _measured_haptic_windings(mol, metal, donors, haptic):
+    """Return the planar-chiral face signs measured from a molecule's first conformer."""
+    if not haptic or mol.GetNumConformers() == 0:
+        return {}
+    pos = mol.GetConformer().GetPositions()
+    ranks = _donor_classes(mol, donors)
+    return {dummy: sign for dummy, face in haptic.items() if (sign := _face_winding(mol, pos, metal, face, ranks))}
 
 
 def from_geometry(mol):
@@ -383,6 +439,7 @@ def from_geometry(mol):
     """
     if mol.GetNumConformers() == 0:
         raise ValueError("from_geometry needs an input geometry (a Mol with a conformer)")
+    ligand_stereo = _stereo.stereo_from_3d(mol, exclude=metal_indices(mol))
     base, m, donors, real_z, real_q = surrogate_metal(mol)  # surrogate; conformer is preserved
     base, sites, haptic = _collapse_haptic(base, donors)  # each haptic face -> one centroid vertex (sigma pass thru)
     cons = coordination_from_geometry(base, m, sites, real_z, haptic)
@@ -414,7 +471,9 @@ def from_geometry(mol):
         geometry=geom,
         vertices=vertices,
         chirality=chirality_of(base, sites, geom, vertices, haptic=haptic),
+        stereo_label=ligand_stereo,
         haptic=dict(haptic),
+        haptic_winding=_measured_haptic_windings(base, m, donors, haptic),
         donor_bonds=[(d, m) for d in donors],  # the M-donor bonds surrogate_metal stripped, re-added on output
     )
 
@@ -423,10 +482,10 @@ def from_surrogate(mol, metals, donor_bonds, donors=()):
     """Record an already-surrogated complex as an `Isomer` carrying no polyhedron.
 
     On the fix/constrain path the sphere is held from the input geometry, not from a named record, so
-    `geometry`/`vertices`/`cons` stay empty and only the restore payload is real: element, oxidation state,
+    `geometry`/`vertices`/`cons` stay empty and only the restore payload is real: element, formal charge,
     spectator metals, and the stripped M-donor bonds a consumer must re-add.
     """
-    (m, real_z, real_q), extra = metals[0], metals[1:]
+    (m, real_z, real_q), spectator_metals = metals[0], metals[1:]
     return Isomer._from_parts(
         mol,
         cons=Constraints(),
@@ -437,7 +496,7 @@ def from_surrogate(mol, metals, donor_bonds, donors=()):
         label="",
         geometry="",
         vertices=[],
-        extra=extra,
+        spectator_metals=spectator_metals,
         donor_bonds=donor_bonds,
     )
 
@@ -457,33 +516,44 @@ class IsomerSet(list):
     Enumeration is cheap; the expensive MC search runs only on the `Isomer` you pick.
     """
 
-    def select(self, geometry=None, label=None, arrangement=None, chirality=None, index=None, stereo=None):
+    def select(self, geometry=None, label=None, arrangement=None, chirality=None, index=None, stereo=None, haptic=None):
         """Return the single `Isomer` matching the given keys.
 
         Key on `arrangement` (the unambiguous per-vertex slot map), `chirality`, `geometry`, `index`, the
-        ligand `stereo` tag (e.g. ``'C16:R'``, ``'16R'``, or unambiguous ``'C:R'``/``'R'``), or the coarse
-        `label`. Raises if zero or several match, listing every isomer so you can narrow it.
+        ligand `stereo` tag (e.g. ``'C16:R'``, ``'16R'``, or unambiguous ``'C:R'``/``'R'``), haptic
+        configuration (``'rac'``/``'meso'``), or the coarse `label`. Raises if zero or several match.
         """
         hits = self.filter(
-            geometry=geometry, label=label, arrangement=arrangement, chirality=chirality, index=index, stereo=stereo
+            geometry=geometry,
+            label=label,
+            arrangement=arrangement,
+            chirality=chirality,
+            index=index,
+            stereo=stereo,
+            haptic=haptic,
         )
         if len(hits) != 1:
-            have = [(k, i.geometry, i.chirality or "-", i.stereo_label or "-", arrange(i)) for k, i in enumerate(self)]
+            have = [
+                (k, i.geometry, i.chirality or "-", i.haptic_configuration or "-", i.stereo_label or "-", arrange(i))
+                for k, i in enumerate(self)
+            ]
             raise ValueError(
                 f"select(geometry={geometry!r}, label={label!r}, arrangement={arrangement!r}, "
-                f"chirality={chirality!r}, index={index!r}, stereo={stereo!r}) matched {len(hits)} isomer(s): "
+                f"chirality={chirality!r}, index={index!r}, stereo={stereo!r}, haptic={haptic!r}) "
+                f"matched {len(hits)} isomer(s): "
                 f"{'narrow it or pick by index' if hits else 'no match'}; have {have}"
             )
         return hits[0]
 
-    def filter(self, geometry=None, label=None, arrangement=None, chirality=None, index=None, stereo=None):
+    def filter(self, geometry=None, label=None, arrangement=None, chirality=None, index=None, stereo=None, haptic=None):
         """Return the subset matching the given keys, as an `IsomerSet` (keep several / pick by index).
 
         `label` matches the base tag, so ``'fac'`` also matches auto-numbered ``fac1``/``fac2``.
         `arrangement`, `chirality` and `geometry` match exactly. `stereo` accepts ``C5:R`` or ``5R``; ``C:R``
         and ``R`` are available when they identify one point centre, and E/Z work the same way for one double
         bond. Ambiguous shorthand raises with the indexed choices. `index` selects positionally. `geometry`
-        also takes a 3-letter code, and `chirality` accepts the Δ/Λ glyphs as well as the stored words.
+        also takes a 3-letter code, `chirality` accepts the Δ/Λ glyphs as well as the stored words, and
+        `haptic` accepts ``'rac'``/``'meso'`` where two equivalent faces define that relative configuration.
         """
         geometry, chirality = resolve_geometry(geometry), chirality_tag(chirality)
 
@@ -494,26 +564,30 @@ class IsomerSet(list):
                 and (arrangement is None or arrange(i) == arrangement)
                 and (chirality is None or i.chirality == chirality)
                 and (stereo is None or _stereo.matches_stereo(i.stereo_label, stereo))
+                and (haptic is None or i.haptic_configuration == haptic)
                 and (label is None or i.label == label or i.label.rstrip("0123456789") == label)
             )
 
         return IsomerSet(i for k, i in enumerate(self) if ok(k, i))
 
     def summary(self):
-        """Print each isomer (index, geometry, vertex slots, metal and ligand stereo) so you can pick one.
+        """Print each isomer (geometry, slots, metal, haptic and ligand stereo) so you can pick one.
 
         The arrangement (which donor sits at which vertex) is the unambiguous identity; chirality is
         displayed as ``Δ``/``Λ``/``-``. Stored values remain ``'delta'``/``'lambda'``/``''``. The coarse
         cis/trans/mer/fac name is not shown, because selecting on it is unreliable: use ``arrangement=`` /
         ``chirality=`` / index. Ligand stereo is displayed as ``C5:R`` or ``C6=C7:E``; indexed forms and
-        unambiguous element/configuration shorthand are selectable. Returns self.
+        unambiguous element/configuration shorthand are selectable. Interchangeable haptic face pairs show
+        ``rac``/``meso``.
         """
-        print("  idx  geometry  slots (vertex order)           metal  ligand")
+        print("  idx  geometry  slots (vertex order)           metal  haptic  ligand")
         for k, i in enumerate(self):
             code = POLYHEDRA[i.geometry].code
             hand = {"delta": "Δ", "lambda": "Λ"}.get(i.chirality, "-")
-            print(f"  [{k:>2}] {code:8s}  {arrange(i):29s} {hand:^5s}  {i.stereo_label or '-'}")
-        return self
+            print(
+                f"  [{k:>2}] {code:8s}  {arrange(i):29s} {hand:^5s}  "
+                f"{i.haptic_configuration or '-':6s}  {i.stereo_label or '-'}"
+            )
 
 
 def _resolve_center(mol, metals, center):
@@ -556,8 +630,10 @@ def _load_in_ligand_stereo(mol, geometry, center, fix, stereo, lengths="auto"):
         return None
     out = IsomerSet()
     for vmol, slabel in variants:  # each variant is stereo-defined, so recurse with stereo='free' and the
-        for iso in enumerate_isomers(vmol, geometry, center, fix, stereo="free", lengths=lengths):  # a no-op
-            iso.stereo_label = slabel
+        built = enumerate_isomers(vmol, geometry, center, fix, stereo="free", lengths=lengths)
+        label = _stereo.defined_stereo_label(vmol, exclude=metal_indices(vmol)) or slabel
+        for iso in _enumerate_haptic_windings(built):
+            iso.stereo_label = label
             out.append(iso)
     logger.info(
         "metal: %d undefined stereocentre(s) -> coordination x %d stereoisomer(s) = %d candidate(s)",
@@ -576,8 +652,8 @@ def _load_in_ligand_stereo(mol, geometry, center, fix, stereo, lengths="auto"):
 def _prepare_spectators(mol, metals, center):
     """Surrogate a multi-metal complex, enumerating `center` while holding each spectator metal's shape.
 
-    Returns ``(base, m, donors, real_z, real_q, extra, retain, spectator_bonds)``. A spectator keeps its
-    oxidation state and gets the same force field as the enumerated centre, its bond-less carbon firing the
+    Returns ``(base, m, donors, real_z, real_q, spectator_metals, retain, spectator_bonds)``. A spectator keeps its
+    formal charge and gets the same force field as the enumerated centre, its bond-less carbon firing the
     same fictitious LJ. ``spectator_bonds`` are its stripped M-donor pairs, re-added dative on the output.
     """
     m = _resolve_center(mol, metals, center)
@@ -601,17 +677,17 @@ def _prepare_spectators(mol, metals, center):
             "would be mis-counted as separate sigma donors). Enumerate the single-metal fragment instead"
         )
     real_z = mol.GetAtomWithIdx(m).GetAtomicNum()
-    real_q = mol.GetAtomWithIdx(m).GetFormalCharge()  # oxidation state, restored so xtb gets the right charge
+    real_q = mol.GetAtomWithIdx(m).GetFormalCharge()  # restored so xtb gets the right total charge
     spec = {
         s: (
             non_metal(mol.GetAtomWithIdx(s).GetNeighbors()),
             mol.GetAtomWithIdx(s).GetAtomicNum(),
-            mol.GetAtomWithIdx(s).GetFormalCharge(),  # a spectator keeps its oxidation state too
+            mol.GetAtomWithIdx(s).GetFormalCharge(),
         )
         for s in spectators
     }
     base, _metals_info = surrogate_all_metals(mol)  # surrogate every metal; the conformer is preserved
-    extra = [(s, spec[s][1], spec[s][2]) for s in spectators]
+    spectator_metals = [(s, spec[s][1], spec[s][2]) for s in spectators]
     # Hold each spectator's shape by relative pairwise distances, which are frame-independent and therefore
     # achiral: its handedness stays random here and is fixed by select_stereo afterward.
     retain = Constraints()
@@ -628,7 +704,7 @@ def _prepare_spectators(mol, metals, center):
         len(retain.distances),
     )
     spectator_bonds = [(d, s) for s in spectators for d in spec[s][0]]  # re-added dative so a spectator connects
-    return base, m, donors, real_z, real_q, extra, retain, spectator_bonds
+    return base, m, donors, real_z, real_q, spectator_metals, retain, spectator_bonds
 
 
 def _select_geometries(base, m, donors, haptic, geometry, n):
@@ -715,7 +791,7 @@ def _isomers_for_geometry(
     frozen_donors,
     fix_cons,
     retain,
-    extra,
+    spectator_metals,
     ref_sig,
     spectator_bonds=(),  # each held spectator metal's stripped M-donor pairs, re-added dative on the output
     lengths="auto",
@@ -768,9 +844,10 @@ def _isomers_for_geometry(
                 geometry=geom,
                 vertices=od,
                 chirality=chirality_of(base, donors, geom, od, haptic),
-                extra=extra,
+                spectator_metals=spectator_metals,
                 stereo_ref=ref_sig,
                 haptic=dict(haptic),
+                haptic_winding=_measured_haptic_windings(base, m, real_donors, haptic),
                 # the centre's real donors plus each spectator's, re-added dative on the output
                 donor_bonds=[(d, m) for d in real_donors] + list(spectator_bonds),
             )
@@ -795,7 +872,7 @@ def _number_shared_labels(out):
 
 
 def stated_arrangement(mol):
-    """Return the ``(geometry, {vertex: donor atom}, chirality)`` stated on `mol`, or ``None``.
+    """Return the stated ``(geometry, sites, chirality, haptic winding)`` on `mol`, or ``None``.
 
     The reading half of `metal_smiles.cxsmiles`, and it lives here rather than there because what it
     reads is RDKit atom properties on a `Mol`: an arrangement, which is this module's subject, not a string,
@@ -821,16 +898,31 @@ def stated_arrangement(mol):
         return None  # atomNote is general CXSMILES metadata; an unrelated note on a metal is not our arrangement
     if separator and chirality not in {"delta", "lambda"}:
         raise ValueError(f"the arrangement on this string has unknown metal chirality {chirality!r}")
-    sites = {}
+    sites, windings = {}, {}
     for atom_idx, (slot, winding) in slots.items():
         if winding:
-            raise NotImplementedError(
-                "CXSMILES haptic winding is recorded but embedding it is not supported; pass the Isomer or Mol"
-            )
+            if slot in windings and windings[slot] != winding:
+                raise ValueError(f"the haptic face at slot s{slot} carries both winding signs")
+            windings[slot] = winding
         sites.setdefault(slot, atom_idx)  # a haptic face writes one slot on every ring atom; any names it
     if name not in POLYHEDRA:
         raise ValueError(f"the arrangement on this string names {name!r}, which is not a polyhedron rxembed has")
-    return name, sites, chirality
+    return name, sites, chirality, windings
+
+
+def _load_stated_windings(iso, windings):
+    """Attach validated haptic winding signs from canonical slots to their centroid vertices."""
+    if not windings:
+        return
+    ranks = _donor_classes(iso.mol, iso.donors)
+    for slot, winding in windings.items():
+        donor = iso.vertices[slot]
+        face = iso.haptic.get(donor)
+        if face is None:
+            raise ValueError(f"slot s{slot}{winding} states haptic winding, but that slot is not a haptic face")
+        if _canonical_face_walk(iso.mol, face, ranks) is None:
+            raise ValueError(f"slot s{slot}{winding} states haptic winding on a mirror-symmetric face")
+        iso.haptic_winding[donor] = winding
 
 
 def _validate_stated_chirality(iso, chirality):
@@ -866,13 +958,39 @@ def _possible_stated_hands(iso):
     return hands
 
 
+def _enumerate_haptic_windings(isomers):
+    """Expand undefined planar-chiral haptic faces and drop symmetry-equivalent sign assignments."""
+    out = IsomerSet()
+    for iso in isomers:
+        ranks = _donor_classes(iso.mol, iso.donors)
+        faces = [
+            dummy
+            for dummy, face in iso.haptic.items()
+            if dummy not in iso.haptic_winding and _canonical_face_walk(iso.mol, face, ranks) is not None
+        ]
+        if not faces:
+            out.append(iso)
+            continue
+        seen = set()
+        for signs in itertools.product("+-", repeat=len(faces)):
+            winding = iso.haptic_winding | dict(zip(faces, signs, strict=True))
+            signature = _winding_signature(iso, winding, ranks)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            candidate = copy(iso)
+            candidate.haptic_winding = winding
+            out.append(candidate)
+    return out
+
+
 def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic", stereo_ref=None, lengths="auto"):
     """Enumerate all distinct coordination isomers of a `Mol` as ready-to-embed `Isomer` objects (metal surrogated).
 
     Returns an `IsomerSet` to pick from with ``IsomerSet.select(…)``. For a coordinate-free input,
-    `stereo='racemic'` also enumerates any undefined ligand stereocentre, so the set spans coordination x
-    ligand-stereo and each `Isomer` carries a `.stereo_label`; `stereo='free'` opts out and a geometry input
-    is untouched.
+    `stereo='racemic'` also enumerates undefined ligand stereocentres and planar-chiral haptic windings, so
+    the set spans their product with coordination isomerism; `stereo='free'` opts out and a geometry input is
+    untouched.
 
     `geometry` selects the polyhedra: ``None`` takes the donor-count default, a name takes one, a list takes
     each so you can compare energies yourself. Names come from ``geometries_for_cn``, each also nameable by
@@ -901,9 +1019,10 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic
     loaded = _load_in_ligand_stereo(mol, geometry, center, fix, stereo, lengths)
     if loaded is not None:
         return loaded  # each ligand-stereo variant recurses, so a stated arrangement is seated on every one
+    ligand_stereo = _stereo.defined_stereo_label(mol, exclude=metal_indices(mol))
     stated = stated_arrangement(mol)
     if stated is not None:
-        name, sites, chirality = stated
+        name, sites, chirality, windings = stated
         if (geometry is not None and resolve_geometry(geometry) != name) or fix:
             raise ValueError(
                 f"this input already states a {name} arrangement, so "
@@ -913,7 +1032,9 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic
         logger.info("using stated %s arrangement", describe(name))
         iso = Isomer(mol, name, sites, lengths=lengths)
         _validate_stated_chirality(iso, chirality)
+        _load_stated_windings(iso, windings)
         iso.chirality = chirality  # the metal note is the carrier; graph equivalence can erase it on chelates
+        iso.stereo_label = ligand_stereo
         return IsomerSet([iso])
     metals = metal_indices(mol)
     if not metals:
@@ -926,9 +1047,11 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic
             _resolve_center(mol, metals, center)
         base, m, donors, real_z, real_q = surrogate_metal(mol)
         base, donors, haptic = _collapse_haptic(base, donors)  # collapse each haptic face to one centroid vertex
-        extra, retain, spectator_bonds = [], Constraints(), []
+        spectator_metals, retain, spectator_bonds = [], Constraints(), []
     else:
-        base, m, donors, real_z, real_q, extra, retain, spectator_bonds = _prepare_spectators(mol, metals, center)
+        base, m, donors, real_z, real_q, spectator_metals, retain, spectator_bonds = _prepare_spectators(
+            mol, metals, center
+        )
     _say_length_source(base, lengths)  # once per molecule, not per ordering
     fix_cons = Constraints()
     frozen_donors = set()
@@ -956,12 +1079,16 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo="racemic
                 frozen_donors=frozen_donors,
                 fix_cons=fix_cons,
                 retain=retain,
-                extra=extra,
+                spectator_metals=spectator_metals,
                 ref_sig=stereo_ref,
                 spectator_bonds=spectator_bonds,
                 lengths=lengths,
             )
         )
+    if stereo != "free" and mol.GetNumConformers() == 0:
+        out = _enumerate_haptic_windings(out)
+    for iso in out:
+        iso.stereo_label = ligand_stereo
     _number_shared_labels(out)
     return out
 

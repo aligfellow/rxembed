@@ -161,6 +161,30 @@ def test_hybridisation_uses_metal_stripped_graph():
         assert h not in hyb, "a hydride has no donation axis and must never be classified"
 
 
+@pytest.mark.parametrize(
+    "smi",
+    ["Cl[Pd](Cl)(Cl)<-[S](=O)(C)CC", "Cl[Pd](Cl)(Cl)<-[S+]([O-])(C)CC"],
+    ids=["neutral-double", "charge-separated"],
+)
+def test_sulfoxide_lewis_forms_are_pyramidal_donors(smi):
+    iso = rx.metal(smi, "square_planar", stereo="free")[0]
+    sulfur = _donor(iso, "S")
+    assert DO._stripped_hybridisation(iso.mol)[sulfur] == Chem.HybridizationType.SP3
+    assert len([k for k in iso.cons.angles if k[1] == sulfur]) == 3
+    assert sulfur not in _capped(iso)
+
+
+def test_thioether_donor_stays_pyramidal():
+    iso = rx.metal("Cl[Pd](Cl)(Cl)<-[S](C)CC", "square_planar", stereo="free")[0]
+    ens = rx.embed(iso, n=1, seed=7).minimize()
+    sulfur = _donor(iso, "S")
+    carbon = [n.GetIdx() for n in iso.mol.GetAtomWithIdx(sulfur).GetNeighbors() if n.GetAtomicNum() > 1]
+    pos = ens.mol.GetConformer(ens.ids[0]).GetPositions()
+    normal = np.cross(pos[carbon[0]] - pos[iso.metal], pos[carbon[1]] - pos[iso.metal])
+    out_of_plane = abs((pos[sulfur] - pos[iso.metal]) @ normal / np.linalg.norm(normal))
+    assert out_of_plane > 0.7, "the coordinated thioether sulfur flattened"
+
+
 # --- the coplanarity cap: which donors get one -----------------------------------------------------------
 
 

@@ -202,7 +202,8 @@ back to original complex indices.
 `dative_smiles` preserves normalized constitution but not the metal arrangement, so cis and trans share a
 string. `cxsmiles` also stores geometry, canonical donor slots, and Λ/Δ chirality in atom properties that
 `rx.embed` reads back. Both outputs are canonical; CX positions follow output order, not input atom indices.
-Planar-chiral haptic winding cannot yet be serialized; pass its `Mol` or `Isomer`.
+Planar-chiral haptic winding enumerates as `ηn+`/`ηn-`, is stored on the face slot, and is selected immediately
+after distance geometry. Use `stereo="free"` to leave it unspecified.
 
 ## Approximations
 

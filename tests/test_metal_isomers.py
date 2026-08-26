@@ -197,9 +197,9 @@ def test_chiral_polyhedra_enumerate_both_hands(geometry, smiles, per_hand):
 
 def test_isomer_summary_uses_compact_selectable_stereo(capsys):
     isos = rx.metal("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "OCT", stereo="free")
-    assert isos.summary() is isos
+    assert isos.summary() is None
     lines = capsys.readouterr().out.splitlines()
-    assert lines[0] == "  idx  geometry  slots (vertex order)           metal  ligand"
+    assert lines[0] == "  idx  geometry  slots (vertex order)           metal  haptic  ligand"
     assert all("OCT" in line and ("Δ" in line or "Λ" in line) for line in lines[1:])
 
     point = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-[NH2]C(C)O", "SPL")
@@ -216,6 +216,11 @@ def test_isomer_summary_uses_compact_selectable_stereo(capsys):
     assert "C5:S" in shown
     assert "C6=C7:E" in shown
     assert "C6=C7:Z" in shown
+
+
+def test_defined_and_enumerated_ligand_stereo_share_one_label():
+    isomers = rx.metal("[Pd](Cl)(Cl)(Cl)([N@H](C)C(O)C)", "SPL")
+    assert {iso.stereo_label for iso in isomers} == {"N4:R,C6:R", "N4:R,C6:S"}
 
 
 @pytest.mark.parametrize(

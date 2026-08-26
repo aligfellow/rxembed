@@ -7,6 +7,7 @@ from rdkit import Chem
 
 from rxembed import stereo
 from rxembed.metal_core import metal_indices
+from rxembed.metal_smiles import parse_smiles
 
 _CHIRAL_P_PD = "C[P](CC)(c1ccccc1)[Pd](Cl)(Cl)Cl"
 # an alpha-diimine-style chelate: both imine C=N sit in the 5-membered ring the metal closes
@@ -124,6 +125,20 @@ def test_metal_bound_chiral_phosphorus_survives_strip():
     assert len(set(labels)) == 2, "the two P-epimers must get distinct labels"
 
 
+@pytest.mark.parametrize(
+    ("smiles", "expected"),
+    [
+        ("C[N@H](->[Pd](Cl)(Cl)Cl)O", "N1:S"),
+        ("C[P@H](->[Pt](Cl)(Cl)Cl)CC", "P1:S"),
+        ("C[S@](->[Pt](Cl)(Cl)Cl)CC", "S1:R"),
+        ("F[C@](Cl)(Br)[Pt](Cl)(Cl)Cl", "C1:S"),
+    ],
+)
+def test_defined_donor_stereo_keeps_replacement_parity_and_bond_type(smiles, expected):
+    mol = parse_smiles(smiles)
+    assert stereo.defined_stereo_label(mol, metal_indices(mol)) == expected
+
+
 def test_ph3_donor_is_not_made_stereogenic_by_the_metal_cap():
     mol, metals = _with_metals("[PH3]->[Pt](Cl)(Cl)Cl")
     variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
@@ -151,3 +166,12 @@ def test_metal_strip_and_graft_are_inverse():
         assert n_unassigned == 1, f"{smiles}: the carbon centre was not enumerated, so this asserts nothing"
         for vmol, _label in variants:
             assert vmol.GetAtomWithIdx(donor).GetChiralTag() == declared, smiles
+
+
+def test_multimetal_donor_enumeration_replays_sequential_parity():
+    mol = parse_smiles("C[N](->[Pd])(->[Pt])O")
+    metals = set(metal_indices(mol))
+    variants, *_ = stereo.enumerate_unassigned(mol, exclude=metals)
+
+    assert {label for _, label in variants} == {"N1:R", "N1:S"}
+    assert all(stereo.defined_stereo_label(variant, metals) == label for variant, label in variants)

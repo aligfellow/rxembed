@@ -7,6 +7,7 @@ grafted back, and `Conformers.minimize()` applies restrained UFF. Parsing and NC
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -174,6 +175,35 @@ def fold_substrate(base, sub, graft_ref):
     )
 
 
+def _seed_stereo_matches(mol, cid, iso, winding_ranks, reflectable):
+    """Return whether one raw DG seed has the selected metal hand and haptic winding."""
+    expected_hand = iso.chirality
+    realised = (
+        _metal.realised_chirality(mol, cid, iso.geometry, iso.vertices, iso.metal, expected_hand, iso.haptic)
+        if expected_hand
+        else ""
+    )
+    if realised and realised != expected_hand and reflectable:
+        _reflect(mol, cid)  # an exact isometry: no distance, angle or conformer diversity changes
+        realised = expected_hand
+    pos = mol.GetConformer(int(cid)).GetPositions()
+    winding_ok = all(
+        _metal._face_winding(mol, pos, iso.metal, iso.haptic[dummy], winding_ranks) == winding
+        for dummy, winding in iso.haptic_winding.items()
+    )
+    return (not expected_hand or realised == expected_hand) and winding_ok
+
+
+def _stereo_batch_size(need, bits, reflectable, has_winding):
+    """Return a DG batch large enough to retain ``need`` selected stereoisomers."""
+    if reflectable:
+        return need
+    if has_winding:
+        # A 2 sqrt(N) spare-success margin avoids a coin-flip second batch at the exact 2^k mean.
+        return 2**bits * (need + 2 * (math.isqrt(need - 1) + 1))
+    return 2 * need + _HAND_BUFFER
+
+
 def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, prune_rms=0.1, threads=0, graft_ref=None):
     """Seed `n` conformers, selecting metal and donor hands before cleanup and grafting a fixed core exactly."""
     if int(seed) < 0:  # every embed route validates here, not just the front door: RDKit's -1 draws from the
@@ -185,12 +215,21 @@ def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, pru
     cons.distances.update(float_encounter_bounds(mol, cons))  # keep free/stray fragments from drifting off
     frozen, ref_core = _frozen_core_ref(mol, cons.frozen, graft_ref or {})
     target = n or seed_count(mol, constrained=cons.is_constrained)
-    reflectable = iso is not None and _mirror_is_free(mol) and not cons.frozen and not cons.dihedrals and not iso.haptic
+    expected_hand = iso.chirality if iso is not None else ""
+    expected_winding = iso.haptic_winding if iso is not None else {}
+    winding_ranks = _metal._donor_classes(mol, iso.donors) if expected_winding else {}
+    reflectable = bool(
+        expected_hand
+        and not expected_winding
+        and _mirror_is_free(mol)
+        and not cons.frozen
+        and not cons.dihedrals
+        and not iso.haptic
+    )
     held = []
     if iso is not None:  # hold a carbanion/amine donor's hand: a degree-3 centre with no M-C bond would
         mol, held = _metal._hold_donor_chirality(mol, iso.metal, iso.donors, cons)  # else invert freely
-    expected = iso.chirality if iso is not None else ""
-    if not expected:
+    if not expected_hand and not expected_winding:
         ids = list(
             seed_coordinates(
                 mol,
@@ -211,7 +250,8 @@ def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, pru
             need = target - kept.GetNumConformers()
             if need <= 0:
                 break
-            batch_n = need if reflectable else 2 * need + _HAND_BUFFER
+            stereo_bits = int(bool(expected_hand)) + len(expected_winding)
+            batch_n = _stereo_batch_size(need, stereo_bits, reflectable, bool(expected_winding))
             ids = list(
                 seed_coordinates(
                     mol,
@@ -226,13 +266,7 @@ def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, pru
             if ref_core is not None:
                 graft_frozen(mol, ids, frozen, ref_core)
             for cid in ids:
-                realised = _metal.realised_chirality(
-                    mol, cid, iso.geometry, iso.vertices, iso.metal, iso.chirality, iso.haptic
-                )
-                if realised and realised != expected and reflectable:
-                    _reflect(mol, cid)  # an exact isometry: no distance, angle or conformer diversity changes
-                    realised = expected
-                if realised == expected:
+                if _seed_stereo_matches(mol, cid, iso, winding_ranks, reflectable):
                     kept.AddConformer(Chem.Conformer(mol.GetConformer(cid)), assignId=True)
                     if kept.GetNumConformers() == target:
                         break
@@ -240,10 +274,17 @@ def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, pru
         ids = [conf.GetId() for conf in mol.GetConformers()]
         if len(ids) < target:
             logger.warning(
-                "embed: kept %d/%d seeds with the requested %s metal hand after %d DG batch(es)",
+                "embed: kept %d/%d seeds with the requested %s after %d DG batch(es)",
                 len(ids),
                 target,
-                iso.chirality,
+                " and ".join(
+                    part
+                    for part in (
+                        f"{expected_hand} metal hand" if expected_hand else "",
+                        f"{len(expected_winding)} haptic winding(s)" if expected_winding else "",
+                    )
+                    if part
+                ),
                 _MAX_HAND_ROUNDS,
             )
     if iso is not None:
@@ -320,7 +361,7 @@ class Conformers:
                 mol.RemoveConformer(conf.GetId())
         if self.iso is None:
             return mol
-        self.iso.restore(mol)  # real element AND oxidation state, on our copy
+        self.iso.restore(mol)  # real element and formal charge, on our copy
         return _metal.connect_metal(mol, self.iso.donor_bonds) if self.iso.donor_bonds else mol
 
     @property
@@ -416,11 +457,15 @@ class Conformers:
                 c: [list(self._mol.GetConformer(c).GetAtomPosition(a)) for a in range(self._mol.GetNumAtoms())]
                 for c in relaxing
             }
+            donor_hands = {
+                c: {donor: _metal.donor_chirality_sign(self._mol, c, donor) for _dummy, donor, _charge in hold}
+                for c in relaxing
+            }
 
-            def restore():
-                for cid, pos in embed_pos.items():
+            def restore(ids=relaxing):
+                for cid in ids:
                     conf = self._mol.GetConformer(cid)
-                    for a, xyz in enumerate(pos):
+                    for a, xyz in enumerate(embed_pos[cid]):
                         conf.SetAtomPosition(a, xyz)
 
             for step, mult in enumerate(FC_ESCALATION):  # half-order steps: find the minimum sufficient stiffness
@@ -453,6 +498,23 @@ class Conformers:
                             fc,
                         )
                     break
+            inverted = [
+                c
+                for c in relaxing
+                if any(
+                    target is not None and _metal.donor_chirality_sign(self._mol, c, donor) != target
+                    for donor, target in donor_hands[c].items()
+                )
+            ]
+            if inverted:
+                restore(inverted)
+                self.unrelaxed.extend(c for c in inverted if c not in self.unrelaxed)
+                e = restrained_uff(self._mol, self.cons, stiffness=fc, max_iters=0, conf_ids=conf_ids)
+                logger.warning(
+                    "%s: UFF inverted a coordinated ligand stereocentre in %d conformer(s); kept the DG seed",
+                    operation,
+                    len(inverted),
+                )
         finally:  # release the hold on every exit path, including the early UFF-failure return; the dummy D
             if hold:  # is scaffolding for this relax alone
                 self._mol = _metal._release_donor_chirality(self._mol, hold, self.cons)

@@ -14,6 +14,8 @@ from .metal_core import COORDINATION_METALS
 from .metal_distance import _APEX_DONORS, APEX, overbond_tier
 from .utils import remove_bond
 
+_PT = Chem.GetPeriodicTable()
+
 # --- the sp2-donor coplanarity cap (`_coplanar_donor`, `cons.coplanar`) -------------------------------
 # An sp2 donor binds from an in-plane sigma lone pair, so the metal sits in its sp2 framework. The surrogate
 # strips the M-donor bond and UFF's improper with it; this puts it back as a flat-bottomed dihedral window.
@@ -35,7 +37,7 @@ _FOLD_WINDOW = {  # deg (floor, ceiling) per (element, hyb); floor gates, ceilin
     ("N", _SP3): (82.0, 158.4),
     ("C", _SP): (155.0, 180.0),
     ("O", _SP2): (90.0, 156.8),
-    ("S", _SP3): (91.0, 137.1),
+    ("S", _SP3): (91.0, 110.0),
     ("C", _SP3): (104.0, 133.8),
     ("N", _SP): (140.0, 180.0),
     ("As", _SP3): (95.0, 131.3),
@@ -71,6 +73,8 @@ _MAX_SIGMA = {  # sigma bonds a class can carry: more is a hypervalent / mis-per
 }
 _CONJUGATING_LP = frozenset({7, 8})  # period-2 only: N/O planarise into an adjacent π system, a period-3 lone
 # pair does not (PPh3 is pyramidal). Letting P/S conjugate would type every triarylphosphine sp2.
+_PYRAMIDAL_SIGMA = 3
+_LONE_PAIR_ELECTRONS = 2
 
 
 # --- donor perception: the metal-stripped hybridisation ruler + the fold-census predicates ------------
@@ -114,9 +118,9 @@ def _stripped_hybridisation(mol) -> dict[int, Chem.HybridizationType]:
 
     An atom is absent (unknown, never gated) when the typer and the π-count disagree, or when it is hypervalent
     for its class: abstaining beats a mis-typed fold, and a rising unknown count is a free perception-bug
-    detector (``FoldReport.unknown``). The one class it *corrects* is an "sp" centre with two substituents: sp
-    is linear, so a second substituent proves it bent and the sp a spurious-triple-bond artefact (a formyl
-    H-C=O read C≡O), and is re-read sp2 so the acyl still earns its fold wall.
+    detector (``FoldReport.unknown``). Two graph facts override a Lewis-form artefact: an "sp" centre with two
+    substituents is bent and therefore sp2; and a three-coordinate centre with a non-conjugating lone pair is
+    pyramidal even when one bond is drawn double (the neutral ``S(=O)R2`` form of a sulfoxide).
 
     Expected holdout: a metal-bound ``[CH-]`` carbanion, which RDKit calls sp2 and the π-count sp3, both defensible;
     rxembed treats it as a pyramidal stereocentre (``_hold_donor_chirality``), not gated.
@@ -133,6 +137,19 @@ def _stripped_hybridisation(mol) -> dict[int, Chem.HybridizationType]:
     out: dict[int, Chem.HybridizationType] = {}
     for a in stripped.GetAtoms():
         rdkit_h, pi_h = a.GetHybridization(), _pi_hybridisation(a)
+        nonbonding = (
+            _PT.GetNOuterElecs(a.GetAtomicNum())
+            - a.GetFormalCharge()
+            - sum(b.GetBondTypeAsDouble() for b in a.GetBonds())
+        )
+        if (
+            rdkit_h == Chem.HybridizationType.SP3
+            and pi_h == Chem.HybridizationType.SP2
+            and a.GetDegree() == _PYRAMIDAL_SIGMA
+            and a.GetAtomicNum() not in _CONJUGATING_LP
+            and nonbonding >= _LONE_PAIR_ELECTRONS
+        ):
+            pi_h = Chem.HybridizationType.SP3
         if rdkit_h != pi_h or rdkit_h not in _MAX_SIGMA:  # the estimators disagree, or it is not sp/sp2/sp3
             continue
         if rdkit_h == Chem.HybridizationType.SP and a.GetDegree() != 1:  # a bent "sp": a spurious triple bond

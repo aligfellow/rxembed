@@ -34,7 +34,7 @@ def _populated():
         dg_floors={(9, 4): 2.8},
         shapes=[{1, 2, 3}],
         phantoms=frozenset({12}),
-        spheres=(SphereRecipe(9, (0, 4), "SPL", (0, 1), 28, ()),),
+        spheres=(SphereRecipe(9, (0, 4), "SPL", (0, 1), ()),),
         haptic={12: [3, 4, 5, 6, 7]},
     )
     add_distance(c.distances, 0, 1, 1.9, 2.1)
@@ -89,7 +89,7 @@ def test_new_fields_preserve_legacy_positional_layout():
         {(2, 5): 2.7},
         [{0, 1}],
         frozenset({6}),
-        (SphereRecipe(5, (0,), "LIN", (0,), 28, ()),),
+        (SphereRecipe(5, (0,), "LIN", (0,), ()),),
         {6: [0, 1]},
     )
     cons = Constraints(*values)

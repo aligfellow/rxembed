@@ -41,6 +41,7 @@ from .metal_core import (
     VACANT,
     _chelate_edges,
     _donor_classes,
+    _face_winding,
     _remove_routine_hydrogens,
     connect_metal,
     donated_charge,
@@ -49,7 +50,8 @@ from .metal_core import (
 )
 from .metal_isomers import from_geometry
 from .metal_polyhedron import canonical_slots, record, slot_note, vertex_dirs
-from .utils import assign_stereo_from_3d, remove_bond
+from .stereo import defined_stereo_label, point_stereo, stereo_from_3d
+from .utils import assign_stereo_from_3d, mirror_tag, remove_bond
 
 logger = logging.getLogger("rxembed.metal")  # spelled out, not __name__: the name `set_verbose` configures
 
@@ -61,12 +63,23 @@ def parse_smiles(smi):
     site, because a block index is a position in the written atom order. Only that case, so a plain SMILES is
     read exactly as before.
 
+    Sanitising before removing hydrogens retains a tetrahedral tag on a donor such as ``[N@H]`` whose fourth
+    neighbour is dative; RDKit's integrated parse cleanup otherwise implicitises H and clears that tag.
+
     The one SMILES door for both tiers, for the same reason `utils.assign_stereo_from_3d` is the one stereo
     door: a second parser that did not know about the block would read the arrangement onto the wrong atoms.
     """
     params = Chem.SmilesParserParams()
-    params.removeHs = "atomProp" not in smi
+    params.sanitize = False  # RDKit's integrated cleanup erases `[N@H]` when its fourth neighbour is dative.
+    params.removeHs = False
     mol = Chem.MolFromSmiles(smi, params)
+    if mol is not None:
+        try:
+            Chem.SanitizeMol(mol)
+            if "atomProp" not in smi:
+                mol = Chem.RemoveHs(mol)
+        except (RuntimeError, ValueError):
+            mol = None
     if mol is None:
         raise ValueError(f"could not parse SMILES: {smi!r}")
     return mol
@@ -146,7 +159,41 @@ def dative_smiles(mol):
     return write_dative(mol)[0]
 
 
-def write_dative(mol):
+def _write_native_stereo(mol, wanted):
+    """Write SMILES, restoring only point stereo that rxembed has already proved as R/S."""
+    smi = Chem.MolToSmiles(mol)
+    order = list(mol.GetPropsAsDict(True, True)["_smilesAtomOutputOrder"])
+    if not wanted:
+        return smi, order
+
+    clean = parse_smiles(smi)
+    actual = point_stereo(defined_stereo_label(clean, metal_indices(clean)))
+    positions = {idx: pos for pos, idx in enumerate(order)}
+    missing = {idx: code for idx, code in wanted.items() if actual.get(positions[idx]) != code}
+    if not missing:
+        return smi, order
+
+    for idx in missing:
+        clean.GetAtomWithIdx(positions[idx]).SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW)
+
+    params = Chem.SmilesWriteParams()
+    params.cleanStereo = False  # `clean` came from RDKit's clean writer; only proved missing centres were restored.
+    for _ in range(2):
+        smi = Chem.MolToSmiles(clean, params)
+        clean_order = list(clean.GetPropsAsDict(True, True)["_smilesAtomOutputOrder"])
+        clean_positions = {idx: pos for pos, idx in enumerate(clean_order)}
+        back = parse_smiles(smi)
+        actual = point_stereo(defined_stereo_label(back, metal_indices(back)))
+        wrong = [idx for idx, code in wanted.items() if actual.get(clean_positions[positions[idx]]) != code]
+        if not wrong:
+            return smi, [order[idx] for idx in clean_order]
+        for idx in wrong:
+            atom = clean.GetAtomWithIdx(positions[idx])
+            atom.SetChiralTag(mirror_tag(atom.GetChiralTag()))
+    raise ValueError(f"could not write ligand stereo at atom(s) {sorted(wrong)}")
+
+
+def write_dative(mol, stereo_label=None):
     """Return ``(smiles, {atom: its position in that string's atom order})``: `dative_smiles` plus the order.
 
     The positions are what an `atomProp` block indexes, so the CXSMILES writer needs them and cannot get
@@ -166,6 +213,11 @@ def write_dative(mol):
     expected = expected_mol.GetNumAtoms() + sum(
         a.GetTotalNumHs() for a in expected_mol.GetAtoms() if a.GetAtomicNum() != 1
     )
+    if stereo_label is None:
+        if mol.GetNumConformers():
+            stereo_label = stereo_from_3d(mol, metal_indices(mol))
+        else:
+            stereo_label = defined_stereo_label(mol, metal_indices(mol))
     rw = Chem.RWMol(mol)
     pos = mol.GetConformer().GetPositions() if mol.GetNumConformers() else None
     for atom in mol.GetAtoms():
@@ -182,10 +234,17 @@ def write_dative(mol):
     _donate_to_metal(rw)
 
     out = rw.GetMol()
+    out.UpdatePropertyCache(strict=False)
+    wanted = {idx: code for idx, code in point_stereo(stereo_label).items() if code in {"R", "S"}}
     # E/Z references atoms picked from the bond's neighbour order, which a renumber does not update: 4 of the
     # 5 corpus structures unstable under reordering differed only in `/` and `\`. Geometry has no such order.
     if out.GetNumConformers():
         assign_stereo_from_3d(out)  # the one door, never the raw call: see its docstring on the dative basis
+
+    point_tags = {Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW}
+    for atom in out.GetAtoms():
+        if atom.GetChiralTag() in point_tags and atom.GetIdx() not in wanted:
+            atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
 
     # The metal's own tag is a permutation index over the neighbour order too, but no geometry settles it:
     # Fe(CO)5 writes @TB20, @TB14 or @TB13 for one molecule, and SMILES has a class for 3 of the 12
@@ -205,7 +264,8 @@ def write_dative(mol):
     ]
     out, reduced = _remove_routine_hydrogens(out, keep_h)
     original = {new: old for old, new in reduced.items()}
-    smi = Chem.MolToSmiles(out)
+    wanted = {reduced[idx]: code for idx, code in wanted.items() if idx in reduced}
+    smi, written = _write_native_stereo(out, wanted)
     back = Chem.MolFromSmiles(smi)
     actual = (
         None
@@ -219,72 +279,10 @@ def write_dative(mol):
             f"result {got}. The perceived graph is likely one SMILES cannot express (a hypervalent or "
             f"partial-bond centre); work from the Mol itself."
         )
-    written = out.GetPropsAsDict(True, True)["_smilesAtomOutputOrder"]  # MolToSmiles sets it: position -> atom
     return smi, {original[int(a)]: p for p, a in enumerate(written)}
 
 
 # --- the arrangement layer: the canonical slot note ------------------------------------------------------
-
-_FACE_MIN = 3  # an eta2 face is one bond, and a bond's two ends are its own mirror: nothing to wind
-_PATH_ENDS = 2  # an open face (an allyl) has exactly two atoms with a single face-neighbour
-
-
-def _face_walk(mol, face):
-    """Return ``(atoms in bond order, closed)`` for a haptic face, or ``None`` if it branches.
-
-    A face is a cycle (Cp, arene) or an open chain (an allyl); `_collapse_haptic` admits both, so this
-    cannot assume a ring. An open chain has to start at an END, or the walk dead-ends halfway and the answer
-    would depend on whether the lowest atom index happened to land in the middle: measured, that made JIWHOQ
-    and NUKHEG give two strings over four atom orderings.
-    """
-    inside = set(face)
-    nbrs = {a: sorted(n.GetIdx() for n in mol.GetAtomWithIdx(a).GetNeighbors() if n.GetIdx() in inside) for a in face}
-    ends = [a for a in face if len(nbrs[a]) == 1]
-    if any(len(nbrs[a]) > _PATH_ENDS for a in face) or len(ends) not in (0, _PATH_ENDS):
-        return None
-    walk = [min(ends) if ends else min(face)]
-    while len(walk) < len(face):
-        prev = walk[-2] if len(walk) > 1 else None
-        step = [a for a in nbrs[walk[-1]] if a != prev]
-        if not step:
-            return None
-        walk.append(min(step))
-    return walk, not ends
-
-
-def _face_winding(mol, pos, metal, face, ranks):
-    """Return ``'+'``/``'-'`` for a planar-chiral haptic face, ``''`` when the face is its own mirror.
-
-    A face is planar-chiral iff its sequence of atom classes differs from its own reverse (over every
-    rotation too, when the face is a closed ring). Then one direction of travel is canonically first, and
-    the sign of that direction's circulation about the metal-to-centroid axis is a mirror-sensitive fact
-    that a slot number alone cannot hold: measured over `benchmark/corpus`, 6 of its 14 faces of eta>=3 are
-    planar-chiral and the sign flips on every one of them under a mirror. A symmetric Cp's direction says
-    only where the walk started, so keying on it would split two identical rings into two classes.
-
-    An eta2 face is one bond and its two ends are its own mirror, so it has no winding. Its orientation
-    about the metal-to-centroid axis still is a stereo element (DEYMIE's three side-on oximates make a
-    propeller); nothing here carries that, and no slot number can.
-    """
-    if len(face) < _FACE_MIN:
-        return ""
-    walked = _face_walk(mol, face)
-    if walked is None:
-        return ""
-    order, closed = walked
-    n = len(order)
-    cls = [ranks[a] for a in order]
-    if closed:  # a ring reads from any atom, a chain only from its two ends
-        fwd = min(tuple(cls[(s + i) % n] for i in range(n)) for s in range(n))
-        rev = min(tuple(cls[(s - i) % n] for i in range(n)) for s in range(n))
-    else:
-        fwd, rev = tuple(cls), tuple(reversed(cls))
-    if fwd == rev:
-        return ""
-    seq = order if fwd < rev else order[::-1]
-    c = np.mean([pos[a] for a in order], axis=0)
-    edges = zip(seq, seq[1:] + seq[:1] if closed else seq[1:], strict=False)  # an open face has no closing edge
-    return "+" if float(sum(np.cross(pos[a] - c, pos[b] - c) for a, b in edges) @ (c - pos[metal])) > 0 else "-"
 
 
 def _site_keys(iso, ranks, pos):
@@ -304,7 +302,7 @@ def _site_keys(iso, ranks, pos):
             keys.append(None)
         elif d in iso.haptic:
             face = iso.haptic[d]
-            wind = "" if pos is None else _face_winding(iso.mol, pos, iso.metal, face, ranks)
+            wind = iso.haptic_winding.get(d, "") if pos is None else _face_winding(iso.mol, pos, iso.metal, face, ranks)
             keys.append((tuple(sorted(ranks[a] for a in face)), wind))
         else:
             keys.append(((ranks[d],), ""))
@@ -314,8 +312,8 @@ def _site_keys(iso, ranks, pos):
 def _slot_notes(iso, keys, slots, at, bites):
     """Return canonical slot notes without separating donors that belong to one ligand.
 
-    Identical chelates may swap as units. Assigning their donors independently can break a bite and flip the
-    metal hand.
+    Identical chelates and haptic ligands may swap as units. Group them by constitution, not winding, so
+    exchanging two identical faces with opposite windings cannot change the canonical string.
     """
     groups = [{v} for v, d in enumerate(iso.vertices) if d != VACANT]
     for bite in bites:
@@ -331,17 +329,17 @@ def _slot_notes(iso, keys, slots, at, bites):
             atoms = tuple(iso.haptic[d]) if d in iso.haptic else (d,)
             sites.append((keys[v], min(at[a] for a in atoms), atoms))
             assigned.append((keys[v], slots[v]))
-        by_ligand.setdefault(tuple(sorted(keys[v] for v in group)), []).append((sites, assigned))
+        by_ligand.setdefault(tuple(sorted(keys[v][0] for v in group)), []).append((sites, assigned))
 
     notes = {}
     for ligands in by_ligand.values():
         sites = sorted((site for site, _assigned in ligands), key=lambda group: tuple(sorted(s[1] for s in group)))
         assigned = sorted((assigned for _site, assigned in ligands), key=lambda group: tuple(sorted(group)))
         for ligand_sites, ligand_slots in zip(sites, assigned, strict=True):
-            for key in {site[0] for site in ligand_sites}:
-                atoms = sorted((site[1], site[2]) for site in ligand_sites if site[0] == key)
-                key_slots = sorted(slot for slot_key, slot in ligand_slots if slot_key == key)
-                for (_position, site_atoms), slot in zip(atoms, key_slots, strict=True):
+            for constitution in {site[0][0] for site in ligand_sites}:
+                atoms = sorted((site[1], site[2]) for site in ligand_sites if site[0][0] == constitution)
+                assignments = sorted((key, slot) for key, slot in ligand_slots if key[0] == constitution)
+                for (_position, site_atoms), (key, slot) in zip(atoms, assignments, strict=True):
                     for atom in site_atoms:
                         notes[atom] = slot_note(slot, key[1])
     return notes
@@ -378,9 +376,12 @@ def cxsmiles(source):
 
     The block states, on the metal, the 3-letter geometry code and the Lambda/Delta word where the centre is
     chiral; on each donor, ``s<n>``, its canonical slot, with a ``+``/``-`` for a planar-chiral haptic ring's
-    winding. A slot is a fact about the molecule only modulo the template's proper rotations, so it is
-    minimised over those and no more: the full point group is ``proper x Z2`` and that Z2 is the handedness.
-    Planar-chiral haptic winding is detected but not yet embeddable, so writing it raises.
+    winding. The sign is a graph-canonical parity, not a CIP descriptor: atom renumbering and proper rotation
+    preserve it, while reflection flips it. Plain SMILES has no haptic-face chirality class, so the CX block
+    retains this exact bit even when no unambiguous ``Rₚ``/``Sₚ`` display name can be derived. A slot exists
+    only modulo the template's proper rotations, so it is minimised over those and no more: the full point
+    group is ``proper x Z2`` and that Z2 is the handedness.
+    A planar-chiral haptic winding is selected immediately after distance geometry when the string states one.
 
     `source` is an `Isomer`, whose arrangement is already stated, or a `Mol` with a conformer, whose
     arrangement is measured off it by `from_geometry`. Reading the string back needs no second verb:
@@ -407,15 +408,11 @@ def cxsmiles(source):
             f"per-centre note is what the format states, but no corpus of bridged complexes has been "
             f"measured, so this raises rather than write a string whose losslessness is unchecked"
         )
-    core, at = write_dative(complexed)
+    core, at = write_dative(complexed, iso.stereo_label if given else None)
     work = iso.mol  # the surrogate: its ligands are separate fragments, so a bite and a class both read right
     coordinating = [a for d in iso.vertices if d != VACANT for a in (iso.haptic.get(d) or (d,))]
     ranks = _donor_classes(work, coordinating)
     keys = _site_keys(iso, ranks, work.GetConformer().GetPositions() if work.GetNumConformers() else None)
-    if any(key and key[1] for key in keys):
-        raise NotImplementedError(
-            "CXSMILES haptic winding is detected but embedding it is not supported; pass the Isomer or Mol"
-        )
     bites = _chelate_edges(work, iso.vertices, iso.haptic)
     slots = canonical_slots(dirs, keys, bites)
     geom = record(iso.geometry).code + (f"-{iso.chirality}" if iso.chirality else "")
@@ -424,5 +421,5 @@ def cxsmiles(source):
     # `atomNote` rather than a key of our own: RDKit reads, writes and DRAWS it, so the arrangement is visible
     # in a depiction and survives a round trip through `MolToCXSmiles` without special handling. Atom index
     # order is not a choice either; RDKit re-emits the block sorted by index whatever order it was built in.
-    block = ":".join(f"{at[a]}.atomNote.{v}" for a, v in sorted(notes.items(), key=lambda kv: at[kv[0]]))
+    block = ":".join(f"{at[a]}.atomNote.{value}" for a, value in sorted(notes.items(), key=lambda x: at[x[0]]))
     return f"{core} |atomProp:{block}|"

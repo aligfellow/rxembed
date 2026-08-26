@@ -188,7 +188,7 @@ def coordination(mol, metal, donors, geometry, order, real_z, *, haptic, frozen=
     ff_terms(mol, c, {metal: (real_z, coord)})  # coordinating atoms, so nondonor_floors never floors a ring atom
     # Record the seating itself, not just the windows it produced: which donor took which vertex of which
     # polytope is what `Umbrella` needs to state a pyramid's improper, and no pairwise window carries it.
-    c.spheres = (SphereRecipe(metal, tuple(donors), geometry, tuple(order), real_z, tuple(sorted(haptic.items()))),)
+    c.spheres = (SphereRecipe(metal, tuple(donors), geometry, tuple(order), tuple(sorted(haptic.items()))),)
     return c
 
 

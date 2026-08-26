@@ -48,7 +48,6 @@ class SphereRecipe(NamedTuple):
     donors: tuple
     geometry: str
     order: tuple
-    real_z: int
     haptic: tuple  # ((centroid-dummy, ring atoms), ...), sorted so the recipe stays hashable and comparable
 
 

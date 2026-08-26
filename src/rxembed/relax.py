@@ -138,6 +138,7 @@ def ff_energies(mol, minimize=True):
 
 def _ff_surrogate(mol, metals, phantoms=()):
     """Retype metals and haptic centroids on a private UFF graph without changing atom indices."""
+    metals = {int(m) for m in metals}
     if not metals and not phantoms:
         return mol  # an organic system: the identical object, so this whole path is a strict no-op
     rw = Chem.RWMol(mol)  # copies the conformers
@@ -151,9 +152,31 @@ def _ff_surrogate(mol, metals, phantoms=()):
         a.SetAtomicNum(UFF_GHOST)
         a.SetNoImplicit(True)
         a.SetFormalCharge(0)
+    # RDKit's UFF table contains only Se3+2. A P=Se Lewis form is perceived SP2 and asks for the absent
+    # Se2+2 type; use the available selenium parameters on this private FF graph without changing the Mol.
+    selenium = [
+        a.GetIdx()
+        for a in rw.GetAtoms()
+        if a.GetSymbol() == "Se"
+        and a.GetHybridization() != Chem.HybridizationType.SP3
+        and sum(
+            bond.GetBondType() != Chem.BondType.DATIVE and bond.GetOtherAtomIdx(a.GetIdx()) not in metals
+            for bond in a.GetBonds()
+        )
+        == 1
+        and any(
+            neighbour.GetSymbol() == "P"
+            and rw.GetBondBetweenAtoms(a.GetIdx(), neighbour.GetIdx()).GetBondType() == Chem.BondType.DOUBLE
+            for neighbour in a.GetNeighbors()
+        )
+    ]
     out = rw.GetMol()
     Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
     out.UpdatePropertyCache(strict=False)
+    for idx in selenium:  # after sanitize, whose hybridisation pass would otherwise reset P=Se to SP2
+        out.GetAtomWithIdx(idx).SetHybridization(Chem.HybridizationType.SP3)
+    if selenium:
+        logger.info("UFF: typed %d selenium atom(s) with RDKit's available Se3+2 parameters", len(selenium))
     return out
 
 

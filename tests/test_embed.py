@@ -18,6 +18,7 @@ from rxembed.constraints import FIX_ANGLE_TOL, FIX_DISTANCE_TOL, Constraints, re
 from rxembed.embed import BASE_STIFFNESS, Conformers, embed, fold_substrate, minimize
 from rxembed.metal_core import TRANSITION_METALS, coplanar
 from rxembed.metal_isomers import Isomer, enumerate_isomers, from_geometry
+from rxembed.metal_smiles import parse_smiles
 from rxembed.relax import bonding_ok
 
 emb = importlib.import_module("rxembed.embed")  # the engine implementation module, not the public facade
@@ -447,6 +448,26 @@ def test_constrained_energies_share_one_final_objective(monkeypatch):
 
     assert calls[-1] == (BASE_STIFFNESS, 0)
     assert set(confs.energies.values()) == {7.0}
+
+
+def test_restored_donor_hand_is_rescored(monkeypatch):
+    mol = Chem.AddHs(parse_smiles("[Pd](Cl)(Cl)(Cl)([N@H](C)O)"))
+    iso = enumerate_isomers(mol, "square_planar")[0]
+    confs = embed(iso, n=1, seed=2)
+    calls = []
+    real_uff = emb.restrained_uff
+
+    def spy_uff(mol, cons, **kw):
+        result = real_uff(mol, cons, **kw)
+        calls.append((kw.get("max_iters"), result.copy()))
+        return result
+
+    monkeypatch.setattr(emb, "restrained_uff", spy_uff)
+    energies = confs._relax_constrained(BASE_STIFFNESS)
+
+    assert confs.unrelaxed == [0]
+    assert calls[-1][0] == 0
+    assert np.array_equal(energies, calls[-1][1])
 
 
 # ---------------------------------------------------------------------------------------------------------

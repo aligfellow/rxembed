@@ -229,7 +229,7 @@ def test_isomer_restore_restores_all_metal_states():
     iso.restore()
     assert iso.mol.GetAtomWithIdx(iso.metal).GetAtomicNum() == iso.real_z
     assert iso.mol.GetAtomWithIdx(iso.metal).GetFormalCharge() == iso.real_q
-    for mi, _rz, rq in iso.extra:  # the spectator ferrocene Fe
+    for mi, _rz, rq in iso.spectator_metals:  # the spectator ferrocene Fe
         assert iso.mol.GetAtomWithIdx(mi).GetFormalCharge() == rq
 
 

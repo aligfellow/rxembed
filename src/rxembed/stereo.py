@@ -17,7 +17,20 @@ from rdkit.Chem.EnumerateStereoisomers import (
     StereoEnumerationOptions,
 )
 
-from .utils import bond_removal_mirrors, mirror_tag, remove_bond, repair_bond_stereo
+from .metal_core import _haptic_sites
+from .utils import bond_removal_mirrors, bond_replacement_mirrors, mirror_tag, remove_bond, repair_bond_stereo
+
+_MIN_POINT_BRANCHES = 3
+
+
+def point_stereo(label):
+    """Return the point-centre codes in a ligand-stereo label, keyed by atom index."""
+    return {
+        int(match.group(1)): match.group(2)
+        for part in label.split(",")
+        if label
+        if (match := re.fullmatch(r"[A-Z][a-z]?(\d+):(R|S|CW|CCW)", part))
+    }
 
 
 def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
@@ -32,11 +45,16 @@ def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
     """
     if cap_to_metal:  # temporarily give each D-cap the metal's atomic number for a coordinated-complex CIP
         rw = Chem.RWMol(mol)
-        for d_idx, z in cap_to_metal.items():
+        charged = set()
+        for d_idx, (z, donated, _mirrored) in cap_to_metal.items():
             rw.GetAtomWithIdx(d_idx).SetAtomicNum(z)
             rw.GetAtomWithIdx(d_idx).SetIsotope(0)
-            for nb in rw.GetAtomWithIdx(d_idx).GetNeighbors():  # neutralise the donor so metal+donor isn't hypervalent
-                nb.SetFormalCharge(0)  # (an anionic carbanion C would be pentavalent with a real M bonded)
+            for nb in rw.GetAtomWithIdx(d_idx).GetNeighbors():
+                # Replacing donor->M by donor-M makes that donation covalent for CIP: C- -> C, N -> N+.
+                # A covalent M-D bond is only replaced, so its donor charge does not move.
+                if donated and nb.GetIdx() not in charged:
+                    nb.SetFormalCharge(nb.GetFormalCharge() + 1)
+                    charged.add(nb.GetIdx())
                 nb.SetNoImplicit(True)
         mol = rw.GetMol()
         Chem.SanitizeMol(
@@ -172,29 +190,51 @@ def _lock_double_bond(work, fb):
 
 
 def _build_enumeration_graph(mol, exclude):
-    """Disconnect each metal and D-cap each freed sp3 donor so RDKit enumerates only ligand stereo.
+    """Disconnect each metal and D-cap each freed sp3 sigma donor so RDKit enumerates only ligand stereo.
 
-    Returns ``(work, cap_to_metal)``: the cap index -> its metal's atomic number. With no `exclude` there is
-    nothing to disconnect, so `mol` is returned unchanged.
+    Returns ``(work, cap_to_metal)``: the cap index -> ``(metal atomic number, was donor->metal dative,
+    replacement changed parity)``.
+    With no `exclude` there is nothing to disconnect, so `mol` is returned unchanged.
     """
     if not exclude:
         return mol, {}
     # Disconnect each metal first: a metal-bound donor is a stereocentre only while bound, so RDKit would
     # enumerate hands the surrogate cannot hold.
-    cap_to_metal = {}  # D-cap atom index -> its metal's atomic number (for the coordinated-complex CIP label)
+    cap_to_metal = {}
     work = Chem.RWMol(mol)
-    for mi in exclude:
+    for mi in sorted(exclude):
         z_metal = mol.GetAtomWithIdx(mi).GetAtomicNum()
-        for nb in [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()]:
+        donors = [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()]
+        haptic = {d for site in _haptic_sites(mol, donors) if len(site) > 1 for d in site}
+        for nb in donors:
+            bond = mol.GetBondBetweenAtoms(mi, nb)
+            donated = bond.GetBondType() == Chem.BondType.DATIVE and bond.GetBeginAtomIdx() == nb
+            replacement_mirrors = bond_replacement_mirrors(work.GetAtomWithIdx(nb), mi)
+            removal_mirrors = bond_removal_mirrors(work.GetAtomWithIdx(nb), mi)
             remove_bond(work, mi, nb)  # re-base the donor's tag onto the stripped order; `graft` inverts it
             donor = mol.GetAtomWithIdx(nb)
+            sigma_only = all(
+                b.GetOtherAtomIdx(nb) in exclude or b.GetBondType() == Chem.BondType.SINGLE for b in donor.GetBonds()
+            )
             # Two identical H rule out tetrahedral chirality; a D cap makes RDKit misclassify bracket `[PH3]`.
-            if donor.GetHybridization() == Chem.HybridizationType.SP3 and donor.GetTotalNumHs() <= 1:
+            # A haptic atom belongs to a pi face, not one sigma-donor point centre; capping it creates a
+            # phantom R/S centre when RDKit parses a fully dative Cp ring as locally sp3.
+            if (
+                nb not in haptic
+                and donor.GetDegree() + donor.GetTotalNumHs() >= _MIN_POINT_BRANCHES
+                and (donor.GetHybridization() == Chem.HybridizationType.SP3 or sigma_only)
+                and donor.GetTotalNumHs() <= 1
+            ):
+                if replacement_mirrors != removal_mirrors:
+                    atom = work.GetAtomWithIdx(nb)
+                    atom.SetChiralTag(mirror_tag(atom.GetChiralTag()))
                 d = work.AddAtom(Chem.Atom(1))
-                work.GetAtomWithIdx(d).SetIsotope(2)  # deuterium
+                work.GetAtomWithIdx(d).SetIsotope(2 + z_metal)  # preserve equal/different metal identity
                 work.AddBond(nb, d, Chem.BondType.SINGLE)
                 work.GetAtomWithIdx(nb).SetNoImplicit(True)
-                cap_to_metal[d] = z_metal
+                cap_to_metal[d] = (z_metal, donated, replacement_mirrors)
+                for conf in work.GetConformers():
+                    conf.SetAtomPosition(d, conf.GetAtomPosition(mi))
     work = work.GetMol()
     Chem.SanitizeMol(work, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
     # The strip above can orphan a C=N whose stereo reference atom WAS the metal, and a flagged bond with no
@@ -244,6 +284,45 @@ def unassigned_centres(mol, exclude=()):
     return out
 
 
+def defined_stereo_label(mol, exclude=()):
+    """Label the ligand stereo already defined on a coordinated molecule."""
+    work, cap_to_metal = _build_enumeration_graph(mol, set(exclude))
+    atom_centers = [
+        atom.GetIdx()
+        for atom in work.GetAtoms()
+        if atom.GetIdx() < mol.GetNumAtoms()
+        and atom.GetChiralTag() in {Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW}
+    ]
+    bond_centers = [
+        bond.GetIdx()
+        for bond in work.GetBonds()
+        if bond.GetStereo()
+        in {
+            Chem.BondStereo.STEREOE,
+            Chem.BondStereo.STEREOZ,
+            Chem.BondStereo.STEREOTRANS,
+            Chem.BondStereo.STEREOCIS,
+        }
+    ]
+    return _stereo_label(work, atom_centers, bond_centers, cap_to_metal)
+
+
+def stereo_from_3d(mol, exclude=()):
+    """Label ligand stereo measured from the first conformer."""
+    if not mol.GetNumConformers():
+        raise ValueError("stereo_from_3d needs a conformer")
+    work, cap_to_metal = _build_enumeration_graph(mol, set(exclude))
+    Chem.AssignStereochemistryFrom3D(work, confId=work.GetConformer().GetId(), replaceExistingTags=True)
+    atom_centers = [
+        atom.GetIdx()
+        for atom in work.GetAtoms()
+        if atom.GetIdx() < mol.GetNumAtoms()
+        and atom.GetChiralTag() in {Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW}
+    ]
+    bond_centers = [bond.GetIdx() for bond in work.GetBonds() if bond.GetStereo() != Chem.BondStereo.STEREONONE]
+    return _stereo_label(work, atom_centers, bond_centers, cap_to_metal)
+
+
 def enumerate_unassigned(mol, cap=32, exclude=()):
     """Enumerate stereoisomers over only the *unspecified* stereo elements (point R/S + double-bond E/Z).
 
@@ -270,22 +349,22 @@ def enumerate_unassigned(mol, cap=32, exclude=()):
     def graft(wv):  # copy the enumerated ligand stereo (atom parity + E/Z) onto the FULL mol; skip the D caps
         full = Chem.Mol(mol)
         for a in wv.GetAtoms():
-            if a.GetIdx() >= n_real:  # an appended D cap has no counterpart on the full mol
+            if a.GetIdx() >= n_real or a.GetIdx() not in atom_centers:
                 continue
             fa = full.GetAtomWithIdx(a.GetIdx())
             # `work` is `mol` with each M-donor bond removed, so a tag enumerated there is in the STRIPPED
             # bond order; writing it back across a bond the full mol still has is the inverse re-basing. The
             # D cap does not enter it: appended last, it stands in the slot the metal's removal vacated.
             tag = a.GetChiralTag()
-            for mi in exclude:
-                if bond_removal_mirrors(fa, mi):
+            for cap_idx, (_z, _donated, mirrored) in cap_to_metal.items():
+                if mirrored and wv.GetBondBetweenAtoms(a.GetIdx(), cap_idx) is not None:
                     tag = mirror_tag(tag)
             fa.SetChiralTag(tag)
         for b in wv.GetBonds():
             i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
             # skip a coordination-locked bond: its `work` stereo is the arbitrary lock value, not a real hand;
             # the full mol keeps it unspecified so the metal embed builds the ring-feasible geometry.
-            if frozenset((i, j)) in locked:
+            if b.GetIdx() not in bond_centers or frozenset((i, j)) in locked:
                 continue
             if b.GetStereo() != Chem.BondStereo.STEREONONE and i < n_real and j < n_real:
                 fb = full.GetBondBetweenAtoms(i, j)

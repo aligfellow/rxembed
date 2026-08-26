@@ -93,6 +93,30 @@ def test_max_iters_zero_scores_without_moving_an_atom():
     assert np.allclose(mol.GetConformer(0).GetPositions(), before), "max_iters=0 moved atoms"
 
 
+@pytest.mark.parametrize("smiles", ["P=[Se]->[Li]", "P=[Se][Pd]"], ids=["dative-metal", "covalent-metal"])
+def test_selenium_uses_available_uff_type_on_private_graph(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for i, xyz in enumerate(((0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (2.5, 2.0, 0.0))):
+        conf.SetAtomPosition(i, xyz)
+    mol.AddConformer(conf)
+    before = Chem.MolToSmiles(mol)
+
+    energies = restrained_uff(mol, Constraints(metals={2}), max_iters=5)
+
+    assert np.isfinite(energies).all()
+    assert Chem.MolToSmiles(mol) == before
+    assert mol.GetAtomWithIdx(1).GetHybridization() == Chem.HybridizationType.SP2
+
+
+def test_selenium_fallback_does_not_retype_nonterminal_pse():
+    mol = Chem.MolFromSmiles("P=[Se](C)->[Li]")
+    mol.AddConformer(Chem.Conformer(mol.GetNumAtoms()))
+
+    with pytest.raises(RuntimeError, match="UFF has unsupported atom types outside the fixed core"):
+        restrained_uff(mol, Constraints(metals={3}), max_iters=0)
+
+
 def test_restrained_uff_seats_an_antipodal_fixed_dihedral():
     mol = _mol("CCCC")
     atoms = (0, 1, 2, 3)

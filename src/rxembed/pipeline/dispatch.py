@@ -676,7 +676,7 @@ def _embed_dispatch(
         # A frozen metal has no DOF, but its bond-less carbon still fires fictitious FF terms, so it gets the
         # zero-vdW type and its floors but no pulls -- pulling a rigid shape's members tears the body. `hold_shape`
         # must run first: ff_terms reads the `cons.shapes` record it writes.
-        real_z = {iso.metal: iso.real_z, **{mi: rz for mi, rz, _rq in iso.extra}}
+        real_z = {iso.metal: iso.real_z, **{mi: rz for mi, rz, _rq in iso.spectator_metals}}
         _distance.ff_terms(mol, metal_cons, {mi: (real_z[mi], list(dons)) for mi, dons in metals_donors.items()})
     for mi, h, target in hydrides:
         half = _cbuild._ML_SEED_HALF_WIDTH
