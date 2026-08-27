@@ -87,9 +87,15 @@ def _angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
 def _dihedral(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
     """Signed dihedral p0-p1-p2-p3 in degrees."""
     b0, b1, b2 = p0 - p1, p2 - p1, p3 - p2
-    b1 /= np.linalg.norm(b1)
+    axis = np.linalg.norm(b1)
+    if axis == 0.0:
+        return float("nan")
+    b1 /= axis
     v = b0 - np.dot(b0, b1) * b1
     w = b2 - np.dot(b2, b1) * b1
+    eps = np.finfo(float).eps
+    if np.linalg.norm(v) <= eps * np.linalg.norm(b0) or np.linalg.norm(w) <= eps * np.linalg.norm(b2):
+        return float("nan")
     return float(np.degrees(np.arctan2(np.dot(np.cross(b1, v), w), np.dot(v, w))))
 
 

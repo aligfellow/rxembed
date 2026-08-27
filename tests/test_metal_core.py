@@ -212,10 +212,10 @@ def _assert_charge_roundtrip(name, mol_charge, ens):
     return ens
 
 
-@pytest.mark.parametrize("route", ["isomer", "constrain"])
+@pytest.mark.parametrize("route", ["isomer", "isomer-constrain"])
 def test_public_embed_restores_oxidation_state(route):
     want = _metal_charges(Chem.MolFromSmiles(_NI_N))
-    spec = rx.metal(_NI_N)[0] if route == "isomer" else _NI_N
+    spec = rx.metal(_NI_N)[0]
     kw = {} if route == "isomer" else {"constrain": {(0, 1): (1.4, 1.6)}}
     ens = _assert_charge_roundtrip(route, 0, rx.embed(spec, n=2, seed=1, **kw))
     assert _metal_charges(ens.mol) == want, f"{route}: the metal came back at the wrong oxidation state"
@@ -258,7 +258,7 @@ def test_connect_disconnect_metal_are_inverses():
 def test_core_embed_returns_connected_copy():
     iso = rx.metal(_EN_PDBRCL, "square_planar")[0]
     ens = rx.embed(iso, n=3, seed=1)
-    assert not ens._minimized, "the fixture must be a bare embed, or this measures nothing"
+    assert ens._stage != "minimized", "the fixture must be a bare embed, or this measures nothing"
 
     out = ens.mol
     assert len(Chem.GetMolFrags(out)) == 1, "bare .mol is not connected"

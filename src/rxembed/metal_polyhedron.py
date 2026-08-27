@@ -600,6 +600,12 @@ def handedness(dirs, order, donor_class, chelate_edges=frozenset()):
     return DELTA if q_star in rot else LAMBDA
 
 
+def ordered_fit_residual(dirs_obs, dirs_ideal):
+    """Return the RMS after best orthogonal alignment with correspondence fixed."""
+    u, _s, vt = np.linalg.svd(dirs_obs.T @ dirs_ideal)
+    return float(np.sqrt(np.mean(np.sum((dirs_obs @ (u @ vt) - dirs_ideal) ** 2, axis=1))))
+
+
 def fit_residual(dirs_obs, record):
     """Return the per-vertex RMS after the best orthogonal seating on `record`.
 
@@ -610,5 +616,4 @@ def fit_residual(dirs_obs, record):
     ideal = np.array(record.vertex_dirs, float)
     ideal /= np.linalg.norm(ideal, axis=1, keepdims=True)
     order = _seat_by_alignment(dirs_obs, ideal)
-    u, _s, vt = np.linalg.svd(dirs_obs[order].T @ ideal)
-    return float(np.sqrt(np.mean(np.sum((dirs_obs[order] @ (u @ vt) - ideal) ** 2, axis=1))))
+    return ordered_fit_residual(dirs_obs[order], ideal)

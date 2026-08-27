@@ -13,13 +13,13 @@ def test_missing_mc_backend_preserves_ensemble(monkeypatch):
 
     monkeypatch.setattr(search, "available", lambda: False)
     ens = rx.embed("CCCCCCO", n=3, seed=1).minimize()
-    before = (list(ens.ids), dict(ens.energies), ens.energy_kind, ens._minimized)
+    before = (list(ens.ids), dict(ens.energies), ens.energy_kind, ens._stage)
     positions = {i: ens.mol.GetConformer(i).GetPositions() for i in ens.ids}
 
     with pytest.raises(ImportError, match=r"mc needs openconf; pip install 'rxembed\[search\]'"):
         ens.mc(preset="rapid")
 
-    assert (ens.ids, ens.energies, ens.energy_kind, ens._minimized) == before
+    assert (ens.ids, ens.energies, ens.energy_kind, ens._stage) == before
     for i, expected in positions.items():
         np.testing.assert_array_equal(ens.mol.GetConformer(i).GetPositions(), expected)
 
@@ -40,7 +40,7 @@ def test_failed_search_clears_stale_energies(monkeypatch):
 
     assert not ens.energies
     assert not ens.energy_kind
-    assert not ens._minimized
+    assert ens._stage == "seeded"
 
 
 # --- config resolution: a preset, then single-knob overrides ----------------------------------------------

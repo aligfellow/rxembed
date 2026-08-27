@@ -17,7 +17,7 @@ UFF_GHOST = 54  # Untypeable Xe gives a haptic centroid no UFF terms inside its 
 
 logger = logging.getLogger("rxembed.relax")
 
-MAX_ITERS = 500  # the one restrained-UFF iteration cap: every relax entry point defaults from this name
+MAX_ITERS = 2000  # the one restrained-UFF iteration cap: every relax entry point defaults from this name
 _DIHEDRAL_ATOMS = 4
 _PT = GetPeriodicTable()
 
@@ -36,6 +36,8 @@ def bonding_ok(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset(), c
     intended distances. The exemption is per pair, so broken free-periphery bonds still fail.
     """
     pos = mol.GetConformer(conf_id).GetPositions()
+    if not np.all(np.isfinite(pos)):
+        return False
     heavy = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
     metals = {i for i in heavy if mol.GetAtomWithIdx(i).GetAtomicNum() in COORDINATION_METALS}
     exclude = set(exclude)
@@ -115,15 +117,20 @@ def _uff_core_graphs(mol, frozen):
         yield out, len(chosen)
 
 
-def ff_energies(mol, minimize=True):
+def ff_energies(mol, minimize=True, max_iters=MAX_ITERS, _statuses=None):
     """FF energies (MMFF94s where typeable, else UFF); optimise in place first when ``minimize``."""
     use_mmff = rdForceFieldHelpers.MMFFHasAllMoleculeParams(mol)
     if minimize:
+        statuses = {} if _statuses is None else _statuses
         res = (
-            rdForceFieldHelpers.MMFFOptimizeMoleculeConfs(mol, numThreads=0, mmffVariant="MMFF94s")
+            rdForceFieldHelpers.MMFFOptimizeMoleculeConfs(mol, numThreads=0, maxIters=max_iters, mmffVariant="MMFF94s")
             if use_mmff
-            else rdForceFieldHelpers.UFFOptimizeMoleculeConfs(mol, numThreads=0)
+            else rdForceFieldHelpers.UFFOptimizeMoleculeConfs(mol, numThreads=0, maxIters=max_iters)
         )
+        statuses.update(
+            {conf.GetId(): int(status) for conf, (status, _energy) in zip(mol.GetConformers(), res, strict=True)}
+        )
+        _warn_unconverged(statuses, max_iters, (conf.GetId() for conf in mol.GetConformers()))
         return np.array([e for _conv, e in res])
     props = rdForceFieldHelpers.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s") if use_mmff else None
 
@@ -181,12 +188,6 @@ def _ff_surrogate(mol, metals, phantoms=()):
     return out
 
 
-def _restore_positions(conf, positions):
-    """Restore one conformer's Cartesian coordinates."""
-    for atom, xyz in enumerate(positions):
-        conf.SetAtomPosition(atom, xyz)
-
-
 def _seat_fixed_dihedrals(confs, fixed, frozen):
     """Rotate connected fixed dihedrals near target without disturbing a rigid graft."""
     frozen = sorted(frozen)
@@ -201,7 +202,7 @@ def _seat_fixed_dihedrals(confs, fixed, frozen):
             except (RuntimeError, ValueError):
                 pass  # rings may not rotate; the strict post-UFF gate remains authoritative
             if before is not None and not np.array_equal(conf.GetPositions()[frozen], before[frozen]):
-                _restore_positions(conf, before)  # a coordinate graft is stricter than a numeric torsion
+                conf.SetPositions(before)  # a coordinate graft is stricter than a numeric torsion
 
 
 def _prepare_uff_work(mol, cons, confs, frozen, max_iters):
@@ -213,19 +214,30 @@ def _prepare_uff_work(mol, cons, confs, frozen, max_iters):
         work = _ff_surrogate(work, cons.metals, cons.phantoms)  # `mol` itself for an organic system
     except Exception:
         for cid, positions in original.items():
-            _restore_positions(mol.GetConformer(cid), positions)
+            mol.GetConformer(cid).SetPositions(positions)
         raise
     return work, original
 
 
-def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=None, _snapshots=None):
+def restrained_uff(
+    mol,
+    cons,
+    *,
+    stiffness=1.0,
+    max_iters=MAX_ITERS,
+    conf_ids=None,
+    _snapshots=None,
+    _statuses=None,
+):
     """Minimise conformers with frozen atoms and flat-bottomed constraint terms.
 
     ``stiffness`` scales the restraint walls. ``conf_ids`` restricts the operation to selected conformers.
     Metal and haptic typing changes only a private graph; relaxed real-atom coordinates return to ``mol``.
+    Internal callers may collect RDKit's per-conformer convergence code through ``_statuses``.
     """
     frozen = set(cons.frozen)
     confs = list(mol.GetConformers()) if conf_ids is None else [mol.GetConformer(int(i)) for i in conf_ids]
+    statuses = {} if _statuses is None else _statuses
     work, original = _prepare_uff_work(mol, cons, confs, frozen, max_iters)
 
     typed = {}
@@ -269,9 +281,9 @@ def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=No
                 log("UFF: retyped %d fixed-core bond(s) as outward dative edges", retyped)
             try:
                 if _snapshots is None:
-                    ff.Minimize(maxIts=max_iters)
+                    status = ff.Minimize(maxIts=max_iters)
                 else:
-                    _status, snapshots = ff.MinimizeTrajectory(1, maxIts=max_iters)
+                    status, snapshots = ff.MinimizeTrajectory(1, maxIts=max_iters)
                     trajectory = _rdtrajectory.Trajectory(3, target.GetNumAtoms(), snapshots)
                     _snapshots[cid] = [
                         np.array(
@@ -282,6 +294,7 @@ def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=No
                         )
                         for snapshot in (trajectory.GetSnapshot(i) for i in range(len(trajectory)))
                     ]
+                _record_optimizer_status(statuses, cid, status, max_iters)
                 energy = ff.CalcEnergy()
             except RuntimeError as error:
                 raise RuntimeError(f"UFF minimization failed: {_error_summary(error)}") from error
@@ -292,6 +305,22 @@ def restrained_uff(mol, cons, *, stiffness=1.0, max_iters=MAX_ITERS, conf_ids=No
                     conf.SetAtomPosition(atom, src.GetAtomPosition(atom))
     except RuntimeError:
         for cid, positions in original.items():
-            _restore_positions(mol.GetConformer(cid), positions)
+            mol.GetConformer(cid).SetPositions(positions)
         raise
+    _warn_unconverged(statuses, max_iters, (conf.GetId() for conf in confs))
     return np.array(energies)
+
+
+def _warn_unconverged(statuses, max_iters, conf_ids):
+    """Warn for recorded non-converged force-field results."""
+    failed = [cid for cid in conf_ids if statuses.get(cid)]
+    if failed:
+        logger.warning(
+            "force field: %d conformer(s) did not converge in %d iterations: %s", len(failed), max_iters, failed
+        )
+
+
+def _record_optimizer_status(statuses, cid, status, max_iters):
+    """Record a real minimization result; a zero-iteration single point has no convergence status."""
+    if max_iters:
+        statuses[cid] = int(status)

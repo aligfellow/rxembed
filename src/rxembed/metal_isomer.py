@@ -12,8 +12,8 @@ from . import metal_core as _core
 from . import metal_slots as _slots
 from . import metal_stereo as _coord_stereo
 from . import stereo as _stereo
-from .constraints import Constraints, _is_index, compose
-from .metal_constraints import compile_constraints, coordination_from_geometry, resolve_lengths
+from .constraints import Constraints, _is_index, add_distance, compose
+from .metal_constraints import _model_distance_window, compile_constraints, coordination_from_geometry, resolve_lengths
 from .metal_core import (
     _APICAL_MIN,
     VACANT,
@@ -166,6 +166,7 @@ class Isomer:
         self._constrained_metals = frozenset({m})
         self._lengths = lengths
         self._length_mol = Chem.Mol(stored)  # retain measured input lengths if the public Mol is edited
+        self._graft_ref = {}
         self.stereo_ref, self.stereo_label = None, ""
 
     @classmethod
@@ -178,6 +179,7 @@ class Isomer:
         constraints=None,
         constrained_metals=(),
         lengths="model",
+        graft_ref=None,
         stereo_ref=None,
         stereo_label="",
     ):
@@ -198,6 +200,7 @@ class Isomer:
         iso._constrained_metals = constrained_metals
         iso._lengths = lengths
         iso._length_mol = Chem.Mol(iso.mol)
+        iso._graft_ref = dict(graft_ref or {})
         iso.stereo_ref, iso.stereo_label = stereo_ref, stereo_label
         return iso
 
@@ -293,6 +296,56 @@ class Isomer:
         out = copy(self)
         out.mol = Chem.Mol(self.mol)
         out._centres = centres
+        return out
+
+    def _seat_vacancies(self, atoms):
+        """Return this identity with real donor atoms seated in primary vacancies, in slot order."""
+        atoms = [int(atom) if _is_index(atom) else atom for atom in atoms]
+        if not atoms:
+            return self
+        n_atoms = self.mol.GetNumAtoms()
+        invalid = [atom for atom in atoms if not _is_index(atom) or not 0 <= atom < n_atoms]
+        if invalid:
+            raise ValueError(f"coordinate atom indices must be in 0-{n_atoms - 1}; got {invalid}")
+        if len(set(atoms)) != len(atoms):
+            raise ValueError(f"coordinate atoms must be distinct; got {atoms}")
+        if set(atoms) & set(self.donors):
+            raise ValueError(f"coordinate atoms are already donors of metal {self.metal}: {atoms}")
+        if set(atoms) & {state.atom for state in self.centres}:
+            raise ValueError(f"coordinate atoms must be ligand donors, not metal atoms: {atoms}")
+
+        state = self.centres[0]
+        vacancies = [position for position, site in enumerate(state.vertices) if site is None]
+        if len(atoms) > len(vacancies):
+            raise ValueError(
+                f"{self.geometry} {self.label} has {len(vacancies)} vacant site(s) "
+                f"but {len(atoms)} atom(s) to coordinate"
+            )
+        sites = list(state.vertices)
+        for atom, position in zip(atoms, vacancies[: len(atoms)], strict=True):
+            sites[position] = atom
+        active = state._replace(vertices=tuple(sites))
+
+        out = copy(self)
+        out.mol = Chem.Mol(self.mol)
+        out.donor_bonds = [*self.donor_bonds, *((atom, self.metal) for atom in atoms)]
+        out._base_cons = self._base_cons.copy()
+        out._constrained_metals = self._constrained_metals | {self.metal}
+        out._length_mol = Chem.Mol(self._length_mol)
+        out._graft_ref = dict(self._graft_ref)
+        out._centres = (active, *self.centres[1:])
+        vertices, haptic, _winding, donors = _core.materialized_state(out, active)
+        hand = _coord_stereo.chirality_of(out.mol, active.geometry, vertices, haptic, isomer_roles(out))
+        out._centres = (active._replace(hand=hand), *self.centres[1:])
+
+        # Existing donors may retain measured lengths; a newly seated donor has no measured M-L state.
+        for atom in atoms:
+            add_distance(
+                out._base_cons.distances,
+                self.metal,
+                atom,
+                *_model_distance_window(out.mol, self.metal, atom, self.real_z, donors),
+            )
         return out
 
     def restore(self, mol=None):
@@ -506,6 +559,7 @@ def from_geometry(mol, center=None):
         centres,
         donor_bonds,
         constraints=compose(*retained),
+        lengths="input",
         stereo_label=ligand_stereo,
     )
 

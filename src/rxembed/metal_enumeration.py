@@ -286,6 +286,7 @@ def _isomers_for_geometry(
     ref_sig,
     lengths,
     source,
+    graft_ref=None,
 ):
     """Enumerate every distinct `Isomer` of one polyhedron `geom` (frozen core held, spectators retained)."""
     base, m, real_z = base_iso.mol, base_iso.metal, base_iso.real_z
@@ -327,6 +328,7 @@ def _isomers_for_geometry(
                 constraints=base_cons,
                 constrained_metals={m},
                 lengths=lengths,
+                graft_ref=graft_ref,
                 stereo_ref=ref_sig,
             )
         )
@@ -510,6 +512,26 @@ def _from_stated_arrangements(mol, center, lengths):
     )
 
 
+def _with_fix(iso, fix):
+    """Compose a geometric fix onto an already stated coordination identity."""
+    if not fix:
+        return iso
+    cons, graft_ref = resolve_core(iso.mol, fix=fix, has_geometry=bool(iso.mol.GetNumConformers()))
+    if not isinstance(fix, dict):
+        graft_ref = {}
+    return _isomer.Isomer._from_state(
+        iso.mol,
+        iso.centres,
+        iso.donor_bonds,
+        constraints=compose(iso._base_cons, cons),
+        constrained_metals=iso._constrained_metals,
+        lengths=iso._lengths,
+        graft_ref=graft_ref,
+        stereo_ref=iso.stereo_ref,
+        stereo_label=iso.stereo_label,
+    )
+
+
 def _winding_variants(iso, state):
     """Return the symmetry-distinct assignments of one state's undefined haptic windings."""
     vertices, haptic, stored, donors = _core.materialized_state(iso, state)
@@ -568,12 +590,12 @@ def _enumerate_all_centers(mol, geometry, fix, haptic_mode, stereo_ref, lengths)
     stated = stated_arrangement(mol, center=metals[0])
     metals = _isomer.canonical_metals(mol, metals, allow_ties=stated is not None)
     if stated is not None:
-        if geometry is not None or fix:
+        if geometry is not None:
             raise ValueError(
-                f"this input already states every metal arrangement, so "
-                f"{'fix=' if fix else f'geometry={geometry!r}'} has nothing to act on"
+                f"this input already states every metal arrangement, so geometry={geometry!r} has nothing to act on"
             )
-        return _haptic_mode(_isomer.IsomerSet([_from_stated_arrangements(mol, metals[0], lengths)]), haptic_mode)
+        iso = _with_fix(_from_stated_arrangements(mol, metals[0], lengths), fix)
+        return _haptic_mode(_isomer.IsomerSet([iso]), haptic_mode)
     if mol.GetNumConformers() == 0:
         raise ValueError("center='all' needs an input geometry to infer one polyhedron per metal centre")
     if geometry is not None:
@@ -592,8 +614,11 @@ def _enumerate_all_centers(mol, geometry, fix, haptic_mode, stereo_ref, lengths)
     lengths = _isomer.length_source(real_base, lengths)
 
     fix_cons = Constraints()
+    graft_ref = {}
     if fix:
-        fix_cons, _ = resolve_core(base, fix=fix, has_geometry=True)
+        fix_cons, graft_ref = resolve_core(base, fix=fix, has_geometry=True)
+        if not isinstance(fix, dict):
+            graft_ref = {}  # frozen atoms are grafted from the retained source conformer; no external frame owns them
     frozen_core = Constraints(frozen=set(fix_cons.frozen))
     choices = []
     for m in metals:
@@ -613,6 +638,7 @@ def _enumerate_all_centers(mol, geometry, fix, haptic_mode, stereo_ref, lengths)
                     ref_sig=stereo_ref,
                     lengths=lengths,
                     source=real_base,
+                    graft_ref=graft_ref,
                 )
             )
         choices.append(_haptic_mode(candidates, haptic_mode))
@@ -628,6 +654,7 @@ def _enumerate_all_centers(mol, geometry, fix, haptic_mode, stereo_ref, lengths)
                 constraints=fix_cons,
                 constrained_metals={state.atom for state in centres},
                 lengths=lengths,
+                graft_ref=graft_ref,
                 stereo_ref=stereo_ref,
             )
         )
@@ -701,21 +728,22 @@ def _enumerate_coordination(mol, geometry, center, fix, haptic_mode, stereo_ref,
     stated = stated_arrangement(mol, center=center)
     if stated is not None:
         name, sites, chirality, windings = stated
-        if (geometry is not None and resolve_geometry(geometry) != name) or fix:
+        if geometry is not None and resolve_geometry(geometry) != name:
             raise ValueError(
-                f"this input already states a {name} arrangement, so "
-                f"{'fix=' if fix else f'geometry={geometry!r}'} has nothing to act on; drop it to use what "
-                f"the input says, or strip the arrangement to enumerate"
+                f"this input already states a {name} arrangement, so geometry={geometry!r} has nothing to act on; "
+                f"drop it to use what the input says, or strip the arrangement to enumerate"
             )
         logger.info("using stated %s arrangement", describe(name))
         if len(metal_indices(mol)) > 1:
-            return _haptic_mode(_isomer.IsomerSet([_from_stated_arrangements(mol, center, lengths)]), haptic_mode)
+            iso = _with_fix(_from_stated_arrangements(mol, center, lengths), fix)
+            return _haptic_mode(_isomer.IsomerSet([iso]), haptic_mode)
         iso = _isomer.Isomer(mol, name, sites, lengths=lengths)
         _validate_stated_chirality(iso, chirality)
         winding = _stated_windings(iso, windings)
         vertices = iso.vertices
         state = iso.centres[0]
         iso = iso._with_stereo((_core.state_with_winding(state, vertices, winding)._replace(hand=chirality),))
+        iso = _with_fix(iso, fix)
         return _haptic_mode(_isomer.IsomerSet([iso]), haptic_mode)
     metals = metal_indices(mol)
     if not metals:
@@ -736,11 +764,14 @@ def _enumerate_coordination(mol, geometry, center, fix, haptic_mode, stereo_ref,
     source = strip_phantoms(Chem.Mol(base), set(haptic))
     lengths = _isomer.length_source(source, lengths)  # once per molecule, not per ordering
     fix_cons = Constraints()
+    graft_ref = {}
     frozen_donors = set()
     # Hold a reacting TS core while the rest of the coordination sphere is enumerated: coordinate forms need
     # an input geometry, while numeric distances and angles are complete on a coordinate-free graph.
     if fix:
-        fix_cons, _ = resolve_core(base, fix=fix, has_geometry=base.GetNumConformers() > 0)
+        fix_cons, graft_ref = resolve_core(base, fix=fix, has_geometry=base.GetNumConformers() > 0)
+        if not isinstance(fix, dict):
+            graft_ref = {}  # `frozen` plus the retained conformer carries a same-source list fix
         frozen_donors = fix_cons.frozen & set(donors)
         logger.info(
             "metal: fixed %d input atoms; enumerating free coordination sites",
@@ -761,6 +792,7 @@ def _enumerate_coordination(mol, geometry, center, fix, haptic_mode, stereo_ref,
                 ref_sig=stereo_ref,
                 lengths=lengths,
                 source=source,
+                graft_ref=graft_ref,
             )
         )
     if mol.GetNumConformers():

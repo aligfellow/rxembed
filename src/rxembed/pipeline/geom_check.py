@@ -23,6 +23,7 @@ import numpy as np
 from rdkit import Chem
 
 # metals excluded from every ground-state check (dative, not vdW):
+from rxembed.constraints import constraint_value, within_window
 from rxembed.metal_core import COORDINATION_METALS
 from rxembed.metal_perceive import (
     _coordinating_carbons,
@@ -344,43 +345,35 @@ def frozen_core(mol, pos, frozen, reference, tol: float = 0.05) -> list[Violatio
 
 
 def check_constraints(mol, pos, spec, dist_slack: float = 0.15, ang_slack: float = 5.0) -> list[Violation]:
-    """Seeded ``distances`` / ``angles`` realised within their window (+ slack).
+    """Return distance, angle and dihedral terms missed by one geometry.
 
-    ``spec`` is a mapping or Constraints-like object exposing ``distances`` / ``angles``.
+    ``spec`` is a mapping or Constraints-like object exposing geometric windows.
     """
-    dists = _attr(spec, "distances", {})
-    angles = _attr(spec, "angles", {})
-    n = len(pos)  # a constraint on a transient (a haptic centroid dummy) has no counterpart in the real geometry:
-    out = []  # its index is >= n, so skip it. The equivalent real check (M -> each ring atom) has real indices.
-    for (i, j), win in dists.items():
-        if i >= n or j >= n:
-            continue
-        lo, hi = win if isinstance(win, tuple) else (win, win)
-        d = float(np.linalg.norm(pos[i] - pos[j]))
-        if not (lo - dist_slack <= d <= hi + dist_slack):
-            out.append(
-                Violation(
-                    kind="constraint",
-                    atoms=(i, j),
-                    value=d,
-                    limit=hi + dist_slack,
-                    detail=f"distance window [{lo}, {hi}]",
+    haptic = _attr(spec, "haptic", {})
+    out = []
+    for name, windows, slack in (
+        ("distance", _attr(spec, "distances", {}), dist_slack),
+        ("angle", _attr(spec, "angles", {}), ang_slack),
+        ("dihedral", _attr(spec, "dihedrals", {}), ang_slack),
+    ):
+        for atoms, given in windows.items():
+            window = tuple(given) if isinstance(given, (tuple, list)) else (given, given)
+            value = constraint_value(pos, atoms, haptic, window)
+            if not within_window(value, window, slack):
+                lo, hi = window
+                out.append(
+                    Violation(
+                        kind="constraint",
+                        atoms=atoms,
+                        value=float("nan") if value is None else value,
+                        limit=hi + slack,
+                        detail=(
+                            f"{name} could not be measured; check atom indices and haptic metadata"
+                            if value is None or not np.isfinite(value)
+                            else f"{name} window [{lo}, {hi}]"
+                        ),
+                    )
                 )
-            )
-    for (i, j, k), (lo, hi) in angles.items():
-        if i >= n or j >= n or k >= n:
-            continue
-        a = _angle(pos[i], pos[j], pos[k])
-        if not (lo - ang_slack <= a <= hi + ang_slack):
-            out.append(
-                Violation(
-                    kind="constraint",
-                    atoms=(i, j, k),
-                    value=a,
-                    limit=hi + ang_slack,
-                    detail=f"angle window [{lo}, {hi}]",
-                )
-            )
     return out
 
 
@@ -427,6 +420,18 @@ def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=No
     if isinstance(reference, str):
         reference = Chem.MolFromXYZFile(reference)  # coords only; atom order must match `mol`
     pos = _positions(mol, conf_id)
+    if not np.all(np.isfinite(pos)):
+        return GeometryReport(
+            [
+                Violation(
+                    kind="coordinates",
+                    atoms=(),
+                    value=float("nan"),
+                    limit=0.0,
+                    detail="non-finite coordinate",
+                )
+            ]
+        )
     exclude = set(frozen) if frozen is not None else set()
     exclude |= {a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS}  # dative, not vdW
     exclude = frozenset(exclude)

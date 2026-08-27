@@ -72,6 +72,13 @@ def test_exemption_is_per_pair_not_per_atom():
     )
 
 
+def test_bonding_gate_rejects_nonfinite_coordinates():
+    mol = _mol()
+    mol.GetConformer().SetAtomPosition(0, (float("nan"), 0.0, 0.0))
+
+    assert not bonding_ok(mol, 0)
+
+
 # ---------------------------------------------------------------------------------------------------------
 # restrained_uff; relax, and score-without-moving
 # ---------------------------------------------------------------------------------------------------------
@@ -91,6 +98,29 @@ def test_max_iters_zero_scores_without_moving_an_atom():
     before = mol.GetConformer(0).GetPositions().copy()
     restrained_uff(mol, cons, max_iters=0)
     assert np.allclose(mol.GetConformer(0).GetPositions(), before), "max_iters=0 moved atoms"
+
+
+def test_restrained_uff_reports_optimizer_status_and_uses_the_full_cap(monkeypatch, caplog):
+    mol = _mol()
+    seen = []
+
+    def force_field(_target, **_kwargs):
+        def minimize(**kwargs):
+            seen.append(kwargs["maxIts"])
+            return 1
+
+        return SimpleNamespace(Initialize=lambda: None, Minimize=minimize, CalcEnergy=lambda: 12.5)
+
+    monkeypatch.setattr(relax_module._mech, "MECHANISM_ORDER", ())
+    monkeypatch.setattr(relax_module.rdForceFieldHelpers, "UFFHasAllMoleculeParams", lambda _mol: True)
+    monkeypatch.setattr(relax_module.rdForceFieldHelpers, "UFFGetMoleculeForceField", force_field)
+    statuses = {}
+    with caplog.at_level("WARNING", logger="rxembed.relax"):
+        restrained_uff(mol, Constraints(), _statuses=statuses)
+
+    assert seen == [2000]
+    assert statuses == {0: 1}
+    assert "did not converge" in caplog.text
 
 
 @pytest.mark.parametrize("smiles", ["P=[Se]->[Li]", "P=[Se][Pd]"], ids=["dative-metal", "covalent-metal"])
@@ -160,6 +190,7 @@ def test_force_field_minimizer_failure_rolls_back_the_batch(monkeypatch):
             target.GetConformer(conf_id).SetAtomPosition(0, (99.0, 99.0, 99.0))
             if conf_id == failed:
                 raise RuntimeError("BFGS diverged")
+            return 0
 
         return SimpleNamespace(Initialize=lambda: None, Minimize=diverge, CalcEnergy=lambda: 12.5)
 

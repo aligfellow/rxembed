@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from rdkit import Chem
 
+from .constraints import _graft_owns
 from .metal_core import COORDINATION_METALS
 from .metal_distance import (
     APEX,
@@ -183,7 +184,7 @@ def donor_orientation(mol, pos, donors=None, frozen=frozenset()) -> list[Violati
     * a hydride, sigma-complex or agostic H has no lone-pair axis;
     * a bridging donor takes its geometry from the bridge;
     * an APEX substituent bonded to >=2 donors sits at ~90° geometrically; a chelate's other arm is not exempt;
-    * a D-X unit inside the frozen core takes its orientation from the reference TS.
+    * an M-D-X unit wholly inside the frozen core takes its orientation from the reference TS.
 
     A donor the two estimators disagree on, or an uncalibrated class (n < 6), is never gated. ``donors`` is
     the intended sphere and the caller must pass it: perceiving it is circular, since a folded atom enters the
@@ -247,7 +248,7 @@ def _donor_walk(mol, pos, donors=None, frozen=frozenset()) -> tuple[list[DonorAn
     unknown: list[int] = []
     for m, sphere in spheres.items():
         for d in sorted(sphere):
-            subs = donation_axis(mol, d, all_donors, sphere=sphere, frozen=frozen)
+            subs = donation_axis(mol, d, all_donors, sphere=sphere)
             if subs is None:  # hydride, bridging or haptic: the donation question does not apply
                 continue
             cls = (mol.GetAtomWithIdx(d).GetSymbol(), hyb[d]) if d in hyb else None  # None when estimators disagree
@@ -256,6 +257,8 @@ def _donor_walk(mol, pos, donors=None, frozen=frozenset()) -> tuple[list[DonorAn
                     unknown.append(d)  # only if it had a judgeable substituent: an honest unknown, not a bare
                 continue  # skip.
             for x in subs:
+                if _graft_owns((m, d, x), frozen):
+                    continue
                 ang = _angle(pos[m], pos[d], pos[x])
                 dev = abs(ang - _FOLD_MEDIAN[cls])
                 out.append(

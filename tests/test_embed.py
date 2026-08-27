@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import itertools
 import logging
 import re
 import sys
@@ -20,7 +21,7 @@ from rxembed.metal_core import TRANSITION_METALS, coplanar
 from rxembed.metal_enumeration import enumerate_isomers
 from rxembed.metal_isomer import Isomer, from_geometry
 from rxembed.metal_smiles import parse_smiles
-from rxembed.relax import bonding_ok
+from rxembed.relax import bonding_ok, restrained_uff
 
 emb = importlib.import_module("rxembed.embed")  # the engine implementation module, not the public facade
 
@@ -65,6 +66,14 @@ def _distance(mol, cid, i, j):
     return float(np.linalg.norm(p[i] - p[j]))
 
 
+def _aligned_rms(a, b):
+    """Return same-order Cartesian RMSD after a proper Kabsch alignment."""
+    a, b = a - a.mean(0), b - b.mean(0)
+    u, _s, vt = np.linalg.svd(a.T @ b)
+    u[:, -1] *= np.linalg.det(u @ vt)
+    return float(np.sqrt(np.mean(np.sum((a @ (u @ vt) - b) ** 2, axis=1))))
+
+
 # ---------------------------------------------------------------------------------------------------------
 # the everyday spine
 # ---------------------------------------------------------------------------------------------------------
@@ -103,9 +112,19 @@ def test_numeric_fix_rejects_when_cleanup_cannot_hold_it(monkeypatch, caplog):
         "restrained_uff",
         lambda mol, cons, conf_ids=None, **kw: np.zeros(len(conf_ids if conf_ids is not None else mol.GetConformers())),
     )
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        confs.minimize()
+    seed_calls = []
+    real_seed = emb.seed_conformers
 
+    def tracked_seed(*args, **kwargs):
+        seed_calls.append(kwargs["seed"])
+        return real_seed(*args, **kwargs)
+
+    monkeypatch.setattr(emb, "seed_conformers", tracked_seed)
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        with pytest.raises(ValueError, match="fix="):
+            confs.minimize()
+
+    assert seed_calls, "the hard fix failure bypassed fresh-seed replacement"
     assert not confs.ids, "an off-target numeric fix was returned after cleanup"
     assert not confs.unrelaxed, "rejected conformer ids leaked into tracked state"
     assert "requested" in caplog.text
@@ -122,6 +141,35 @@ def test_undefined_dihedral_fails_numeric_fix_gate():
     misses = Conformers(mol, [0], cons)._fixed_geometry_misses(0)
     assert len(misses) == 1
     assert np.isinf(misses[0][0])
+
+
+def test_coordination_gate_rejects_a_poor_nearest_shape():
+    iso = _isomer()
+    confs = embed(iso, n=1, seed=1)
+    conf = confs._mol.GetConformer(confs.ids[0])
+    metal = np.array(conf.GetAtomPosition(iso.metal))
+    for donor in iso.donors:
+        conf.SetAtomPosition(donor, (metal + np.array([1.0, 0.0, 0.0])).tolist())
+
+    assert not emb._coordination_state_ok(confs._mol, confs.ids[0], iso)
+
+
+def test_coordination_gate_rejects_nonfinite_donor_coordinates():
+    iso = _isomer()
+    confs = embed(iso, n=1, seed=1)
+    confs._mol.GetConformer(confs.ids[0]).SetAtomPosition(iso.donors[0], (float("nan"), 0.0, 0.0))
+
+    assert not emb._coordination_state_ok(confs._mol, confs.ids[0], iso)
+
+
+def test_structural_gate_rejects_undefined_coplanarity():
+    mol = _with_geometry("CCCC")
+    conf = mol.GetConformer()
+    for atom, xyz in enumerate(((0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0))):
+        conf.SetAtomPosition(atom, xyz)
+    cons = Constraints(coplanar=[(0, 1, 2, 3, 180.0, 10.0)])
+
+    assert not emb._structural_constraints_ok(mol, 0, cons)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -223,10 +271,20 @@ def test_fix_landing_on_a_sphere_hold_overrides_it():
 def test_sphere_hold_remains_nonreleasable():
     iso = _isomer()
     key = _sphere_key(iso)
-    cons = _fold(iso, constrain={key: (2.3, 2.5)})
-    assert cons.distances[key] == pytest.approx((2.3, 2.5))
-    assert key not in cons.contacts[0], "a sphere hold became releasable"
-    assert key in cons.relaxed().distances, "the exploratory pass would drop the coordination sphere"
+    with pytest.raises(ValueError, match="soft bias cannot replace the selected metal state"):
+        _fold(iso, constrain={key: (2.3, 2.5)})
+
+
+def test_soft_dihedral_cannot_replace_structural_metal_torsion():
+    base = Constraints(coplanar=[(0, 1, 2, 3, 180.0, 15.0)], umbrellas={(6, 1, 2, 7): None})
+    key = (4, 1, 2, 5)
+    sub = Constraints(
+        dihedrals={key: (80.0, 100.0)},
+        contacts=(frozenset(), frozenset({key})),
+    )
+
+    with pytest.raises(ValueError, match="soft bias cannot replace the selected metal state"):
+        fold_substrate(base, sub, {})
 
 
 def test_graft_allows_one_sphere_atom_not_two():
@@ -377,8 +435,7 @@ def test_minimize_preserves_input_metal_sphere():
 def test_stiffness_retry_rescues_torn_conformer(caplog, monkeypatch):
     confs = embed(_isomer(_NI_N), n=2, seed=1, threads=1, prune_rms=-1)
     victim = int(confs.ids[0])
-    real_intact = confs._intact
-    retries = []  # stiffnesses used when `_rescue_torn` retries the victim alone
+    retries = []  # stiffnesses used when `_retry_relaxation` retries the victim alone
     batch_marked = False
 
     embed_mod = sys.modules[Conformers.__module__]
@@ -393,19 +450,19 @@ def test_stiffness_retry_rescues_torn_conformer(caplog, monkeypatch):
             confs.unrelaxed = [victim]  # a failed batch may flag it before the individual retry succeeds
         return real_uff(mol, cons, **kw)
 
-    def torn_until_retried(cid):  # torn until it has been re-relaxed on its own, honest from then on
-        return False if cid == victim and not retries else real_intact(cid)
-
     monkeypatch.setattr(embed_mod, "restrained_uff", spy_uff)
-    monkeypatch.setattr(confs, "_intact", torn_until_retried)
     with caplog.at_level(logging.INFO, logger="rxembed"):
         confs = confs.minimize()
 
-    line = next(
-        (r.getMessage() for r in caplog.records if r.getMessage().startswith("minimize:") and "torn" in r.getMessage()),
-        "",
-    )
-    assert line, "the injected tear did not reach `_rescue_torn`"
+        line = next(
+            (
+                r.getMessage()
+                for r in caplog.records
+                if r.getMessage().startswith("minimize:") and "failed the relax contract" in r.getMessage()
+            ),
+            "",
+        )
+    assert line, "the injected tear did not reach `_retry_relaxation`"
     assert retries, "a torn conformer must be re-relaxed on its own, not left to the global ladder"
     assert retries[0] > BASE_STIFFNESS, f"the retry did not escalate above {BASE_STIFFNESS}: {retries[0]}"
     rescued = re.search(r"(\d+) rescued", line)
@@ -413,6 +470,23 @@ def test_stiffness_retry_rescues_torn_conformer(caplog, monkeypatch):
     assert int(rescued.group(1)) >= 1, f"a conformer that is intact on retry must be rescued, not seeded: {line}"
     assert victim not in confs.unrelaxed, "a rescued conformer must not be reported as unrelaxed"
     assert len(confs) == 2, "the ladder must not spend the caller's n"
+
+
+def test_higher_uff_ceiling_preserves_ni_seed_diversity():
+    confs = embed(_isomer(_NI_N), n=20, seed=42, threads=1, prune_rms=-1)
+    raw = {cid: confs._mol.GetConformer(cid).GetPositions().copy() for cid in confs.ids}
+    statuses = {}
+    restrained_uff(confs._mol, confs.cons, conf_ids=confs.ids, _statuses=statuses)
+
+    assert len(confs.ids) == 20
+    assert statuses == dict.fromkeys(confs.ids, 0)
+    final = {cid: confs._mol.GetConformer(cid).GetPositions().copy() for cid in confs.ids}
+    pairs = [
+        (_aligned_rms(raw[i], raw[j]), _aligned_rms(final[i], final[j]))
+        for i, j in itertools.combinations(confs.ids, 2)
+    ]
+    assert min(after for _before, after in pairs) >= 0.5
+    assert not [(before, after) for before, after in pairs if before > 1.0 and after < 0.5]
 
 
 def test_constrained_embed_returns_intact_or_seed():
@@ -440,18 +514,19 @@ def test_constrained_energies_share_one_final_objective(monkeypatch):
         calls.append((kw["stiffness"], kw.get("max_iters")))
         return np.full(len(result), 7.0 if kw.get("max_iters") == 0 else 99.0)
 
-    def replace_after_relax(self, *args):
+    def replace_after_relax(self, *args, **kwargs):
         self.energies = dict.fromkeys(self.ids, -50.0)  # stand in for a hand re-seed's separately scored batch
+        return {}
 
     monkeypatch.setattr(emb, "restrained_uff", marked_uff)
-    monkeypatch.setattr(Conformers, "_hold_metal_hand", replace_after_relax)
+    monkeypatch.setattr(Conformers, "_accept_relaxed", replace_after_relax)
     confs.minimize()
 
     assert calls[-1] == (BASE_STIFFNESS, 0)
     assert set(confs.energies.values()) == {7.0}
 
 
-def test_restored_donor_hand_is_rescored(monkeypatch):
+def test_relax_result_is_rescored_on_a_common_objective(monkeypatch):
     mol = Chem.AddHs(parse_smiles("[Pd](Cl)(Cl)(Cl)([N@H](C)O)"))
     iso = enumerate_isomers(mol, "square_planar")[0]
     confs = embed(iso, n=1, seed=2)
@@ -466,7 +541,6 @@ def test_restored_donor_hand_is_rescored(monkeypatch):
     monkeypatch.setattr(emb, "restrained_uff", spy_uff)
     energies = confs._relax_constrained(BASE_STIFFNESS)
 
-    assert confs.unrelaxed == [0]
     assert calls[-1][0] == 0
     assert np.array_equal(energies, calls[-1][1])
 
@@ -477,11 +551,13 @@ def test_trajectory_keeps_only_the_accepted_stiffness(monkeypatch):
     seed = mol.GetConformer(0).GetPositions().copy()
     attempts = []
 
-    def marked_uff(mol, cons, *, stiffness, max_iters, conf_ids=None, _snapshots=None, **_kw):
+    def marked_uff(mol, cons, *, stiffness, max_iters, conf_ids=None, _snapshots=None, _statuses=None, **_kw):
         if max_iters == 0:
             return np.array([0.0])
         attempts.append(stiffness)
         cid = int(conf_ids[0]) if conf_ids else 0
+        if _statuses is not None:
+            _statuses[cid] = 0
         positions = mol.GetConformer(cid).GetPositions().copy()
         positions[0, 0] = len(attempts)
         for atom, xyz in enumerate(positions):
@@ -491,7 +567,11 @@ def test_trajectory_keeps_only_the_accepted_stiffness(monkeypatch):
         return np.array([float(stiffness)])
 
     monkeypatch.setattr(emb, "restrained_uff", marked_uff)
-    monkeypatch.setattr(Conformers, "_intact", lambda self, cid: len(attempts) >= 2)
+    monkeypatch.setattr(
+        Conformers,
+        "_geometry_failure",
+        lambda _self, _cid, _iso=None: "injected failure" if len(attempts) < 2 else None,
+    )
     frames = []
     confs._relax_constrained(BASE_STIFFNESS, _frames=frames)
     confs._store_trajectory(frames)
@@ -520,7 +600,6 @@ def test_named_metal_hand_is_preserved(want):
     confs = embed(iso, n=8, seed=0xF00D).minimize()
     assert len(confs) >= 4, "the fixture must return enough conformers to be a fair sample"
     assert _hands(confs) == [want] * len(confs)
-    assert confs.wrong_hand == []
 
 
 def test_unstated_metal_hand_skips_hand_check(monkeypatch):
@@ -546,7 +625,6 @@ def test_stereocentre_preserves_metal_hand_and_energies():
     assert not emb._mirror_is_free(iso.mol), "the premise: this fixture must be beyond the free fix"
     confs = embed(iso, n=6, seed=0xF00D).minimize()
     assert _hands(confs) == [iso.chirality] * len(confs)
-    assert confs.wrong_hand == []
     assert set(confs.energies) == {int(c) for c in confs.ids}, "a re-seeded conformer must bring its own energy"
 
 
@@ -567,17 +645,82 @@ def _mirrored_input(smiles):
 
 def test_minimize_preserves_isomer_hand():
     confs = minimize(_mirrored_input(_CO_EN))
-    assert confs.wrong_hand == []
     assert _hands(confs) == ["delta"]
 
 
-def test_unfixable_metal_hand_is_reported(caplog):
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        confs = minimize(_mirrored_input(_CO_EN_ME))
-    assert confs.seed is None, "nothing was embedded here, so there is no seed to re-roll"
-    assert confs.wrong_hand == list(confs.ids)
-    assert "wrong_hand" in caplog.text
-    assert confs[0].wrong_hand == [confs.ids[0]], "a slice must not silently lose the wrong-hand flag"
+def test_unfixable_metal_hand_fails_instead_of_returning_the_wrong_identity():
+    with pytest.raises(ValueError, match="the requested metal state"):
+        minimize(_mirrored_input(_CO_EN_ME))
+
+
+def test_requested_metal_hand_still_fails_when_its_replacement_breaks_a_bond(monkeypatch):
+    iso = next(i for i in enumerate_isomers(_mol(_CO_EN), "octahedral") if i.chirality)
+    confs = embed(iso, n=1, seed=1)
+    replaced = False
+
+    def wrong_failure(self, operation="minimize", validator=None):
+        reason = "broken bond" if replaced else "the requested metal state"
+        return {reason: list(self.ids)}
+
+    def broken_replacement(_self, failed, *_args, **_kwargs):
+        nonlocal replaced
+        replaced = True
+        return list(failed)
+
+    monkeypatch.setattr(Conformers, "_acceptance_failures", wrong_failure)
+    monkeypatch.setattr(Conformers, "_replace_failed", broken_replacement)
+
+    with pytest.raises(ValueError, match="the requested metal state"):
+        confs.minimize()
+
+
+def test_valid_unrelaxed_reseed_preserves_its_status(monkeypatch):
+    confs = embed(_isomer(), n=1, seed=1)
+    victim = confs.ids[0]
+    confs.unrelaxed = [victim]
+
+    monkeypatch.setattr(emb, "seed_conformers", lambda *_args, **_kwargs: (Chem.Mol(confs._mol), [victim], None))
+
+    def leave_unrelaxed(self, *_args, **_kwargs):
+        self.unrelaxed = list(self.ids)
+        self.energies = dict.fromkeys(self.ids, 42.0)
+        return [0.0] * len(self.ids)
+
+    monkeypatch.setattr(Conformers, "_relax_once", leave_unrelaxed)
+    monkeypatch.setattr(Conformers, "_acceptance_failures", lambda *_args, **_kwargs: {})
+
+    assert confs._replace_failed([victim], BASE_STIFFNESS, 1) == []
+    assert confs.unrelaxed == [victim]
+    assert confs.energies == {victim: 42.0}
+
+
+def test_requested_metal_hand_must_fill_the_seed_count(monkeypatch):
+    iso = next(i for i in enumerate_isomers(_mol(_CO_EN), "octahedral") if i.chirality)
+    monkeypatch.setattr(emb, "_seed_stereo_matches", lambda *_args, **_kwargs: False)
+
+    with pytest.raises(RuntimeError, match=r"found 0/1 seeds with the requested metal state"):
+        embed(iso, n=1, seed=1)
+
+
+def test_unconstrained_max_iteration_replaces_invalid_geometry_and_keeps_status(monkeypatch):
+    confs = embed(_mol("CCC"), n=1, seed=1)
+    owner = confs._mol
+
+    def stall(mol, _cons, **kwargs):
+        ids = kwargs.get("conf_ids") or [conf.GetId() for conf in mol.GetConformers()]
+        if mol is owner:
+            mol.GetConformer(ids[0]).SetAtomPosition(0, (99.0, 99.0, 99.0))
+        statuses = kwargs.get("_statuses")
+        if statuses is not None:
+            statuses.update(dict.fromkeys(ids, 1))
+        return [0.0] * len(ids)
+
+    monkeypatch.setattr(emb, "restrained_uff", stall)
+    confs.minimize()
+
+    assert confs.ids
+    assert confs.unrelaxed == confs.ids
+    assert all(confs._relax_ok(cid) for cid in confs.ids)
 
 
 def test_measure_reports_distance_and_angle():

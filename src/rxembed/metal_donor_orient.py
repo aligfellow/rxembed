@@ -200,7 +200,7 @@ def codonor_in_plane(mol, d, donors, hyb=None) -> bool:
     return False
 
 
-def donation_axis(mol, d, all_donors, sphere=None, frozen=frozenset()) -> list[int] | None:
+def donation_axis(mol, d, all_donors, sphere=None) -> list[int] | None:
     """Return donor ``d``'s judgeable heavy substituents X, or ``None`` when it donates along no axis.
 
     The M-D-X question is only meaningful for a donor with one lone-pair axis pointed at one metal. Three donors
@@ -213,8 +213,9 @@ def donation_axis(mol, d, all_donors, sphere=None, frozen=frozenset()) -> list[i
 
     The abstention is about the donor, so both the coordinate-space ruler (``_donor_walk``) and the enumerator's
     screen (``_donor_faces_metal``) read it here. Returns a possibly-empty list when every substituent is
-    itself exempt (a co-donor, a κ2 bite ``APEX``, a proton, a metal, or a frozen-core D-X): "ask, but nothing
-    to measure", distinct from the ``None`` that means "do not ask".
+    itself exempt (a co-donor, a κ2 bite ``APEX``, a proton, or a metal): "ask, but nothing to measure",
+    distinct from the ``None`` that means "do not ask". Freeze ownership is not chemistry and is applied only
+    after the complete M-D-X term is known.
 
     ``sphere`` is this metal's own donors (the ``APEX`` bite test); it defaults to ``all_donors``.
     """
@@ -233,7 +234,6 @@ def donation_axis(mol, d, all_donors, sphere=None, frozen=frozenset()) -> list[i
         and nb.GetAtomicNum() not in COORDINATION_METALS
         and nb.GetIdx() not in all_donors  # co-donor
         and overbond_tier(mol, sphere, nb.GetIdx()) != APEX  # a κ2 bite apex is forced by its ring
-        and not (d in frozen and nb.GetIdx() in frozen)  # the frozen core's own orientation, grafted from the TS
     ]
 
 
@@ -249,7 +249,7 @@ def _is_chelated(mol, d, donor_set, metal) -> bool:
     )
 
 
-def _orient_donor(mol, metal, d, donor_set, cons, core_frozen=()):
+def _orient_donor(mol, metal, d, donor_set, cons):
     """Wall every donor substituent, heavy or proton, off the metal: the M-D-X bend the stripped bond lost.
 
     One flat-bottomed angle wall per non-metal, non-apex substituent, keyed on the donor's (element, hyb) census
@@ -258,18 +258,11 @@ def _orient_donor(mol, metal, d, donor_set, cons, core_frozen=()):
     holds the surrogate used to need separately (sp end-on, pnictogen proton splay, heavy-substituent fold); a
     PROTON is a substituent too, which is the fix for an sp3 amine folding an H onto the metal over its lone pair.
 
-    Skipped for a ``fix=`` TS-core donor (``core_frozen``, whose orientation is the reference's) and an uncalibrated
-    class (estimators disagree / n<6), exactly as the gate abstains. A HEAVY APEX substituent (bonded to >= 2
-    donors) is a geometrically forced bite apex, never walled. The OUT-of-plane coplanarity is the sibling
-    `_coplanar_donor`; this covers the IN-plane / axial. The class reads `_stripped_hybridisation`, so a bent acyl
-    read "sp" is re-read sp2 and earns the sp2 fold wall.
-
-    The skip here is the DONOR's alone; whether a frozen METAL also silences it is the caller's call, since it
-    turns on whether the input geometry is being trusted (`coordination.coordination`).
+    An uncalibrated class (estimators disagree / n<6) abstains, exactly as the gate does. A heavy APEX
+    substituent (bonded to >= 2 donors) is a geometrically forced bite apex, never walled. Freeze ownership is
+    resolved after the complete term exists. The out-of-plane coplanarity is the sibling `_coplanar_donor`.
     """
     a = mol.GetAtomWithIdx(d)
-    if d in core_frozen:  # a fix= TS core grafts this donor's orientation
-        return
     sym, hyb = a.GetSymbol(), _stripped_hybridisation(mol).get(d)
     window = _ORIENT_WALL.get((sym, hyb))
     if window is None:  # estimators disagree or the class is uncalibrated (n < 6): the gate abstains, so does this

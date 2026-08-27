@@ -657,13 +657,17 @@ def test_identical_haptic_faces_canonicalize_opposite_windings():
     assert len(strings) == 1
 
 
-def test_stated_arrangement_rejects_redundant_arguments():
+def test_stated_arrangement_rejects_shape_override_and_composes_fix():
     text = rx.cxsmiles(_isomer("[Pt](F)(F)(F)(Cl)(Cl)Cl", "octahedral", _MA3B3_SEATS["fac"]))
     mol = S.parse_smiles(text)
     assert len(rx.enumerate_isomers(mol, "OCT")) == 1, "naming the shape the string states is not a contradiction"
-    for kwargs in ({"geometry": "trigonal_prismatic"}, {"fix": [1, 2]}):
-        with pytest.raises(ValueError, match="nothing to act on"):
-            rx.enumerate_isomers(mol, **kwargs)
+    with pytest.raises(ValueError, match="nothing to act on"):
+        rx.enumerate_isomers(mol, geometry="trigonal_prismatic")
+    with pytest.raises(ValueError, match="source has no geometry"):
+        rx.enumerate_isomers(mol, fix=[1, 2])
+
+    fixed = rx.enumerate_isomers(mol, fix={(1, 2): 2.0})
+    assert fixed[0].cons.fixed[(1, 2)] == (2.0, 2.0)
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")

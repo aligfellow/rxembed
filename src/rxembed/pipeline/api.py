@@ -10,22 +10,19 @@ import logging
 
 from rxembed.embed import BASE_STIFFNESS as _BASE_STIFFNESS
 from rxembed.metal_isomer import Isomer
+from rxembed.relax import ff_energies
 
-from . import calculators as _refine
 from .dispatch import (
-    _attach_stereo,
     _default_stereo,
     _embed_dispatch,
     _normalize,
-    _stereo_enumerated_embed,
-    _stereo_expand,
     _template_to_fix,
     _validate_stereo,
 )
 
 # The workflow name accepts strings and paths; the engine name accepts a Mol.
 from .dispatch import enumerate_isomers as metal
-from .ensemble import Ensemble, EnsembleSet
+from .ensemble import _MINIMIZED, Ensemble, EnsembleSet
 
 logger = logging.getLogger("rxembed")
 
@@ -93,14 +90,9 @@ def embed(
         "seed": seed,
         "threads": threads,
         "knowledge": knowledge,
-        "stereo": stereo,  # the metal load-in (enumerate_isomers) reads it; the organic path uses _stereo_expand
+        "stereo": stereo,
     }
-    expanded = _stereo_expand(source, stereo)  # undefined-stereocentre racemate load-in (or None)
-    if expanded is not None:
-        result = _stereo_enumerated_embed(expanded, stereo, dispatch_kw)
-    else:
-        result = _embed_dispatch(source, **dispatch_kw)
-        _attach_stereo(result, source, charge, stereo)
+    result = _embed_dispatch(source, **dispatch_kw)
     return _relax_embedded(result, trajectory)
 
 
@@ -168,8 +160,8 @@ def wrap(mol, ids=None, *, energies=None, minimized=False):
             ens.energies = {i: float(e) for i, e in zip(ids, energies, strict=False)}
     if minimized:
         if not ens.energies:
-            e = _refine.ff_energies(mol, minimize=False)  # single-point, geometry untouched
+            e = ff_energies(mol, minimize=False)  # single-point, geometry untouched
             by_id = {c.GetId(): float(e[k]) for k, c in enumerate(mol.GetConformers())}
             ens.energies = {i: by_id[i] for i in ids if i in by_id}
-        ens._minimized = True
+        ens._stage = _MINIMIZED
     return ens

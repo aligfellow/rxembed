@@ -8,7 +8,16 @@ import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 
-from rxembed.constraints import Constraints, add_distance, compose, match, resolve_core, template_to_fix
+from rxembed.constraints import (
+    Constraints,
+    add_distance,
+    compose,
+    compose_soft,
+    constraint_value,
+    match,
+    resolve_core,
+    template_to_fix,
+)
 
 
 def _mol(smiles="CCO", seed=1):
@@ -87,6 +96,7 @@ def test_relaxed_releases_only_the_seeded_contacts():
     assert (0, 1, 2) not in r.angles
     assert (0, 1, 2, 3) not in r.dihedrals
     assert r.dihedrals[(2, 3, 4, 5)] == (170.0, 190.0)
+    assert r.planes == []
     assert r.contacts == (frozenset(), frozenset())
     for f in (
         "coplanar",
@@ -98,7 +108,6 @@ def test_relaxed_releases_only_the_seeded_contacts():
         "phantoms",
         "haptic",
         "umbrellas",
-        "planes",
         "frozen",
         "shapes",
     ):
@@ -132,6 +141,71 @@ def test_compose_distance_is_last_wins():
     add_distance(a.distances, 0, 1, 1.9, 2.1)
     add_distance(b.distances, 0, 1, 2.5, 2.7)
     assert compose(a, b).distances[(0, 1)] == (2.5, 2.7)
+
+
+def test_compose_soft_never_replaces_a_rigid_term():
+    mol = _mol("CCCC")
+    rigid = resolve_core(mol, fix={(0, 2): 2.0, (0, 1, 2): 110.0}, has_geometry=True)[0]
+    incoming = resolve_core(
+        mol,
+        constrain={(0, 2): 3.0, (0, 1, 2): 120.0, (1, 3): 2.5},
+        has_geometry=True,
+    )[0]
+
+    merged = compose_soft(rigid, incoming)
+
+    assert merged.fixed[(0, 2)] == (2.0, 2.0)
+    assert merged.angles[(0, 1, 2)] == (108.0, 112.0)
+    assert merged.distances[(1, 3)] == pytest.approx((2.4, 2.6))
+    assert merged.relaxed().distances[(0, 2)] == pytest.approx((1.98, 2.02))
+    assert set(merged.relaxed().distances) == {(0, 2)}
+
+
+def test_compose_soft_rejects_two_owners_of_one_soft_term():
+    mol = _mol("CCCC")
+    base = resolve_core(mol, constrain={(0, 2): 2.0}, has_geometry=True)[0]
+    incoming = resolve_core(mol, constrain={(0, 2): 3.0}, has_geometry=True)[0]
+
+    with pytest.raises(ValueError, match="state each degree of freedom once"):
+        compose_soft(base, incoming)
+
+
+def test_compose_soft_cannot_replace_a_structural_torsion():
+    key = (4, 1, 2, 5)
+    base = Constraints(coplanar=[(0, 1, 2, 3, 180.0, 15.0)], umbrellas={(6, 1, 2, 7): None})
+    incoming = Constraints(
+        dihedrals={key: (80.0, 100.0)},
+        contacts=(frozenset(), frozenset({key})),
+    )
+
+    merged = compose_soft(base, incoming)
+
+    assert not merged.dihedrals
+    assert merged.coplanar == base.coplanar
+    assert merged.umbrellas == base.umbrellas
+
+
+def test_compose_soft_owns_each_dihedral_by_its_central_bond():
+    base_key, incoming_key = (0, 1, 2, 3), (4, 1, 2, 5)
+    fixed = Constraints(dihedrals={base_key: (-62.0, -58.0)}, fixed={base_key: (-60.0, -60.0)})
+    incoming = Constraints(
+        dihedrals={incoming_key: (80.0, 100.0)},
+        contacts=(frozenset(), frozenset({incoming_key})),
+    )
+
+    merged = compose_soft(fixed, incoming)
+    assert set(merged.dihedrals) == {base_key}
+
+    soft = fixed.copy(fixed={}, contacts=(frozenset(), frozenset({base_key})))
+    with pytest.raises(ValueError, match="state each degree of freedom once"):
+        compose_soft(soft, incoming)
+
+
+def test_constraint_value_rejects_invalid_real_and_haptic_indices():
+    positions = np.zeros((3, 3))
+
+    assert constraint_value(positions, (0, -1)) is None
+    assert constraint_value(positions, (0, 9), {9: [0, 3]}) is None
 
 
 def test_numeric_fix_wins_over_approximate_builder_in_either_order():
@@ -270,6 +344,16 @@ def test_constrain_ring_pair_becomes_a_pi_stack_plane():
     ra, rb = (tuple(r) for r in m.GetRingInfo().AtomRings()[:2])
     cons, _ = resolve_core(m, constrain={(ra, rb): 3.7}, has_geometry=True)
     assert cons.planes == [(ra, rb, 3.7)]
+    assert cons.relaxed().planes == []
+
+
+@pytest.mark.parametrize(
+    ("rings", "separation"),
+    [(((0, 1), (3, 4, 5)), 3.7), (((0, 1, 2), (2, 3, 4)), 3.7), (((0, 1, 2), (3, 4, 5)), np.nan)],
+)
+def test_constrain_plane_rejects_undefined_geometry(rings, separation):
+    with pytest.raises(ValueError, match="constrain plane"):
+        resolve_core(_mol("CCCCCC"), constrain={rings: separation}, has_geometry=True)
 
 
 # ---------------------------------------------------------------------------------------------------------

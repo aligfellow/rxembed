@@ -17,7 +17,7 @@ from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 
 from . import metal_donor_orient as _donor  # module import keeps the gate and caps on the same functions
-from .constraints import _DIST_ATOMS, FIX_ANGLE_TOL, FIX_DISTANCE_TOL
+from .constraints import _DIST_ATOMS, FIX_ANGLE_TOL, FIX_DISTANCE_TOL, _central_bond, _graft_owns
 from .utils import _CARBON_Z, _DISCONNECTED, _SP2_DEGREE, conjugated_quartets
 
 _PHANTOM_FLOOR = 0.30  # Å: a haptic centroid dummy may sit this close to any atom, living inside its own ring
@@ -67,8 +67,8 @@ def _angular_wall(atoms, window, cons, stiffness, releasable):
 
 def _stated_dihedral(cons, *atoms):
     """Return whether the user states any torsion around this central bond."""
-    bond = frozenset(atoms[1:3])
-    return any(frozenset(key[1:3]) == bond for key in cons.dihedrals)
+    bond = _central_bond(atoms)
+    return any(_central_bond(key) == bond for key in cons.dihedrals)
 
 
 @dataclass
@@ -279,6 +279,8 @@ class Coplanar(Mechanism):
             b if a in cons.metals else a for a, b in cons.distances if a in cons.metals or b in cons.metals
         } or {e[1] for e in cons.coplanar}
         for i, j, k, w, _anchor, cap in cons.coplanar:
+            if _graft_owns((i, j, k, w), cons.frozen, cons.haptic):
+                continue
             if _stated_dihedral(cons, i, j, k, w):
                 continue
             if _donor.codonor_in_plane(mol, j, donors, hyb):
@@ -335,13 +337,11 @@ class Sp2Planar(Mechanism):
         for atom in mol.GetAtoms():
             if atom.GetAtomicNum() != _CARBON_Z or atom.GetHybridization() != Chem.HybridizationType.SP2:
                 continue
-            if atom.GetIdx() in cons.frozen:  # a frozen-core atom is held with zero DOF; never double-restrain it
-                continue
             nbrs = [n.GetIdx() for n in atom.GetNeighbors()]
             if len(nbrs) != _SP2_DEGREE:
                 continue
             key = (nbrs[0], nbrs[1], nbrs[2], atom.GetIdx())
-            if _stated_dihedral(cons, *key):
+            if _graft_owns(key, cons.frozen) or _stated_dihedral(cons, *key):
                 continue
             phi = rdMolTransforms.GetDihedralDeg(conf, *key)
             ff.UFFAddTorsionConstraint(*key, False, phi - _SP2_HOLD_WIN, phi + _SP2_HOLD_WIN, _SP2_HOLD_FC)
@@ -351,7 +351,7 @@ class ConjugationCap(Mechanism):
     """Pull organic conjugated C=X-N/O torsions to the nearest in-plane well.
 
     This targets the C-X torsion, unlike `Sp2Planar`'s seed-centred improper, and shares
-    `conjugated_quartets` with the geometry gate. Metal systems and quartets touching frozen atoms are excluded.
+    `conjugated_quartets` with the geometry gate. Metal systems and fully graft-owned quartets are excluded.
     """
 
     def _ff_terms(self, ff, cons, conf, stiffness):
@@ -359,7 +359,7 @@ class ConjugationCap(Mechanism):
             return
         for a, c, x, s in conjugated_quartets(conf.GetOwningMol()):
             key = (a, c, x, s)
-            if _stated_dihedral(cons, *key) or cons.frozen.intersection(key):
+            if _stated_dihedral(cons, *key) or _graft_owns(key, cons.frozen):
                 continue
             phi = rdMolTransforms.GetDihedralDeg(conf, *key)
             lo, hi = _coplanar_window(phi, _CONJ_CAP)
@@ -377,7 +377,7 @@ class Umbrella(Mechanism):
 
     def _ff_terms(self, ff, cons, conf, stiffness):
         for key, ideal in cons.umbrellas.items():
-            if cons.frozen.intersection(key):  # a fix= core already pins this geometry exactly
+            if _graft_owns(key, cons.frozen, cons.haptic):
                 continue
             if _stated_dihedral(cons, *key):
                 continue

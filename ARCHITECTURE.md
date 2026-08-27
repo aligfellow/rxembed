@@ -5,30 +5,104 @@
 ## Flow
 
 ```text
-Mol | Isomer
-  +-- fix= / constrain= / template= --> constraints.resolve_core ---+
-  +-- Isomer.cons --> metal_constraints ----------------------------+
-                                                                    v
-                                                               Constraints
-                                                                    |
-                                                             MECHANISM_ORDER
-                                                               /          \
-                                                     DG windows            FF terms
-                                                         |                    |
-                                                      bounds.py            relax.py
-                                                         \                    /
-                                                          +--> Conformers <--+
+source
+  -> normalize input and dissolve template= into fix=
+  -> expand organic stereo identities
+  -> select ordinary, retained-metal or enumerated-metal identities
+  -> seat coordinate= donors
+  -> expand automatic contact modes
+  -> Candidate(spec, fix, tag) x contact mode
+  -> prepare + compose soft contacts
+  -> Constraints
+  -> MECHANISM_ORDER -> DG windows + FF terms
+  -> seed -> graft -> relax -> validate -> replace failed -> finalize
+  -> Ensemble | EnsembleSet | list[EnsembleSet]
 ```
 
-`Constraints` is the sole constraint payload. `embed.py` also carries the `Isomer` identity and temporary
-graft coordinates while it drives the sequence. `bounds.py` edits RDKit's bounds matrix, `relax.py` applies
-the matching restrained-UFF terms, and the result is `Conformers`.
+`Constraints` is the sole geometric payload. `Isomer` is chemical identity: real metals, polyhedra, occupied
+vertices, haptic faces and donor bonds. `embed.py` also carries temporary graft coordinates while it drives
+the sequence. `bounds.py` edits RDKit's bounds matrix, `relax.py` applies the matching restrained-UFF terms,
+and the result is `Conformers`.
 
-The DG engine remains RDKit: `bounds.etkdg` creates `ETKDGv3`, and `seed_coordinates` supplies only an edited
-native bounds matrix through `SetBoundsMat`. RDKit currently constructs signed `ChiralSet` records for
-tetrahedral atoms and atropisomeric bonds, but not SP/TB/OH tags, and Python cannot supply an extra chiral set.
-Metal hand and haptic winding are therefore checked on raw DG seeds before UFF. A future RDKit chiral-set input
-can replace that seed filter; it does not change metal enumeration, canonical slots or constraint compilation.
+Identity is complete before geometry compiles. `coordinate=` fills vacant vertices on a copied `Isomer` and
+adds its donor bonds; it is not a late constraint patch. `metal=<geometry>` is pipeline sugar for
+`enumerate_isomers` followed by one independent embed per isomer. A selected `Isomer` skips enumeration but
+not compilation, execution or validation.
+
+Candidate expansion and candidate execution are separate responsibilities. Stereo, metal identity,
+`coordinate=` and automatic contacts only produce tagged candidate data. None calls another dispatcher or
+embeds a conformer. `pipeline.dispatch._execute` is the only candidate executor and always runs `prepare`,
+soft-contact composition and `seed_conformers` in that order.
+
+User-selected metal and `coordinate=` identities are mandatory: one failing candidate fails the call instead
+of disappearing because it has siblings. Generated organic stereoisomers and automatic contact modes are
+alternatives and may be skipped with a warning; if none survive, the error includes the last concrete cause.
+
+A coordinate `fix=` may participate in metal identity selection because frozen donors retain their measured
+vertices. In that case enumeration consumes the raw fix and stores the resulting base `Constraints` on each
+`Isomer`; a selected `Isomer` or ordinary molecule carries the raw fix to `prepare`. Both meet at the same
+`Constraints` composition seam before embedding. This phase dependency does not create a second chemistry or
+relaxation path.
+
+Constraint compilation is chemistry-first. `metal_constraints.py` derives the complete coordination field,
+then removes a term only when the coordinate graft owns every real atom that defines it. A measured M-L
+length, a modelled newly coordinated donor and graph-derived donor orientation may coexist in one state.
+Length provenance, partial freezing and soft workflow contacts therefore do not create alternate chemistry
+paths.
+
+`fix` is the rigid verb and `constrain` is the releasable verb. `template` only supplies coordinates to
+`fix`; contacts are adapted through the same validated `constrain` resolver. Rigid terms win over inferred
+soft contacts. Two soft sources may not claim the same coordinate. A soft window may not replace a selected
+metal-state term, while an explicit numeric `fix` may override one. Torsions are owned by their central bond,
+so two sources cannot state competing quartets around one bond and a soft dihedral cannot suppress
+coplanarity or an umbrella restraint. Plane constraints are soft and release with other `constrain` terms
+during exploratory search.
+
+`relax.py` owns one force-field attempt and reports its optimizer status. `Conformers` in `embed.py` owns the
+same-seed stiffness ladder, the sole fresh-seed replacement loop, and the core geometry contract: numeric fixes,
+graph bonds, rigid shapes, selected coordination state and structural coordination terms. Acceptance returns the
+failed conformer ids grouped by reason. `pipeline.Ensemble` supplies one additional validator for requested
+workflow stereo, labile donor hand and, with the workflow extra, perceived connectivity; it does not restate the
+core contract or seed a replacement itself. Broader free-periphery `geom_check` remains diagnostic during metal
+finalization because an
+explicit `fix` may intentionally violate a ground-state rule. `.check()` and `.filter("geometry")` expose that
+report when the caller wants it as a gate.
+
+Replacement batches run the same relaxation and acceptance functions as their parent, without recursively
+starting another replacement controller. Successful replacements keep the original conformer id and propagate
+energy and optimizer status. `Ensemble` records lifecycle as one stage value (`seeded`, `relaxed`, `minimized`),
+while `Isomer` remains the only durable metal-connectivity record. Search invalidates stage-dependent energy,
+optimizer, reaction and trajectory records together.
+
+A converged force-field outlier is removed only after structural acceptance. The relative energy window is an
+ensemble ranking heuristic, not a molecular-identity failure, so it does not trigger fresh embedding.
+
+Optimizer convergence and structural identity are independent. A conformer that reaches the iteration ceiling
+may remain explicitly listed in `.unrelaxed` when its geometry still passes the structural contract. A wrong
+metal state may not be published: fresh seeds replace it, and an exhausted public operation fails rather than
+returning fewer conformers or the wrong identity.
+
+The selected `Isomer` remains attached when the workflow restores and connects the public metal graph. Later
+search and minimization cycles therefore validate against the same occupied slots, hand and haptic winding.
+Before a later search moves atoms, the workflow rebuilds the `Isomer`'s surrogate graph and copies the current
+conformers onto it; the connected real-metal graph never enters ETKDG or a force field.
+
+Every core and workflow acceptance starts by rejecting non-finite coordinates. Downstream distance, shape,
+connectivity and frozen-core comparisons may therefore assume a numerical conformer; NaN cannot satisfy a
+contract by making both sides of a range comparison false.
+
+The selected metal state is validated as one correspondence-preserving fit of realised donor directions to
+their occupied polyhedron slots. Individual D-M-D windows bias the ideal seat but are not separate hard gates:
+chelates and haptic faces can validly distort one angle while retaining the requested state. Structural M-L
+windows, donor orientation, coplanarity and umbrella caps remain direct postconditions.
+
+`constraints.constraint_value` is the shared ruler for distances, angles, periodic dihedrals and haptic
+centroids. Core acceptance, pipeline QA, diagnostics and public `.measure()` choose different policies but do
+not reimplement the measurement.
+
+The DG engine remains RDKit: `bounds.etkdg` creates `ETKDGv3`, and `seed_coordinates` supplies an edited native
+bounds matrix through `SetBoundsMat`. Metal hand and haptic winding are checked on raw DG seeds because RDKit's
+Python distance-geometry API cannot accept those coordination stereo records.
 
 `metal_core.py` owns graph surgery, perception primitives and the immutable `MetalState`: one real metal,
 polyhedron, slot-ordered donors or haptic faces, and hand. `metal_stereo.py` canonicalizes site identity and
@@ -36,13 +110,9 @@ reads metal or haptic hands. `metal_slots.py` produces distinct, reachable donor
 `metal_enumeration.py` combines ligand, haptic and per-centre choices into the `Isomer` and `IsomerSet` types in
 `metal_isomer.py`, without building numerical fields for every candidate.
 
-`Isomer.cons` asks the plain compiler in `metal_constraints.py` for a fresh `Constraints`. It compiles only that
-selected isomer's active centre(s) from one private source-Mol snapshot, then composes their coordination field
-with the same `Constraints` carrying a fixed TS core, NCI contacts or a retained spectator shape. The snapshot
-keeps `lengths='input'` independent of later edits to the public Mol; transient centroid indices still follow
-the public Mol's current atom count. A retained input geometry is already one selected state, so `from_geometry`
-records its measured field immediately. Haptic centroids exist transiently while deriving a state and while
-running DG/UFF; stored molecules and `MetalState` contain real atom indices only.
+`Isomer.cons` asks `metal_constraints.py` for a fresh `Constraints` compiled from the selected state. A private
+source-Mol snapshot preserves `lengths='input'`; haptic centroids exist only while compiling and running DG/UFF.
+Stored molecules and `MetalState` contain real atom indices only.
 
 The normal API adapts strings, paths and external tools around that core:
 
@@ -51,6 +121,10 @@ rxembed.embed(str | path | Mol | Isomer)
     -> pipeline dispatch -> core constraint / seed / relax seam
     -> Ensemble | EnsembleSet | list[EnsembleSet] -> search / select / score
 ```
+
+`embed.prepare` is the core Mol/Isomer-to-`Constraints` seam. Pipeline adapters normalize sources and expand
+candidate identities. Search-free relaxation uses `prepare_relax`, which calls the same preparation and applies
+the returned graft directly.
 
 ## Tiers
 

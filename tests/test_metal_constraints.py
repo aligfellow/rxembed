@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
+from importlib.util import find_spec
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -12,6 +15,7 @@ from rdkit.Chem.rdMolTransforms import GetAngleDeg
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
+from rxembed.constraints import FIX_ANGLE_TOL
 from rxembed.metal_constraints import _CHELATE_BITE, _chelate_bite_window
 from rxembed.metal_core import HapticSite, MetalState, classify_geometry
 from rxembed.metal_enumeration import enumerate_isomers
@@ -95,7 +99,7 @@ def test_requested_pyramid_survives_relax():
     assert got == ["trigonal_pyramidal"] * len(got), f"Pt(PPh3)3: requested a pyramid, got {got}"
 
 
-def test_flattened_pyramid_is_reported(caplog):
+def test_flattened_pyramid_is_rejected():
     ens = rx.embed("C[P](C)(C)[Fe]([P](C)(C)C)[P](C)(C)C", metal="TPY", n=4, seed=7)[0]
     iso, mol = ens.iso, ens._mol  # `_mol`: `.mol` hands back a metal-restored COPY, which the edits below lose
     verts = list(iso.vertices)
@@ -105,11 +109,8 @@ def test_flattened_pyramid_is_reported(caplog):
         conf = mol.GetConformer(cid)
         pos = conf.GetPositions()
         conf.SetAtomPosition(iso.metal, Point3D(*np.mean([pos[v] for v in verts], axis=0)))
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        ens._drop_bad_geometries(iso)
-    assert ens.n >= 1, "the flattened conformers must be KEPT, not dropped"
-    assert any("relaxed flat" in r.message for r in caplog.records), caplog.text
-    assert any("trigonal_pyramidal" in r.getMessage() for r in caplog.records), caplog.text
+    failures = ens._acceptance_failures()
+    assert failures == {"wrong coordination state": ens.ids}
 
 
 def test_secondary_planar_centre_is_checked():
@@ -119,47 +120,122 @@ def test_secondary_planar_centre_is_checked():
     pos = conf.GetPositions()
     donor = secondary.vertices[0]
     conf.SetAtomPosition(donor, Point3D(*(pos[donor] + np.array([0.0, 0.0, 2.0]))))
-    assert ens._puckered_centres(0, iso) == (secondary,)
     assert not ens._coordination_ok(0, iso), "the puckered secondary square plane passed the final gate"
 
 
-def test_secondary_nonplanar_centre_flattening_is_reported(caplog):
+def test_secondary_nonplanar_centre_flattening_is_rejected():
     ens, iso = _two_centre_ensemble("square_planar", "trigonal_pyramidal")
     secondary = iso.centres[1]
     conf = ens._mol.GetConformer()
     pos = conf.GetPositions()
     conf.SetAtomPosition(secondary.atom, Point3D(*np.mean(pos[list(secondary.vertices)], axis=0)))
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        ens._warn_shape_flattened(iso)
-    assert any(
-        "trigonal_pyramidal" in record.message and f"atom {secondary.atom}" in record.message
-        for record in caplog.records
-    ), caplog.text
+    assert not ens._coordination_ok(0, iso)
 
 
-def test_one_haptic_site_is_not_diagnosed_as_flat(caplog):
+def test_one_haptic_site_does_not_define_a_nonplanar_state():
     ens, iso = _two_centre_ensemble("tetrahedral", "tetrahedral")
     secondary = iso.centres[1]
     face = HapticSite(tuple(secondary.vertices))
     sparse = secondary._replace(vertices=(face, None, None, None))
     iso = Isomer._from_state(iso.mol, (iso.centres[0], sparse))
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        ens._warn_shape_flattened(iso)
-    assert not [record for record in caplog.records if f"atom {secondary.atom}" in record.message], caplog.text
+    assert ens._coordination_ok(0, iso)
 
 
-def test_rigid_meridional_kappa3_is_not_pyramidalised(caplog):
+def test_infeasible_rigid_pyramid_is_rejected(caplog):
     iso = rx.metal("[Cu+]12<-n3ccccc3-c3cccc(n->13)-c1ccccn->21", "trigonal_pyramidal").select(index=0)
     with caplog.at_level(logging.WARNING, logger="rxembed"):
         ens = rx.embed(iso, n=4, seed=7).minimize()
-    assert ens.n >= 1
-    verts = list(iso.vertices)
-    spans = [
-        max(GetAngleDeg(ens._mol.GetConformer(cid), verts[i], iso.metal, verts[j]) for i, j in ((0, 1), (0, 2), (1, 2)))
-        for cid in ens.ids
-    ]
-    assert min(spans) > 145.0, f"terpy's trans N-Cu-N was pinched out of meridional: {spans}"
-    assert any("relaxed flat" in r.message for r in caplog.records), caplog.text
+    assert ens.n == 0
+    assert "arrangement may be infeasible" in caplog.text
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+@pytest.mark.parametrize(
+    ("fixed", "first_present"),
+    [
+        ([1, 2, 5], True),
+        ([1, 2, 5, 64], True),
+        ([1, 2, 3, 5, 64], False),
+    ],
+    ids=["metal-fixed", "metal-donor-fixed", "complete-term-fixed"],
+)
+def test_partial_fix_drops_only_complete_carbonyl_terms(fixed, first_present):
+    path = Path(__file__).parents[1] / "examples" / "structures" / "mnh.xyz"
+    iso = rx.metal(str(path), center="all", fix=fixed)[0]
+
+    assert ((1, 64, 3) in iso.cons.angles) is first_present
+    assert (1, 65, 4) in iso.cons.angles
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_partial_frozen_mnh_carbonyls_pass_the_relax_contract():
+    path = Path(__file__).parents[1] / "examples" / "structures" / "mnh.xyz"
+    iso = rx.metal(str(path), center="all", fix=[1, 2, 5])[0]
+    ens = rx.embed(iso, n=1, seed=0xF00D)
+
+    assert ens.ids
+    assert not ens.unrelaxed
+    conf = ens._mol.GetConformer(ens.ids[0])
+    for atoms in ((1, 64, 3), (1, 65, 4)):
+        assert ens.cons.angles[atoms] == (165.0, 180.0)
+        assert GetAngleDeg(conf, *atoms) >= 165.0 - FIX_ANGLE_TOL
+        pair = atoms[:2]
+        value = float(np.linalg.norm(conf.GetPositions()[pair[0]] - conf.GetPositions()[pair[1]]))
+        lo, hi = ens.cons.distances[pair]
+        assert lo <= value <= hi
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_retained_geometry_uses_the_same_donor_orientation_compiler():
+    from rxembed.metal_isomer import from_geometry
+
+    path = Path(__file__).parents[1] / "examples" / "structures" / "mnh.xyz"
+    mol = Chem.AddHs(rx.read_xyz(str(path)), addCoords=True)
+    cons = from_geometry(mol, center="all").cons
+
+    assert cons.angles[(1, 64, 3)] == (165.0, 180.0)
+    assert cons.angles[(1, 65, 4)] == (165.0, 180.0)
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_two_fixed_donors_do_not_own_their_angle_when_the_metal_is_free():
+    path = Path(__file__).parents[1] / "examples" / "structures" / "mnh.xyz"
+    isos = rx.metal(str(path), center="all", fix=[6, 64])
+
+    assert any(any(key[1] == 1 and {key[0], key[2]} == {6, 64} for key in iso.cons.angles) for iso in isos)
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_partial_frozen_mn_fe_state_passes_the_relax_contract():
+    path = Path(__file__).parents[1] / "examples" / "structures" / "mn-h2.xyz"
+    states = rx.metal(str(path), center="all", fix=[1, 5, 63, 64, 65, 66], stereo={"planar": "racemic"})
+    iso = states.filter(center="Mn", label="mer", hand="lambda").select(center="Fe", haptic="Rₚ")
+    ens = rx.embed(iso, n=1, seed=0xF00D)
+
+    assert len(states) == 12
+    assert ens.ids
+    assert not ens.unrelaxed
+    assert ens._metal_states() == {ens.ids[0]: True}
+    assert ens.cons.angles[(1, 61, 3)] == (165.0, 180.0)
+    assert ens.cons.angles[(1, 62, 4)] == (165.0, 180.0)
+    conf = ens._mol.GetConformer(ens.ids[0])
+    assert GetAngleDeg(conf, 1, 61, 3) >= 165.0 - FIX_ANGLE_TOL
+    assert GetAngleDeg(conf, 1, 62, 4) >= 165.0 - FIX_ANGLE_TOL
+    for pair in ((1, 61), (1, 62)):
+        value = float(np.linalg.norm(conf.GetPositions()[pair[0]] - conf.GetPositions()[pair[1]]))
+        lo, hi = ens.cons.distances[pair]
+        assert lo <= value <= hi
+    reference = iso.mol.GetConformer().GetPositions()
+    frozen = sorted(ens.cons.frozen)
+    drift = max(
+        abs(
+            np.linalg.norm(reference[i] - reference[j])
+            - np.linalg.norm(conf.GetPositions()[i] - conf.GetPositions()[j])
+        )
+        for i, j in itertools.combinations(frozen, 2)
+    )
+    assert drift < 1e-12
+    assert not ens._scan_connectivity()
 
 
 # --- the chelate bite comes from the backbone, not the polyhedron ---------------------------------------
@@ -239,24 +315,22 @@ def test_planar_haptic_umbrella_does_not_depend_on_the_centroid_slot():
 
 def test_rejected_seeds_are_replaced_to_n_clean(monkeypatch):
     ens = rx.embed(rx.metal("CCCN[Pd](Cl)(Cl)NCCC", "square_planar")[0], n=2)
-    initial = set(ens.ids)
     donors = list(ens.iso.donors)
-    drop_bad = type(ens)._drop_bad_geometries
+    workflow_failure = type(ens)._workflow_failure
     rejected = False
 
-    def reject_one_seed(self, iso):
+    def reject_one_seed(self, owner, cid):
         nonlocal rejected
-        drops = drop_bad(self, iso)
-        if not rejected and iso is not None and self.ids:
-            self.ids.pop()
-            drops["test rejection"] = 1
+        reason = workflow_failure(self, owner, cid)
+        if not rejected and owner is self:
             rejected = True
-        return drops
+            return "test rejection"
+        return reason
 
-    monkeypatch.setattr(type(ens), "_drop_bad_geometries", reject_one_seed)
+    monkeypatch.setattr(type(ens), "_workflow_failure", reject_one_seed)
+    ens._stage = "seeded"
     ens.minimize()
     assert rejected, "the test did not send a seed through the rejection path"
-    assert set(ens.ids) - initial, "the rejected seed was not replaced by a fresh embed"
     assert ens.n == 2, "embed(n=2) must hand back exactly 2 geometries after re-seeding"
     assert all(geom.check(ens.mol, c, donors=donors, constraints=ens.cons).ok() for c in ens.ids)
 
@@ -282,16 +356,44 @@ def test_free_fragment_is_tethered_at_vdw_contact():
 def test_coordinate_binds_a_substrate_at_the_vacant_site():
     es = rx.embed("CCCN[Pd](Cl)NCCC.O", metal="square_planar", coordinate="[OX2]", n=3, seed=1)
     for ens in list(es) if isinstance(es, rx.EnsembleSet) else [es]:
-        ens.minimize()
-        assert ens.n >= 1
         m = next(a.GetIdx() for a in ens.mol.GetAtoms() if a.GetSymbol() == "Pd")
         o = next(a.GetIdx() for a in ens.mol.GetAtoms() if a.GetSymbol() == "O")
+        assert o in ens.iso.vertices
+        assert (o, m) in ens.iso.donor_bonds
         assert o in ens.sphere[m]
+        ens.minimize()
+        assert ens.n >= 1
         assert all(report.ok() for report in ens.check().values())
         lo, hi = ens.cons.distances[(min(m, o), max(m, o))]
         for cid in ens.ids:
             pos = ens.mol.GetConformer(cid).GetPositions()
             assert lo - 0.1 <= float(np.linalg.norm(pos[m] - pos[o])) <= hi + 0.1, "the substrate did not seat"
+
+
+def test_coordinate_composes_with_fix_constrain_and_contacts():
+    iso = rx.metal("CCCN[Pd](Cl)NCCC.O", "square_planar")[0]
+    metal = iso.metal
+    oxygen = next(atom.GetIdx() for atom in iso.mol.GetAtoms() if atom.GetSymbol() == "O")
+    carbons = [atom.GetIdx() for atom in iso.mol.GetAtoms() if atom.GetSymbol() == "C"]
+    nitrogen = next(atom.GetIdx() for atom in iso.mol.GetAtoms() if atom.GetSymbol() == "N")
+    fixed = (carbons[0], carbons[1])
+    soft = (carbons[-2], carbons[-1])
+    contact = (nitrogen, oxygen)
+
+    ens = rx.embed(
+        iso,
+        coordinate=oxygen,
+        fix={fixed: 1.53},
+        constrain={soft: (1.4, 1.7)},
+        contacts={contact: (2.5, 4.5)},
+        n=1,
+        seed=1,
+    )
+
+    assert oxygen in ens.iso.vertices
+    assert ens.cons.fixed[fixed] == (1.53, 1.53)
+    assert ens.cons.contacts[0] == frozenset({soft, contact})
+    assert tuple(sorted((metal, oxygen))) in ens.cons.distances
 
 
 def test_coordinate_relieves_the_phantom_floor_it_creates(monkeypatch):
@@ -307,9 +409,33 @@ def test_coordinate_relieves_the_phantom_floor_it_creates(monkeypatch):
     monkeypatch.setattr(_b, "_bounds", spy)
     iso = rx.metal("N->[Pt](Cl)Cl.CC(C)=O", "square_planar").select(index=0)  # one vacant site + free acetone
     o = next(a.GetIdx() for a in iso.mol.GetAtoms() if a.GetSymbol() == "O")
-    rx.embed(iso, coordinate=o, n=1)
+    ens = rx.embed(iso, coordinate=o, n=1)
+    carbonyl = next(n.GetIdx() for n in iso.mol.GetAtomWithIdx(o).GetNeighbors())
+    assert (iso.metal, o, carbonyl) in ens.cons.angles
     assert tols, "the embed never built a bounds matrix"
     assert max(tols) == 0.0, f"bound crossover repaired: {max(tols) * 100:.4f}%"
+
+
+@pytest.mark.parametrize(
+    ("coordinate", "message"),
+    [
+        ("donor", "already donors"),
+        ("metal", "not metal atoms"),
+        ("missing", "must be in"),
+        ("repeated", "must be distinct"),
+    ],
+)
+def test_coordinate_rejects_invalid_identity_expansion(coordinate, message):
+    iso = rx.metal("N->[Pt](Cl)Cl.CC(C)=O", "square_planar").select(index=0)
+    oxygen = next(a.GetIdx() for a in iso.mol.GetAtoms() if a.GetSymbol() == "O")
+    choice = {
+        "donor": iso.donors[0],
+        "metal": iso.metal,
+        "missing": iso.mol.GetNumAtoms(),
+        "repeated": [oxygen, oxygen],
+    }[coordinate]
+    with pytest.raises(ValueError, match=message):
+        rx.embed(iso, coordinate=choice, n=1)
 
 
 # ---------------------------------------------------------------------------------------------------------

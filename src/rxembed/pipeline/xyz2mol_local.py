@@ -15,6 +15,9 @@ Modifications here:
 - ``get_proto_mol`` seeded atom 0 from ``Chem.MolFromSmarts``, making it a query atom while every
   other atom was plain. ``RemoveHs`` would not remove a query atom, so an explicit H could survive
   based on the index ordering of the .xyz file.
+
+The remaining upstream helpers and command-line entry point are retained for provenance but are
+not used by rxembed.
 """
 
 import copy

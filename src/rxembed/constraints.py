@@ -32,6 +32,8 @@ from dataclasses import dataclass, field, fields, replace
 import numpy as np
 from rdkit import Chem
 
+from .utils import _angle, _dihedral
+
 _STRAIGHT = 180.0  # degrees: angle ceiling and one half-turn of a periodic dihedral
 
 
@@ -41,7 +43,7 @@ class Constraints:
 
     distances: dict = field(default_factory=dict)  # (i, j) -> (lo, hi) Angstrom
     angles: dict = field(default_factory=dict)  # (i, j, k) -> (lo, hi) degrees
-    planes: list = field(default_factory=list)  # (ring_a, ring_b, separation) parallel stack
+    planes: list = field(default_factory=list)  # soft (ring_a, ring_b, separation) parallel stack
     coplanar: list = field(default_factory=list)  # (i, j, k, l, anchor, cap): hold i-j-k-l within `cap` deg of
     #   its in-plane `anchor` (0 syn / 180 anti). A window, not a point, so real out-of-plane scatter survives.
     frozen: set = field(default_factory=set)  # pin to embedded coords
@@ -84,7 +86,7 @@ class Constraints:
         """Return a copy with the seeded NCI/user contacts released, for the exploratory search.
 
         Released atoms are no longer pose-frozen, so a strained contact may break or a new one form. Every
-        structural hold (frozen core, metal sphere, coplanarity cap, pi planes, centroid dummies) is carried
+        structural hold (frozen core, metal sphere, coplanarity cap, centroid dummies) is carried
         through by `copy`. The caller adds encounter bounds if releasing leaves a fragment unconstrained.
         """
         dk, angular = self.contacts
@@ -92,6 +94,7 @@ class Constraints:
             distances={k: v for k, v in self.distances.items() if k not in dk or k in self.fixed},
             angles={k: v for k, v in self.angles.items() if k not in angular or k in self.fixed},
             dihedrals={k: v for k, v in self.dihedrals.items() if k not in angular or k in self.fixed},
+            planes=[],
             contacts=(frozenset(), frozenset()),
         )
 
@@ -111,6 +114,25 @@ class Constraints:
 
 def _merge_last_wins(a, b):
     return {**a, **b}
+
+
+def _graft_owns(atoms, frozen, haptic=None):
+    """Return whether every real atom defining a term belongs to the coordinate graft."""
+    real = set()
+    haptic = haptic or {}
+    for atom in atoms:
+        real.update(haptic.get(atom, (atom,)))
+    return real.issubset(frozen)
+
+
+def _central_bond(atoms):
+    """Return the bond that owns a torsional degree of freedom."""
+    return frozenset(atoms[1:3])
+
+
+def _structural_torsion_bonds(cons):
+    """Return central bonds reserved by metal coplanarity or umbrella terms."""
+    return {_central_bond(row) for row in cons.coplanar} | {_central_bond(atoms) for atoms in cons.umbrellas}
 
 
 def _merge_floor(a, b):  # a wall is a physical minimum: the stricter (higher) of two claims on one pair wins
@@ -213,6 +235,44 @@ def compose(*parts: Constraints) -> Constraints:
     return out
 
 
+def compose_soft(base: Constraints, soft: Constraints) -> Constraints:
+    """Compose incoming soft terms without replacing a structural term or another soft owner."""
+    base_d, base_a = base.contacts
+    structural_d = set(base.distances) - set(base_d)
+
+    def canonical(key):
+        key = tuple(key)
+        return min(key, key[::-1])
+
+    def angular_owner(key):
+        return ("dihedral", _central_bond(key)) if len(key) == _DIHEDRAL_ATOMS else ("angle", canonical(key))
+
+    base_soft_a = {angular_owner(key) for key in base_a}
+    incoming_a = [*soft.angles, *soft.dihedrals]
+    structural_a = {angular_owner(key) for terms in (base.angles, base.dihedrals) for key in terms} - base_soft_a
+    structural_a |= {angular_owner(key) for key in base.fixed if len(key) >= _ANGLE_ATOMS}
+    structural_a |= {("dihedral", bond) for bond in _structural_torsion_bonds(base)}
+    overlap = (set(base_d) & set(soft.distances)) | {key for key in incoming_a if angular_owner(key) in base_soft_a}
+    if overlap:
+        raise ValueError(
+            f"soft constraints overlap at {sorted(overlap)}; state each degree of freedom once with either "
+            "constrain= or contacts="
+        )
+    distances = {key: value for key, value in soft.distances.items() if key not in structural_d}
+    angles = {key: value for key, value in soft.angles.items() if angular_owner(key) not in structural_a}
+    dihedrals = {key: value for key, value in soft.dihedrals.items() if angular_owner(key) not in structural_a}
+    d_soft, a_soft = soft.contacts
+    return compose(
+        base,
+        soft.copy(
+            distances=distances,
+            angles=angles,
+            dihedrals=dihedrals,
+            contacts=(frozenset(d_soft & distances.keys()), frozenset(a_soft & (angles.keys() | dihedrals.keys()))),
+        ),
+    )
+
+
 def _seed_window(window, pad):
     """Pad only a scalar target for distance-geometry seeding; preserve an explicit range verbatim."""
     lo, hi = window
@@ -249,10 +309,47 @@ _CON_PAD = 0.1  # constrain distance half-window when a scalar target is given
 _CON_ANG_PAD = 5.0  # constrain angular half-window
 _SHAPE_PAD = 0.05  # graft pairwise-shape half-window (a rigid hold; the exact graft does the real work)
 _MIN_SHAPE_ATOMS = 3  # below this a core has only a distance to pin, not an orientable 3-D shape
+_PLANE_ATOMS = 3  # the minimum number of distinct points that defines a plane
 _COORD_LEN = 3  # an (x, y, z) coordinate
 _DIST_ATOMS = 2  # a distance key names two atoms
 _ANGLE_ATOMS = 3  # an angle key names three atoms
 _DIHEDRAL_ATOMS = 4  # a dihedral key names four atoms
+
+
+def constraint_value(positions, atoms, haptic=None, window=None):
+    """Measure one distance, angle or dihedral, resolving haptic centroids when present."""
+    haptic = haptic or {}
+
+    def point(atom):
+        if 0 <= atom < len(positions):
+            return positions[atom]
+        face = haptic.get(atom)
+        if not face or any(index < 0 or index >= len(positions) for index in face):
+            return None
+        return np.mean(positions[list(face)], axis=0)
+
+    points = [point(atom) for atom in atoms]
+    if any(value is None for value in points):
+        return None
+    if len(atoms) == _DIST_ATOMS:
+        return float(np.linalg.norm(points[0] - points[1]))
+    if len(atoms) == _ANGLE_ATOMS:
+        return _angle(*points)
+    if len(atoms) != _DIHEDRAL_ATOMS:
+        raise ValueError("a geometric term needs 2, 3 or 4 atoms")
+    value = _dihedral(*points)
+    if window is not None:
+        middle = 0.5 * sum(window)
+        value = middle + (value - middle + _STRAIGHT) % (2 * _STRAIGHT) - _STRAIGHT
+    return value
+
+
+def within_window(value, window, slack=0.0):
+    """Return whether a finite measured value lies within a window and tolerance."""
+    lo, hi = window
+    return value is not None and np.isfinite(value) and lo - slack <= value <= hi + slack
+
+
 _SHOWN_HITS = 4  # how many ambiguous matches to name before trailing off
 
 
@@ -370,7 +467,15 @@ def _resolve_ring(mol, ring):
             "explicitly, e.g. constrain={(tuple(ring_a), tuple(ring_b)): 3.7} "
             "(get them with mol.GetSubstructMatch / GetRingInfo)"
         )
-    return tuple(int(a) for a in ring)
+    atoms = tuple(ring)
+    if len(atoms) < _PLANE_ATOMS:
+        raise ValueError(f"constrain plane needs at least 3 atoms per ring; got {atoms}")
+    if any(not _is_index(atom) for atom in atoms):
+        raise ValueError(f"constrain plane ring atoms must be integer indices; got {atoms}")
+    atoms = tuple(int(atom) for atom in atoms)
+    if len(set(atoms)) != len(atoms):
+        raise ValueError(f"constrain plane ring atoms must be distinct; got {atoms}")
+    return atoms
 
 
 def _validate_indices(mol, atoms):
@@ -470,7 +575,12 @@ def _apply_constrain(mol, constrain, cons):
     for key, val in constrain.items():
         if _is_plane_key(key):
             ra, rb = key
-            cons.planes.append((_resolve_ring(mol, ra), _resolve_ring(mol, rb), float(val)))
+            ra, rb, separation = _resolve_ring(mol, ra), _resolve_ring(mol, rb), float(val)
+            if set(ra) & set(rb):
+                raise ValueError("constrain plane rings must not share atoms")
+            if not np.isfinite(separation) or separation <= 0.0:
+                raise ValueError(f"constrain plane separation must be a positive finite distance; got {val!r}")
+            cons.planes.append((ra, rb, separation))
             continue
         idx = _index_tuple(key)
         if len(idx) == _DIST_ATOMS:
@@ -624,7 +734,7 @@ def _drop_determined_by_graft(cons, coord_fix, keys):
     against a distance the graft then contradicts. Restore the shape window (a distance) or drop it (an
     angle/dihedral), loudly: silently ignoring it would leave the user thinking the constraint applied.
     """
-    dropped = {key for key in keys if all(a in coord_fix for a in key)}
+    dropped = {key for key in keys if _graft_owns(key, coord_fix)}
     for key in sorted(dropped):
         if len(key) == _DIST_ATOMS:
             add_pairwise_shape(cons, key, coord_fix, _SHAPE_PAD)  # back to what the graft implies

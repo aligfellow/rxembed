@@ -251,11 +251,12 @@ def test_uncalibrated_donor_class_still_gets_the_cap():
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_frozen_ts_core_metal_gets_no_cap():
+def test_partial_frozen_ts_keeps_each_unowned_cap():
     isos = list(rx.metal(_MN_H2, "octahedral", center="Mn", fix=_MN_H2_RC))
-    assert isos, "nothing was enumerated: the no-cap claim was never tested"
+    assert isos, "nothing was enumerated: the partial-freeze claim was never tested"
     for iso in isos:
-        assert not iso.cons.coplanar
+        assert iso.cons.coplanar
+        assert all(not set(row[:4]) <= iso.cons.frozen for row in iso.cons.coplanar)
 
 
 # --- the coplanarity cap is SOFT: a window the relax lands inside, never a pin ---------------------------
@@ -321,7 +322,7 @@ def test_cap_excludes_its_aryl_anchor():
 
 
 def test_cap_survives_every_constraints_rebuild():
-    from rxembed.pipeline.ensemble import _refine
+    import rxembed.pipeline.ensemble as ensemble_module
 
     c = Constraints()
     c.coplanar.append((0, 1, 2, 3, 180.0, 45.0))
@@ -330,18 +331,18 @@ def test_cap_survives_every_constraints_rebuild():
 
     ens = rx.embed(rx.metal(NI_N, "square_planar")[0], n=2, seed=1)
     assert ens.cons.coplanar, "the fixture must carry a cap for this to mean anything"
-    seen, real = [], _refine.restrained_uff
+    seen, real = [], ensemble_module.restrained_uff
 
     def spy(mol, cons, *a, **kw):
         seen.append(cons)
         return real(mol, cons, *a, **kw)
 
     # ty types every function literal nominally, so no stand-in is ever assignable to what it replaces.
-    _refine.restrained_uff = spy  # ty: ignore[invalid-assignment]
+    ensemble_module.restrained_uff = spy  # ty: ignore[invalid-assignment]
     try:
         ens._settle_seeds(bins=2)
     finally:
-        _refine.restrained_uff = real
+        ensemble_module.restrained_uff = real
     assert seen, "the settle never reached the relax"
     assert all(x.coplanar for x in seen), "the settle relaxed with the coplanarity cap absent"
 
@@ -404,17 +405,14 @@ def test_skipping_an_ester_cap_does_not_collapse_the_ester():
     assert measured, "no seed embedded: the collapse guard measured nothing"
 
 
-def test_frozen_metal_disables_only_its_wall():
+def test_length_source_does_not_control_partial_freeze_walls():
 
     def walls(lengths):  # (metal, donor, substituent) windows, i.e. `_orient_donor`'s, not the polyhedron's
         iso = rx.metal(_MN_H2, "octahedral", center="Mn", fix=_MN_H2_RC, lengths=lengths)[0]
         return {k: v for k, v in iso.cons.angles.items() if k[0] == iso.metal and k[1] != iso.metal}
 
-    assert not walls("auto"), "a measured geometry is the orientation truth; a wall on top can only fight it"
-
-    modelled = walls("model")
-    assert modelled, "with no geometry to trust, every free donor needs its wall back"
-    assert not {k for k in modelled if k[1] in _MN_H2_RC}, "a fix=d donor's own orientation is still the reference's"
+    measured, modelled = walls("auto"), walls("model")
+    assert measured == modelled, "M-L length provenance changed which graph-derived orientations exist"
+    assert measured, "partially free donors lost every orientation wall"
     why = "the carbonyl that motivated this must be the sp-carbon wall, or the test is measuring something else"
-    assert (1, 61, 3) in modelled, why
-    assert modelled[(1, 61, 3)] == (165.0, 180.0), why
+    assert measured[(1, 61, 3)] == (165.0, 180.0), why

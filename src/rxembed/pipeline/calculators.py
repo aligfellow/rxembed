@@ -10,8 +10,7 @@ correction::
 
     E = E_gxtb(gas) + [E_gfn2(solvent) - E_gfn2(gas)]
 
-and likewise for the gradient. Set $XTB_EXE to override the binary. `ff_energies` / `restrained_uff` are
-re-exported from the core relax, so `Ensemble` reaches every tier through this one module.
+and likewise for the gradient. Set $XTB_EXE to override the binary.
 """
 
 from __future__ import annotations
@@ -22,8 +21,6 @@ import tempfile
 
 import numpy as np
 from rdkit import Chem
-
-from rxembed.relax import ff_energies, restrained_uff  # noqa: F401  the FF tier of the refine ladder
 
 XTB_EXE = os.environ.get("XTB_EXE", os.path.expanduser("~/bin/xtb"))
 XTB_TIMEOUT = int(os.environ.get("XTB_TIMEOUT", "600"))  # s; a hung/non-converging xtb must not freeze the caller

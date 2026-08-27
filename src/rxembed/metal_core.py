@@ -336,7 +336,7 @@ def _hold_donor_chirality(mol, metal, donors, cons):
 def _release_donor_chirality(mol, held, cons):
     """Remove the hold dummy D's + their ``(metal, D)`` cons keys, restore donor charges, keep the tag.
 
-    Dropping the cons key is critical: `cons` is the Ensemble's, reused by `minimize`/`_reembed`/`mc`, and a
+    Dropping the cons key is critical: `cons` is the Ensemble's, reused by minimize, replacement and MC, and a
     distance to a now-removed atom would index past the mol (an IndexError in the bounds matrix).
     """
     if not held:

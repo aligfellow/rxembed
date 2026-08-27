@@ -82,6 +82,16 @@ def test_ensemble_checks_every_tracked_conformer():
     assert all(report.ok() for report in reports.values())
 
 
+def test_geometry_check_rejects_nonfinite_coordinates():
+    mol = _reference_conformer("CCO")
+    mol.GetConformer().SetAtomPosition(0, (float("nan"), 0.0, 0.0))
+
+    report = geom.check(mol, 0)
+
+    assert _kinds(report) == {"coordinates"}
+    assert "non-finite coordinate" in report.summary()
+
+
 # --- one deliberate break per violation kind --------------------------------------------------------------
 
 
@@ -144,6 +154,38 @@ def test_kwarg_checks_accept_matching_geometry():
     d = float(np.linalg.norm(ref.GetConformer(0).GetPositions()[1] - ref.GetConformer(0).GetPositions()[9]))
     assert geom.check(ref, 0, frozen=list(range(6)), reference=ref).ok(), "an identical geometry moved the core"
     assert geom.check(ref, 0, constraints={"distances": {(1, 9): (d - 0.1, d + 0.1)}}).ok()
+
+
+def test_constraint_gate_checks_periodic_dihedrals():
+    mol = _reference_conformer("CCCC")
+    pos = mol.GetConformer().GetPositions()
+    atoms = (0, 1, 2, 3)
+    phi = rdMolTransforms.GetDihedralDeg(mol.GetConformer(), *atoms)
+
+    missed = geom.check_constraints(mol, pos, {"dihedrals": {atoms: (phi + 50.0, phi + 70.0)}})
+    equivalent = geom.check_constraints(mol, pos, {"dihedrals": {atoms: (phi + 350.0, phi + 370.0)}})
+
+    assert [violation.atoms for violation in missed] == [atoms]
+    assert not equivalent
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"distances": {(0, -1): (1.0, 2.0)}},
+        {"distances": {(0, 999): (1.0, 2.0)}, "haptic": {999: [0, 999]}},
+    ],
+    ids=["negative-atom", "invalid-haptic-face"],
+)
+def test_constraint_gate_rejects_an_unmeasurable_virtual_term(spec):
+    mol = _reference_conformer("CC")
+    pos = mol.GetConformer().GetPositions()
+
+    violations = geom.check_constraints(mol, pos, spec)
+
+    assert len(violations) == 1
+    assert np.isnan(violations[0].value)
+    assert "could not be measured" in violations[0].detail
 
 
 # --- TS-awareness: a held core is not judged by ground-state rules ----------------------------------------

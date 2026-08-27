@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import rdMolTransforms
 
 from . import metal_core as _metal
 from . import metal_polyhedron as _poly
@@ -22,11 +21,14 @@ from .constraints import (
     FIX_ANGLE_TOL,
     FIX_DISTANCE_TOL,
     Constraints,
-    add_distance,
+    _central_bond,
+    _structural_torsion_bonds,
     compose,
+    constraint_value,
     resolve_atom,
     resolve_core,
     template_to_fix,
+    within_window,
 )
 from .metal_core import VACANT, materialized_state
 from .metal_isomer import Isomer, from_geometry
@@ -39,12 +41,108 @@ _EPS = 1e-6  # near-zero norm floor for the graft axis
 _BOND_ATOMS = 2  # a two-atom frozen core is a bond: fix its length, not an orientation
 _ANGLE_ATOMS = 3
 _DIHEDRAL_ATOMS = 4
+_STRUCT_ANGLE_SLACK = 0.05  # deg: numerical settling tolerance at a finite-force orientation wall
+_STRUCT_CAP_SLACK = 2.0  # deg: finite-force settling tolerance on coplanarity and umbrella caps
+_SHAPE_TEAR_TOL = 0.10  # A beyond a rigid body's own 0.1 A all-pairs windows
+_SPATIAL_DIMENSION = 3
 
 
-def _periodic_near(value, lo, hi):
-    """Return the periodic image of an angle nearest a stated interval's midpoint."""
-    middle = 0.5 * (lo + hi)
-    return middle + (value - middle + 180.0) % 360.0 - 180.0
+def _structural_dihedrals_ok(conf, cons):
+    """Return whether graph-derived coplanarity and umbrella terms pass their structural caps."""
+    pos = conf.GetPositions()
+    stated = {_central_bond(atoms) for atoms in cons.dihedrals}
+    for key in cons.coplanar:
+        atoms, cap = key[:4], key[5]
+        if _central_bond(atoms) in stated:
+            continue
+        measured = constraint_value(pos, atoms, cons.haptic)
+        if measured is None or not np.isfinite(measured):
+            return False
+        value = abs(measured)
+        if min(value, 180.0 - value) > cap + _STRUCT_CAP_SLACK:
+            return False
+    for atoms, ideal in cons.umbrellas.items():
+        if ideal is None or _central_bond(atoms) in stated:
+            continue
+        measured = constraint_value(pos, atoms, cons.haptic)
+        if measured is None or not np.isfinite(measured):
+            return False
+        value = abs(measured)
+        if not ideal - _STRUCT_CAP_SLACK <= value <= 90.0 + _STRUCT_CAP_SLACK:
+            return False
+    return True
+
+
+def _structural_constraints_ok(mol, cid, cons):
+    """Return whether one conformer satisfies the coordination terms that are structural postconditions."""
+    conf = mol.GetConformer(int(cid))
+    pos = conf.GetPositions()
+    soft_d, soft_angular = cons.contacts
+
+    for key, window in cons.distances.items():
+        if key in soft_d or not cons.metals.intersection(key):
+            continue
+        value = constraint_value(pos, key, cons.haptic, window)
+        if not within_window(value, window, FIX_DISTANCE_TOL):
+            return False
+    for key, window in cons.angles.items():
+        # D-M-D walls bias ideal seating, but a chelate or haptic face can be a valid distorted polyhedron.
+        # `_coordination_state_ok` judges those angles together with donor-to-slot correspondence.
+        if key in soft_angular or key[1] in cons.metals or not cons.metals.intersection(key):
+            continue
+        value = constraint_value(pos, key, cons.haptic, window)
+        if not within_window(value, window, _STRUCT_ANGLE_SLACK):
+            return False
+    return _structural_dihedrals_ok(conf, cons)
+
+
+def _coordination_state_ok(mol, cid, iso):
+    """Return whether one conformer retains each selected polyhedron."""
+    if iso is None:
+        return True
+    pos = mol.GetConformer(int(cid)).GetPositions()
+    parts = _metal.materialized_states(iso.mol, iso.centres)
+    for state in iso.centres:
+        poly = _poly.POLYHEDRA.get(state.geometry)
+        if poly is None:
+            continue
+        vertices, haptic, _winding, donors = parts[state.atom]
+        occupied = [i for i, vertex in enumerate(vertices) if vertex != VACANT]
+        if len(occupied) < 2:  # noqa: PLR2004 - one site has no relative direction and cannot define a shape
+            continue
+        if not np.all(np.isfinite(pos[state.atom])):
+            return False
+        points = {}
+        for slot in occupied:
+            vertex = vertices[slot]
+            point = np.mean(pos[list(haptic[vertex])], axis=0) if vertex in haptic else pos[vertex]
+            if not np.all(np.isfinite(point)):
+                return False
+            points[slot] = point
+
+        if poly.planar and donors and not _metal.coplanar(pos, state.atom, donors, haptic=haptic):
+            return False
+        if (
+            not poly.planar
+            and len(occupied) >= _SPATIAL_DIMENSION
+            and np.linalg.matrix_rank(np.array([poly.vertex_dirs[i] for i in occupied], float)) == _SPATIAL_DIMENSION
+            and _metal.coplanar(pos, state.atom, donors, haptic=haptic)
+        ):
+            return False
+        observed = []
+        for slot in occupied:
+            direction = points[slot] - pos[state.atom]
+            if not np.all(np.isfinite(direction)):
+                return False
+            length = np.linalg.norm(direction)
+            if length <= _EPS:
+                return False
+            observed.append(direction / length)
+        ideal = np.array([poly.vertex_dirs[slot] for slot in occupied], float)
+        ideal /= np.linalg.norm(ideal, axis=1, keepdims=True)
+        if _poly.ordered_fit_residual(np.array(observed), ideal) > _metal._FIT_FLOOR:
+            return False
+    return True
 
 
 _MIN_FRAGS = 2  # below this there is no inter-fragment separation to enforce
@@ -141,24 +239,17 @@ def _frozen_core_ref(mol, frozen_atoms, graft_ref):
     return frozen, None
 
 
-def _determined_by_graft(base, graft_ref):
-    """Return grafted sphere atoms when two or more would determine the arrangement."""
-    if not graft_ref:
-        return []
-    sphere = {a for k in base.distances for a in k}
-    pinned = sorted(sphere & set(graft_ref))
-    return pinned if len(pinned) > 1 else []
-
-
-def fold_substrate(base, sub, graft_ref):
+def fold_substrate(base, sub, graft_ref, *, protect_arrangement=True):
     """Compose substrate constraints with a coordination sphere.
 
     Field-driven composition keeps every constraint kind; the previous hand-written merge dropped `sub.planes`.
-    A substrate grip overlapping a sphere hold remains structural. A coordinate graft may pin at most one sphere
-    atom; two would silently replace the selected arrangement with the reference arrangement.
+    A soft substrate grip may not replace a structural sphere hold. A numeric fix may override one explicitly.
+    A coordinate graft may pin at most one sphere atom; two would silently replace the selected arrangement.
     """
-    pinned = _determined_by_graft(base, graft_ref)
-    if pinned:
+    sphere = set(base.metals)
+    sphere.update(atom for pair in base.distances if base.metals.intersection(pair) for atom in pair)
+    pinned = sorted(sphere & set(graft_ref)) if protect_arrangement else []
+    if len(pinned) > 1:
         raise ValueError(
             f"the coordinate graft (fix={{i: (x,y,z)}} / template=) pins coordination-sphere atoms {pinned}: "
             f"the graft restores them to their exact reference coordinates after the embed, so it, not the "
@@ -167,15 +258,24 @@ def fold_substrate(base, sub, graft_ref):
             f"composes fine), or embed the reference geometry itself as the source."
         )
     sphere_d = set(base.distances)
-    sphere_angular = set(base.angles) | set(base.dihedrals)
     soft_d, soft_angular = sub.contacts
-    merged = compose(base, sub)
-    return merged.copy(
-        contacts=(
-            frozenset(k for k in soft_d if k not in sphere_d),
-            frozenset(k for k in soft_angular if k not in sphere_angular),
-        ),
+    canonical = lambda key: min(tuple(key), tuple(reversed(key)))  # noqa: E731
+    sphere_angular = {canonical(k) for k in (*base.angles, *base.dihedrals)}
+    structural_torsions = _structural_torsion_bonds(base)
+    overlap = sorted(
+        (soft_d & sphere_d)
+        | {
+            k
+            for k in soft_angular
+            if canonical(k) in sphere_angular or (len(k) == _DIHEDRAL_ATOMS and _central_bond(k) in structural_torsions)
+        }
     )
+    if overlap:
+        raise ValueError(
+            f"constrain= overlaps structural coordination term(s) {overlap}: a soft bias cannot replace the "
+            f"selected metal state. Keep the structural term, or use fix= for an explicit rigid override."
+        )
+    return compose(base, sub)
 
 
 def _stereo_targets(iso):
@@ -323,24 +423,18 @@ def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, pru
                         break
         mol = kept
         ids = [conf.GetId() for conf in mol.GetConformers()]
-        if len(ids) < target:
-            logger.warning(
-                "embed: kept %d/%d seeds with the requested %s after %d DG batch(es)",
-                len(ids),
-                target,
-                " and ".join(
-                    part
-                    for part in (
-                        f"{hands} metal hand(s)" if hands else "",
-                        f"{windings} winding(s)" if windings else "",
-                    )
-                    if part
-                ),
-                _MAX_HAND_ROUNDS,
-            )
     if iso is not None:
         mol = _metal._release_donor_chirality(mol, held, cons)  # drop the dummy D's + cons keys, restore charges
-    return mol, ids
+    return mol, ids, target if targets else None
+
+
+def require_seed_count(ids, target):
+    """Reject public results that underfill the requested coordination identity."""
+    if target is not None and len(ids) < target:
+        raise RuntimeError(
+            f"embed: found {len(ids)}/{target} seeds with the requested metal state after "
+            f"{_MAX_HAND_ROUNDS} DG batches; choose a compatible metal identity or relax fix="
+        )
 
 
 def _mirror_is_free(mol):
@@ -359,8 +453,7 @@ def _reflect(mol, cid):
     conf = mol.GetConformer(int(cid))
     pos = conf.GetPositions()
     pos[:, 0] *= -1.0
-    for a, xyz in enumerate(pos):
-        conf.SetAtomPosition(a, xyz.tolist())
+    conf.SetPositions(pos)
 
 
 def _realised_hand(mol, iso, cid):
@@ -396,10 +489,8 @@ class Conformers:
     iso: Isomer | None = None
     energies: dict = field(default_factory=dict)  # conformer id -> restrained-UFF or downstream score
     unrelaxed: list = field(default_factory=list, kw_only=True)
-    # ids restored to their embed seed because no stiffness relaxed them without tearing or missing a fix
+    # ids restored to their embed seed because no stiffness produced a converged result that passed the contract
     seed: int | None = field(default=None, kw_only=True)
-    # ids whose metal centre does not realise the selected hand
-    wrong_hand: list = field(default_factory=list, kw_only=True)
     # seed plus snapshots from the accepted restrained-UFF attempt; recorded only when explicitly requested
     trajectory: Chem.Mol | None = field(default=None, kw_only=True)
 
@@ -415,11 +506,6 @@ class Conformers:
             return mol
         self.iso.restore(mol)  # real element and formal charge, on our copy
         return _metal.connect_metal(mol, self.iso.donor_bonds) if self.iso.donor_bonds else mol
-
-    @property
-    def _bond_tol(self):
-        """The break threshold the accept gate uses; looser for a metal (see `METAL_BOND_TOL`)."""
-        return METAL_BOND_TOL if self.iso is not None else BOND_TOL
 
     def _store_trajectory(self, frames):
         """Store accepted cleanup frames on the restored public graph."""
@@ -437,16 +523,9 @@ class Conformers:
         mol.RemoveAllConformers()
         for positions in frames:
             conf = Chem.Conformer(mol.GetNumAtoms())
-            for atom, xyz in enumerate(positions):
-                conf.SetAtomPosition(atom, xyz.tolist())
+            conf.SetPositions(positions)
             mol.AddConformer(conf, assignId=True)
         self.trajectory = mol
-
-    def _intact(self, cid):
-        """Return True if `cid` retains its graph and every numeric fix."""
-        return self._fixed_geometry_ok(cid) and bonding_ok(
-            self._mol, cid, bond_tol=self._bond_tol, exclude=self.cons.frozen, constrained=self.cons.distances
-        )
 
     def _fixed_geometry_misses(self, cid):
         """Return numeric fixes missed by `cid`, including their excess over the public tolerance."""
@@ -454,14 +533,8 @@ class Conformers:
         pos = conf.GetPositions()
         misses = []
         for atoms, (lo, hi) in self.cons.fixed.items():
-            if len(atoms) == _BOND_ATOMS:
-                i, j = atoms
-                actual, tol, unit = float(np.linalg.norm(pos[i] - pos[j])), FIX_DISTANCE_TOL, "A"
-            elif len(atoms) == _ANGLE_ATOMS:
-                actual, tol, unit = rdMolTransforms.GetAngleDeg(conf, *atoms), FIX_ANGLE_TOL, "deg"
-            else:
-                actual = _periodic_near(rdMolTransforms.GetDihedralDeg(conf, *atoms), lo, hi)
-                tol, unit = FIX_ANGLE_TOL, "deg"
+            actual = constraint_value(pos, atoms, self.cons.haptic, (lo, hi))
+            tol, unit = (FIX_DISTANCE_TOL, "A") if len(atoms) == _BOND_ATOMS else (FIX_ANGLE_TOL, "deg")
             excess = abs(actual - lo) - tol if lo == hi else max(lo - actual, actual - hi)
             if not np.isfinite(actual):
                 excess = float("inf")
@@ -473,16 +546,19 @@ class Conformers:
         """Return whether every scalar target or explicit fixed window meets its contract."""
         return not self._fixed_geometry_misses(cid)
 
-    def _reject_missed_fixes(self, operation):
-        """Reject and report conformers that could not retain a numeric fix."""
-        failures = {cid: miss for cid in self.ids if (miss := self._fixed_geometry_misses(cid))}
+    def _remove(self, ids):
+        """Stop tracking conformers and their attached status records."""
+        removed = set(ids)
+        self.ids = [cid for cid in self.ids if cid not in removed]
+        self.unrelaxed = [cid for cid in self.unrelaxed if cid not in removed]
+        for cid in removed:
+            self.energies.pop(cid, None)
+
+    def _report_missed_fixes(self, ids, operation):
+        """Report conformers that could not retain a numeric fix and return their ids."""
+        failures = {cid: miss for cid in ids if (miss := self._fixed_geometry_misses(cid))}
         bad = list(failures)
         if bad:
-            rejected = set(bad)
-            self.ids = [cid for cid in self.ids if cid not in rejected]
-            self.unrelaxed = [cid for cid in self.unrelaxed if cid not in rejected]
-            for cid in bad:
-                self.energies.pop(cid, None)
             _excess, atoms, actual, lo, hi, tol, unit = max(
                 (miss for misses in failures.values() for miss in misses), key=lambda miss: miss[0]
             )
@@ -501,46 +577,69 @@ class Conformers:
             )
         return bad
 
-    def _puckered_centres(self, cid, iso=None):
-        """Return declared planar centres that relaxed out of plane."""
-        iso = self.iso if iso is None else iso
-        if iso is None:
-            return ()
-        pos = self._mol.GetConformer(cid).GetPositions()
-        parts = _metal.materialized_states(iso.mol, iso.centres)
-        return tuple(
-            state
-            for state in iso.centres
-            if _poly.is_planar(state.geometry)
-            and parts[state.atom][3]
-            and not _metal.coplanar(pos, state.atom, parts[state.atom][3], haptic=parts[state.atom][1])
-        )
+    def _required_failure(self, failures):
+        """Name the failed core request that requires acceptance to restore the starting count."""
+        required = []
+        if "missed numeric fix" in failures:
+            required.append("fix=")
+        if "the requested metal state" in failures:
+            required.append("the requested metal state")
+        return " and ".join(required)
 
     def _coordination_ok(self, cid, iso=None):
-        """Reject a puckered result for any declared planar polyhedron."""
-        return not self._puckered_centres(cid, iso)
+        """Return whether every selected coordination state retains its shape."""
+        return _coordination_state_ok(self._mol, cid, self.iso if iso is None else iso)
 
-    def _relax_constrained(self, stiffness, max_iters=MAX_ITERS, conf_ids=None, operation="minimize", _frames=None):
+    def _geometry_failure(self, cid, iso=None):
+        """Return the first failed core publication contract, or ``None``."""
+        if not self._fixed_geometry_ok(cid):
+            return "missed numeric fix"
+        bond_tol = METAL_BOND_TOL if self.iso is not None or iso is not None else BOND_TOL
+        if not bonding_ok(self._mol, cid, bond_tol=bond_tol, exclude=self.cons.frozen, constrained=self.cons.distances):
+            return "broken bond"
+        pos = self._mol.GetConformer(int(cid)).GetPositions()
+        for body in self.cons.shapes:
+            for (i, j), (lo, hi) in self.cons.distances.items():
+                if i in body and j in body:
+                    value = float(np.linalg.norm(pos[i] - pos[j]))
+                    if value < lo - _SHAPE_TEAR_TOL or value > hi + _SHAPE_TEAR_TOL:
+                        return "torn rigid body"
+        if not self._coordination_ok(cid, iso):
+            return "wrong coordination state"
+        if not _structural_constraints_ok(self._mol, cid, self.cons):
+            return "missed structural constraint"
+        return None
+
+    def _relax_ok(self, cid):
+        """Return whether one relaxed conformer satisfies every structural acceptance gate."""
+        return self._geometry_failure(cid) is None
+
+    def _relax_constrained(self, stiffness, max_iters=MAX_ITERS, operation="minimize", _frames=None):
+        """Run the shared restrained-relax and per-conformer retry policy."""
+        relaxing = list(self.ids)
+        seed_pos = {cid: self._mol.GetConformer(cid).GetPositions().copy() for cid in relaxing}
+        energies = self._relax_batch(stiffness, max_iters, relaxing, operation, _frames)
+        retried = self._retry_relaxation(seed_pos, stiffness, max_iters, operation, _frames)
+        if energies is not None and retried:
+            energies = restrained_uff(self._mol, self.cons, stiffness=stiffness, max_iters=0, conf_ids=relaxing)
+        return energies
+
+    def _relax_batch(self, stiffness, max_iters, relaxing, operation, frames):
         """Relax with restrained UFF, escalating only when no conformer passes the accept gate.
 
-        Returns the accepted energies, or ``None`` when UFF cannot type the graph. `conf_ids` limits the batch.
+        Return the accepted energies, or ``None`` when UFF cannot type the graph.
         """
         # Hold a labile (carbanion/amine) donor's hand through the relax: the surrogate's bare degree-3 centre
         # inverts under UFF. Cap it with a dummy D, release when done.
         n_atoms = self._mol.GetNumAtoms()
-        all_ids = [c.GetId() for c in self._mol.GetConformers()]
-        relaxing = all_ids if conf_ids is None else [int(c) for c in conf_ids]
-        initial = self._mol.GetConformer(relaxing[0]).GetPositions().copy() if _frames is not None else None
+        initial = self._mol.GetConformer(relaxing[0]).GetPositions().copy() if frames is not None else None
         recorded, trajectory_done = [], False
         self._mol, hold = _hold_donors(self._mol, self.iso, self.cons)
         e, fc = None, stiffness
         try:
             retrying = set(relaxing)
             self.unrelaxed = [i for i in self.unrelaxed if i not in retrying]
-            embed_pos = {
-                c: [list(self._mol.GetConformer(c).GetAtomPosition(a)) for a in range(self._mol.GetNumAtoms())]
-                for c in relaxing
-            }
+            embed_pos = {c: self._mol.GetConformer(c).GetPositions().copy() for c in relaxing}
             donor_hands = {
                 c: {donor: _metal.donor_chirality_sign(self._mol, c, donor) for _dummy, donor, _charge in hold}
                 for c in relaxing
@@ -548,23 +647,23 @@ class Conformers:
 
             def restore(ids=relaxing):
                 for cid in ids:
-                    conf = self._mol.GetConformer(cid)
-                    for a, xyz in enumerate(embed_pos[cid]):
-                        conf.SetAtomPosition(a, xyz)
+                    self._mol.GetConformer(cid).SetPositions(embed_pos[cid])
 
+            statuses = {}
             for step, mult in enumerate(FC_ESCALATION):  # half-order steps: find the minimum sufficient stiffness
                 if step:  # restore the embed geometry before a stiffer retry (a big jump over-stiffens it)
                     restore()
                 fc = stiffness * mult
-                snapshots = {} if _frames is not None else None
+                snapshots = {} if frames is not None else None
                 try:
                     e = restrained_uff(
                         self._mol,
                         self.cons,
                         stiffness=fc,
                         max_iters=max_iters,
-                        conf_ids=conf_ids,
+                        conf_ids=relaxing,
                         _snapshots=snapshots,
+                        _statuses=statuses,
                     )
                 except RuntimeError as err:  # UFF can't build a force field for this graph, so keep the embed
                     restore()
@@ -576,9 +675,8 @@ class Conformers:
                         _error_summary(err),
                     )
                     return None
-                # accept a stiffness only if a conformer is both bonded and, for a planar polyhedron, coplanar,
-                # so escalation never forces a phantom through as an out-of-plane pucker.
-                kept = [i for i in self.ids if self._intact(i) and self._coordination_ok(i)]
+                # Accept only converged conformers satisfying the same structural contract every retry reads.
+                kept = [i for i in relaxing if statuses.get(i, 1) == 0 and self._relax_ok(i)]
                 if kept or step == len(FC_ESCALATION) - 1:  # some survived (accept), or out of steps (caller drops)
                     if snapshots is not None:
                         recorded = snapshots.get(relaxing[0], [])
@@ -593,6 +691,7 @@ class Conformers:
                             fc,
                         )
                     break
+            self.unrelaxed.extend(i for i in relaxing if statuses.get(i, 1) != 0 and i not in self.unrelaxed)
             inverted = [
                 c
                 for c in relaxing
@@ -605,7 +704,7 @@ class Conformers:
                 restore(inverted)
                 recorded = []  # the UFF path inverted the centre; the accepted result is the restored seed
                 self.unrelaxed.extend(c for c in inverted if c not in self.unrelaxed)
-                e = restrained_uff(self._mol, self.cons, stiffness=fc, max_iters=0, conf_ids=conf_ids)
+                e = restrained_uff(self._mol, self.cons, stiffness=fc, max_iters=0, conf_ids=relaxing)
                 logger.warning(
                     "%s: UFF inverted a coordinated ligand stereocentre in %d conformer(s); kept the DG seed",
                     operation,
@@ -615,76 +714,73 @@ class Conformers:
         finally:  # release the hold on every exit path, including the early UFF-failure return; the dummy D
             if hold:  # is scaffolding for this relax alone
                 self._mol = _metal._release_donor_chirality(self._mol, hold, self.cons)
-            if _frames is not None and trajectory_done:
+            if frames is not None and trajectory_done:
                 assert initial is not None
                 final = self._mol.GetConformer(relaxing[0]).GetPositions().copy()
                 path = [initial, *(frame[:n_atoms] for frame in recorded)]
                 if not np.allclose(path[-1], final):
                     path.append(final)
-                _frames[:] = path
+                frames[:] = path
         return e
 
-    def _rescue_torn(self, seed_pos, stiffness, operation="minimize", _frames=None):
-        """Retry each torn or off-fix conformer separately; restore its seed if every stiffness fails.
+    def _retry_relaxation(self, seed_pos, stiffness, max_iters, operation, frames):
+        """Retry each failed conformer separately; restore its seed if every stiffness fails.
 
-        Returns the number tried. The pipeline separately rejects a donor hand that changes during rescue.
+        Returns the number tried. The pipeline separately rejects a donor hand that changes during retry.
         """
 
         def place(cid, pos):
-            conf = self._mol.GetConformer(cid)
-            for a, xyz in enumerate(pos):
-                conf.SetAtomPosition(a, xyz.tolist())
+            self._mol.GetConformer(cid).SetPositions(pos)
 
-        torn = [c for c in self.ids if not self._intact(c)]
+        failed = [c for c in self.ids if c in self.unrelaxed or not self._relax_ok(c)]
         rescued = 0
-        for cid in torn:
+        for cid in failed:
+            accepted = False
             for mult in FC_ESCALATION[1:]:  # rung 0 is the pass that already tore it
                 place(cid, seed_pos[cid])
-                snapshots = {} if _frames is not None else None
+                snapshots = {} if frames is not None else None
+                statuses = {}
                 try:
                     restrained_uff(
                         self._mol,
                         self.cons,
                         stiffness=stiffness * mult,
+                        max_iters=max_iters,
                         conf_ids=[int(cid)],
                         _snapshots=snapshots,
+                        _statuses=statuses,
                     )
                 except RuntimeError:  # UFF cannot build for this graph, so the seed is the best available
                     break
-                if self._intact(cid):
-                    if _frames is not None:
+                if statuses.get(cid, 1) == 0 and self._relax_ok(cid):
+                    accepted = True
+                    if frames is not None:
                         assert snapshots is not None
                         final = self._mol.GetConformer(cid).GetPositions().copy()
                         path = [seed_pos[cid], *snapshots.get(cid, [])]
                         if not np.allclose(path[-1], final):
                             path.append(final)
-                        _frames[:] = path
-                    rescued += 1
-                    self.unrelaxed = [i for i in self.unrelaxed if i != cid]
+                        frames[:] = path
                     break
-            else:
-                place(cid, seed_pos[cid])
-                if _frames is not None:
-                    _frames[:] = [seed_pos[cid]]
-                if cid not in self.unrelaxed:
-                    self.unrelaxed.append(cid)  # never relaxed: say so, or nothing downstream can tell
+            if accepted:
+                rescued += 1
+                self.unrelaxed = [i for i in self.unrelaxed if i != cid]
                 continue
-            if not self._intact(cid):
-                place(cid, seed_pos[cid])
-                if _frames is not None:
-                    _frames[:] = [seed_pos[cid]]
-                if cid not in self.unrelaxed:
-                    self.unrelaxed.append(cid)
-        if torn:
+            place(cid, seed_pos[cid])
+            if frames is not None:
+                frames[:] = [seed_pos[cid]]
+            if cid not in self.unrelaxed:
+                self.unrelaxed.append(cid)  # every retry failed, so publish the seed only with an explicit flag
+        if failed:
             logger.warning(  # a geometry that never completed a relax is not what `minimize` promises: say so
-                "%s: %d/%d torn or off-fix; %d rescued, %d restored to their seeds",
+                "%s: %d/%d failed the relax contract; %d rescued, %d restored to their seeds",
                 operation,
-                len(torn),
+                len(failed),
                 len(self.ids),
                 rescued,
-                len(torn) - rescued,
+                len(failed) - rescued,
             )
-        return len(torn)
+        return len(failed)
 
     def _rescore_restrained(self, stiffness):
         """Record one comparable restrained-UFF single point for every tracked conformer."""
@@ -708,56 +804,63 @@ class Conformers:
         ranks, eta2 = _winding_ranks(mol, targets)
         return {c: _seed_stereo_matches(mol, c, targets, ranks, eta2, False) for c in self.ids}
 
-    def _reseed_hand(self, wrong, stiffness, max_iters):
-        """Replace wrong-hand conformers with fresh right-hand seeds; return ids not replaced.
+    def _replace_failed(self, failed, stiffness, max_iters, *, template=None, validator=None, seed=None):
+        """Replace failed conformers from one fresh-seed loop; return ids not replaced.
 
         Replacements keep the original ids. Each batch receives a constraint copy because embedding may add
-        encounter bounds or move phantom indices.
+        encounter bounds or move phantom indices. ``validator`` may add pipeline publication checks after the
+        core contract; it never controls how a replacement is generated or relaxed.
         """
-        seed, iso = self.seed, self.iso
-        if seed is None or iso is None:  # `_hold_metal_hand` gates both; a direct caller gets a no-op, not a
-            return list(wrong)  # crash, and "fixed none of them" is the honest answer without a seed to re-roll
-        left = list(wrong)
+        seed = self.seed if seed is None else seed
+        if seed is None:
+            return list(failed)
+        left = list(failed)
+        source = self._mol if template is None else template
         for attempt in range(1, _MAX_HAND_ROUNDS + 1):
             if not left:
                 break
             cons = self.cons.copy()
-            mol, ids = seed_conformers(Chem.Mol(self._mol), cons, iso, len(left) + _HAND_BUFFER, seed=seed + attempt)
+            mol, ids, _target = seed_conformers(
+                Chem.Mol(source), cons, self.iso, len(left) + _HAND_BUFFER, seed=seed + attempt
+            )
             if not ids:
                 continue
-            batch = Conformers(mol, ids, cons, iso).minimize(stiffness, max_iters, _retry=False)
-            states = batch._metal_states()  # `_retry=False` above: this batch is read here, never re-seeded again
-            spare = [c for c in batch.ids if states[c] and c not in batch.unrelaxed]
-            for cid, src in zip(list(left), spare, strict=False):
+            batch = Conformers(mol, ids, cons, self.iso, seed=seed + attempt)
+            batch._relax_once(stiffness, max_iters)
+            failures = batch._acceptance_failures(validator=validator)
+            batch._remove({cid for rejected in failures.values() for cid in rejected})
+            for cid, src in zip(list(left), batch.ids, strict=False):
                 pos = batch._mol.GetConformer(int(src)).GetPositions()
-                conf = self._mol.GetConformer(int(cid))
-                for a, xyz in enumerate(pos):
-                    conf.SetAtomPosition(a, xyz.tolist())
+                self._mol.GetConformer(int(cid)).SetPositions(pos)
+                if cid not in self.ids:
+                    self.ids.append(cid)
                 self.energies.pop(cid, None)
                 if src in batch.energies:
                     self.energies[cid] = batch.energies[src]
-                if cid in self.unrelaxed:  # the geometry that flag described is gone: the replacement relaxed
+                if src in batch.unrelaxed:
+                    if cid not in self.unrelaxed:
+                        self.unrelaxed.append(cid)
+                elif cid in self.unrelaxed:
                     self.unrelaxed.remove(cid)
                 left.remove(cid)
         return left
 
-    def _hold_metal_hand(self, stiffness, max_iters, operation="minimize"):
-        """Correct the selected metal state where possible and record any failures.
+    def _correct_metal_hand(self, operation="minimize"):
+        """Reflect free metal inversions and return conformers that remain in the wrong state.
 
         Distance and angle constraints cannot choose a mirror; a signed dihedral can. The hand is read after
         relaxation, then corrected by reflection only when no stated geometry distinguishes the mirror.
         """
         iso = self.iso
-        self.wrong_hand = []
         targets = _stereo_targets(iso)
         if iso is None or not self.ids or not targets:
-            return
+            return []
         states = self._metal_states()
         wrong = [c for c, matches in states.items() if not matches]
         if not wrong:
-            return
+            return []
         hands = self._metal_hands()
-        reflected, reseeded = 0, 0
+        reflected = 0
         # The mirror is free only where the metal centre is the one thing it inverts: no other stereocentre
         # (`_mirror_is_free`), no grafted core (its contract is the caller's exact geometry, and a chiral
         # core's mirror is a different core -- re-seeding re-grafts it instead), and no haptic face, which can
@@ -776,35 +879,96 @@ class Conformers:
             reflected = len(reflectable)
             states = self._metal_states()
             wrong = [cid for cid in wrong if not states[cid]]
-        if wrong and self.seed is not None:
-            reseeded = len(wrong)
-            wrong = self._reseed_hand(wrong, stiffness, max_iters)
-            reseeded -= len(wrong)
-        self.wrong_hand = wrong
         logger.info(
-            "%s: corrected metal state in %d conformer(s): %d reflected, %d re-seeded",
+            "%s: metal-state correction: %d reflected, %d unresolved",
             operation,
-            reflected + reseeded + len(wrong),
             reflected,
-            reseeded,
+            len(wrong),
         )
-        if wrong:  # the caller asked for one hand and is getting the other: only this list says so
-            logger.warning(
-                "%s: %d of %d conformer(s) do not realise the requested metal state (see .wrong_hand)",
-                operation,
-                len(wrong),
-                len(self.ids),
-            )
+        return wrong
 
-    def minimize(self, stiffness=BASE_STIFFNESS, max_iters=MAX_ITERS, _retry=True):
+    def _acceptance_failures(self, operation="minimize", validator=None):
+        """Return publication failures grouped by reason after free hand correction."""
+        failures = {}
+        wrong = self._correct_metal_hand(operation)
+        for cid in self.ids:
+            if reason := self._geometry_failure(cid):
+                failures.setdefault(reason, []).append(cid)
+            elif validator is not None and (reason := validator(self, cid)):
+                failures.setdefault(reason, []).append(cid)
+        if wrong:
+            failures["the requested metal state"] = wrong
+        return failures
+
+    def _accept_relaxed(self, stiffness, max_iters, operation="minimize", *, validator=None, template=None, seed=None):
+        """Replace core publication failures once, reject unresolved ids and return their reasons.
+
+        Optimizer status is metadata: an unrelaxed conformer may survive when its restored seed still satisfies
+        the structural contract. Structurally invalid seeds and wrong metal states share the same fresh-seed
+        replacement loop. Internal replacement batches call `_acceptance_failures` directly and cannot recurse.
+        """
+        target = len(self.ids)
+        failures = self._acceptance_failures(operation, validator)
+        requirement = self._required_failure(failures)
+        failed = {cid for rejected in failures.values() for cid in rejected}
+        if failed:
+            self._replace_failed(
+                failed,
+                stiffness,
+                max_iters,
+                template=template,
+                validator=validator,
+                seed=seed,
+            )
+            failures = self._acceptance_failures(operation, validator)
+            failed = {cid for rejected in failures.values() for cid in rejected}
+            self._report_missed_fixes(failures.get("missed numeric fix", ()), operation)
+            self._remove(failed)
+        if not failures:
+            return {}
+
+        reason = ", ".join(f"{len(ids)}x {name}" for name, ids in failures.items())
+        message = (
+            f"{operation}: could not produce {target} conformer(s); {reason} remained after re-seeding; "
+            "the arrangement may be infeasible"
+        )
+        if len(self.ids) < target and requirement:
+            raise ValueError(f"{message}; could not satisfy {requirement}")
+        logger.warning(message)
+        return failures
+
+    def _relax_once(self, stiffness, max_iters, operation="minimize", frames=None):
+        """Run one same-seed relaxation policy without generating replacement seeds."""
+        if not self.ids:
+            return None
+        if not self.cons.is_constrained:
+            statuses = {}
+            e = restrained_uff(
+                self._mol,
+                self.cons,
+                stiffness=stiffness,
+                max_iters=max_iters,
+                conf_ids=self.ids,
+                _statuses=statuses,
+            )
+            self.energies = {i: float(v) for i, v in zip(self.ids, e, strict=False)}
+            self.unrelaxed = [i for i in self.ids if statuses.get(i, 1) != 0]
+            return e
+        self.unrelaxed = []
+        e = self._relax_constrained(stiffness, max_iters, operation, frames)
+        if e is not None:
+            self.energies = {i: float(v) for i, v in zip(self.ids, e, strict=False)}
+        return e
+
+    def minimize(self, stiffness=BASE_STIFFNESS, max_iters=MAX_ITERS):
         """Relax every conformer in place with restrained UFF; return ``self``.
 
         `stiffness` scales flat-bottomed walls and strict scalar fixes; approximate target pulls stay fixed.
         A constrained run escalates restraints only when the relaxed geometries miss the accept gate, then retries
         each failed seed separately. A seed no rung can relax is
         restored and listed in `.unrelaxed`; an untypeable graph keeps its embedded geometry without an energy.
-        A conformer that cannot retain a numeric fix is rejected; other failures remain flagged in
-        `.unrelaxed` or `.wrong_hand`.
+        A max-iteration seed remains in `.unrelaxed` only when it satisfies the structural contract. A wrong
+        metal state is re-seeded, then rejected; a public call fails if that spends the requested count.
 
         `.energies` holds restrained-UFF values for ranking this result, not comparison across species.
         `pipeline.Ensemble.minimize()` adds acceptance gates and may drop failures.
@@ -812,21 +976,9 @@ class Conformers:
         self.trajectory = None
         if not self.ids:
             return self
-        if not self.cons.is_constrained:  # no window to tear against, so no ladder to climb
-            e = restrained_uff(self._mol, self.cons, stiffness=stiffness, max_iters=max_iters, conf_ids=self.ids)
-            self.energies = {i: float(v) for i, v in zip(self.ids, e, strict=False)}
-            return self
-        self.unrelaxed = []  # a re-minimize re-decides it; a stale list would outlive the geometry it described
-        self.wrong_hand = []
-        seed_pos = {c: self._mol.GetConformer(c).GetPositions() for c in self.ids}
-        e = self._relax_constrained(stiffness, max_iters, conf_ids=self.ids)
-        self._rescue_torn(seed_pos, stiffness)
-        if e is not None:
-            self.energies = {i: float(v) for i, v in zip(self.ids, e, strict=False)}
-        self._reject_missed_fixes("minimize")
-        if _retry:
-            self._hold_metal_hand(stiffness, max_iters)
-        if e is not None or self.energies:
+        e = self._relax_once(stiffness, max_iters)
+        self._accept_relaxed(stiffness, max_iters)
+        if self.cons.is_constrained and (e is not None or self.energies):
             # Rescue and hand re-seeding may relax different conformers at different stiffnesses. Rank them
             # only after one single-point pass on the caller's stated objective.
             self._rescore_restrained(stiffness)
@@ -841,16 +993,13 @@ class Conformers:
             raise ValueError(
                 "measure() on an empty result: embed/minimize may have produced no conformers (check the log)"
             )
-        idx = [resolve_atom(self._mol, a) for a in atoms]
-        fns = {2: rdMolTransforms.GetBondLength, 3: rdMolTransforms.GetAngleDeg, 4: rdMolTransforms.GetDihedralDeg}
-        if len(idx) not in fns:
+        idx = tuple(resolve_atom(self._mol, a) for a in atoms)
+        if len(idx) not in (_BOND_ATOMS, _ANGLE_ATOMS, _DIHEDRAL_ATOMS):
             raise ValueError("measure() takes 2 (distance), 3 (angle) or 4 (dihedral) atoms")
-        f = fns[len(idx)]
-        v = [f(self._mol.GetConformer(c), *idx) for c in self.ids]
+        window = None
         if len(idx) == _DIHEDRAL_ATOMS:
-            key = min(tuple(idx), tuple(reversed(idx)))
-            if window := self.cons.dihedrals.get(key):
-                v = [_periodic_near(value, *window) for value in v]
+            window = self.cons.dihedrals.get(min(idx, idx[::-1]))
+        v = [constraint_value(self._mol.GetConformer(c).GetPositions(), idx, window=window) for c in self.ids]
         return {"mean": float(np.mean(v)), "min": float(np.min(v)), "max": float(np.max(v)), "n": len(v)}
 
     def xyz(self, conf_id=None):
@@ -884,7 +1033,6 @@ class Conformers:
             {i: self.energies[i] for i in sel if i in self.energies},
             unrelaxed=[i for i in self.unrelaxed if i in sel],  # a slice must not silently lose these flags
             seed=self.seed,
-            wrong_hand=[i for i in self.wrong_hand if i in sel],
             trajectory=Chem.Mol(self.trajectory) if self.trajectory is not None and sel == self.ids else None,
         )
 
@@ -967,9 +1115,10 @@ def embed(
     if not isinstance(spec, Isomer):
         _check_bare_mol(spec)
     mol, cons, iso, graft_ref = prepare(spec, fix=fix, constrain=constrain)
-    mol, ids = seed_conformers(
+    mol, ids, target = seed_conformers(
         mol, cons, iso, n, seed=seed, knowledge=knowledge, prune_rms=prune_rms, threads=threads, graft_ref=graft_ref
     )
+    require_seed_count(ids, target)
     n_frag = len(Chem.GetMolFrags(mol))
     if not ids:  # ETKDG met no constraint set it could realise; silence reads as "embedded, then pruned"
         logger.warning(
@@ -991,54 +1140,31 @@ def embed(
 def prepare(spec, *, fix=None, constrain=None):
     """Prepare a copied Mol and its constraints for embedding or relaxation.
 
-    Return ``(mol, constraints, isomer, graft_reference)``. A plain metal Mol is represented by carbon
-    surrogates; an input geometry keeps each measured sphere, while a graph keeps a terminal hydride through
-    its modelled M-H window. An Isomer keeps its declared coordination constraints.
+    Return ``(mol, constraints, isomer, graft_reference)``. A metal geometry becomes one retained `Isomer`;
+    a coordinate-free metal must arrive as an explicitly selected `Isomer`.
     """
-    from .metal_constraints import _ML_SEED_HALF_WIDTH
-    from .metal_distance import ff_terms, ml_distance
-    from .metal_isomer import from_surrogate
-
     iso = spec if isinstance(spec, Isomer) else None
     mol = Chem.Mol(iso.mol if iso is not None else spec)  # our own copy: never the caller's conformers
     has_geometry = mol.GetNumConformers() > 0
-    spheres, hydrides, metals = {}, [], []
-    if iso is None and _metal.metal_index(mol) is not None:  # as `embed`: a bond-less surrogate on a zero-vdW FF,
-        metal_indices = _metal.metal_indices(mol)
-        donors = {mi: [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()] for mi in metal_indices}
-        donor_bonds = [(d, mi) for mi, sphere in donors.items() for d in sphere]  # re-added DATIVE on the output
-        if has_geometry:
-            spheres = donors  # measured all-pairs holds retain each realised sphere without fixing its frame
-        else:
-            hydrides = [
-                (mi, d, ml_distance(mol, mi, d, mol.GetAtomWithIdx(mi).GetAtomicNum(), set(ds), {}, hyb={}))
-                for mi, ds in donors.items()
-                for d in ds
-                if mol.GetAtomWithIdx(d).GetAtomicNum() == 1 and mol.GetAtomWithIdx(d).GetDegree() == 1
-            ]
-        mol, metals = _metal.surrogate_all_metals(mol)
-        iso = from_surrogate(mol, metals, donor_bonds)
-        logger.debug("metal complex: %d metal(s) swapped to carbon surrogate for the FF", len(metals))
+    if iso is None and _metal.metal_index(mol) is not None and has_geometry:
+        centre = "all" if len(_metal.metal_indices(mol)) > 1 else None
+        iso = from_geometry(mol, center=centre)
+        mol = Chem.Mol(iso.mol)
+    elif iso is None and _metal.metal_index(mol) is not None:
+        raise ValueError(
+            "a coordinate-free metal needs a selected coordination state; pass an Isomer from "
+            "enumerate_isomers()/rx.metal(), or use the pipeline metal=<geometry> sugar"
+        )
     cons, ref = resolve_core(mol, fix=fix, constrain=constrain, has_geometry=has_geometry)
-    if metals:  # perceived from a plain Mol: retain its measured spheres or coordinate-free terminal hydrides
-        rz = {mi: z for mi, z, _q in metals}
-        sphere_cons = Constraints()
-        for mi, dons in spheres.items():
-            _metal.hold_shape(mol, [mi, *dons], sphere_cons)
-        if spheres:
-            ff_terms(mol, sphere_cons, {mi: (rz[mi], dons) for mi, dons in spheres.items()})
-        for mi, hydride, target in hydrides:
-            add_distance(
-                sphere_cons.distances,
-                mi,
-                hydride,
-                target - _ML_SEED_HALF_WIDTH,
-                target + _ML_SEED_HALF_WIDTH,
-            )
-        cons = compose(sphere_cons, cons)
-    elif iso is not None:  # an Isomer arrives with its polyhedron built: the same fold `embed` does
-        base = iso.cons
-        cons = fold_substrate(base, cons, ref) if (fix or constrain) else base
+    if iso is not None:
+        graft_ref = {**iso._graft_ref, **ref}
+        cons = fold_substrate(
+            iso.cons,
+            cons,
+            graft_ref,
+            protect_arrangement=bool(iso._constrained_metals),
+        )
+        ref = graft_ref
     return mol, cons, iso, ref
 
 

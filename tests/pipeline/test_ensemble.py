@@ -33,6 +33,81 @@ def _dissociate(ens, cid, atom, centre, distance=4.0):
     conf.SetAtomPosition(int(atom), (pm + distance * (p - pm) / np.linalg.norm(p - pm)).tolist())
 
 
+def test_structurally_valid_nonconverged_result_stays_flagged(monkeypatch):
+    import importlib
+
+    core_embed = importlib.import_module("rxembed.embed")
+
+    ens = rx.embed("CCCC", n=1, seed=1)
+    failed = ens.ids[0]
+
+    def nonconverged(mol, _cons, *, _statuses, **_kwargs):
+        _statuses.update({conf.GetId(): 1 for conf in mol.GetConformers()})
+        return np.zeros(mol.GetNumConformers())
+
+    monkeypatch.setattr(core_embed, "restrained_uff", nonconverged)
+    ens.minimize()
+
+    assert ens.ids == [failed]
+    assert ens.unrelaxed == [failed]
+    assert failed not in ens.discarded
+
+
+def test_optional_connectivity_gate_does_not_break_base_minimize(monkeypatch):
+    import rxembed.pipeline.ensemble as ensemble_module
+
+    ens = rx.embed("CCCC", n=1, seed=1)
+    monkeypatch.setattr(
+        ensemble_module.Ensemble,
+        "_scan_connectivity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ImportError("xyzgraph unavailable")),
+    )
+
+    assert ens.minimize().ids
+
+
+def test_changed_connectivity_is_not_published(monkeypatch):
+    import rxembed.pipeline.ensemble as ensemble_module
+
+    ens = rx.embed("CCCC", n=1, seed=1)
+    failed = ens.ids[0]
+    monkeypatch.setattr(ensemble_module._metrics, "connectivity", lambda *args, **kwargs: ([(0, 3)], []))
+
+    ens.minimize()
+
+    assert not ens.ids
+    assert failed in ens.discarded
+
+
+def test_wrong_requested_stereo_fails_if_replacement_cannot_restore_count(monkeypatch):
+    import rxembed.pipeline.ensemble as ensemble_module
+
+    ens = rx.embed("CCCC", n=1, seed=1)
+    ens._stereo = ("preserve", ())
+    monkeypatch.setattr(ensemble_module.Ensemble, "_workflow_failure", lambda *_args: "wrong requested stereo")
+    monkeypatch.setattr(ensemble_module.Ensemble, "_replace_failed", lambda _self, failed, *_args, **_kw: failed)
+
+    with pytest.raises(ValueError, match="wrong requested stereo"):
+        ens.minimize()
+
+    assert not ens.ids
+
+
+def test_constraint_warning_reports_the_worst_conformer(caplog):
+    ens = rx.embed("CC", n=1, seed=1)
+    ens.ids.append(ens._mol.AddConformer(Chem.Conformer(ens._mol.GetConformer(ens.ids[0])), assignId=True))
+    ens.cons.distances[(0, 1)] = (4.9, 5.1)
+    for cid, distance in zip(ens.ids, (1.0, 9.0), strict=True):
+        conf = ens._mol.GetConformer(cid)
+        origin = np.array(conf.GetAtomPosition(0))
+        conf.SetAtomPosition(1, (origin + np.array([distance, 0.0, 0.0])).tolist())
+
+    with caplog.at_level("WARNING", logger="rxembed"):
+        ens._validate()
+
+    assert "distance(0, 1) = 1.00" in caplog.text
+
+
 # --- the connectivity finalize: the output is a molecule, not a bag of fragments ---------------------------
 
 
@@ -71,7 +146,7 @@ def test_spectator_ferrocene_stays_rigid():
     windows = {k: v for k, v in iso.cons.distances.items() if set(k) <= shape}
     assert len(windows) > 50, "the rigid body is all pairs of {Fe, *10 Cp carbons}"
 
-    ens = rx.embed(iso, n=2, seed=1).minimize(_retry=False)  # seed 0 tears; seed 1 is the smallest live witness
+    ens = rx.embed(iso, n=2, seed=1).minimize()
     assert ens.n, "no conformer survived: the per-conformer assertion below never ran"
     assert len(Chem.GetMolFrags(ens.mol)) == 1
     assert all(ens.mol.GetAtomWithIdx(m).GetDegree() for m in metal.metal_indices(ens.mol))
@@ -99,8 +174,30 @@ def test_search_disconnects_then_minimize_reconnects_metal():
     searched.minimize().mc(preset="ensemble", seed=1).minimize()
     assert searched.n >= 1, "the mc search collapsed: a bonded metal was handed to the relax"
     assert searched.cons.floors == floors, "the search dropped the structural non-donor floor"
-    assert searched.metal_bonds, "the M-L bond record must outlive the surrogate teardown"
+    assert searched.iso.donor_bonds, "the selected isomer must retain the M-L connectivity record"
+    assert all(_dative(searched.mol, donor, centre) for donor, centre in searched.iso.donor_bonds)
     assert len(Chem.GetMolFrags(searched.mol)) == 1
+
+
+@pytest.mark.parametrize("smiles", [_EN_PDBRCL, "[Pd+2]"], ids=["coordinated", "vacant"])
+def test_search_rebuilds_the_selected_surrogate_graph(monkeypatch, smiles):
+    import rxembed.pipeline.ensemble as ensemble_module
+
+    iso = rx.metal(smiles, "square_planar")[0]
+    ens = rx.embed(iso, n=1, seed=1).minimize()
+    assert ens._mol.GetAtomWithIdx(iso.metal).GetAtomicNum() != metal.SURROGATE
+    seen = []
+
+    monkeypatch.setattr(ensemble_module._mc, "available", lambda: True)
+
+    def inspect(mol, *_args, **_kwargs):
+        seen.append(mol.GetAtomWithIdx(iso.metal).GetAtomicNum())
+
+    monkeypatch.setattr(ensemble_module._mc, "search", inspect)
+    ens.mc()
+
+    assert seen == [metal.SURROGATE]
+    assert ens.iso is iso
 
 
 def test_organic_minimize_adds_no_dative_bonds():
@@ -143,7 +240,7 @@ def test_geometry_filter_drops_only_failed_conformer():
 
     energies = dict(ens.energies)
     assert ens.filter("geometry").ids == [good]
-    assert ens.energies == energies
+    assert ens.energies == {good: energies[good]}
     assert bad in ens.discarded
 
 
@@ -299,27 +396,57 @@ def test_slice_preserves_ensemble_state():
     ens = rx.embed("CCCCO", n=4, seed=1).minimize()
     flagged = ens.ids[0]
     ens.seed = 1
-    ens._seeds_relaxed = True
     ens.unrelaxed = [flagged]
-    ens.wrong_hand = [flagged]
     assert ens.energy_kind == "ff"
     child = ens[0]
     assert child.energy_kind == "ff"
     assert child.seed == 1
-    assert child._seeds_relaxed
+    assert child._stage == ens._stage == "minimized"
     assert child.unrelaxed == [flagged]
-    assert child.wrong_hand == [flagged]
     assert ens.lowest(2).energy_kind == "ff"
     assert ens.align().energy_kind == "ff"
 
+    ens.trajectory = Chem.Mol(ens._mol)
+    assert ens._derive(ens.ids, Chem.Mol(ens._mol)).trajectory is None
 
-def test_reembedded_conformer_drops_stale_unrelaxed_id():
+
+def test_rescued_conformer_drops_stale_unrelaxed_id():
     iso = rx.metal("[Pd](Cl)(Cl)(Cl)([N@H](C)O)", "square_planar")[0]
     ens = rx.embed(iso, n=1, seed=2)
-    assert ens.unrelaxed == [0]
-    ens.minimize()
-    assert ens.ids == [1]
+    assert ens.ids == [0]
     assert not ens.unrelaxed
+    ens.minimize()
+    assert ens.ids == [0]
+    assert not ens.unrelaxed
+
+
+def test_replacement_carries_unrelaxed_status_to_the_original_id(monkeypatch):
+    import importlib
+
+    core_embed = importlib.import_module("rxembed.embed")
+
+    iso = rx.metal("[Pd](Cl)(Cl)(Cl)N", "square_planar")[0]
+    ens = rx.embed(iso, n=1, seed=2)
+    template = Chem.Mol(ens._mol)
+    source_id = ens.ids[0]
+    ens.ids = []
+
+    monkeypatch.setattr(
+        core_embed,
+        "seed_conformers",
+        lambda *_args, **_kwargs: (Chem.Mol(template), [source_id], None),
+    )
+
+    def leave_unrelaxed(self, *_args, **_kwargs):
+        self.unrelaxed = list(self.ids)
+        return self
+
+    monkeypatch.setattr(core_embed.Conformers, "_relax_once", leave_unrelaxed)
+    monkeypatch.setattr(core_embed.Conformers, "_acceptance_failures", lambda *_args, **_kwargs: {})
+    ens._replace_failed([source_id], 1.0, 1, template=template, seed=ens.seed)
+
+    assert len(ens.ids) == 1
+    assert ens.unrelaxed == ens.ids
 
 
 def test_refinement_preserves_ensemble_records():

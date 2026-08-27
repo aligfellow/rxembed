@@ -36,10 +36,11 @@ def test_threads_reach_both_seed_dispatches(monkeypatch):
     from rxembed.pipeline import dispatch
 
     seen = []
+    real = dispatch.seed_conformers
 
     def capture(mol, _cons, _iso, _n, **kwargs):
         seen.append(kwargs["threads"])
-        return mol, []
+        return real(mol, _cons, _iso, _n, **kwargs)
 
     iso = rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0]
     monkeypatch.setattr(dispatch, "seed_conformers", capture)
@@ -83,10 +84,9 @@ def test_unqualified_coordinate_free_metal_fails_loudly():
         rx.embed("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", n=1)
 
 
-def test_coordinate_free_hydride_uses_the_ml_target(monkeypatch):
+def test_coordinate_free_hydride_uses_the_ml_target_through_a_metal_state():
     from rxembed import metal_distance as distance
     from rxembed.metal_constraints import _ML_SEED_HALF_WIDTH
-    from rxembed.pipeline import dispatch
 
     params = Chem.SmilesParserParams()
     params.removeHs = False
@@ -103,10 +103,8 @@ def test_coordinate_free_hydride_uses_the_ml_target(monkeypatch):
         {},
         hyb={},
     )
-    monkeypatch.setattr(dispatch, "seed_conformers", lambda mol, *args, **kwargs: (mol, []))
-
-    ens = rx.embed(source, constrain={(2, 3): (2.5, 4.0)}, n=1)
-    lo, hi = ens.cons.distances[(hydride, metal)]
+    iso = rx.metal(source, "tetrahedral")[0]
+    lo, hi = iso.cons.distances[(hydride, metal)]
 
     assert (lo + hi) / 2 == pytest.approx(target)
     assert hi - lo == pytest.approx(2 * _ML_SEED_HALF_WIDTH)
@@ -124,11 +122,11 @@ def test_geometry_metal_constraint_uses_shared_preparation():
 
     ens = rx.embed(source, constrain={pair: (target - 0.2, target + 0.2)}, n=1, seed=2)
 
-    held = next(shape for shape in ens.cons.shapes if metal in shape)
-    assert held == {metal, *donors}
-    for i, j in itertools.combinations(held, 2):
-        lo, hi = ens.cons.distances[(min(i, j), max(i, j))]
-        assert (lo + hi) / 2 == pytest.approx(float(np.linalg.norm(pos[i] - pos[j])))
+    assert ens.iso is not None
+    assert set(ens.iso.donors) == set(donors)
+    for donor in donors:
+        lo, hi = ens.cons.distances[(min(metal, donor), max(metal, donor))]
+        assert (lo + hi) / 2 == pytest.approx(float(np.linalg.norm(pos[metal] - pos[donor])))
     restored = ens.mol
     assert restored.GetAtomWithIdx(metal).GetAtomicNum() == 46
     assert all(restored.GetBondBetweenAtoms(donor, metal).GetBondType() == Chem.BondType.DATIVE for donor in donors)
@@ -228,6 +226,11 @@ def test_auto_contacts_preserve_template_core():
         assert _max_core_drift(ens.mol, ens.ids[:1], core, ref_pos) < 1e-6
 
 
+def test_raw_contacts_use_the_shared_constraint_validator():
+    with pytest.raises(ValueError, match="out of range"):
+        rx.embed("CCCC", contacts={(0, 99): (2.0, 3.0)}, n=1)
+
+
 def test_cxsmiles_contacts_use_restored_metal_graph(monkeypatch):
     from rxembed.pipeline import dispatch
 
@@ -245,6 +248,83 @@ def test_cxsmiles_contacts_use_restored_metal_graph(monkeypatch):
     discovered = seen["mol"]
     assert any(a.GetAtomicNum() == 78 for a in discovered.GetAtoms()), "contact discovery saw the carbon surrogate"
     assert len(Chem.GetMolFrags(discovered)) == 2, "the coordinated ligands were presented as separate fragments"
+
+
+def test_stated_metal_return_shape_does_not_depend_on_source_representation():
+    from rxembed.pipeline import dispatch
+
+    text = rx.cxsmiles(rx.metal("[NH3]->[Pt](<-[NH3])(Cl)Cl", "square_planar")[0])
+    mol = dispatch._normalize(text)[0]
+
+    from_text = rx.embed(text, metal="square_planar", n=1, seed=1)
+    from_mol = rx.embed(mol, metal="square_planar", n=1, seed=1)
+
+    assert isinstance(from_text, rx.Ensemble)
+    assert type(from_text) is type(from_mol)
+
+
+def test_metal_candidate_failure_is_not_hidden_by_siblings(monkeypatch):
+    from rxembed.pipeline import dispatch
+
+    calls = 0
+
+    def execute(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("second candidate failed")
+        mol = _embedded("CC")
+        return dispatch.Ensemble(mol, [0])
+
+    monkeypatch.setattr(dispatch, "_execute", execute)
+
+    with pytest.raises(ValueError, match="second candidate failed"):
+        rx.embed("Cl[Pd](Cl)(N)N", metal="square_planar", n=1)
+    assert calls == 2
+
+
+def test_empty_metal_candidate_is_not_published(monkeypatch):
+    from rxembed.pipeline import dispatch
+
+    monkeypatch.setattr(dispatch, "_execute", lambda *args, **kwargs: dispatch.Ensemble(_embedded("CC"), []))
+
+    with pytest.raises(ValueError, match="no conformer satisfied"):
+        rx.embed("Cl[Pd](Cl)(N)N", metal="square_planar", n=1)
+
+
+def test_empty_identity_expansion_names_the_candidate_axis(monkeypatch):
+    from rxembed.pipeline import dispatch
+
+    monkeypatch.setattr(dispatch, "enumerate_isomers", lambda *args, **kwargs: [])
+
+    with pytest.raises(ValueError, match="no feasible coordination identity"):
+        rx.embed("Cl[Pd](Cl)(N)N", metal="square_planar", n=1)
+
+
+def test_geometry_source_is_normalized_once_for_stereo(monkeypatch):
+    from rxembed.pipeline import dispatch
+
+    normalized = _embedded("CC")
+    normalized_calls = []
+    signature_calls = []
+    monkeypatch.setattr(
+        dispatch, "_normalize", lambda source, charge=0: (normalized_calls.append(source) or normalized, True)
+    )
+    monkeypatch.setattr(
+        dispatch._stereo,
+        "signature",
+        lambda mol, charge=0: signature_calls.append(mol) or {},
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "_execute",
+        lambda *args, **kwargs: dispatch.Ensemble(normalized, [normalized.GetConformer().GetId()]),
+    )
+
+    dispatch._embed_dispatch("input.xyz", n=1, stereo="all")
+
+    assert normalized_calls == ["input.xyz"]
+    assert signature_calls == [normalized]
 
 
 # --- contacts: a discovered binding mode is one the embed can actually realise ------------------------------
@@ -268,6 +348,20 @@ def test_auto_contacts_form_hydrogen_bonds():
             assert positions[1] < 0.8, f"the seeded grip rode its upper wall at position {positions[1]:.3f}"
 
 
+def test_stereo_and_contact_candidates_compose_before_embedding(monkeypatch):
+    from rxembed.pipeline import dispatch
+
+    modes = {"near": dispatch._nci.Contact(), "far": dispatch._nci.Contact()}
+    monkeypatch.setattr(dispatch._nci, "auto_binding_modes", lambda _mol, seed: modes)
+
+    result = rx.embed("CC(N)O.N", contacts="auto", n=1, seed=1)
+
+    assert isinstance(result, rx.EnsembleSet)
+    assert {(ens.tag["stereo"], ens.tag["nci"]) for ens in result} == {
+        (hand, mode) for hand in ("C1:R", "C1:S") for mode in modes
+    }
+
+
 # --- the organic path pays nothing for the metal path ------------------------------------------------------
 
 
@@ -289,8 +383,9 @@ def test_shape_hold_carries_the_spectator_sphere():
     assert spectators <= states.keys()
     assert all(any(getattr(site, "winding", "") for site in states[metal].vertices) for metal in spectators)
     assert not [k for k in iso.cons.pulls if spectators & set(k)]
-    for d in iso.donors:  # ...while the enumerated centre's modelled window still gets its pull
-        assert (min(iso.metal, d), max(iso.metal, d)) in iso.cons.pulls
+    for donor in iso.donors:
+        pair = (min(iso.metal, donor), max(iso.metal, donor))
+        assert (pair in iso.cons.pulls) != ({iso.metal, donor} <= iso.cons.frozen)
     assert iso.cons.relaxed().shapes == iso.cons.shapes, "mc(explore=) must not release a structural shape hold"
 
     from_smiles = rx.metal("CCCN[Pd](Cl)(Cl)NCCC", "square_planar")[0]  # no input geometry -> nothing shape-held
@@ -336,8 +431,8 @@ def test_minimize_accepts_xyz_and_rejects_smiles(tmp_path):
 
 # --- the `stereo=` route: an undefined centre is a set of distinct species ----------------------------------
 #
-# `_stereo_expand` drives the core `stereo.enumerate_unassigned` (its own graph-level contract is
-# tests/test_stereo.py) and folds the variants into one EnsembleSet. These are the pipeline end of it.
+# The dispatch drives the core `stereo.enumerate_unassigned` and folds the variants into one EnsembleSet.
+# Its graph-level contract lives in tests/test_stereo.py; these are the pipeline checks.
 
 
 def _configs(es):

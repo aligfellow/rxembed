@@ -155,7 +155,8 @@ confs.measure((carbon, chloride))
 ```
 
 `template=(ref, SMARTS)` maps one ordered match on each graph. Symmetric SMARTS and coordinate-only templates
-need an explicit `{target_index: reference_index}` map.
+need an explicit `{target_index: reference_index}` map. `template` is not a third constraint type: it supplies
+coordinates to the same rigid `fix` path.
 
 ## Metal Complexes
 
@@ -165,10 +166,25 @@ import rxembed as rx
 isomers = rx.metal("CCCN->[Pd+2](<-[Cl-])(<-[Cl-])<-NCCC", "SPL")
 isomers.summary()
 ens = rx.embed(isomers.select(label="trans"))
+
+# Convenience form: enumerate every square-planar isomer, then embed n conformers for each one.
+all_isomers = rx.embed("CCCN->[Pd+2](<-[Cl-])(<-[Cl-])<-NCCC", metal="SPL", n=10)
 ```
 
 `rx.metal` accepts SMILES, `.xyz`, or `Mol` and returns distinct arrangements. Write ionic dative SMILES with
 donor-to-metal arrows and charged anionic ligands; neutral/covalent SMILES are also accepted as input.
+
+`rx.metal` exposes enumeration for explicit user selection. `rx.embed(source, metal="SPL")` is its convenience
+form: it embeds every distinct enumerated isomer and returns an `EnsembleSet`; `n` applies independently to
+each isomer. Passing one selected `Isomer` embeds only that identity.
+
+`coordinate=` fills open vertices before constraints are compiled, so the added donor receives the same M-L,
+donor-orientation, polyhedral, floor and final-validation treatment as every original donor:
+
+```python
+pocket = rx.metal("N->[Pt](Cl)Cl.CC(C)=O", "SPL").select(index=0)
+bound = rx.embed(pocket, coordinate="[OX1]", n=10)
+```
 
 For a geometry containing several metals, all centres are handled by default. The measured ligand and haptic
 stereo is retained while the coordination arrangements are enumerated. Scope a choice with `center=`, or ask
