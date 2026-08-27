@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 
 from rxembed.embed import BASE_STIFFNESS as _BASE_STIFFNESS
-from rxembed.metal_isomers import Isomer
+from rxembed.metal_isomer import Isomer
 
 from . import calculators as _refine
 from .dispatch import (

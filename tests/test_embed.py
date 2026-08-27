@@ -17,7 +17,8 @@ from rxembed import bounds as bnd
 from rxembed.constraints import FIX_ANGLE_TOL, FIX_DISTANCE_TOL, Constraints, resolve_core
 from rxembed.embed import BASE_STIFFNESS, Conformers, embed, fold_substrate, minimize
 from rxembed.metal_core import TRANSITION_METALS, coplanar
-from rxembed.metal_isomers import Isomer, enumerate_isomers, from_geometry
+from rxembed.metal_enumeration import enumerate_isomers
+from rxembed.metal_isomer import Isomer, from_geometry
 from rxembed.metal_smiles import parse_smiles
 from rxembed.relax import bonding_ok
 
@@ -51,7 +52,7 @@ def _isomer(smiles=_BIPY_PD, geometry="square_planar"):
 def _fold(iso, **spec):
     """Fold a user `fix`/`constrain` onto the isomer's polyhedron, exactly as `embed(iso, **spec)` does."""
     sub, graft_ref = resolve_core(iso.mol, **spec, has_geometry=iso.mol.GetNumConformers() > 0)
-    return fold_substrate(iso.coordination().copy(), sub, graft_ref)
+    return fold_substrate(iso.cons.copy(), sub, graft_ref)
 
 
 def _sphere_key(iso, which=0):
@@ -213,7 +214,7 @@ def test_fix_landing_on_a_sphere_hold_overrides_it():
     iso = _isomer()
     key = _sphere_key(iso)
     alone, _ref = resolve_core(iso.mol, fix={key: 2.42}, has_geometry=False)
-    assert alone.distances[key] != iso.coordination().distances[key], "premise: the two windows must differ"
+    assert alone.distances[key] != iso.cons.distances[key], "premise: the two windows must differ"
     folded = _fold(iso, fix={key: 2.42})
     assert folded.distances[key] == alone.distances[key], "the sphere hold clipped the fix"
     assert key not in folded.pulls, "the sphere's approximate pull still competes with the numeric fix"
@@ -577,25 +578,6 @@ def test_unfixable_metal_hand_is_reported(caplog):
     assert confs.wrong_hand == list(confs.ids)
     assert "wrong_hand" in caplog.text
     assert confs[0].wrong_hand == [confs.ids[0]], "a slice must not silently lose the wrong-hand flag"
-
-
-# ---------------------------------------------------------------------------------------------------------
-# HANDOVER; these two assert the `Isomer` CONSTRUCTOR (`metal_isomers.py`), not this door. They belong in
-# `test_metal_isomers.py`; they live here, where they were written, until that file adopts them.
-# ---------------------------------------------------------------------------------------------------------
-
-
-def test_set_of_sites_is_refused():
-    with pytest.raises(TypeError, match="vertex-ordered"):
-        Isomer(_mol(_EN_PD), "SPL", {0, 2, 3, 7})
-
-
-def test_undefined_ligand_stereocentre_warns(caplog):
-    mol = _mol("[NH2](C(C)CC)->[Pd](<-[NH3])(Cl)Cl")
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        Isomer(mol, "SPL", {0: 0, 1: 6, 2: 7, 3: 8})
-    assert "undefined" in caplog.text
-    assert "enumerate_isomers" in caplog.text
 
 
 def test_measure_reports_distance_and_angle():

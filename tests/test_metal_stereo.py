@@ -1,4 +1,4 @@
-"""Test native signed volumes and rxembed orientation over non-tetrahedral geometry matrices."""
+"""Test metal-centre handedness perception and selection."""
 
 from __future__ import annotations
 
@@ -11,14 +11,26 @@ from rdkit import Chem, rdBase
 from rdkit.Chem import rdDistGeom
 
 import rxembed as rx
-from rxembed import metal_core as metal
-from rxembed.metal_isomers import Isomer
+from rxembed import metal_stereo as metal
+from rxembed.metal_isomer import Isomer
 from rxembed.metal_polyhedron import POLYHEDRA, orientation_parity, point_group
 
 emb = importlib.import_module("rxembed.embed")
 
 _MATRIX_CONFS = 32
 _RX_CONFS = 8
+_ACAC = "CC(=O)C=C([O-])C"
+
+
+def test_donor_classes_ignore_resonance_form():
+    mol = Chem.MolFromSmiles(_ACAC)
+    oxygens = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() == 8]
+    perceived = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
+    assert perceived[oxygens[0]] != perceived[oxygens[1]], "fixture no longer distinguishes resonance forms"
+    every = list(range(mol.GetNumAtoms()))
+    canonical = metal.donor_classes(mol, every)
+    assert canonical[oxygens[0]] == canonical[oxygens[1]]
+    assert all(perceived[a] != perceived[b] or canonical[a] == canonical[b] for a in every for b in every)
 
 
 def _native_embed(smiles, n=_MATRIX_CONFS):

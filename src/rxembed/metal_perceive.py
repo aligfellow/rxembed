@@ -7,12 +7,8 @@ distance is not covalent: ``metal_overbond`` asks whether an atom reached bondin
 behind the same walk. The rest is the sphere perception both resolve on; `pipeline.select` also reads its
 `_coordinating` leaf when a wrapped metal has no bonds.
 
-This is the *gate* side; enforcement (``_orient_donor`` / ``_coplanar_donor``) lives in ``donor_orient``,
-imported below so the two cannot drift. The organic conjugation perception the gate and the FF caps share
-(``conjugated_quartets``, ``_SP2_DEGREE``) is here for the same reason: one definition each.
-
-``Violation`` and the coordinate math at the bottom live here because a core gate builds them, so they
-cannot follow ``GeometryReport`` up into ``pipeline/``.
+Enforcement (``_orient_donor`` / ``_coplanar_donor``) lives in ``metal_donor_orient``; both paths share its
+donation-axis rules. Shared coordinate math and ``Violation`` live in ``utils``.
 """
 
 from __future__ import annotations
@@ -354,11 +350,3 @@ def _coordination_pairs(mol, pos) -> set[tuple[int, int]]:
             for y in range(x + 1, len(donors)):
                 out.add((donors[x], donors[y]))
     return out
-
-
-# --- organic conjugation perception (shared by the QA gate and the FF caps) --------------------------------
-
-
-# --- the shared leaf: coordinate + periodic-table math ----------------------------------------------------
-# Depends on nothing above it, and the pipeline QA gate (`rxembed.pipeline.geom_check`) reads it from here,
-# is what lets gate and perception measure an angle the same way without a second definition or a cycle.

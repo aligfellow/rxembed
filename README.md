@@ -176,12 +176,16 @@ for selected stereo to vary:
 
 ```python
 isomers = rx.metal("examples/structures/mnh.xyz")
+isomers.summary()
 mer = isomers.filter(center="Mn", label="mer")
 chosen = mer.select(hand="lambda")
 
 n_hands = rx.metal("examples/structures/mnh.xyz", stereo={"N5": "racemic"})
 all_hands = rx.metal("examples/structures/mnh.xyz", stereo="racemic")
 ```
+
+Reactive ligand geometry is filtered after embedding. Near a linear H-M-N relation, H-M-N-H is not a stable
+dihedral, so use the H-H distance or another non-collinear coordinate.
 
 `.summary(details=True)` adds trans pairs or axial/equatorial sites and distinguishes graph-non-equivalent
 same-element donors. `center="Mn"` enumerates only Mn and retains the other spheres.

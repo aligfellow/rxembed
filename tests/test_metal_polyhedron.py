@@ -14,6 +14,8 @@ from rxembed.metal_core import n_sites
 from rxembed.metal_polyhedron import (
     _ALIASES,
     POLYHEDRA,
+    _fit_trace,
+    _seat_by_alignment,
     _vertex_angle,
     canonical_slots,
     describe,
@@ -23,6 +25,7 @@ from rxembed.metal_polyhedron import (
     resolve_geometry,
     rotation_group,
     seat_properly,
+    vertex_dirs,
 )
 
 # --- codes and aliases --------------------------------------------------------------------------------
@@ -155,3 +158,33 @@ def test_canonical_slots_fold_rotations_not_reflection():
     assert len(seats) == 1, f"the fold is not constant on a proper orbit: {seats}"
     mirror = {tuple(sorted(zip(slots_for(g), (keys[g[v]] for v in range(6)), strict=True))) for g in refl}
     assert not (seats & mirror), "the fold gave an enantiomeric labelling the same canonical seating"
+
+
+def test_seating_finds_distorted_antiprism_optimum():
+    directions = np.array(vertex_dirs("square_antiprism"), float)
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+    rng = np.random.RandomState(0)
+    optima = (7.9744270801213695, 7.988318361026678, 7.989758899386766)
+    for trial, optimum in enumerate(optima):
+        observed = directions[rng.permutation(len(directions))] + rng.randn(len(directions), 3) * 0.05
+        observed /= np.linalg.norm(observed, axis=1, keepdims=True)
+        order = _seat_by_alignment(observed, directions)
+        score = float(np.linalg.svd(observed[list(order)].T @ directions, compute_uv=False).sum())
+        assert score == pytest.approx(optimum, abs=1e-12), f"trial {trial}: {score:.6f} vs {optimum:.6f}"
+
+
+def test_seating_allows_reflection_for_achiral_template():
+    ideal = np.array(vertex_dirs("octahedral"), float)
+    rng = np.random.RandomState(0)
+    for magnitude in (0.10, 0.18):
+        observed = ideal[rng.permutation(6)] * np.array([1.0, 1.0, -1.0]) + rng.randn(6, 3) * magnitude
+    observed /= np.linalg.norm(observed, axis=1, keepdims=True)
+    order = max(
+        isomer_permutations("octahedral"),
+        key=lambda candidate: _fit_trace(observed[list(candidate)].T @ ideal),
+    )
+    trans = [
+        float(np.degrees(np.arccos(np.clip(observed[order[i]] @ observed[order[j]], -1, 1))))
+        for i, j in ((0, 1), (2, 3), (4, 5))
+    ]
+    assert min(trans) > 140.0

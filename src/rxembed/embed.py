@@ -16,6 +16,7 @@ from rdkit.Chem import rdMolTransforms
 
 from . import metal_core as _metal
 from . import metal_polyhedron as _poly
+from . import metal_stereo as _metal_stereo
 from .bounds import DEFAULT_SEED, probe_conformer, seed_coordinates, seed_count
 from .constraints import (
     FIX_ANGLE_TOL,
@@ -26,7 +27,8 @@ from .constraints import (
     resolve_core,
     template_to_fix,
 )
-from .metal_isomers import Isomer, from_geometry
+from .metal_core import VACANT, materialized_state
+from .metal_isomer import Isomer, from_geometry
 from .relax import MAX_ITERS, _error_summary, bonding_ok, restrained_uff
 
 logger = logging.getLogger("rxembed")  # configured by rxembed.set_verbose
@@ -175,34 +177,43 @@ def fold_substrate(base, sub, graft_ref):
     )
 
 
-def _stereo_targets(cons):
-    """Return sphere recipes that state a metal hand or haptic winding."""
-    return [(recipe, cons.sphere_haptic(recipe)) for recipe in cons.spheres if recipe.chirality or recipe.winding]
+def _stereo_targets(iso):
+    """Return metal states that require hand or haptic-winding selection after DG."""
+    if iso is None:
+        return []
+    out = []
+    for state in iso.centres:
+        vertices, haptic, winding, _donors = materialized_state(iso, state)
+        if state.hand or winding:
+            out.append((state, vertices, haptic, winding))
+    return out
 
 
 def _winding_ranks(mol, targets):
     """Return donor and eta2 CIP ranks needed by the stated haptic windings."""
     ranks = {}
-    for recipe, haptic in targets:
-        donors = [d for d in recipe.donors if d != _metal.VACANT and d not in haptic]
+    for state, vertices, haptic, winding in targets:
+        donors = [d for d in vertices if d != VACANT and d not in haptic]
         donors += [atom for face in haptic.values() for atom in face]
-        ranks[recipe.metal] = _metal._donor_classes(mol, donors) if recipe.winding else {}
-    eta2 = any(len(haptic[dummy]) == _metal._ETA2 for recipe, haptic in targets for dummy, _ in recipe.winding)
+        ranks[state.atom] = _metal_stereo.donor_classes(mol, donors) if winding else {}
+    eta2 = any(
+        len(haptic[dummy]) == _metal._ETA2 for _state, _vertices, haptic, winding in targets for dummy in winding
+    )
     return ranks, list(Chem.ComputeAtomCIPRanks(mol)) if eta2 else None
 
 
 def _seed_stereo_matches(mol, cid, targets, winding_ranks, eta2_ranks, reflectable):
     """Return whether one raw DG seed matches every stated metal hand and haptic winding."""
     pos = mol.GetConformer(int(cid)).GetPositions()
-    for recipe, haptic in targets:
-        hand = recipe.chirality
+    for state, vertices, haptic, winding in targets:
+        hand = state.hand
         realised = (
-            _metal.realised_chirality(
+            _metal_stereo.realised_chirality(
                 mol,
                 cid,
-                recipe.geometry,
-                [recipe.donors[k] for k in recipe.order],
-                recipe.metal,
+                state.geometry,
+                vertices,
+                state.atom,
                 hand,
                 haptic,
             )
@@ -215,9 +226,9 @@ def _seed_stereo_matches(mol, cid, targets, winding_ranks, eta2_ranks, reflectab
         if hand and realised != hand:
             return False
         if any(
-            _metal._face_winding(mol, pos, recipe.metal, haptic[dummy], winding_ranks[recipe.metal], eta2_ranks)
-            != winding
-            for dummy, winding in recipe.winding
+            _metal_stereo.face_winding(mol, pos, state.atom, haptic[dummy], winding_ranks[state.atom], eta2_ranks)
+            != sign
+            for dummy, sign in winding.items()
         ):
             return False
     return True
@@ -254,9 +265,9 @@ def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, pru
     cons.distances.update(float_encounter_bounds(mol, cons))  # keep free/stray fragments from drifting off
     frozen, ref_core = _frozen_core_ref(mol, cons.frozen, graft_ref or {})
     target = n or seed_count(mol, constrained=cons.is_constrained)
-    targets = _stereo_targets(cons)
-    hands = sum(bool(recipe.chirality) for recipe, _haptic in targets)
-    windings = sum(len(recipe.winding) for recipe, _haptic in targets)
+    targets = _stereo_targets(iso)
+    hands = sum(bool(state.hand) for state, _vertices, _haptic, _winding in targets)
+    windings = sum(len(winding) for _state, _vertices, _haptic, winding in targets)
     winding_ranks, eta2_ranks = _winding_ranks(mol, targets)
     reflectable = bool(
         len(targets) == 1
@@ -265,7 +276,7 @@ def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, pru
         and _mirror_is_free(mol)
         and not cons.frozen
         and not cons.dihedrals
-        and not targets[0][1]
+        and not targets[0][2]
     )
     mol, held = _hold_donors(mol, iso, cons)
     if not targets:
@@ -682,7 +693,7 @@ class Conformers:
     def _metal_states(self):
         """Return whether each conformer realises every stated metal stereo target."""
         mol = self.mol
-        targets = _stereo_targets(self.cons)
+        targets = _stereo_targets(self.iso)
         ranks, eta2 = _winding_ranks(mol, targets)
         return {c: _seed_stereo_matches(mol, c, targets, ranks, eta2, False) for c in self.ids}
 
@@ -727,7 +738,7 @@ class Conformers:
         """
         iso = self.iso
         self.wrong_hand = []
-        targets = _stereo_targets(self.cons)
+        targets = _stereo_targets(iso)
         if iso is None or not self.ids or not targets:
             return
         states = self._metal_states()
@@ -950,11 +961,7 @@ def embed(
     if iso is None or fix or constrain:
         cons, graft_ref = resolve_core(mol, fix=fix, constrain=constrain, has_geometry=mol.GetNumConformers() > 0)
     if iso is not None:
-        cons = (
-            fold_substrate(iso.coordination().copy(), cons, graft_ref)
-            if (fix or constrain)
-            else iso.coordination().copy()
-        )
+        cons = fold_substrate(iso.cons, cons, graft_ref) if (fix or constrain) else iso.cons
     mol, ids = seed_conformers(
         mol, cons, iso, n, seed=seed, knowledge=knowledge, prune_rms=prune_rms, threads=threads, graft_ref=graft_ref
     )
@@ -983,7 +990,7 @@ def prepare_relax(spec, *, fix=None, constrain=None):
     declared coordination constraints. Coordinate-fixed atoms are grafted exactly.
     """
     from .metal_distance import ff_terms
-    from .metal_isomers import from_surrogate
+    from .metal_isomer import from_surrogate
 
     iso = spec if isinstance(spec, Isomer) else None
     mol = Chem.Mol(iso.mol if iso is not None else spec)  # our own copy: never the caller's conformers
@@ -1004,7 +1011,7 @@ def prepare_relax(spec, *, fix=None, constrain=None):
         ff_terms(mol, sphere_cons, {mi: (rz[mi], dons) for mi, dons in spheres.items()})
         cons = compose(sphere_cons, cons)
     elif iso is not None:  # an Isomer arrives with its polyhedron built: the same fold `embed` does
-        base = iso.coordination().copy()  # copy: the relax edits cons in place, the Isomer keeps its record
+        base = iso.cons
         cons = fold_substrate(base, cons, ref) if (fix or constrain) else base
     ids = [c.GetId() for c in mol.GetConformers()]
     if ref:

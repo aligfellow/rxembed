@@ -28,7 +28,6 @@ import logging
 import os
 from copy import deepcopy
 from dataclasses import dataclass, field, fields, replace
-from typing import NamedTuple
 
 import numpy as np
 from rdkit import Chem
@@ -36,25 +35,9 @@ from rdkit import Chem
 _STRAIGHT = 180.0  # degrees: angle ceiling and one half-turn of a periodic dihedral
 
 
-class SphereRecipe(NamedTuple):
-    """One metal centre's polytope as it was seated: which donor sits at which vertex, and of which shape.
-
-    The windows themselves are already in `distances` / `angles`; this is the seating behind them, which a
-    pairwise window cannot express. `Umbrella` is its one reader, needing the three base vertices in vertex
-    order to state a pyramid's improper.
-    """
-
-    metal: int
-    donors: tuple
-    geometry: str
-    order: tuple
-    chirality: str = ""
-    winding: tuple = ()  # ((centroid-dummy, canonical sign), ...)
-
-
-@dataclass
+@dataclass(kw_only=True)
 class Constraints:
-    """The one struct every builder fills and every stage reads: geometric windows and rigid holds."""
+    """Carry named geometric windows and rigid holds between stages; construct every field by keyword."""
 
     distances: dict = field(default_factory=dict)  # (i, j) -> (lo, hi) Angstrom
     angles: dict = field(default_factory=dict)  # (i, j, k) -> (lo, hi) degrees
@@ -77,16 +60,16 @@ class Constraints:
     #   the bond-less carbon floors every M...X at a carbon vdW contact, forbidding the real geometry. See `compose`.
     shapes: list = field(default_factory=list)  # atom sets held as an all-pairs rigid body (a spectator sphere).
     #   Distinguishes a modelled window, which needs a `pull`, from a rigid-body member, which must not get one.
-    phantoms: frozenset = field(default_factory=frozenset)  # zero-volume dummies: an eta>=3 face's centroid,
+    phantoms: frozenset = field(default_factory=frozenset)  # zero-volume dummies: one haptic face's centroid,
     #   standing in as the one vertex a Cp/arene presents. Transient: materialised inside the embed and the
     #   relax, never in a stored Mol, so nothing downstream (gate, metrics, dump, calculator) sees one.
-    spheres: tuple = field(default_factory=tuple)  # one `SphereRecipe` per metal centre: which donor sits at
-    #   which vertex of which polytope, which no pairwise window records. Read by the stereo gate and `Umbrella`.
-    haptic: dict = field(default_factory=dict)  # {centroid dummy -> its ring atoms}; the source of truth for
-    #   eta>=3 faces. The stored mol and donor list stay real: the ring atoms are the donors.
+    haptic: dict = field(default_factory=dict)  # {centroid dummy -> its ring atoms}: transient physical
+    #   scaffolding. The stored mol and donor list stay real: the face atoms are the donors.
     dihedrals: dict = field(default_factory=dict)  # (i, j, k, l) -> periodic (lo, hi) degrees
     fixed: dict = field(default_factory=dict)  # numeric fix pair/triple/quartet -> requested (lo, hi); lo == hi
-    #   is a scalar target. Both new fields are appended to preserve positional `Constraints(...)` arguments.
+    #   is a scalar target.
+    umbrellas: dict = field(default_factory=dict)  # (base0, base1, base2, metal) -> ideal improper magnitude;
+    #   None means planar. The UFF term preserves the already-selected DG side rather than choosing a hand.
 
     @property
     def is_constrained(self) -> bool:
@@ -96,10 +79,6 @@ class Constraints:
     def copy(self, **overrides) -> "Constraints":
         """Return a field-complete deep copy, with any keyword replacing that field outright."""
         return replace(deepcopy(self), **overrides)
-
-    def sphere_haptic(self, recipe: SphereRecipe) -> dict:
-        """Return this constraint set's haptic faces used by one sphere recipe."""
-        return {donor: self.haptic[donor] for donor in recipe.donors if donor in self.haptic}
 
     def relaxed(self) -> "Constraints":
         """Return a copy with the seeded NCI/user contacts released, for the exploratory search.
@@ -195,8 +174,8 @@ _MERGE = {  # field -> how two sources combine. See `compose`.
     "dg_floors": _merge_relief,
     "shapes": lambda a, b: [*a, *(set(s) for s in b)],
     "phantoms": lambda a, b: a | b,
-    "spheres": lambda a, b: (*a, *b),  # concat: a bimetallic complex carries one recipe per centre
     "haptic": _merge_exclusive("haptic"),  # a shared key = two faces claiming one reserved index = corruption
+    "umbrellas": _merge_exclusive("umbrellas"),
 }
 
 _names = {f.name for f in fields(Constraints)}  # a new field must be given a merge policy, not defaulted

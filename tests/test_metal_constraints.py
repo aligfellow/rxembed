@@ -12,9 +12,9 @@ from rdkit.Chem.rdMolTransforms import GetAngleDeg
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
-from rxembed.metal_coordination import _CHELATE_BITE, _chelate_bite_window
+from rxembed.metal_constraints import _CHELATE_BITE, _chelate_bite_window
 from rxembed.metal_core import classify_geometry
-from rxembed.metal_isomers import enumerate_isomers
+from rxembed.metal_enumeration import enumerate_isomers
 from rxembed.metal_polyhedron import POLYHEDRA, _vertex_angle
 from rxembed.pipeline import geom_check as geom
 
@@ -152,6 +152,33 @@ def test_side_on_eta2_ligand_embeds_geometry_clean():
     assert any(geom.check(ens.mol, c).ok() for c in ens.ids), "no geom.check-clean side-on conformer"
 
 
+def test_haptic_face_and_sigma_donor_on_one_ligand_compile_without_a_virtual_bite_path():
+    rw = Chem.RWMol()
+    metal = rw.AddAtom(Chem.Atom(26))
+    rw.GetAtomWithIdx(metal).SetFormalCharge(2)
+    face = [rw.AddAtom(Chem.Atom(6)) for _ in range(2)]
+    linker = rw.AddAtom(Chem.Atom(6))
+    donor = rw.AddAtom(Chem.Atom(7))
+    rw.AddBond(face[0], face[1], Chem.BondType.DOUBLE)
+    rw.AddBond(face[1], linker, Chem.BondType.SINGLE)
+    rw.AddBond(linker, donor, Chem.BondType.SINGLE)
+    for atom in (*face, donor):
+        rw.AddBond(atom, metal, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+
+    iso = rx.Isomer(mol, "trigonal_planar", {0: face[0], 1: donor})
+    assert iso.cons.haptic
+
+
+def test_planar_haptic_umbrella_does_not_depend_on_the_centroid_slot():
+    smiles = r"C/[CH]1=[CH](/F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1"
+    isomers = rx.metal(smiles, "square_planar", stereo="free")
+
+    assert len(isomers) == 3
+    assert all(iso.cons.umbrellas for iso in isomers)
+
+
 def test_rejected_seeds_are_replaced_to_n_clean(monkeypatch):
     ens = rx.embed(rx.metal("CCCN[Pd](Cl)(Cl)NCCC", "square_planar")[0], n=2)
     initial = set(ens.ids)
@@ -242,7 +269,7 @@ def _fake_geometry(smiles, seed=1):
 
 
 def _ml_windows(iso):
-    return {k: v for k, v in iso.coordination().distances.items() if iso.metal in k}
+    return {k: v for k, v in iso.cons.distances.items() if iso.metal in k}
 
 
 def test_etkdg_conformer_is_not_metal_geometry():
@@ -269,6 +296,20 @@ def test_input_and_model_lengths_ignore_mol_metadata():
     auto_g = _ml_windows(enumerate_isomers(Chem.Mol(graph), "square_planar")[0])
     model_g = _ml_windows(enumerate_isomers(Chem.Mol(graph), "square_planar", lengths="model")[0])
     assert auto_g == model_g, "'auto' on a Mol WITHOUT one is 'model'"
+
+
+def test_lazy_length_source_is_fixed_when_isomers_are_built():
+    graph = Chem.MolFromSmiles(_SQUARE_PD)
+    expected_model = _ml_windows(enumerate_isomers(Chem.Mol(graph), "square_planar")[0])
+    deferred_model = enumerate_isomers(Chem.Mol(graph), "square_planar")[0]
+    deferred_model.mol.AddConformer(Chem.Conformer(deferred_model.mol.GetNumAtoms()))
+    assert _ml_windows(deferred_model) == expected_model
+
+    geometry = _fake_geometry(_SQUARE_PD)
+    expected_input = _ml_windows(enumerate_isomers(Chem.Mol(geometry), "square_planar")[0])
+    deferred_input = enumerate_isomers(Chem.Mol(geometry), "square_planar")[0]
+    deferred_input.mol.GetConformer().SetAtomPosition(deferred_input.donors[0], Point3D(20, 20, 20))
+    assert _ml_windows(deferred_input) == expected_input
 
 
 def test_input_lengths_require_geometry():

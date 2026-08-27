@@ -477,15 +477,13 @@ def test_surrogate_accepts_all_readable_metals():
 
 def test_haptic_face_and_chirality_cap_compose():
     import rxembed as rx
-    from tests.test_metal_isomers import ferrocene
+    from tests.metal_fixtures import ferrocene
 
     iso = next(iter(rx.metal(ferrocene())))
     cons = iso.cons
     assert cons.haptic, "fixture must carry a haptic face"
+    state = iso.centres
     before = sorted(cons.haptic)
-    cons.spheres = tuple(
-        sphere._replace(winding=tuple((dummy, "+") for dummy in cons.sphere_haptic(sphere))) for sphere in cons.spheres
-    )
 
     _metal._shift_phantoms(cons, 2)  # as if two D-caps had been appended ahead of the centroids
     after = sorted(cons.haptic)
@@ -497,9 +495,7 @@ def test_haptic_face_and_chirality_cap_compose():
     for name in ("distances", "angles", "pulls", "floors", "dg_floors"):
         for k in getattr(cons, name):
             assert not (stale & set(k)), f"{name} still names a pre-shift dummy index {k}"
-    for s in cons.spheres:
-        assert not (stale & set(s.donors)), "the sphere recipe's donor list still names a pre-shift dummy"
-        assert not (stale & {d for d, _sign in s.winding}), "the winding still names a pre-shift dummy"
+    assert iso.centres == state, "transient index shifts must not alter real-atom metal identity"
 
 
 def test_release_chirality_restores_phantom_indices():
@@ -548,22 +544,3 @@ def test_ligands_reports_denticity_per_metal():
 def test_ligands_refuses_a_molecule_with_no_metal():
     with pytest.raises(ValueError, match="no metal centre"):
         _metal.ligands(Chem.AddHs(Chem.MolFromSmiles("CCO")))
-
-
-# --- the donor equivalence key: which donors are interchangeable ----------------------------------------
-
-_ACAC = "CC(=O)C=C([O-])C"  # acetylacetonate: two chemically equivalent oxygens, one localised resonance form
-
-
-def test_donor_key_ignores_resonance_form():
-    mol = Chem.MolFromSmiles(_ACAC)
-    oxygens = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 8]
-    perceived = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
-    assert perceived[oxygens[0]] != perceived[oxygens[1]], "perception no longer splits acac; rewrite the fixture"
-    every = list(range(mol.GetNumAtoms()))
-    coarse = _metal._donor_classes(mol, every)
-    assert coarse[oxygens[0]] == coarse[oxygens[1]], "the two acac oxygens are still two classes"
-    for a in every:
-        for b in every:
-            if perceived[a] == perceived[b]:
-                assert coarse[a] == coarse[b], f"the flat reading SPLIT atoms {a} and {b}, which it must not"

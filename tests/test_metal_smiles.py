@@ -11,12 +11,15 @@ import pytest
 from rdkit import Chem
 
 import rxembed as rx
+from rxembed import metal_constraints as C  # noqa: N812
 from rxembed import metal_core as _metal
-from rxembed import metal_isomers as K  # noqa: N812
+from rxembed import metal_enumeration as K  # noqa: N812
+from rxembed import metal_isomer as I  # noqa: N812
 from rxembed import metal_smiles as S  # noqa: N812
+from rxembed import metal_stereo as _metal_stereo
 from rxembed import stereo
 from rxembed.core import embed as core_embed
-from rxembed.metal_core import VACANT
+from rxembed.metal_core import VACANT, materialized_state
 from rxembed.metal_polyhedron import SLOT_BOND_PROP, rotation_group, vertex_dirs
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.perceive import read_xyz
@@ -37,7 +40,7 @@ def _isomer(smi, geometry, seating):
     vertex ordering already fixes the arrangement and the handedness. Read the record in `metal_polyhedron`
     for what a vertex number means; the convention is not uniform across the shapes.
     """
-    return K.Isomer(Chem.MolFromSmiles(smi), geometry, seating)
+    return I.Isomer(Chem.MolFromSmiles(smi), geometry, seating)
 
 
 def _seated(iso):
@@ -69,11 +72,11 @@ def _planar_chiral_ferrocene(two_chiral_faces=False, point_stereo=False):
 def _haptic_windings(mol, iso, cid):
     """Read every planar-chiral haptic winding from one conformer."""
     pos = mol.GetConformer(int(cid)).GetPositions()
-    ranks = _metal._donor_classes(mol, iso.donors)
+    ranks = _metal_stereo.donor_classes(mol, iso.donors)
     return {
         dummy: sign
         for dummy, face in iso.haptic.items()
-        if (sign := _metal._face_winding(mol, pos, iso.metal, face, ranks))
+        if (sign := _metal_stereo.face_winding(mol, pos, iso.metal, face, ranks))
     }
 
 
@@ -141,7 +144,7 @@ def test_write_dative_returns_written_atom_order():
 
 def test_writer_hides_routine_h_and_keeps_hydride():
     cisplatin = Chem.AddHs(Chem.MolFromSmiles("[NH3]->[Pt](<-[NH3])(Cl)Cl"))
-    text = rx.cxsmiles(K.Isomer(cisplatin, "square_planar", [0, 2, 3, 4]))
+    text = rx.cxsmiles(I.Isomer(cisplatin, "square_planar", [0, 2, 3, 4]))
     assert "[H]" not in text, text
 
     mol = S.parse_smiles(text)
@@ -345,7 +348,7 @@ def test_planar_chiral_ferrocene_winding_roundtrips_and_selects_after_dg():
     for sign, cid in by_sign.items():
         realised = Chem.Mol(raw.mol, False, int(cid))
         text = rx.cxsmiles(realised)
-        retained = K.from_geometry(realised)
+        retained = I.from_geometry(realised)
         assert set(retained.haptic_winding.values()) == {sign}
         assert set(rx.metal(realised, stereo="free")[0].haptic_winding.values()) == {sign}
         retained_embed = core_embed(retained, n=4, seed=17, prune_rms=-1)
@@ -478,8 +481,8 @@ def test_coordinate_free_haptic_winding_enumerates_both_hands():
     isomers = rx.metal(_planar_chiral_ferrocene())
     assert len(isomers) == 2
     assert {next(iter(iso.haptic_winding.values())) for iso in isomers} == {"+", "-"}
-    assert {"η5Rₚ", "η5Sₚ"} <= {part[:4] for iso in isomers for part in K.arrangement(iso).split()}
-    by_sign = {next(iter(iso.haptic_winding.values())): K.arrangement(iso) for iso in isomers}
+    assert {"η5Rₚ", "η5Sₚ"} <= {part[:4] for iso in isomers for part in I.arrangement(iso).split()}
+    by_sign = {next(iter(iso.haptic_winding.values())): I.arrangement(iso) for iso in isomers}
     assert "η5Rₚ" in by_sign["+"]
     assert "η5Sₚ" in by_sign["-"]
     assert all("Rₚ" not in rx.cxsmiles(iso) and "Sₚ" not in rx.cxsmiles(iso) for iso in isomers)
@@ -505,7 +508,7 @@ def test_coordinate_free_haptic_winding_enumerates_both_hands():
 )
 def test_eta2_face_orientation_matrix(smiles, count, names):
     isomers = rx.metal(smiles, "SPL")
-    shown = {name for name in names if any(name in K.arrangement(iso) for iso in isomers)}
+    shown = {name for name in names if any(name in I.arrangement(iso) for iso in isomers)}
     assert len(isomers) == count
     assert shown == names
     assert {tuple(iso.haptic_winding.values()) for iso in isomers} == ({("+",), ("-",)} if names else {()})
@@ -532,6 +535,18 @@ def test_eta2_face_is_selected_after_dg_and_reflection_flips_it():
         )
 
 
+def test_eta2_face_and_coordinated_amine_stereo_compose_in_one_dg_seed():
+    smiles = r"C/[CH]1=[CH](\F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[N@H](C)O)<-1"
+    for iso in rx.metal(smiles, "SPL")[:2]:  # one seating, its two eta2 faces
+        embedded = core_embed(iso, n=2, seed=7, prune_rms=-1)
+        assert {next(iter(_haptic_windings(embedded.mol, iso, cid).values())) for cid in embedded.ids} == set(
+            iso.haptic_winding.values()
+        )
+        assert {
+            stereo.stereo_from_3d(Chem.Mol(embedded.mol, False, int(cid)), exclude={iso.metal}) for cid in embedded.ids
+        } == {iso.stereo_label}
+
+
 def test_eta2_face_enumerates_from_a_mol_with_implicit_hydrogens():
     isomers = rx.metal(rx.parse_smiles(_ETA2_ASYM_E), "SPL")
     assert len(isomers) == 6
@@ -542,7 +557,7 @@ def test_eta2_stereoany_does_not_imply_a_face_relation():
     iso = rx.metal(_ETA2_ASYM_E, "SPL")[0]
     face = next(iter(iso.haptic.values()))
     iso.mol.GetBondBetweenAtoms(*face).SetStereo(Chem.BondStereo.STEREOANY)
-    assert _metal._eta2_signatures(iso.mol, face) == ((), ())
+    assert _metal_stereo.eta2_signatures(iso.mol, face) == ((), ())
 
 
 @pytest.mark.parametrize(
@@ -578,7 +593,7 @@ def test_eta2_face_and_ez_are_one_cxsmiles_fixed_point(smiles, label):
 def test_cxsmiles_round_trips_two_eta2_bonds_and_rejects_invalid_fields():
     isomers = rx.metal(_TWO_ETA2, "SPL")
     assert len(isomers) == 24  # 3 SPL seatings x 2 and 4 configurations of the non-equivalent eta2 faces
-    assert len({K.arrangement(iso) for iso in isomers}) == len(isomers)
+    assert len({I.arrangement(iso) for iso in isomers}) == len(isomers)
     two_faces = next(iso for iso in isomers if iso.stereo_label.count(":E") == 2)
     text = rx.cxsmiles(two_faces)
     back = rx.metal(text)
@@ -658,17 +673,18 @@ def test_multimetal_cxsmiles_roundtrips_and_gates_every_sphere_after_dg():
     text = rx.cxsmiles(direct)
     iso = rx.metal(text, center="Mn", stereo="free")[0]
 
-    assert len(direct.cons.spheres) == len(iso.cons.spheres) == 2
+    assert len(direct.centres) == len(iso.centres) == 2
     assert rx.cxsmiles(iso) == text
-    assert len(rx.metal(rx.cxsmiles(source), center="Mn", stereo="free")[0].cons.spheres) == 2
+    assert len(rx.metal(rx.cxsmiles(source), center="Mn", stereo="free")[0].centres) == 2
     raw = core_embed(direct, n=4, seed=7, prune_rms=-1)
-    expected_fe = next(recipe for recipe in direct.cons.spheres if recipe.metal != direct.metal)
+    expected_fe = I.centre_states(direct, "Fe")[0]
+    expected_fe_winding = materialized_state(direct, expected_fe)[2]
     assert {
-        tuple(K.from_geometry(Chem.Mol(raw.mol, False, int(cid)), center="Fe").haptic_winding.values())
+        tuple(I.from_geometry(Chem.Mol(raw.mol, False, int(cid)), center="Fe").haptic_winding.values())
         for cid in raw.ids
-    } == {tuple(dict(expected_fe.winding).values())}
+    } == {tuple(expected_fe_winding.values())}
     assert {
-        _metal.realised_chirality(
+        _metal_stereo.realised_chirality(
             raw.mol, cid, direct.geometry, direct.vertices, direct.metal, direct.chirality, direct.haptic
         )
         for cid in raw.ids
@@ -676,23 +692,24 @@ def test_multimetal_cxsmiles_roundtrips_and_gates_every_sphere_after_dg():
 
     fe = rx.metal(text, center="Fe", stereo="free")[0]
     raw = core_embed(fe, n=2, seed=9, prune_rms=-1)
-    expected_mn = next(recipe for recipe in fe.cons.spheres if recipe.metal != fe.metal)
+    expected_mn = I.centre_states(fe, "Mn")[0]
+    mn_vertices, mn_haptic, _mn_winding, _mn_donors = materialized_state(fe, expected_mn)
     assert {
-        tuple(K.from_geometry(Chem.Mol(raw.mol, False, int(cid)), center="Fe").haptic_winding.values())
+        tuple(I.from_geometry(Chem.Mol(raw.mol, False, int(cid)), center="Fe").haptic_winding.values())
         for cid in raw.ids
     } == {tuple(fe.haptic_winding.values())}
     assert {
-        _metal.realised_chirality(
+        _metal_stereo.realised_chirality(
             raw.mol,
             cid,
             expected_mn.geometry,
-            [expected_mn.donors[k] for k in expected_mn.order],
-            expected_mn.metal,
-            expected_mn.chirality,
-            fe.cons.sphere_haptic(expected_mn),
+            mn_vertices,
+            expected_mn.atom,
+            expected_mn.hand,
+            mn_haptic,
         )
         for cid in raw.ids
-    } == {expected_mn.chirality}
+    } == {expected_mn.hand}
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
@@ -716,7 +733,7 @@ def test_multimetal_haptic_center_enumerates_each_face_before_uff():
     for iso in racemic:
         raw = core_embed(iso, n=2, seed=3, prune_rms=-1)
         assert {
-            tuple(K.from_geometry(Chem.Mol(raw.mol, False, int(cid)), center="Fe").haptic_winding.values())
+            tuple(I.from_geometry(Chem.Mol(raw.mol, False, int(cid)), center="Fe").haptic_winding.values())
             for cid in raw.ids
         } == {tuple(iso.haptic_winding.values())}
 
@@ -726,6 +743,24 @@ def test_multimetal_haptic_center_enumerates_each_face_before_uff():
     assert {stereo.stereo_from_3d(Chem.Mol(cleaned.mol, False, int(cid)), exclude={0, 1}) for cid in cleaned.ids} == {
         spectator_n.stereo_label
     }
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_all_centers_compiles_only_the_selected_product(monkeypatch):
+    calls = []
+    build = C.coordination
+
+    def counted(*args, **kwargs):
+        calls.append(args[1])
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(C, "coordination", counted)
+    isomers = rx.metal(read_xyz(_MNH))
+    assert len(isomers) == 9
+    assert calls == []
+    _ = isomers[0].cons
+    assert len(calls) == 2
+    assert set(calls) == {state.atom for state in isomers[0].centres}
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
@@ -741,14 +776,17 @@ def test_all_centers_is_the_cartesian_product_and_roundtrips():
         isomers.select(center="Fe", haptic="Sₚ")
     assert "Fe0" in str(error.value)
     assert "linear" in str(error.value)
-    assert all(len(iso.cons.spheres) == 2 and not iso.cons.shapes and not iso.cons.frozen for iso in isomers)
+    assert all(len(iso.centres) == 2 and not iso.cons.shapes and not iso.cons.frozen for iso in isomers)
 
     n_racemic = rx.metal(source, stereo={"N5": "racemic"})
     assert len(n_racemic) == 18
     assert {iso.stereo_label for iso in n_racemic} == {"N5:R,C47:R", "N5:S,C47:R"}
     racemic = rx.metal(source, stereo="racemic")
     assert len(racemic) == 72
-    assert {tuple(dict(iso.cons.spheres[1].winding).values()) for iso in racemic} == {("+",), ("-",)}
+    assert {tuple(materialized_state(iso, I.centre_states(iso, "Fe")[0])[2].values()) for iso in racemic} == {
+        ("+",),
+        ("-",),
+    }
     assert len(racemic.filter(stereo="N5:S,C47:R")) == 18
 
     free = rx.metal(source, stereo="free")
@@ -761,11 +799,11 @@ def test_all_centers_is_the_cartesian_product_and_roundtrips():
         with pytest.raises(ValueError, match="not configurable point stereocentres"):
             rx.metal(source, stereo=selector)
 
-    retained = K.from_geometry(source, center="all")
-    assert len(retained.cons.spheres) == 2
+    retained = I.from_geometry(source, center="all")
+    assert len(retained.centres) == 2
     direct = rx.embed(source, n=1, seed=7)
     assert direct.ids
-    assert len(direct.iso.cons.spheres) == 2
+    assert len(direct.iso.centres) == 2
 
     strings = {rx.cxsmiles(iso) for iso in isomers}
     reversed_source = Chem.RenumberAtoms(source, list(reversed(range(source.GetNumAtoms()))))
@@ -786,18 +824,24 @@ def test_all_centers_is_the_cartesian_product_and_roundtrips():
 
     planar = rx.metal(written, stereo={"planar": "racemic"})
     assert len(planar) == 2
-    assert {tuple(dict(iso.cons.spheres[1].winding).values()) for iso in planar} == {("+",), ("-",)}
+    assert {tuple(materialized_state(iso, I.centre_states(iso, "Fe")[0])[2].values()) for iso in planar} == {
+        ("+",),
+        ("-",),
+    }
     inverted = rx.metal(written, stereo="invert")
     assert len(inverted) == 1
     assert list(stereo.point_stereo(inverted[0].stereo_label).values()) == ["S", "S"]
-    assert tuple(dict(inverted[0].cons.spheres[1].winding).values()) == ("+",)
+    assert tuple(materialized_state(inverted[0], I.centre_states(inverted[0], "Fe")[0])[2].values()) == ("+",)
     assert rx.embed(written, n=1, seed=7, stereo="invert").ids
 
     unsigned = written.replace(".atomNote.s1-", ".atomNote.s1")
     for requested in (None, "unassigned", "invert"):
         expanded = rx.metal(unsigned, stereo=requested)
         assert len(expanded) == 2
-        assert {tuple(dict(iso.cons.spheres[1].winding).values()) for iso in expanded} == {("+",), ("-",)}
+        assert {tuple(materialized_state(iso, I.centre_states(iso, "Fe")[0])[2].values()) for iso in expanded} == {
+            ("+",),
+            ("-",),
+        }
     with pytest.raises(ValueError, match="stereo expansion produced several states"):
         rx.embed(unsigned, n=1, seed=7)
 
@@ -809,24 +853,24 @@ def test_all_centers_is_the_cartesian_product_and_roundtrips():
 
     for iso in (racemic[0], racemic[1]):  # one Mn arrangement, both Fe faces
         raw = core_embed(iso, n=1, seed=7, prune_rms=-1)
-        recipes = {recipe.metal: recipe for recipe in iso.cons.spheres}
-        for recipe in recipes.values():
-            if recipe.chirality:
+        for state in iso.centres:
+            vertices, haptic, winding, _donors = materialized_state(iso, state)
+            if state.hand:
                 assert (
-                    _metal.realised_chirality(
+                    _metal_stereo.realised_chirality(
                         raw._mol,
                         raw.ids[0],
-                        recipe.geometry,
-                        [recipe.donors[k] for k in recipe.order],
-                        recipe.metal,
-                        recipe.chirality,
-                        iso.cons.sphere_haptic(recipe),
+                        state.geometry,
+                        vertices,
+                        state.atom,
+                        state.hand,
+                        haptic,
                     )
-                    == recipe.chirality
+                    == state.hand
                 )
-            if recipe.winding:
-                realised = K.from_geometry(Chem.Mol(raw.mol, False, int(raw.ids[0])), center=recipe.metal)
-                assert realised.haptic_winding == dict(recipe.winding)
+            if winding:
+                realised = I.from_geometry(Chem.Mol(raw.mol, False, int(raw.ids[0])), center=state.atom)
+                assert realised.haptic_winding == winding
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
@@ -874,7 +918,7 @@ def test_bridging_donor_carries_one_slot_per_adjacent_metal():
     slots = note.split(";")
     assert len(slots) == 2
     assert all(slot in {"s0", "s1"} for slot in slots)
-    assert all(len(rx.metal(text, center=metal, stereo="free")[0].cons.spheres) == 2 for metal in ("Pd", "Pt"))
+    assert all(len(rx.metal(text, center=metal, stereo="free")[0].centres) == 2 for metal in ("Pd", "Pt"))
     assert all(rx.cxsmiles(rx.metal(text, center=metal, stereo="free")[0]) == text for metal in ("Pd", "Pt"))
 
     # The bridge list is resolved onto RDKit bond properties at parse time, so renumbering cannot swap it.
@@ -916,7 +960,7 @@ def test_multimetal_writer_rejects_lossy_graphs():
         conf.SetAtomPosition(atom, (float(2 * atom), 0.0, 0.0))
     direct.AddConformer(conf)
     with pytest.raises(ValueError, match="bond type cannot be restored"):
-        K.from_geometry(direct)
+        I.from_geometry(direct)
 
 
 def _tied_palladium_centres(second_seating):
@@ -944,6 +988,6 @@ def test_identical_states_on_tied_centres_roundtrip():
 
 
 def test_cxsmiles_rejects_unknown_shape():
-    bare = K.from_surrogate(Chem.MolFromSmiles("[Pt](F)(F)(Cl)Cl"), [(0, 78, 0)], [])
+    bare = I.from_surrogate(Chem.MolFromSmiles("[Pt](F)(F)(Cl)Cl"), [(0, 78, 0)], [])
     with pytest.raises(ValueError, match="no polyhedron template"):
         rx.cxsmiles(bare)

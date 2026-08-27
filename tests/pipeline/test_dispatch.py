@@ -80,7 +80,7 @@ def test_numeric_fix_reaches_explicit_hydrogen():
 
 def test_coordinate_free_hydride_uses_the_ml_target(monkeypatch):
     from rxembed import metal_distance as distance
-    from rxembed.metal_coordination import _ML_SEED_HALF_WIDTH
+    from rxembed.metal_constraints import _ML_SEED_HALF_WIDTH
     from rxembed.pipeline import dispatch
 
     params = Chem.SmilesParserParams()
@@ -258,14 +258,13 @@ def test_shape_hold_carries_the_spectator_sphere():
     spectators = {m for m in iso.cons.metals if m != iso.metal}
     assert spectators, "mn-h2 is bimetallic: the ferrocene Fe must be surrogated as a spectator"
     assert spectators <= set().union(*iso.cons.shapes), "the spectator's sphere is the rigid body hold_shape pinned"
-    recipes = {recipe.metal: recipe for recipe in iso.cons.spheres}
-    assert spectators <= recipes.keys()
-    assert all(recipes[metal].winding for metal in spectators)
+    states = {state.atom: state for state in iso.centres}
+    assert spectators <= states.keys()
+    assert all(any(getattr(site, "winding", "") for site in states[metal].vertices) for metal in spectators)
     assert not [k for k in iso.cons.pulls if spectators & set(k)]
     for d in iso.donors:  # ...while the enumerated centre's modelled window still gets its pull
         assert (min(iso.metal, d), max(iso.metal, d)) in iso.cons.pulls
     assert iso.cons.relaxed().shapes == iso.cons.shapes, "mc(explore=) must not release a structural shape hold"
-    assert iso.cons.relaxed().spheres == iso.cons.spheres
 
     from_smiles = rx.metal("CCCN[Pd](Cl)(Cl)NCCC", "square_planar")[0]  # no input geometry -> nothing shape-held
     assert not from_smiles.cons.shapes

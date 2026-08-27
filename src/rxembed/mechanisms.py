@@ -18,8 +18,6 @@ from rdkit.Chem import rdMolTransforms
 
 from . import metal_donor_orient as _donor  # module import keeps the gate and caps on the same functions
 from .constraints import _DIST_ATOMS, FIX_ANGLE_TOL, FIX_DISTANCE_TOL
-from .metal_core import VACANT, _frag_map
-from .metal_polyhedron import _IMPROPER_VERTICES, POLYHEDRA, resolve_geometry
 from .utils import _CARBON_Z, _DISCONNECTED, _SP2_DEGREE, conjugated_quartets
 
 _PHANTOM_FLOOR = 0.30  # Å: a haptic centroid dummy may sit this close to any atom, living inside its own ring
@@ -378,27 +376,9 @@ class Umbrella(Mechanism):
     """
 
     def _ff_terms(self, ff, cons, conf, stiffness):
-        frag = _frag_map(conf.GetOwningMol())  # same ligand = same fragment
-        for recipe in cons.spheres:
-            poly = POLYHEDRA[resolve_geometry(recipe.geometry)]
-            ideal = poly.umbrella_improper  # None for a planar record and for anything genuinely 3-D
-            if ideal is None and not poly.planar:  # neither a flat-based pyramid nor a plane: nothing to say
+        for key, ideal in cons.umbrellas.items():
+            if cons.frozen.intersection(key):  # a fix= core already pins this geometry exactly
                 continue
-            base = [recipe.donors[k] for k in recipe.order]
-            if len(base) < _IMPROPER_VERTICES:  # `linear`: two vertices state no improper at all
-                continue
-            haptic = set(cons.sphere_haptic(recipe))
-            if any(d == VACANT or d in haptic for d in base):  # an empty vertex or centroid face: no case
-                continue
-            if cons.frozen.intersection((*base, recipe.metal)):  # a fix= core already pins this geometry exactly
-                continue
-            if len({frag[d] for d in base}) == 1:  # a kappa3 of one ligand: its backbone owns the whole base,
-                # so the improper could only be met by twisting it. Measured on mer-terpy/Cu(I): N-Cu-N pinched
-                # 154.4 -> 126.1 deg, inter-ring torsions twisted 13 deg, the metal pushed 0.96 A off terpy's
-                # own plane. A bipy+Cl base has two fragments, a real inter-ligand pair, and stays held.
-                continue
-            d0, d1, d2 = base[0], base[1], base[2]  # the same three vertices `umbrella_improper` measures
-            key = (d0, d1, d2, recipe.metal)
             if _stated_dihedral(cons, *key):
                 continue
             phi = rdMolTransforms.GetDihedralDeg(conf, *key)

@@ -6,7 +6,8 @@ from importlib.metadata import PackageNotFoundError, version
 from .constraints import Constraints, compose, match, resolve_core
 from .embed import Conformers, embed, minimize
 from .metal_core import Ligand, ligands
-from .metal_isomers import Isomer, IsomerSet, enumerate_isomers
+from .metal_enumeration import enumerate_isomers
+from .metal_isomer import Isomer, IsomerSet
 from .metal_smiles import cxsmiles, dative_smiles, parse_smiles
 from .relax import ff_energies, restrained_uff
 

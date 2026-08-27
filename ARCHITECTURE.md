@@ -6,28 +6,43 @@
 
 ```text
 Mol | Isomer
-  +-- fix= / constrain= / template= --> constraints.resolve_core --+
-  +-- Isomer.coordination() ---------------------------------------+
-                                                                   v
-                                                              Constraints
-                                                                   |
-                                                            MECHANISM_ORDER
-                                                              /          \
-                                                    DG windows            FF terms
-                                                        |                    |
-                                                     bounds.py            relax.py
-                                                        \                    /
-                                                         +--> Conformers <--+
+  +-- fix= / constrain= / template= --> constraints.resolve_core ---+
+  +-- Isomer.cons --> metal_constraints ----------------------------+
+                                                                    v
+                                                               Constraints
+                                                                    |
+                                                             MECHANISM_ORDER
+                                                               /          \
+                                                     DG windows            FF terms
+                                                         |                    |
+                                                      bounds.py            relax.py
+                                                         \                    /
+                                                          +--> Conformers <--+
 ```
 
 `Constraints` is the sole constraint payload. `embed.py` also carries the `Isomer` identity and temporary
 graft coordinates while it drives the sequence. `bounds.py` edits RDKit's bounds matrix, `relax.py` applies
 the matching restrained-UFF terms, and the result is `Conformers`.
 
-Each metal centre contributes one `SphereRecipe`. `metal_isomers.py` either retains the unselected recipes or
-forms their Cartesian product, then uses ordinary `compose()` to make one `Constraints` payload.
-`Isomer` stores only that payload, the metal restore identities and the stripped donor bonds. Its geometry,
-vertices and handedness are views of the primary recipe, not a second copy of the same state.
+The DG engine remains RDKit: `bounds.etkdg` creates `ETKDGv3`, and `seed_coordinates` supplies only an edited
+native bounds matrix through `SetBoundsMat`. RDKit currently constructs signed `ChiralSet` records for
+tetrahedral atoms and atropisomeric bonds, but not SP/TB/OH tags, and Python cannot supply an extra chiral set.
+Metal hand and haptic winding are therefore checked on raw DG seeds before UFF. A future RDKit chiral-set input
+can replace that seed filter; it does not change metal enumeration, canonical slots or constraint compilation.
+
+`metal_core.py` owns graph surgery, perception primitives and the immutable `MetalState`: one real metal,
+polyhedron, slot-ordered donors or haptic faces, and hand. `metal_stereo.py` canonicalizes site identity and
+reads metal or haptic hands. `metal_slots.py` produces distinct, reachable donor-to-polyhedron slot assignments.
+`metal_enumeration.py` combines ligand, haptic and per-centre choices into the `Isomer` and `IsomerSet` types in
+`metal_isomer.py`, without building numerical fields for every candidate.
+
+`Isomer.cons` asks the plain compiler in `metal_constraints.py` for a fresh `Constraints`. It compiles only that
+selected isomer's active centre(s) from one private source-Mol snapshot, then composes their coordination field
+with the same `Constraints` carrying a fixed TS core, NCI contacts or a retained spectator shape. The snapshot
+keeps `lengths='input'` independent of later edits to the public Mol; transient centroid indices still follow
+the public Mol's current atom count. A retained input geometry is already one selected state, so `from_geometry`
+records its measured field immediately. Haptic centroids exist transiently while deriving a state and while
+running DG/UFF; stored molecules and `MetalState` contain real atom indices only.
 
 The normal API adapts strings, paths and external tools around that core:
 
@@ -78,8 +93,11 @@ already owns the molecular graph. Optional backends are enabled only by calling 
 | `__init__.py`, `core.py` | workflow and engine facades; no implementation |
 | `constraints.py`, `mechanisms.py` | constraint data and its DG/FF interpretation |
 | `bounds.py`, `embed.py`, `relax.py` | seed, orchestrate and relax conformers |
-| `metal_polyhedron.py`, `metal_isomers.py`, `metal_coordination.py` | shapes, arrangements and coordination constraints |
-| `metal_core.py`, `metal_distance.py`, `metal_donor_orient.py`, `metal_perceive.py` | metal graph surgery, distances, donor geometry and QA rulers |
+| `metal_core.py` | metal state, graph surgery and shape perception primitives |
+| `metal_isomer.py`, `metal_enumeration.py` | selected isomers, collections and candidate enumeration |
+| `metal_polyhedron.py`, `metal_stereo.py`, `metal_slots.py` | shape tables, canonical site identity and reachable slot assignments |
+| `metal_constraints.py`, `metal_distance.py`, `metal_donor_orient.py` | compile selected states into coordination constraints |
+| `metal_perceive.py` | geometry QA rulers used by perception and validation |
 | `metal_smiles.py`, `stereo.py`, `utils.py` | string round trips, organic stereo and shared RDKit geometry facts |
 | `pipeline/api.py`, `pipeline/dispatch.py`, `pipeline/ensemble.py` | public pipeline verbs, routing and the chainable result |
 | `pipeline/perceive.py`, `pipeline/xyz2mol_*.py` | coordinate input and bond perception |

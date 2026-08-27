@@ -1,13 +1,14 @@
 """Test the Constraints struct and fix/constrain resolution."""
 
 from dataclasses import fields
+from typing import Any, cast
 
 import numpy as np
 import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 
-from rxembed.constraints import Constraints, SphereRecipe, add_distance, compose, match, resolve_core, template_to_fix
+from rxembed.constraints import Constraints, add_distance, compose, match, resolve_core, template_to_fix
 
 
 def _mol(smiles="CCO", seed=1):
@@ -34,8 +35,8 @@ def _populated():
         dg_floors={(9, 4): 2.8},
         shapes=[{1, 2, 3}],
         phantoms=frozenset({12}),
-        spheres=(SphereRecipe(9, (0, 4), "SPL", (0, 1)),),
         haptic={12: [3, 4, 5, 6, 7]},
+        umbrellas={(0, 1, 2, 9): None},
     )
     add_distance(c.distances, 0, 1, 1.9, 2.1)
     add_distance(c.distances, 2, 3, 1.8, 2.2)
@@ -59,42 +60,10 @@ def test_copy_carries_every_field():
         assert getattr(d, f.name) == getattr(c, f.name), f"copy() dropped {f.name}"
 
 
-def test_new_fields_preserve_legacy_positional_layout():
-    names = (
-        "distances",
-        "angles",
-        "planes",
-        "coplanar",
-        "frozen",
-        "contacts",
-        "metals",
-        "pulls",
-        "floors",
-        "dg_floors",
-        "shapes",
-        "phantoms",
-        "spheres",
-        "haptic",
-    )
-    values = (
-        {(0, 1): (1.0, 2.0)},
-        {(0, 1, 2): (90.0, 100.0)},
-        [((0,), (1,), 3.0)],
-        [(0, 1, 2, 3, 180.0, 20.0)],
-        {4},
-        (frozenset({(0, 1)}), frozenset({(0, 1, 2)})),
-        {5},
-        {(0, 5): 2.1},
-        {(1, 5): 2.8},
-        {(2, 5): 2.7},
-        [{0, 1}],
-        frozenset({6}),
-        (SphereRecipe(5, (0,), "LIN", (0,)),),
-        {6: [0, 1]},
-    )
-    cons = Constraints(*values)
-    assert tuple(getattr(cons, name) for name in names) == values
-    assert cons.dihedrals == cons.fixed == {}
+def test_constraints_are_keyword_only():
+    constructor = cast("Any", Constraints)
+    with pytest.raises(TypeError):
+        constructor({})
 
 
 def test_copy_does_not_alias_mutable_state():
@@ -128,6 +97,7 @@ def test_relaxed_releases_only_the_seeded_contacts():
         "dg_floors",
         "phantoms",
         "haptic",
+        "umbrellas",
         "planes",
         "frozen",
         "shapes",
@@ -146,6 +116,7 @@ def test_compose_merges_every_field():
     assert len(m.planes) == 2  # concatenated, never de-duplicated
     assert m.distances[(0, 1)] == (1.9, 2.1)
     assert m.distances[(4, 5)] == (1.0, 2.0)
+    assert m.umbrellas == a.umbrellas
 
 
 def test_compose_does_not_mutate_its_inputs():

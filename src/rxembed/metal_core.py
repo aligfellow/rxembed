@@ -16,15 +16,12 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 from rdkit.Geometry import Point3D
 
-from . import metal_polyhedron as _poly
 from .constraints import add_distance, add_pairwise_shape
 from .metal_polyhedron import (
     POLYHEDRA,
-    _vertex_angle,
     fit_residual,
     geometries_for_cn,
     resolve_geometry,
-    vertex_dirs,
 )
 from .metal_polyhedron import describe as _describe
 from .utils import bond_removal_mirrors, remove_bond, repair_bond_stereo
@@ -35,7 +32,7 @@ logger = logging.getLogger("rxembed.metal")  # spelled out, not __name__ ("rxemb
 # The d-block proper: Sc-Zn, Y-Cd, La, Lu, Hf-Hg. A chemistry set, not the centre predicate. It names the
 # elements the tmQM-fitted tables were trained on (exactly the keys of `metal_distance._METAL_GROUP`), which
 # is why La and Lu are in it and Ce-Yb are not. "Is this atom a coordination centre" is `COORDINATION_METALS`
-# below; every reader that asked the centre question through this name (`metal_distance`, `metal_isomers`,
+# below; every reader that asked the centre question through this name (`metal_distance`, `metal_enumeration`,
 # `metal_smiles`, `pipeline/nci`, `pipeline/ensemble`) now reads that one instead, so no module in `src/`
 # reads this set. It states what the fit covers, and the suite reads it to find the metal in a d-block input.
 TRANSITION_METALS = {
@@ -83,6 +80,77 @@ COORDINATION_METALS = (
     frozenset(range(21, 31)) | frozenset(range(39, 49)) | frozenset(range(57, 81)) | frozenset(range(89, 113))
 )
 SURROGATE = 6  # carbon: its excluded volume stops a ligand folding into the metal, so the distance geometry keeps it
+VACANT = -1  # materialized empty vertex; immutable MetalState stores it as None
+
+
+class HapticSite(NamedTuple):
+    """Identify one haptic coordination site by its real face atoms and stated winding."""
+
+    atoms: tuple
+    winding: str = ""
+
+
+class MetalState(NamedTuple):
+    """Identify one real metal and its coordination arrangement."""
+
+    atom: int
+    atomic_num: int
+    charge: int
+    geometry: str = ""
+    vertices: tuple = ()
+    hand: str = ""
+
+
+def from_vertices(metal, atomic_num, charge, geometry, vertices, haptic, winding=(), hand=""):
+    """Build one real-atom state from materialized coordination vertices."""
+    winding = dict(winding)
+    sites = tuple(
+        None
+        if donor == VACANT
+        else HapticSite(tuple(haptic[donor]), winding.get(donor, ""))
+        if donor in haptic
+        else donor
+        for donor in vertices
+    )
+    return MetalState(metal, atomic_num, charge, geometry, sites, hand)
+
+
+def materialized_states(mol, centres):
+    """Assign transient centroid indices to states in centre and vertex order."""
+    dummy = mol.GetNumAtoms()
+    out = {}
+    for state in centres:
+        vertices, haptic, winding, donors = [], {}, {}, []
+        for site in state.vertices:
+            if site is None:
+                vertices.append(VACANT)
+            elif isinstance(site, HapticSite):
+                vertices.append(dummy)
+                haptic[dummy] = site.atoms
+                donors.extend(site.atoms)
+                if site.winding:
+                    winding[dummy] = site.winding
+                dummy += 1
+            else:
+                vertices.append(site)
+                donors.append(site)
+        out[state.atom] = (vertices, haptic, winding, donors)
+    return out
+
+
+def materialized_state(iso, state):
+    """Return transient vertices, haptic faces, windings and donors for one state."""
+    centres = tuple(state if current.atom == state.atom else current for current in iso.centres)
+    return materialized_states(iso.mol, centres)[state.atom]
+
+
+def state_with_winding(state, vertices, winding):
+    """Return a state carrying `winding` on its materialized haptic vertices."""
+    sites = tuple(
+        HapticSite(site.atoms, winding.get(vertices[position], "")) if isinstance(site, HapticSite) else site
+        for position, site in enumerate(state.vertices)
+    )
+    return state._replace(vertices=sites)
 
 
 def _frag_map(mol):
@@ -224,13 +292,6 @@ def _shift_phantoms(cons, offset):
     for name in ("distances", "pulls", "floors", "dg_floors"):
         setattr(cons, name, {key(k): v for k, v in getattr(cons, name).items()})
     cons.angles = {key(k): v for k, v in cons.angles.items()}
-    cons.spheres = tuple(
-        s._replace(
-            donors=tuple(bump.get(d, d) for d in s.donors),
-            winding=tuple((bump[d], sign) for d, sign in s.winding),
-        )
-        for s in cons.spheres
-    )
 
 
 def _hold_donor_chirality(mol, metal, donors, cons):
@@ -411,6 +472,9 @@ def metal_indices(mol):
     `prepare_relax`'s perceived-complex path, and the `embed` guard that refuses an un-surrogated centre.
     """
     return [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS]
+
+
+_ETA2 = 2
 
 
 def _haptic_sites(mol, donors):
@@ -809,13 +873,6 @@ def coplanar(pos, metal, donors, tol=COPLANAR_TOL, haptic=None):
     return _plane_rms(pos[metal], verts) <= tol
 
 
-VACANT = -1  # a coordination vertex left empty (donors < sites)
-_TRANS_ANGLE = 150  # degrees: a same-element donor pair beyond this is trans (else cis)
-_TRIAD = 3  # a mer/fac triad is exactly three donors
-_PAIR = 2  # a same-element pair that can be cis/trans
-_COLINEAR_TOL = 0.5  # topological-distance tolerance for the "central donor" collinearity test
-
-
 def n_sites(geometry):
     """Return the number of coordination vertices the geometry has (name or 3-letter code)."""
     return len(POLYHEDRA[resolve_geometry(geometry)].vertex_dirs)  # unknown geometry -> KeyError (deliberate)
@@ -830,431 +887,6 @@ def hold_shape(mol, atoms, cons, pad=0.1, cid=-1):
     """
     add_pairwise_shape(cons, atoms, mol.GetConformer(cid).GetPositions(), pad)
     cons.shapes.append(set(atoms))
-
-
-_SPAN_ANGLE = 135  # a same-ligand donor pair at a vertex separation this wide is a *trans*-type span
-_SPAN_TOL = 0.1  # Å slack on the backbone reach: drops a 5-membered chelate forced trans (backbone ~3.7 Å, needs ~3.85)
-# while a genuine long backbone passes. At 0.2 the amidate-trans phantom came back.
-
-
-def label(mol, metal, donors, cid, geometry=None):
-    """Coordination-isomer label of one conformer: 'trans' if a same-element donor pair is trans, else 'cis'.
-
-    Geometries with no geometric isomerism (linear / trigonal-planar / tetrahedral) get no label ('').
-    """
-    p = POLYHEDRA.get(geometry)
-    if p is not None and not p.geometric_isomerism:
-        return ""
-    pos = mol.GetConformer(cid).GetPositions()
-    for a in range(len(donors)):
-        for b in range(a + 1, len(donors)):
-            same = mol.GetAtomWithIdx(donors[a]).GetSymbol() == mol.GetAtomWithIdx(donors[b]).GetSymbol()
-            if same and _vertex_angle(pos[donors[a]] - pos[metal], pos[donors[b]] - pos[metal]) >= _TRANS_ANGLE:
-                return "trans"
-    return "cis"
-
-
-def _flat_ranks(mol):
-    """Canonical ranks on the resonance-insensitive skeleton: bond orders, aromaticity, charge and stereo flat.
-
-    Perception has to pick one localised resonance form, and which atom it leaves holding the charge or the
-    double bond is not a fact about the molecule. Measured over `benchmark/corpus`: this ties ferrocene's ten
-    ring atoms (as perceived they fall in three classes, because a five-ring cannot alternate), JIWHOQ's two
-    allyl termini, and VOacac2's four acac oxygens, which the perceived ranks split into a ketone and an
-    enolate pair. The E/Z on the C=C is what splits the acac oxygens, so bond stereo has to go too.
-
-    The total H count is pinned rather than dropped: a resonance-localised carbanion carries an explicit H
-    where its ring-mates carry an implicit one, and unpinning it reads a symmetric ring as asymmetric.
-    """
-    rw = Chem.RWMol(mol)
-    total_h = [a.GetTotalNumHs() for a in rw.GetAtoms()]
-    for bond in rw.GetBonds():
-        bond.SetBondType(Chem.BondType.SINGLE)
-        bond.SetIsAromatic(False)
-        bond.SetStereo(Chem.BondStereo.STEREONONE)
-    for atom, h in zip(rw.GetAtoms(), total_h, strict=True):
-        atom.SetFormalCharge(0)
-        atom.SetIsAromatic(False)
-        atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
-        atom.SetNumExplicitHs(h)
-        atom.SetNoImplicit(True)
-    flat = rw.GetMol()
-    flat.UpdatePropertyCache(strict=False)
-    Chem.FastFindRings(flat)  # the RWMol edit cleared RingInfo, which canonical ranking reads
-    return list(Chem.CanonicalRankAtoms(flat, breakTies=False))
-
-
-def _remove_routine_hydrogens(mol, keep=()):
-    """Return ``(Mol without routine explicit H, {old index: new index})``.
-
-    Hydrogens in `keep` remain explicit. A temporary isotope protects a neutral metal-bound or agostic H
-    from RDKit's normal suppression and is cleared before return.
-    """
-    out, keep = Chem.Mol(mol), set(keep)
-    for atom in out.GetAtoms():
-        atom.SetIntProp("_rxembedOriginalIndex", atom.GetIdx())
-        if atom.GetIdx() in keep and atom.GetAtomicNum() == 1 and not atom.GetIsotope():
-            atom.SetBoolProp("_rxembedCoordinationH", True)
-            atom.SetIsotope(1)
-    params = Chem.RemoveHsParameters()
-    params.removeDegreeZero = True  # protected donor H stays; avoid RDKit warning on a stripped terminal hydride
-    out = Chem.RemoveHs(out, params, sanitize=False)
-    at = {}
-    for atom in out.GetAtoms():
-        at[atom.GetIntProp("_rxembedOriginalIndex")] = atom.GetIdx()
-        atom.ClearProp("_rxembedOriginalIndex")
-        if atom.HasProp("_rxembedCoordinationH"):
-            atom.SetIsotope(0)
-            atom.ClearProp("_rxembedCoordinationH")
-    out.UpdatePropertyCache(strict=False)
-    return out, at
-
-
-def _donor_classes(mol, donors):
-    """Map each donor atom -> its symmetry-equivalence class; interchangeable donors share one.
-
-    Canonical rank with ``breakTies=False`` gives graph automorphism classes, which is what the handedness
-    parity must key on: the two N of one en, or three equivalent chlorides, rank equal. Coarsened by
-    `_flat_ranks` where a frozen resonance form is all that separates two donors. The merge only ever
-    coarsens, by construction: two donors join iff they agree on EITHER reading, transitively, so a flat
-    reading that split a perceived class could not act on it. That direction matters, because a lost
-    labelling is a lost arrangement, where an over-merge only reports a false achirality, which the mirror
-    audit sees. Falls back to the element symbol if ranking is unavailable.
-    """
-    try:
-        ranked, at = _remove_routine_hydrogens(mol, donors)
-        ranks = list(Chem.CanonicalRankAtoms(ranked, breakTies=False))
-        flat = _flat_ranks(ranked)
-    except Exception:  # pragma: no cover - canonical ranking is robust, but never let chirality crash embed
-        return {d: mol.GetAtomWithIdx(d).GetSymbol() for d in donors}
-    root = {}
-
-    def find(x):
-        while root.setdefault(x, x) != x:
-            x = root[x] = root[root[x]]
-        return x
-
-    for d in donors:  # a class is a component of "same perceived rank OR same flat rank"
-        a, b = find(("perceived", ranks[at[d]])), find(("flat", flat[at[d]]))
-        root[max(a, b)] = min(a, b)  # the representative is a reading, so it is order-invariant too
-    return {d: find(("perceived", ranks[at[d]])) for d in donors}
-
-
-def _site_classes(mol, sites, haptic=None, coordination=()):
-    """Map each occupied coordination site to the symmetry class of its atom or complete haptic face.
-
-    A face marker joined to every constituent atom ranks the rooted atom set itself. A multiset of individual
-    atom ranks is insufficient: a vertex-transitive ligand can still have constitutionally distinct edge orbits.
-    `coordination` temporarily restores stripped donor roles, so bridging and terminal donors cannot tie.
-    """
-    haptic = haptic or {}
-    occupied = [site for site in sites if site != VACANT]
-    atoms = {atom for site in occupied for atom in (haptic.get(site) or (site,))}
-    atoms.update(donor for donor, _metal, _atomic_num, _charge in coordination)
-    ranked, at = _remove_routine_hydrogens(mol, atoms)
-    rw = Chem.RWMol(ranked)
-    for donor, metal, atomic_num, charge in coordination:
-        if donor not in at or metal not in at:
-            continue
-        atom = rw.GetAtomWithIdx(at[metal])
-        atom.SetAtomicNum(atomic_num)
-        atom.SetFormalCharge(charge)
-        atom.SetIsotope(1000 + charge)  # retain oxidation state through the resonance-flat ranking
-        if rw.GetBondBetweenAtoms(at[donor], at[metal]) is None:
-            rw.AddBond(at[donor], at[metal], Chem.BondType.ZERO)
-    markers = {}
-    for site in occupied:
-        marker = rw.AddAtom(Chem.Atom(0))
-        rw.GetAtomWithIdx(marker).SetNoImplicit(True)
-        for atom in haptic.get(site) or (site,):
-            rw.AddBond(marker, at[atom], Chem.BondType.ZERO)
-        markers[site] = marker
-    marked = rw.GetMol()
-    marked.UpdatePropertyCache(strict=False)
-    Chem.FastFindRings(marked)
-    perceived = list(Chem.CanonicalRankAtoms(marked, breakTies=False))
-    flat = _flat_ranks(marked)
-    root = {}
-
-    def find(x):
-        while root.setdefault(x, x) != x:
-            x = root[x] = root[root[x]]
-        return x
-
-    for marker in markers.values():
-        a, b = find(("perceived", perceived[marker])), find(("flat", flat[marker]))
-        root[max(a, b)] = min(a, b)
-    return {site: (find(("perceived", perceived[marker])),) for site, marker in markers.items()}
-
-
-_ETA2 = 2
-_FACE_MIN = 3
-_PATH_ENDS = 2  # an open haptic face (an allyl) has two atoms with one face-neighbour
-_FACE_EPS = 1e-8
-_HALF_TURN = 180
-_CIS_STEREO = {Chem.BondStereo.STEREOCIS, Chem.BondStereo.STEREOZ}
-_TRANS_STEREO = {Chem.BondStereo.STEREOTRANS, Chem.BondStereo.STEREOE}
-
-
-def _face_walk(mol, face):
-    """Order a haptic face that is a simple path or cycle; otherwise return ``None``."""
-    inside = set(face)
-    nbrs = {a: sorted(n.GetIdx() for n in mol.GetAtomWithIdx(a).GetNeighbors() if n.GetIdx() in inside) for a in face}
-    ends = [a for a in face if len(nbrs[a]) == 1]
-    if any(len(nbrs[a]) > _PATH_ENDS for a in face) or len(ends) not in (0, _PATH_ENDS):
-        return None
-    walk = [min(ends) if ends else min(face)]
-    while len(walk) < len(face):
-        prev = walk[-2] if len(walk) > 1 else None
-        step = [a for a in nbrs[walk[-1]] if a != prev]
-        if not step:
-            return None
-        walk.append(min(step))
-    return walk, not ends
-
-
-def _canonical_face_walk(mol, face, ranks):
-    """Return the canonical direction around a planar-chiral haptic face, else ``None``."""
-    if len(face) < _FACE_MIN or (walked := _face_walk(mol, face)) is None:
-        return None
-    order, closed = walked
-    n = len(order)
-    classes = [ranks[a] for a in order]
-    if closed:
-        forward = min(tuple(classes[(start + i) % n] for i in range(n)) for start in range(n))
-        reverse = min(tuple(classes[(start - i) % n] for i in range(n)) for start in range(n))
-    else:
-        forward, reverse = tuple(classes), tuple(reversed(classes))
-    if forward == reverse:
-        return None
-    return (order if forward < reverse else order[::-1]), closed
-
-
-def _eta2_centres(mol, face, ranks, metal=None):
-    """Return CIP-orderable trigonal centres on an eta2 face."""
-    if len(face) != _ETA2 or mol.GetBondBetweenAtoms(*face) is None:
-        return []
-    out = []
-    for atom in face:
-        neighbours = [n.GetIdx() for n in mol.GetAtomWithIdx(atom).GetNeighbors() if n.GetIdx() != metal]
-        ordered = sorted(neighbours, key=ranks.__getitem__, reverse=True)
-        if len(ordered) == _MIN_STEREO_NEIGHBOURS and len({ranks[n] for n in ordered}) == len(ordered):
-            key = (ranks[atom], tuple(sorted((ranks[n] for n in ordered), reverse=True)))
-            out.append((atom, key, ordered))
-    return out
-
-
-def _eta2_signatures(mol, face, ranks=None):
-    """Return the two mirror-related re/si signatures available to an eta2 face."""
-    try:
-        ranks = list(Chem.ComputeAtomCIPRanks(mol)) if ranks is None else ranks
-    except (RuntimeError, ValueError):
-        return (), ()
-    centres = _eta2_centres(mol, face, ranks)
-    if not centres:
-        return (), ()
-    if len(centres) == 1:
-        signature = ((centres[0][1], "re"),)
-    else:
-        a, b = face
-        bond = mol.GetBondBetweenAtoms(a, b)
-        refs = list(bond.GetStereoAtoms())
-        if len(centres) != _ETA2:
-            return (), ()
-        if bond.GetStereo() in _CIS_STEREO | _TRANS_STEREO and len(refs) == _ETA2:
-            cis = bond.GetStereo() in _CIS_STEREO
-        elif (
-            bond.GetStereo() == Chem.BondStereo.STEREONONE
-            and bond.IsInRing()
-            and not any(
-                info.type == Chem.StereoType.Bond_Double and info.centeredOn == bond.GetIdx()
-                for info in Chem.FindPotentialStereo(mol)
-            )
-        ):
-            cis = True  # the graph fixes the small-ring alkene; there is no independent E/Z element
-            ring = min((set(r) for r in mol.GetRingInfo().AtomRings() if {a, b} <= set(r)), key=len)
-            refs = [
-                next(
-                    n.GetIdx()
-                    for n in mol.GetAtomWithIdx(atom).GetNeighbors()
-                    if n.GetIdx() != other and n.GetIdx() in ring
-                )
-                for atom, other in ((a, b), (b, a))
-            ]
-        else:
-            return (), ()  # includes STEREOANY and an undefined large-ring E/Z element
-        if bond.GetBeginAtomIdx() != a:
-            refs.reverse()
-        ra, rb = refs
-        try:
-            other_a = next(n.GetIdx() for n in mol.GetAtomWithIdx(a).GetNeighbors() if n.GetIdx() not in {b, ra})
-            other_b = next(n.GetIdx() for n in mol.GetAtomWithIdx(b).GetNeighbors() if n.GetIdx() not in {a, rb})
-        except StopIteration:
-            return (), ()
-        angle = {b: 0, ra: 120, other_a: 240, a: 180}
-        angle[rb], angle[other_b] = (60, -60) if cis else (-60, 60)
-        signature = tuple(
-            sorted(
-                (
-                    key,
-                    "si" if 0 < (angle[ordered[1]] - angle[ordered[0]]) % 360 < _HALF_TURN else "re",
-                )
-                for _atom, key, ordered in centres
-            )
-        )
-    mirror = tuple(sorted((key, "si" if name == "re" else "re") for key, name in signature))
-    return signature, mirror
-
-
-def _face_has_orientation(mol, face, ranks):
-    """Return whether a haptic face has two distinguishable mirror orientations."""
-    if len(face) == _ETA2:
-        signature, mirror = _eta2_signatures(mol, face)
-        return bool(signature and signature != mirror)
-    return _canonical_face_walk(mol, face, ranks) is not None
-
-
-def _face_winding(mol, pos, metal, face, ranks, eta2_ranks=None):
-    """Return the canonical ``'+'``/``'-'`` orientation of a haptic face, else ``''``."""
-    if len(face) == _ETA2:
-        try:
-            eta2_ranks = list(Chem.ComputeAtomCIPRanks(mol)) if eta2_ranks is None else eta2_ranks
-        except (RuntimeError, ValueError):
-            return ""
-        signature = []
-        for atom, key, ordered in _eta2_centres(mol, face, eta2_ranks, metal):
-            centre = pos[atom]
-            volume = float(np.cross(pos[ordered[0]] - centre, pos[ordered[1]] - centre) @ (pos[metal] - centre))
-            if abs(volume) <= _FACE_EPS:
-                return ""
-            signature.append((key, "si" if volume > 0 else "re"))
-        signature = tuple(sorted(signature))
-        mirror = tuple(sorted((key, "si" if name == "re" else "re") for key, name in signature))
-        return "+" if signature < mirror else "-" if signature > mirror else ""
-    canonical = _canonical_face_walk(mol, face, ranks)
-    if canonical is None:
-        return ""
-    sequence, closed = canonical
-    centre = np.mean([pos[a] for a in sequence], axis=0)
-    following = sequence[1:] + sequence[:1] if closed else sequence[1:]
-    circulation = sum(
-        (np.cross(pos[a] - centre, pos[b] - centre) for a, b in zip(sequence, following, strict=False)),
-        start=np.zeros(3),
-    )
-    return "+" if float(circulation @ (centre - pos[metal])) > 0 else "-"
-
-
-def _face_descriptors(mol, donors, haptic, windings):
-    """Return re/si or ``Rₚ``/``Sₚ`` labels for uniquely priority-orderable haptic faces.
-
-    Schlögl's metallocene convention views the face from opposite the metal: descending CIP priority
-    clockwise is ``Rₚ``. The stored ``+`` winding means the canonical face walk is counterclockwise in
-    that view. RDKit supplies its legacy CIP atom ranks; a tied pilot atom or tied direction keeps the exact
-    ``+``/``-`` parity unnamed instead of inventing an absolute descriptor. The stored sign remains the
-    authoritative general representation because RDKit does not implement planar CIP assignment. A choice
-    that disappears when other stereo is removed also stays unnamed rather than risk an uppercase descriptor
-    on a pseudoasymmetric plane.
-    """
-    if not windings:
-        return {}
-
-    def reference(ranks, sequence):
-        highest = max(ranks[a] for a in sequence)
-        pilots = [a for a in sequence if ranks[a] == highest]
-        if len(pilots) != 1:
-            return None
-        pilot = pilots[0]
-        i = sequence.index(pilot)
-        previous, following = sequence[i - 1], sequence[(i + 1) % len(sequence)]
-        if ranks[previous] == ranks[following]:
-            return None
-        return pilot, following if ranks[following] > ranks[previous] else previous
-
-    try:
-        priorities = Chem.ComputeAtomCIPRanks(mol)
-        unmarked = Chem.Mol(mol)
-        Chem.RemoveStereochemistry(unmarked)
-        constitutional = Chem.ComputeAtomCIPRanks(unmarked)
-    except (RuntimeError, ValueError):
-        return {}
-    classes = _donor_classes(mol, donors)
-    out = {}
-    for dummy, winding in windings.items():
-        face = haptic.get(dummy, ())
-        if len(face) == _ETA2:
-            signature, mirror = _eta2_signatures(mol, face, priorities)
-            if winding in "+-" and signature and signature != mirror:
-                selected = min(signature, mirror) if winding == "+" else max(signature, mirror)
-                out[dummy] = f"({','.join(name for _key, name in selected)})"
-            continue
-        canonical = _canonical_face_walk(mol, face, classes)
-        if winding not in "+-" or canonical is None or not canonical[1]:
-            continue
-        sequence = canonical[0]
-        choice = reference(priorities, sequence)
-        if choice is None or choice != reference(constitutional, sequence):
-            continue
-        pilot, toward_second = choice
-        following = sequence[(sequence.index(pilot) + 1) % len(sequence)]
-        sense = (1 if winding == "+" else -1) * (1 if toward_second == following else -1)
-        out[dummy] = "Rₚ" if sense < 0 else "Sₚ"
-    return out
-
-
-def _chelate_edges(mol, vertices, haptic=None):
-    """Return ``{frozenset({vertex_i, vertex_j})}`` for vertex pairs whose donors chelate one ligand.
-
-    Two occupied vertices are a *bite* when their donors sit in the same fragment (same ligand). A
-    tris/bis-chelate's handedness lives in this bite graph, not the per-vertex donor class. A haptic
-    face's centroid is resolved through its ring (`_vertex_atom`) so a tethered face bites its co-donor.
-    """
-    frag = _frag_map(mol)
-    occ = [v for v in range(len(vertices)) if vertices[v] != VACANT]
-    return frozenset(
-        frozenset((a, b))
-        for i, a in enumerate(occ)
-        for b in occ[i + 1 :]
-        if frag[_vertex_atom(haptic, vertices[a])] == frag[_vertex_atom(haptic, vertices[b])]
-    )
-
-
-def chirality_of(mol, donors, geometry, vertices, haptic=None, coordination=()):
-    """Return the metal centre's chirality tag (``'D'`` / ``'L'``, or ``''`` when achiral or undecidable).
-
-    `vertices[v]` is the donor seated at polyhedron vertex `v`, or ``VACANT``. Name-agnostic and
-    order-invariant: the parity of the frame that canonicalises the donor-class plus chelate-bite labelling
-    over the geometry's point group. Empty when the record has no template or a vertex is vacant.
-    """
-    dirs = vertex_dirs(geometry)
-    if dirs is None:
-        return ""
-    return _poly.handedness(
-        dirs,
-        list(vertices),
-        _site_classes(mol, vertices, haptic, coordination),
-        _chelate_edges(mol, vertices, haptic),
-    )
-
-
-def realised_chirality(mol, cid, geometry, vertices, metal, chirality, haptic=None):
-    """Read ``delta``/``lambda`` from one raw 3D frame, or return empty when no hand is defined."""
-    dirs = vertex_dirs(geometry) if chirality else None
-    if dirs is None or len(vertices) != len(dirs) or any(atom < 0 for atom in vertices):
-        return ""
-    pos = mol.GetConformer(int(cid)).GetPositions()
-    haptic = haptic or {}
-
-    def point(atom):
-        ring = haptic.get(atom)
-        return np.mean(pos[list(ring)], axis=0) if ring else pos[atom]
-
-    observed = np.asarray([point(atom) - pos[metal] for atom in vertices])
-    lengths = np.linalg.norm(observed, axis=1, keepdims=True)
-    if not np.all(np.isfinite(observed)) or not np.all(lengths > _EPS_LEN):
-        return ""
-    if _poly.orientation_parity(observed / lengths, dirs) > 0:
-        return chirality
-    return _poly.LAMBDA if chirality == _poly.DELTA else _poly.DELTA
 
 
 _LONE_PAIR_Z = {7, 8, 15, 16, 33, 34, 51, 52}  # N O P S As Se Sb Te: p-block groups 15 and 16

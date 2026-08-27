@@ -24,6 +24,7 @@ def _vertex_angle(u, v):
 
 _FLAT_EPS = 1e-6  # smallest singular value below which a point set is one plane
 _IMPROPER_VERTICES = 3  # an improper states exactly three vertices; a CN4 record would be held 3-of-4
+CHELATE_SPAN_ANGLE = 135  # a same-ligand donor pair this wide needs a trans-spanning backbone
 
 
 def _improper(p1, p2, p3, p4):
@@ -519,7 +520,7 @@ def seat_properly(dirs_obs, dirs, order):
 
     Reflection leaves the alignment score unchanged, so one improper template symmetry flips the fitted
     parity without another search. This distinguished all 7 chiral centres in the 45-structure corpus.
-    Re-seating changed the minimal angle subset on 3 structures; `metal_coordination` handles the chelate case.
+    Re-seating changed the minimal angle subset on 3 structures; `metal_constraints` handles the chelate case.
     """
     refl = point_group(tuple(map(tuple, dirs)))[1]
     if not refl or orientation_parity(np.asarray(dirs_obs)[list(order)], dirs) >= 0:

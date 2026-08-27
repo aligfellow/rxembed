@@ -297,12 +297,12 @@ def mode_signature(mol, ids, nci=True):
             contacts = _interfragment_contacts(an, mol.GetConformer(i).GetPositions(), fmap)
             sigs[k].append(("nci", frozenset((t, p) for t, _a, p in contacts)))
     if "metal" in blocks:
-        from rxembed.metal_core import label as metal_label
+        from rxembed.metal_slots import realised_label
 
         m, donors = _metal_donors(mol, ids)
         if donors:
             for k, i in enumerate(ids):
-                sigs[k].append(("metal", metal_label(mol, m, donors, i)))
+                sigs[k].append(("metal", realised_label(mol, m, donors, i)))
     return [tuple(s) for s in sigs]
 
 

@@ -10,14 +10,14 @@ import itertools
 import numpy as np
 from rdkit import Chem
 
-from .constraints import Constraints, SphereRecipe, add_distance
+from .constraints import Constraints, add_distance, compose
 from .metal_core import (
-    _SPAN_ANGLE,
     VACANT,
     _frag_map,
     _regular_face,
     _site_radius,
     _vertex_atom,
+    materialized_states,
 )
 from .metal_distance import (
     _FLOOR_REACH,
@@ -28,13 +28,13 @@ from .metal_distance import (
     overbond_tier,
 )
 from .metal_donor_orient import _coplanar_donor, _orient_donor, _stripped_hybridisation
-from .metal_polyhedron import POLYHEDRA, _vertex_angle, resolve_geometry
+from .metal_polyhedron import _IMPROPER_VERTICES, CHELATE_SPAN_ANGLE, POLYHEDRA, _vertex_angle, resolve_geometry
 from .utils import _DISCONNECTED, _PT
 
 _ML_SEED_HALF_WIDTH = 0.05  # Å: numerical room around an M-L seed target, not a prediction interval
 
 
-def _centroid_constraints(mol, metal, dummy, ring, real_z, *, qdel, c, pos, hyb):
+def _centroid_constraints(mol, metal, dummy, ring, real_z, *, qdel, c, pos, hyb, source=None):
     """Pin a haptic face by its centroid dummy: the one polyhedron vertex an η² alkene, Cp or arene presents.
 
     The metal->ring-atom distance is ``mc`` and the dummy sits ``d_c = sqrt(mc^2 - r^2)`` up the axis, exact for any
@@ -45,7 +45,7 @@ def _centroid_constraints(mol, metal, dummy, ring, real_z, *, qdel, c, pos, hyb)
     the bent face relaxes freely; the rigid cone over-constrains it into a torn geometry (the metal-mode
     fallback). The dummy is a ``phantom``, zero vdW in the FF with its DG floor relaxed: it lives inside its ring.
     """
-    r = _site_radius(mol, ring)  # circumradius of the face
+    r = _site_radius(source if source is not None else mol, ring)  # circumradius of the face
     if pos is not None:  # realised metal->ring-atom distances from the input geometry
         mcs = [float(np.linalg.norm(pos[metal] - pos[a])) for a in ring]
     else:  # the fitted model; the ring is its own co-donor set so the hapticity term sees the whole face
@@ -55,6 +55,7 @@ def _centroid_constraints(mol, metal, dummy, ring, real_z, *, qdel, c, pos, hyb)
     add_distance(  # M -> centroid vertex, both modes
         c.distances, metal, dummy, d_c - _ML_SEED_HALF_WIDTH, d_c + _ML_SEED_HALF_WIDTH
     )
+    c.pulls[(min(metal, dummy), max(metal, dummy))] = d_c
     cone = _regular_face(mol, ring)  # a regular face is equidistant from its own centroid -> CONE mode; an
     #   irregular one (allyl/diene/pentadienyl) is floppy AND not centroid-equidistant -> METAL mode.
     for a, mca in zip(ring, mcs, strict=True):
@@ -71,20 +72,10 @@ LENGTHS = ("auto", "input", "model")  # where an M-L window comes from; see `res
 
 
 def resolve_lengths(mol, lengths="auto"):
-    """Return ``(positions, note)``: where each M-L window is measured from. ``None`` positions mean the model.
+    """Resolve M-L windows to input coordinates or the fitted distance model.
 
-    There are two honest answers and the caller means one of them:
-
-    * ``input``: `mol`'s own conformer. Right when the geometry is real (a crystal, a DFT optimum), being a measured
-      M-L length is the truth about *that* structure, and beats any fit.
-    * ``model``: `metal_distance.ml_distance`, the fitted periodic model (element, group, delocalised charge
-      / hapticity). Right when there is no geometry, and when the one present is not a metal-aware geometry:
-      plain ETKDG has no M-L parameter, so a conformer it produced puts chemically equivalent donors at
-      different lengths (the paired chlorides differed by 0.34 Å) and the sphere ~0.25 Å short.
-
-    ``'auto'`` (the default, and what this always did) picks input when there is a conformer. That reads a
-    property of the Mol, not a statement of intent, so `'input'` / `'model'` are there to say which you meant.
-    `note` describes the decision for a caller that wants to log it once.
+    ``'auto'`` uses a conformer when present, otherwise the model. ``'input'`` requires coordinates and
+    ``'model'`` ignores them. The note makes an automatic coordinate choice visible to the caller.
     """
     if lengths not in LENGTHS:
         raise ValueError(f"lengths={lengths!r}; expected one of {LENGTHS}")
@@ -103,32 +94,66 @@ def resolve_lengths(mol, lengths="auto"):
     return mol.GetConformer().GetPositions(), "the input conformer; use lengths='model' if it is not metal-aware"
 
 
-def coordination(mol, metal, donors, geometry, order, real_z, *, haptic, frozen=(), core_frozen=(), lengths="auto"):
-    """Build one isomer's constraints: metal-donor distances + donor-metal-donor angles.
+def compile_constraints(mol, centres, *, length_mol, base, constrained_metals, lengths):
+    """Compile selected metal states onto a copy of `base`.
 
-    `donors` may be padded with ``VACANT`` for empty vertices (a coordination pocket), which get no constraints.
-    `lengths` says where the M-donor windows are measured from (`resolve_lengths`); this builder runs once per
-    candidate vertex ordering, so the decision is logged by the caller that makes it, not here.
+    `mol` supplies current topology and atom indexing; `length_mol` preserves the input geometry used for lengths.
+    """
+    if not constrained_metals:
+        return compose(base)
+    parts = materialized_states(mol, centres)
+    built = []
+    for state in centres:
+        if state.atom not in constrained_metals:
+            continue
+        vertices, haptic, _winding, _donors = parts[state.atom]
+        built.append(
+            coordination(
+                mol,
+                state.atom,
+                vertices,
+                state.geometry,
+                state.atomic_num,
+                haptic=haptic,
+                frozen=base.frozen & set(vertices),
+                core_frozen=base.frozen,
+                lengths=lengths,
+                source=length_mol,
+            )
+        )
+    return compose(*built, base)
 
-    `frozen` is the donor set held rigid by a ``fix=`` reacting core: an angle between two frozen donors is
-    omitted (the freeze already pins that sub-triangle exactly, so an ideal-polyhedron angle only over-determines
-    and distorts it); a free-vs-frozen angle is kept, to seat the free donor at its vertex.
 
-    An intra-chelate L-M-L angle (two donors of one ligand) never takes the ideal polyhedron angle, which
-    contradicts the backbone that actually sets the bite (a side-on chelate bites ~45°, and even ±25° tore the
-    bond): a *cis* pair takes its ring size's census window (`_chelate_bite_window`), a *trans*-assigned one a
-    wide ±25°, and only inter-ligand pairs are held at ±8°. Impossible placements (a short backbone forced
-    trans) are dropped in `distinct_vertex_orderings` / `bonding_ok`.
+def coordination(
+    mol,
+    metal,
+    vertices,
+    geometry,
+    real_z,
+    *,
+    haptic,
+    frozen=(),
+    core_frozen=(),
+    lengths="auto",
+    source=None,
+):
+    """Build one metal state's distance, angle, floor and umbrella constraints.
+
+    Frozen donor pairs need no duplicate angle. Inter-ligand pairs follow the ideal polyhedron; cis chelates
+    use calibrated ring-size bite windows and trans chelates remain wide. `source` preserves input-length
+    measurements while `mol` supplies the current topology.
     """
     frag = _frag_map(mol)  # same ligand = same fragment
+    poly = POLYHEDRA[resolve_geometry(geometry)]
 
     def frag_of(v):  # a face tethered to a co-donor (η²-alkyne + alkyl of one metallacycle; an ansa Cp) must read
         return frag[_vertex_atom(haptic, v)]  # as one ligand: the bond-less centroid carries no fragment of its own
 
-    pos, _note = resolve_lengths(mol, lengths)
+    pos, _note = resolve_lengths(source if source is not None else mol, lengths)
     c = Constraints()
-    od = [donors[k] for k in order]  # od[vertex] = donor atom there, or VACANT
-    real_od = {x for x in od if x != VACANT}  # the co-donors, for the haptic (side-on) check in _orient_donor
+    od = list(vertices)
+    real_od = {x for x in od if x != VACANT and x not in haptic}
+    real_od.update(a for face in haptic.values() for a in face)  # real co-donors; centroid keys are not Mol atoms
     qdel = delocalised_charges(mol)  # a Lewis charge is an artefact, so spread it
     # The model needs the metal-stripped class because RDKit counts a dative bond. Input lengths do not.
     hyb = _stripped_hybridisation(mol) if pos is None else None
@@ -136,7 +161,18 @@ def coordination(mol, metal, donors, geometry, order, real_z, *, haptic, frozen=
         if d == VACANT:
             continue
         if d in haptic:  # a centroid vertex: pin its whole ring, not a single donor (no orient/coplanar)
-            _centroid_constraints(mol, metal, d, haptic[d], real_z, qdel=qdel, c=c, pos=pos, hyb=hyb)
+            _centroid_constraints(
+                mol,
+                metal,
+                d,
+                haptic[d],
+                real_z,
+                qdel=qdel,
+                c=c,
+                pos=pos,
+                hyb=hyb,
+                source=source,
+            )
             continue
         if pos is not None:  # measured: this structure's value, and wider (±0.1) because it is one sample
             d_md = float(np.linalg.norm(pos[metal] - pos[d]))
@@ -156,7 +192,7 @@ def coordination(mol, metal, donors, geometry, order, real_z, *, haptic, frozen=
         # input, and biasing it toward coplanar only fights the freeze.
         if metal not in core_frozen and d not in core_frozen:
             _coplanar_donor(mol, metal, d, c)
-    for i, j, a in POLYHEDRA[resolve_geometry(geometry)].resolved_angles:
+    for i, j, a in poly.resolved_angles:
         if (
             od[i] == VACANT or od[j] == VACANT
         ):  # an angle to an empty vertex is unconstrained. NB a shape reached AS a vacancy is stated more weakly than
@@ -166,7 +202,7 @@ def coordination(mol, metal, donors, geometry, order, real_z, *, haptic, frozen=
         if od[i] in frozen and od[j] in frozen:  # both held by freeze -> don't over-determine the core
             continue
         intra = frag_of(od[i]) == frag_of(od[j])  # two donors of one chelating ligand
-        if intra and a < _SPAN_ANGLE:  # a *cis* chelate: the ideal polyhedron angle predicts the bite poorly,
+        if intra and a < CHELATE_SPAN_ANGLE:  # a *cis* chelate: the ideal polyhedron angle predicts the bite poorly,
             # and a backbone-only distance lets the DG fold it shut, so pin it from the ring SIZE where
             # calibrated (4/5/6). Outside that domain (η², 3-membered, floppy 7+) there is no window, and a
             # HAPTIC partner is always outside it: the centroid is bond-less, so there is no ring to size.
@@ -184,12 +220,22 @@ def coordination(mol, metal, donors, geometry, order, real_z, *, haptic, frozen=
         c.angles[(od[i], metal, od[j])] = (max(0.0, a - pad), min(180.0, a + pad))
     # NB an η² π bond needs no hold of its own: the face is a centroid vertex, so one axial pull plus the cone
     # pins both π atoms at the face radius. Two separate M-donor pulls tore C≡C from 1.2 to 1.7 Å.
-    coord = od + [a for site in haptic.values() for a in site]  # vertices + haptic RING atoms: the real
+    coord = [d for d in od if d != VACANT and d not in haptic]
+    coord += [a for site in haptic.values() for a in site]  # real coordinating atoms; centroid keys are reserved
     ff_terms(mol, c, {metal: (real_z, coord)})  # coordinating atoms, so nondonor_floors never floors a ring atom
-    # Record the seating itself, not just the windows it produced: which donor took which vertex of which
-    # polytope is what `Umbrella` needs to state a pyramid's improper, and no pairwise window carries it.
-    c.spheres = (SphereRecipe(metal, tuple(donors), geometry, tuple(order)),)
+    _add_umbrella(c, metal, od, poly, haptic, frag)
     return c
+
+
+def _add_umbrella(cons, metal, vertices, poly, haptic, fragments):
+    """Add the shared planar or pyramidal metal improper when three independent donors define it."""
+    if poly.umbrella_improper is None and not poly.planar:
+        return
+    real = (d for d in vertices if d != VACANT and d not in haptic)
+    for base in itertools.combinations(real, _IMPROPER_VERTICES):
+        if len({fragments[d] for d in base}) > 1:
+            cons.umbrellas[(*base, metal)] = poly.umbrella_improper
+            return
 
 
 _CHELATE_BITE = {4: (58.0, 81.0), 5: (70.0, 91.0), 6: (74.0, 104.0)}  # chelate ring size -> M-D-D bite window (deg):
@@ -198,20 +244,22 @@ _CHELATE_BITE = {4: (58.0, 81.0), 5: (70.0, 91.0), 6: (74.0, 104.0)}  # chelate 
 
 
 def _chelate_bite_window(mol, a, b):
-    """Bite window for two donors of one chelate, from the ring SIZE (backbone bond-path + the 2 M-donor bonds).
+    """Return a chelate bite window from the backbone path plus the two metal-donor bonds.
 
     The surrogate strips the M-donor bonds, so the chelate ring is open, the metal is bond-less, and the two donors
     relate only through the backbone: ring size = that backbone path + 2, read straight off `mol`'s own (cached)
-    topological distances. Returns ``None`` for a non-chelate (no shared path, which is also what a bond-less
-    haptic centroid gives) or a ring outside the calibrated 4/5/6 domain (3-membered / floppy 7+).
+    topological distances. Returns ``None`` for a virtual site, non-chelate, or ring outside the calibrated 4/5/6
+    domain (3-membered / floppy 7+).
     """
+    if not 0 <= a < mol.GetNumAtoms() or not 0 <= b < mol.GetNumAtoms():
+        return None  # a haptic centroid is a coordination site, not an atom with a ligand-backbone path
     path = float(Chem.GetDistanceMatrix(mol)[a][b])
     if path > _DISCONNECTED:  # different fragments -> not a chelate
         return None
     return _CHELATE_BITE.get(int(path) + 2)
 
 
-def coordination_from_geometry(mol, metal, vertices, real_z, haptic):
+def coordination_from_geometry(mol, metal, vertices, geometry, real_z, haptic):
     """Build coordination constraints from the actual input geometry: the specific ligand arrangement.
 
     The realised metal-donor distances and donor-metal-donor angles, so the *specific* arrangement is held
@@ -230,26 +278,27 @@ def coordination_from_geometry(mol, metal, vertices, real_z, haptic):
             continue
         dist = float(np.linalg.norm(pos[metal] - pos[v]))
         add_distance(c.distances, metal, v, dist - _ML_SEED_HALF_WIDTH, dist + _ML_SEED_HALF_WIDTH)
+
+    def position(vertex):
+        return np.mean(pos[list(haptic[vertex])], axis=0) if vertex in haptic else pos[vertex]
+
     for a, b in itertools.combinations(vertices, 2):
-        ang = _vertex_angle(pos[a] - pos[metal], pos[b] - pos[metal])
+        ang = _vertex_angle(position(a) - pos[metal], position(b) - pos[metal])
         c.angles[(a, metal, b)] = (max(0.0, ang - 8), min(180.0, ang + 8))
-    coord = list(vertices) + [a for ring in haptic.values() for a in ring]  # + ring atoms so nondonor_floors
+    coord = [d for d in vertices if d not in haptic]
+    coord += [a for ring in haptic.values() for a in ring]  # real donors only; reserved centroids are not Mol atoms
     ff_terms(mol, c, {metal: (real_z, coord)})  # never floors a ring atom; same force field as every other path
+    poly = POLYHEDRA.get(resolve_geometry(geometry))
+    if poly is not None:
+        _add_umbrella(c, metal, vertices, poly, haptic, _frag_map(mol))
     return c
 
 
 def coordinate(iso, atoms):
-    """Build constraints seating substrate `atoms` into the metal's vacant vertices.
+    """Constrain substrate atoms into an isomer's vacant slots.
 
-    The metal-donor coordinative distance + the polyhedron angles that orient each donor at its empty
-    vertex. Reuses the real-ligand machinery: a substrate atom simply fills a VACANT slot. Returns a
-    `Constraints` to merge.
-
-    The window is ``(r_M + r_donor - 0.2, … + 0.15)``. The realised distance lands at the upper bound, because
-    the carbon surrogate has no metal-donor attraction and its vdW pushes them apart, so the restraint
-    only caps the separation), so the upper bound is set to a realistic dative length ≈ covalent-sum +
-    0.15 Å (a true distance needs the xTB calculator on the real metal). Raises if there are more atoms
-    than vacant sites; `atoms` fill vacant vertices in order.
+    Atoms fill vacancies in slot order. Covalent-radius distance windows and existing polyhedron angles
+    orient them around the surrogate; excess atoms raise.
     """
     od = list(iso.vertices)
     vac = [v for v in range(len(od)) if od[v] == VACANT]
