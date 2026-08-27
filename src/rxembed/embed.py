@@ -22,6 +22,7 @@ from .constraints import (
     FIX_ANGLE_TOL,
     FIX_DISTANCE_TOL,
     Constraints,
+    add_distance,
     compose,
     resolve_atom,
     resolve_core,
@@ -500,14 +501,24 @@ class Conformers:
             )
         return bad
 
-    def _coordination_ok(self, cid, iso=None):
-        """Reject a puckered result for a declared planar polyhedron."""
+    def _puckered_centres(self, cid, iso=None):
+        """Return declared planar centres that relaxed out of plane."""
         iso = self.iso if iso is None else iso
-        if iso is None or not _poly.is_planar(iso.geometry) or not iso.donors:
-            return True
+        if iso is None:
+            return ()
         pos = self._mol.GetConformer(cid).GetPositions()
-        # a haptic face is one vertex
-        return _metal.coplanar(pos, iso.metal, iso.donors, haptic=self.cons.haptic)
+        parts = _metal.materialized_states(iso.mol, iso.centres)
+        return tuple(
+            state
+            for state in iso.centres
+            if _poly.is_planar(state.geometry)
+            and parts[state.atom][3]
+            and not _metal.coplanar(pos, state.atom, parts[state.atom][3], haptic=parts[state.atom][1])
+        )
+
+    def _coordination_ok(self, cid, iso=None):
+        """Reject a puckered result for any declared planar polyhedron."""
+        return not self._puckered_centres(cid, iso)
 
     def _relax_constrained(self, stiffness, max_iters=MAX_ITERS, conf_ids=None, operation="minimize", _frames=None):
         """Relax with restrained UFF, escalating only when no conformer passes the accept gate.
@@ -953,15 +964,9 @@ def embed(
         src = spec.mol if isinstance(spec, Isomer) else spec
         own = src.GetConformer().GetPositions() if src.GetNumConformers() else None
         fix = template_to_fix(template, fix, own, src)
-    iso = spec if isinstance(spec, Isomer) else None  # `seed`/`n` are validated at the seam (`seed_conformers`)
-    if iso is None:
+    if not isinstance(spec, Isomer):
         _check_bare_mol(spec)
-    mol = Chem.Mol(iso.mol if iso is not None else spec)  # our own copy: conformers are never shared with the caller
-    cons, graft_ref = Constraints(), {}
-    if iso is None or fix or constrain:
-        cons, graft_ref = resolve_core(mol, fix=fix, constrain=constrain, has_geometry=mol.GetNumConformers() > 0)
-    if iso is not None:
-        cons = fold_substrate(iso.cons, cons, graft_ref) if (fix or constrain) else iso.cons
+    mol, cons, iso, graft_ref = prepare(spec, fix=fix, constrain=constrain)
     mol, ids = seed_conformers(
         mol, cons, iso, n, seed=seed, knowledge=knowledge, prune_rms=prune_rms, threads=threads, graft_ref=graft_ref
     )
@@ -983,36 +988,66 @@ def embed(
     return Conformers(mol, ids, cons, iso, seed=int(seed))  # `minimize`'s handedness gate re-seeds off this
 
 
-def prepare_relax(spec, *, fix=None, constrain=None):
-    """Prepare a copied geometry for search-free relaxation.
+def prepare(spec, *, fix=None, constrain=None):
+    """Prepare a copied Mol and its constraints for embedding or relaxation.
 
-    Returns ``(mol, ids, constraints, isomer)``. A plain metal Mol keeps its input sphere; an Isomer keeps its
-    declared coordination constraints. Coordinate-fixed atoms are grafted exactly.
+    Return ``(mol, constraints, isomer, graft_reference)``. A plain metal Mol is represented by carbon
+    surrogates; an input geometry keeps each measured sphere, while a graph keeps a terminal hydride through
+    its modelled M-H window. An Isomer keeps its declared coordination constraints.
     """
-    from .metal_distance import ff_terms
+    from .metal_constraints import _ML_SEED_HALF_WIDTH
+    from .metal_distance import ff_terms, ml_distance
     from .metal_isomer import from_surrogate
 
     iso = spec if isinstance(spec, Isomer) else None
     mol = Chem.Mol(iso.mol if iso is not None else spec)  # our own copy: never the caller's conformers
-    spheres, metals = {}, []
+    has_geometry = mol.GetNumConformers() > 0
+    spheres, hydrides, metals = {}, [], []
     if iso is None and _metal.metal_index(mol) is not None:  # as `embed`: a bond-less surrogate on a zero-vdW FF,
-        spheres = {  # because handing UFF a real metal makes the force field depend on which metal you have
-            mi: [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()] for mi in _metal.metal_indices(mol)
-        }
-        donor_bonds = [(d, mi) for mi, dons in spheres.items() for d in dons]  # re-added DATIVE on the output
+        metal_indices = _metal.metal_indices(mol)
+        donors = {mi: [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()] for mi in metal_indices}
+        donor_bonds = [(d, mi) for mi, sphere in donors.items() for d in sphere]  # re-added DATIVE on the output
+        if has_geometry:
+            spheres = donors  # measured all-pairs holds retain each realised sphere without fixing its frame
+        else:
+            hydrides = [
+                (mi, d, ml_distance(mol, mi, d, mol.GetAtomWithIdx(mi).GetAtomicNum(), set(ds), {}, hyb={}))
+                for mi, ds in donors.items()
+                for d in ds
+                if mol.GetAtomWithIdx(d).GetAtomicNum() == 1 and mol.GetAtomWithIdx(d).GetDegree() == 1
+            ]
         mol, metals = _metal.surrogate_all_metals(mol)
         iso = from_surrogate(mol, metals, donor_bonds)
-    cons, ref = resolve_core(mol, fix=fix, constrain=constrain, has_geometry=True)
-    if spheres:  # perceived from a plain Mol: hold what the input realises
+        logger.debug("metal complex: %d metal(s) swapped to carbon surrogate for the FF", len(metals))
+    cons, ref = resolve_core(mol, fix=fix, constrain=constrain, has_geometry=has_geometry)
+    if metals:  # perceived from a plain Mol: retain its measured spheres or coordinate-free terminal hydrides
         rz = {mi: z for mi, z, _q in metals}
         sphere_cons = Constraints()
         for mi, dons in spheres.items():
             _metal.hold_shape(mol, [mi, *dons], sphere_cons)
-        ff_terms(mol, sphere_cons, {mi: (rz[mi], dons) for mi, dons in spheres.items()})
+        if spheres:
+            ff_terms(mol, sphere_cons, {mi: (rz[mi], dons) for mi, dons in spheres.items()})
+        for mi, hydride, target in hydrides:
+            add_distance(
+                sphere_cons.distances,
+                mi,
+                hydride,
+                target - _ML_SEED_HALF_WIDTH,
+                target + _ML_SEED_HALF_WIDTH,
+            )
         cons = compose(sphere_cons, cons)
     elif iso is not None:  # an Isomer arrives with its polyhedron built: the same fold `embed` does
         base = iso.cons
         cons = fold_substrate(base, cons, ref) if (fix or constrain) else base
+    return mol, cons, iso, ref
+
+
+def prepare_relax(spec, *, fix=None, constrain=None):
+    """Prepare a copied geometry for search-free relaxation.
+
+    Returns ``(mol, ids, constraints, isomer)``. Coordinate-fixed atoms are grafted exactly.
+    """
+    mol, cons, iso, ref = prepare(spec, fix=fix, constrain=constrain)
     ids = [c.GetId() for c in mol.GetConformers()]
     if ref:
         graft = sorted(ref)

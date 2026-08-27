@@ -469,7 +469,7 @@ def metal_indices(mol):
     """Return the indices of every metal coordination centre (d- or f-block).
 
     The one answer to "which atoms does the surrogate own", so every door reads it: the `Isomer` enumeration,
-    `prepare_relax`'s perceived-complex path, and the `embed` guard that refuses an un-surrogated centre.
+    `embed.prepare`'s perceived-complex path, and the guard that refuses an un-surrogated centre.
     """
     return [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS]
 

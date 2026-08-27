@@ -78,6 +78,11 @@ def test_numeric_fix_reaches_explicit_hydrogen():
     assert ens.measure((n, h))["mean"] == pytest.approx(1.20, abs=0.1)
 
 
+def test_unqualified_coordinate_free_metal_fails_loudly():
+    with pytest.raises(ValueError, match="plain RDKit embedding does not model metals"):
+        rx.embed("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", n=1)
+
+
 def test_coordinate_free_hydride_uses_the_ml_target(monkeypatch):
     from rxembed import metal_distance as distance
     from rxembed.metal_constraints import _ML_SEED_HALF_WIDTH
@@ -105,6 +110,28 @@ def test_coordinate_free_hydride_uses_the_ml_target(monkeypatch):
 
     assert (lo + hi) / 2 == pytest.approx(target)
     assert hi - lo == pytest.approx(2 * _ML_SEED_HALF_WIDTH)
+
+
+def test_geometry_metal_constraint_uses_shared_preparation():
+    selected = rx.metal("CCCN->[Pd+2](<-[Cl-])(<-[Cl-])<-NCCC", "square_planar")[0]
+    source = rx.embed(selected, n=1, seed=1).mol
+    metal = next(atom.GetIdx() for atom in source.GetAtoms() if atom.GetAtomicNum() == 46)
+    donors = [atom.GetIdx() for atom in source.GetAtomWithIdx(metal).GetNeighbors()]
+    carbons = [atom.GetIdx() for atom in source.GetAtoms() if atom.GetAtomicNum() == 6]
+    pair = (carbons[0], carbons[-1])
+    pos = source.GetConformer().GetPositions()
+    target = float(np.linalg.norm(pos[pair[0]] - pos[pair[1]]))
+
+    ens = rx.embed(source, constrain={pair: (target - 0.2, target + 0.2)}, n=1, seed=2)
+
+    held = next(shape for shape in ens.cons.shapes if metal in shape)
+    assert held == {metal, *donors}
+    for i, j in itertools.combinations(held, 2):
+        lo, hi = ens.cons.distances[(min(i, j), max(i, j))]
+        assert (lo + hi) / 2 == pytest.approx(float(np.linalg.norm(pos[i] - pos[j])))
+    restored = ens.mol
+    assert restored.GetAtomWithIdx(metal).GetAtomicNum() == 46
+    assert all(restored.GetBondBetweenAtoms(donor, metal).GetBondType() == Chem.BondType.DATIVE for donor in donors)
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")

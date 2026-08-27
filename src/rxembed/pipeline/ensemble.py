@@ -31,6 +31,7 @@ from . import stereo_check as _stereo
 logger = logging.getLogger("rxembed")
 
 _MIN_OVERLAY_ATOMS = 3  # need >=3 atoms to define an alignment frame
+_MIN_PLANE_SITES = 3  # three coordination vertices define a donor plane against which the metal can flatten
 _HARTREE_KCAL = 627.5094740631  # Eh -> kcal/mol
 # Additional Å slack beyond a rigid body's own 0.1 Å pair windows.
 _SHAPE_TEAR_TOL = 0.10
@@ -497,12 +498,7 @@ class Ensemble(Conformers):
         # A metal keeps the looser bond tol: a slightly-stretched bond in a coplanar coordination is a
         # surrogate artifact xtb recovers, and the coplanarity gate already rejects the phantom ones.
         bt = _METAL_BOND_TOL if iso else _BOND_TOL
-        # name the polyhedron and the number in the reason: "out-of-plane" alone says neither which shape
-        # declared itself planar nor what it was measured against
-        oop = "out-of-plane coordination sphere"
-        if iso is not None and _poly.is_planar(iso.geometry):
-            oop = f"{oop} ({_poly.describe(iso.geometry)} is declared planar; RMS > {_metal.COPLANAR_TOL} A)"
-        kept, drops = [], {"broken bond": 0, "missed numeric fix": 0, oop: 0, "torn rigid body": 0}
+        kept, drops = [], {"broken bond": 0, "missed numeric fix": 0, "torn rigid body": 0}
         for i in self.ids:  # one pass; record which gate rejected each so the log can name it
             if not _metrics.bonding_ok(
                 self._mol, i, bond_tol=bt, exclude=self.cons.frozen, constrained=self.cons.distances
@@ -510,8 +506,10 @@ class Ensemble(Conformers):
                 drops["broken bond"] += 1
             elif not self._fixed_geometry_ok(i):
                 drops["missed numeric fix"] += 1
-            elif not self._coordination_ok(i, iso):
-                drops[oop] += 1
+            elif puckered := self._puckered_centres(i, iso):
+                names = ", ".join(f"{_poly.describe(state.geometry)} at atom {state.atom}" for state in puckered)
+                reason = f"out-of-plane coordination sphere ({names}; RMS > {_metal.COPLANAR_TOL} A)"
+                drops[reason] = drops.get(reason, 0) + 1
             elif not self._shape_intact(i):
                 drops["torn rigid body"] += 1
             else:
@@ -521,26 +519,33 @@ class Ensemble(Conformers):
         return drops
 
     def _warn_shape_flattened(self, iso):
-        """Warn when a non-planar polyhedron relaxed flat and will re-perceive as another shape.
+        """Warn when any non-planar polyhedron relaxed flat and will re-perceive as another shape.
 
         The surrogate has no lone-pair or d-electron preference. Keep the requested geometry, but report that
         its coordinates no longer state it.
         """
-        if iso is None or not iso.donors or _poly.is_planar(iso.geometry):
+        if iso is None:
             return
-        flat = [
-            i
-            for i in self.ids
-            if _metal.coplanar(self._mol.GetConformer(i).GetPositions(), iso.metal, iso.donors, haptic=self.cons.haptic)
-        ]
-        if flat:
-            logger.warning(
-                "minimize: %d of %d conformer(s) of %s relaxed flat (metal <%.2f A RMS from its donor plane)",
-                len(flat),
-                len(self.ids),
-                _poly.describe(iso.geometry),
-                _metal.COPLANAR_TOL,
-            )
+        parts = _metal.materialized_states(iso.mol, iso.centres)
+        for state in iso.centres:
+            vertices, haptic, _winding, donors = parts[state.atom]
+            occupied = sum(vertex != _metal.VACANT for vertex in vertices)
+            if occupied < _MIN_PLANE_SITES or _poly.is_planar(state.geometry):
+                continue
+            flat = [
+                i
+                for i in self.ids
+                if _metal.coplanar(self._mol.GetConformer(i).GetPositions(), state.atom, donors, haptic=haptic)
+            ]
+            if flat:
+                logger.warning(
+                    "minimize: %d/%d conformer(s) of %s at atom %d relaxed flat (metal RMS < %.2f A)",
+                    len(flat),
+                    len(self.ids),
+                    _poly.describe(state.geometry),
+                    state.atom,
+                    _metal.COPLANAR_TOL,
+                )
 
     def _drop_unconverged(self, drops):
         """Drop conformers whose relax energy sits above the window: a non-physical, un-converged geometry."""

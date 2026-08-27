@@ -2,9 +2,9 @@
 
 Turns SMILES / .xyz / Mol / metal `Isomer` + a constraint spec into an `Ensemble` (or an `EnsembleSet` of
 candidates): parse -> (discover NCI -> constrain) -> the core seam -> `Ensemble`. Owns the source
-normalisation, the metal carbon-surrogate swap, and the isomer / template / auto-NCI routing; every embed
-here goes through the one core seam `rxembed.embed.seed_conformers` (encounter bounds, the Kabsch
-graft, the substrate fold). The package root exports the user-facing objects constructed here.
+normalisation and the isomer / template / auto-NCI routing; `rxembed.embed.prepare` owns graph and constraint
+preparation, then every embed goes through `rxembed.embed.seed_conformers` (encounter bounds, the Kabsch graft,
+the substrate fold). The package root exports the user-facing objects constructed here.
 """
 
 from __future__ import annotations
@@ -17,14 +17,14 @@ from rdkit import Chem
 
 import rxembed.metal_constraints as _cbuild
 import rxembed.metal_core as _metal
-import rxembed.metal_distance as _distance
 import rxembed.metal_enumeration as _kiso
 import rxembed.metal_isomer as _isomer
 import rxembed.metal_polyhedron as _poly
-from rxembed.constraints import Constraints, add_distance, compose, resolve_atom, resolve_core
+from rxembed.constraints import add_distance, compose, resolve_atom, resolve_core
 from rxembed.constraints import template_to_fix as _core_template_to_fix
 from rxembed.embed import (  # the module, not the `embed` function the package root re-exports
     fold_substrate,
+    prepare,
     seed_conformers,
 )
 from rxembed.metal_core import VACANT
@@ -663,75 +663,14 @@ def _embed_dispatch(
                 keep_input=True,
             )
         )
-    iso = None
-    metals_donors = {}
-    hydrides = []
-    # The metal surrogate assembly below is step for step `embed.prepare_relax`'s: read the M-donor bonds and
-    # each metal's donors before the strip, surrogate every metal, record it as a polyhedron-less `Isomer`,
-    # hold each sphere (`hold_shape`), add the metal FF terms. It is written out rather than calling that
-    # helper because the embed path needs three arguments it has no parameter for. `has_geometry`: it
-    # hardcodes True, relaxing a geometry it already has, while a SMILES here resolves at False and takes the
-    # hydride window instead of a sphere hold. `ref`: it grafts the coordinate fix onto the input conformer
-    # and hands nothing back, while here `ref` has to reach `seed_conformers` to graft the fresh seeds.
-    # The NCI `contacts` fold is the pipeline's alone. So unifying the two is an
-    # `embed.py` change -- `prepare_relax` taking `has_geometry` and returning `ref` rather than consuming it
-    # -- not a `dispatch.py` one.
-    if _metal.metal_index(mol) is not None and (fix or constrain or contacts or template):
-        # every M-donor bond, read before the strip, re-added as dative on the output (`connect_metal`)
-        donor_bonds = [
-            (n.GetIdx(), mi) for mi in _metal.metal_indices(mol) for n in mol.GetAtomWithIdx(mi).GetNeighbors()
-        ]
-        if has_geom:  # capture each metal's donors BEFORE the bonds
-            metals_donors = {
-                mi: [n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()] for mi in _metal.metal_indices(mol)
-            }
-        else:  # no geometry to hold the sphere from -> at least keep a modelled terminal M-H window
-            hydrides = [
-                (
-                    mi,
-                    nb.GetIdx(),
-                    _distance.ml_distance(
-                        mol,
-                        mi,
-                        nb.GetIdx(),
-                        mol.GetAtomWithIdx(mi).GetAtomicNum(),
-                        {n.GetIdx() for n in mol.GetAtomWithIdx(mi).GetNeighbors()},
-                        {},
-                        hyb={},
-                    ),
-                )  # keep a terminal hydride bonded so an M-H NCI donor mode survives the surrogate strip
-                for mi in _metal.metal_indices(mol)
-                for nb in mol.GetAtomWithIdx(mi).GetNeighbors()
-                if nb.GetAtomicNum() == 1 and nb.GetDegree() == 1
-            ]
-        mol, metals = _metal.surrogate_all_metals(mol)  # surrogate every metal (bimetallic-safe)
-        iso = _isomer.from_surrogate(mol, metals, donor_bonds)  # no polyhedron here: hold_shape below holds the sphere
-        logger.debug("metal complex: %d metal(s) swapped to carbon surrogate for the FF", len(metals))
-
-    cons, ref = resolve_core(mol, fix=fix, constrain=constrain, has_geometry=has_geom)
-    user_graft = dict(ref)  # atoms to Kabsch-graft onto their exact coords (own / explicit / template)
-    metal_cons = Constraints()
-    # a spectator metal's sphere is held intact-but-achiral: a relative all-pairs shape, deliberately not in
-    # cons.frozen, because a graft would pin its handedness, which the stereo filter owns
-    for mi, dons in metals_donors.items():
-        _metal.hold_shape(mol, [mi, *dons], metal_cons)
-    if metals_donors and iso is not None:
-        # A frozen metal has no DOF, but its bond-less carbon still fires fictitious FF terms, so it gets the
-        # zero-vdW type and its floors but no pulls -- pulling a rigid shape's members tears the body. `hold_shape`
-        # must run first: ff_terms reads the `cons.shapes` record it writes.
-        real_z = {iso.metal: iso.real_z, **{mi: rz for mi, rz, _rq in iso.spectator_metals}}
-        _distance.ff_terms(mol, metal_cons, {mi: (real_z[mi], list(dons)) for mi, dons in metals_donors.items()})
-    for mi, h, target in hydrides:
-        half = _cbuild._ML_SEED_HALF_WIDTH
-        add_distance(metal_cons.distances, mi, h, target - half, target + half)
-    cons = compose(metal_cons, cons)  # user constraints stack on, and fixed windows win by contract
+    has_metal = _metal.metal_index(mol) is not None
+    if has_metal and not (fix or constrain or contacts or template):
+        raise ValueError("plain RDKit embedding does not model metals; pass metal=<geometry>")
+    mol, cons, iso, user_graft = prepare(mol, fix=fix, constrain=constrain)
     _add_soft(
         cons, *_nci_windows(contacts)
     )  # NCI grips are soft and released by mc(explore=); fixed/shape/M-H holds are structural
 
-    # the core seam: free fragments tethered, donor hand held, embed, exact core grafted back. `iso` here has
-    # no polyhedron (the sphere is held by `hold_shape` above) and no donor list, so the hand-hold is a no-op:
-    # passed anyway, so it starts working the day this path learns its donors, rather than silently not.
     mol, ids = seed_conformers(mol, cons, iso, n, seed=seed, threads=threads, knowledge=knowledge, graft_ref=user_graft)
     n_frag = len(Chem.GetMolFrags(mol))
     logger.info(

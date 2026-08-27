@@ -13,10 +13,12 @@ from rdkit.Geometry import Point3D
 
 import rxembed as rx
 from rxembed.metal_constraints import _CHELATE_BITE, _chelate_bite_window
-from rxembed.metal_core import classify_geometry
+from rxembed.metal_core import HapticSite, MetalState, classify_geometry
 from rxembed.metal_enumeration import enumerate_isomers
+from rxembed.metal_isomer import Isomer
 from rxembed.metal_polyhedron import POLYHEDRA, _vertex_angle
 from rxembed.pipeline import geom_check as geom
+from rxembed.pipeline.ensemble import Ensemble
 
 _WINDOW = 9.0  # deg: the coordination angle window is ±8°; 9 is that plus slack
 _NI_N_CY = (  # the same N-bound isomer on a Cy2P-arene backbone
@@ -29,6 +31,26 @@ def _realised(ens, iso, cid, i, j):
     """The vertex i-metal-vertex j angle realised in conformer `cid`."""
     pos = ens.mol.GetConformer(cid).GetPositions()
     return _vertex_angle(pos[iso.vertices[i]] - pos[iso.metal], pos[iso.vertices[j]] - pos[iso.metal])
+
+
+def _two_centre_ensemble(primary, secondary):
+    """Build two ideal, separated coordination spheres on one conformer."""
+    rw = Chem.RWMol()
+    states = []
+    for geometry in (primary, secondary):
+        metal = rw.AddAtom(Chem.Atom(6))
+        donors = tuple(rw.AddAtom(Chem.Atom(7)) for _ in POLYHEDRA[geometry].vertex_dirs)
+        states.append(MetalState(metal, 46, 2, geometry, donors))
+    mol = rw.GetMol()
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for origin, state in zip((np.zeros(3), np.array([8.0, 0.0, 0.0])), states, strict=True):
+        conf.SetAtomPosition(state.atom, Point3D(*origin))
+        for donor, direction in zip(state.vertices, POLYHEDRA[state.geometry].vertex_dirs, strict=True):
+            unit = np.asarray(direction, dtype=float)
+            conf.SetAtomPosition(donor, Point3D(*(origin + 2.0 * unit / np.linalg.norm(unit))))
+    mol.AddConformer(conf)
+    iso = Isomer._from_state(mol, states)
+    return Ensemble(mol, [0], iso=iso), iso
 
 
 # --- the polyhedron angles are realised, not merely stated -----------------------------------------------
@@ -88,6 +110,42 @@ def test_flattened_pyramid_is_reported(caplog):
     assert ens.n >= 1, "the flattened conformers must be KEPT, not dropped"
     assert any("relaxed flat" in r.message for r in caplog.records), caplog.text
     assert any("trigonal_pyramidal" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_secondary_planar_centre_is_checked():
+    ens, iso = _two_centre_ensemble("tetrahedral", "square_planar")
+    secondary = iso.centres[1]
+    conf = ens._mol.GetConformer()
+    pos = conf.GetPositions()
+    donor = secondary.vertices[0]
+    conf.SetAtomPosition(donor, Point3D(*(pos[donor] + np.array([0.0, 0.0, 2.0]))))
+    assert ens._puckered_centres(0, iso) == (secondary,)
+    assert not ens._coordination_ok(0, iso), "the puckered secondary square plane passed the final gate"
+
+
+def test_secondary_nonplanar_centre_flattening_is_reported(caplog):
+    ens, iso = _two_centre_ensemble("square_planar", "trigonal_pyramidal")
+    secondary = iso.centres[1]
+    conf = ens._mol.GetConformer()
+    pos = conf.GetPositions()
+    conf.SetAtomPosition(secondary.atom, Point3D(*np.mean(pos[list(secondary.vertices)], axis=0)))
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        ens._warn_shape_flattened(iso)
+    assert any(
+        "trigonal_pyramidal" in record.message and f"atom {secondary.atom}" in record.message
+        for record in caplog.records
+    ), caplog.text
+
+
+def test_one_haptic_site_is_not_diagnosed_as_flat(caplog):
+    ens, iso = _two_centre_ensemble("tetrahedral", "tetrahedral")
+    secondary = iso.centres[1]
+    face = HapticSite(tuple(secondary.vertices))
+    sparse = secondary._replace(vertices=(face, None, None, None))
+    iso = Isomer._from_state(iso.mol, (iso.centres[0], sparse))
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        ens._warn_shape_flattened(iso)
+    assert not [record for record in caplog.records if f"atom {secondary.atom}" in record.message], caplog.text
 
 
 def test_rigid_meridional_kappa3_is_not_pyramidalised(caplog):
