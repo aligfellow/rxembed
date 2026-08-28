@@ -216,6 +216,7 @@ complex with an η3 or higher face instead defaults to tetrahedral for a piano-s
 
 | CN | geometries (default first) |
 |---|---|
+| 1 | `monocoordinate` (`MCO`) |
 | 2 | `linear` (`LIN`) |
 | 3 | `trigonal_planar` (`TPL`) · `t_shape` (`TSH`) · `trigonal_pyramidal` (`TPY`) |
 | 4 | `square_planar` (`SPL`) · `tetrahedral` (`TET`) · `seesaw` (`SEE`) |

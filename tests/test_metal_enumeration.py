@@ -101,6 +101,16 @@ def tetrahedral_four_distinct():
 # --- enumeration: the textbook isomers ------------------------------------------------------------------
 
 
+def test_single_donor_defaults_to_monocoordinate_without_a_vacancy():
+    isomers = rx.metal("N->[Pd+2]")
+
+    assert len(isomers) == 1
+    assert isomers[0].geometry == "monocoordinate"
+    assert isomers[0].vertices == [isomers[0].donors[0]]
+    assert "MCO" in str(isomers[0])
+    assert rx.metal(rx.cxsmiles(isomers[0]))[0].geometry == "monocoordinate"
+
+
 @pytest.mark.parametrize(
     ("smiles", "geometry", "labels"),
     [

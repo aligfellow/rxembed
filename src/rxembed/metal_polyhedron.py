@@ -140,6 +140,17 @@ _OCT_ISOMERS = (
 POLYHEDRA: dict[str, Polyhedron] = {
     p.name: p
     for p in [
+        # One donor defines a distance but no relative angle. Keep it distinct from CN2 linear so inference
+        # does not invent an open coordination site; requesting `linear` still states that pocket explicitly.
+        Polyhedron(
+            name="monocoordinate",
+            code="MCO",
+            default_rank=0,
+            vertex_dirs=((0, 0, 1),),
+            angles=(),
+            planar=True,
+            geometric_isomerism=False,
+        ),
         Polyhedron(
             name="linear",
             code="LIN",
