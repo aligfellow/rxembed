@@ -80,7 +80,10 @@ def _rcov(z: int) -> float:
 
 def _angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     u, w = a - b, c - b
-    cos = np.dot(u, w) / (np.linalg.norm(u) * np.linalg.norm(w))
+    scale = np.linalg.norm(u) * np.linalg.norm(w)
+    if scale == 0.0:
+        return float("nan")
+    cos = np.dot(u, w) / scale
     return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
 
 
