@@ -2,14 +2,14 @@
 check: lint type test
 
 lint:
-    uv run ruff format .
-    uv run ruff check --fix .
+    uv run ruff format src tests
+    uv run ruff check --fix src tests
 
 type:
-    uv run ty check
+    uv run ty check src tests
 
 test:
-    uv run python -m pytest --cov --cov-report=xml -v
+    uv run python -m pytest -v
 
 build:
     uv build

@@ -14,7 +14,7 @@ venv/
 ENV/
 env/
 
-plan.md
+*plan*md
 *PLAN*md
 *WORKLOG*md
 
@@ -53,5 +53,4 @@ coverage.xml
 
 # Ignore temporary local notebooks/output
 output/
-
 benchmark/
