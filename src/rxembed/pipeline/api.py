@@ -13,11 +13,9 @@ from rxembed.metal_isomer import Isomer
 from rxembed.relax import ff_energies
 
 from .dispatch import (
-    _default_stereo,
     _embed_dispatch,
     _normalize,
     _template_to_fix,
-    _validate_stereo,
 )
 
 # The workflow name accepts strings and paths; the engine name accepts a Mol.
@@ -71,8 +69,6 @@ def embed(
     for chirality the embed cannot keep. ``contacts=`` reaches `nci_modes`; ``metal=`` / ``coordinate=`` reach
     `rx.metal`.
     """
-    stereo = _default_stereo(source, stereo)
-    _validate_stereo(stereo)
     if not isinstance(trajectory, bool):
         raise TypeError("trajectory must be True or False")
     if trajectory and n != 1:

@@ -519,6 +519,7 @@ def _embed_dispatch(
 ):
     """Expand every candidate axis, execute each candidate once, and assemble the public result."""
     stereo = _default_stereo(source, stereo)
+    _validate_stereo(stereo)
     if not isinstance(source, _isomer.Isomer):
         source = _normalize(source, charge)[0]
     own_mol = source.mol if isinstance(source, _isomer.Isomer) else source
