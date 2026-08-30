@@ -17,7 +17,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-search = ["openconf @ git+https://github.com/rowansci/openconf@1fa1441096dc2d4ff662894750644b62c82a20ba"]
+search = ["openconf>=0.0.16"]
 workflow = ["xyzgraph>=1.6.14", "prism_pruner", "scikit-learn", "matplotlib"]
 
 [project.urls]

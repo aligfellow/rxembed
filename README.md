@@ -312,7 +312,7 @@ just check     # lint + type + test
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Vendored components retain their upstream notices in [LICENSES.md](LICENSES.md).
 
 ## References
 

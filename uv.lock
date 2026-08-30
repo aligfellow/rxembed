@@ -802,12 +802,15 @@ wheels = [
 
 [[package]]
 name = "openconf"
-version = "0.0.16"
-source = { git = "https://github.com/rowansci/openconf?rev=1fa1441096dc2d4ff662894750644b62c82a20ba#1fa1441096dc2d4ff662894750644b62c82a20ba" }
+version = "0.0.18"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
-    { name = "prism-pruner" },
     { name = "rdkit" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/41/ab/5ddb9351a992adf8cd9d16cd94a70e6477053561ae8fc76b192291dab3ed/openconf-0.0.18.tar.gz", hash = "sha256:493832a7150e60f8bbbb9228ce5e9ad218e7ec31fdb6969e51c2db04fe3e795e", size = 156893, upload-time = "2026-07-31T14:57:48.359Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/30/7d/15dae58c60ba9d6a40bebabcd7ad4ee0654e1ab4b9c556bb0b7d41ba4cc4/openconf-0.0.18-py3-none-any.whl", hash = "sha256:0506aa5e81861f15f95a436fa11009c5837beb1e6fa77a5d573258a0280e235a", size = 92598, upload-time = "2026-07-31T14:57:47.414Z" },
 ]
 
 [[package]]
@@ -1354,7 +1357,7 @@ requires-dist = [
     { name = "matplotlib", marker = "extra == 'workflow'" },
     { name = "networkx" },
     { name = "numpy" },
-    { name = "openconf", marker = "extra == 'search'", git = "https://github.com/rowansci/openconf?rev=1fa1441096dc2d4ff662894750644b62c82a20ba" },
+    { name = "openconf", marker = "extra == 'search'", specifier = ">=0.0.16" },
     { name = "prism-pruner", marker = "extra == 'workflow'" },
     { name = "rdkit" },
     { name = "scikit-learn", marker = "extra == 'workflow'" },
