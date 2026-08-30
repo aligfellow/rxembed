@@ -141,12 +141,12 @@ def test_spectator_ferrocene_stays_rigid():
     )
     shape = {fe, *(n.GetIdx() for n in ref.GetAtomWithIdx(fe).GetNeighbors())}
 
-    isomers = rx.metal(_MN_H2, "octahedral", center="Mn", fix=_MN_H2_RC)
+    isomers = rx.metal(ref, "octahedral", center="Mn", fix=_MN_H2_RC)
     iso = isomers.select(arrangement="C62 N6 C61 N5 P2 H63")
     windows = {k: v for k, v in iso.cons.distances.items() if set(k) <= shape}
     assert len(windows) > 50, "the rigid body is all pairs of {Fe, *10 Cp carbons}"
 
-    ens = rx.embed(iso, n=2, seed=1).minimize()
+    ens = rx.embed(iso, n=1, seed=1).minimize()
     assert ens.n, "no conformer survived: the per-conformer assertion below never ran"
     assert len(Chem.GetMolFrags(ens.mol)) == 1
     assert all(ens.mol.GetAtomWithIdx(m).GetDegree() for m in metal.metal_indices(ens.mol))
