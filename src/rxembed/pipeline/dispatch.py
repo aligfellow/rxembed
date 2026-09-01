@@ -318,7 +318,7 @@ def _stereo_variants(source, stereo, cap=_STEREO_CAP):
             len(variants),
             labels,
         )
-    if unresolved:  # an allene/cumulene/atropisomer axis: EnumerateStereoisomers can't encode it from a flat SMILES
+    if unresolved:  # an allene/cumulene axis which RDKit cannot encode from a flat SMILES
         logger.warning(
             "stereo=%r: %d stereo axis(es) not enumerable from a flat SMILES; one arbitrary hand each",
             stereo,

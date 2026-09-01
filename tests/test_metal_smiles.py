@@ -9,6 +9,7 @@ from importlib.util import find_spec
 import numpy as np
 import pytest
 from rdkit import Chem
+from rdkit.Chem import rdDistGeom
 
 import rxembed as rx
 from rxembed import metal_constraints as C  # noqa: N812
@@ -31,6 +32,13 @@ _MA3B3_SEATS = {"fac": [1, 4, 2, 5, 3, 6], "mer": [1, 2, 3, 4, 5, 6]}  # octahed
 _CIS3 = [1, 3, 2, 5, 4, 6]  # cis,cis,cis-MA2B2C2: every same-element pair at 90 degrees, so the centre is chiral
 _ETA2_ASYM_E = r"C/[CH]1=[CH](/F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1"
 _TWO_ETA2 = r"C/[CH]1=[CH](/F)->[Pt+2]2(<-[CH](Cl)=[CH](Br)->2)(<-[NH3])(<-[Cl-])<-1"
+_ATROP_RU_COVALENT_CX = (
+    "[Cl-][Ru+2]12([Cl-])([NH2][C@H](c3ccccc3)[C@H]([NH2]1)c1ccccc1)"
+    "[P](c1ccccc1)(c1ccccc1)c1ccc3ccccc3c1-c1c([P]2(c2ccccc2)c2ccccc2)ccc2ccccc12 |wU:41.47|"
+)
+_BINAP_PD = (
+    "[Pd+2]%90(<-[Cl-])(<-[Cl-])(<-P(c1ccccc1)(c2ccccc2)c3ccc4ccccc4c3-c3c(P(c4ccccc4)(c5ccccc5)->%90)ccc4ccccc34)"
+)
 
 
 def _isomer(smi, geometry, seating):
@@ -126,6 +134,49 @@ def test_bad_smiles_raises():
     assert S.parse_smiles("CCO").GetNumAtoms() == 3
     with pytest.raises(ValueError, match="could not parse SMILES"):
         S.parse_smiles("C1CC")
+
+
+def test_native_atrop_cx_survives_covalent_input_and_metal_enumeration():
+    isomers = rx.metal(_ATROP_RU_COVALENT_CX, "OCT")
+
+    assert len(isomers) == 3
+    assert all(iso.stereo_label.endswith(":M") for iso in isomers)
+    for iso in isomers:
+        text = rx.cxsmiles(iso)
+        back = rx.metal(text)
+        assert [item.stereo_label for item in back] == [iso.stereo_label]
+        assert rx.cxsmiles(back[0]) == text
+    with pytest.raises(ValueError, match="plain dative SMILES cannot retain atropisomer stereo"):
+        S.dative_smiles(S.parse_smiles(_ATROP_RU_COVALENT_CX))
+
+
+def test_cxsmiles_measures_a_marked_atrop_axis_from_3d():
+    atrop = Chem.MolFromSmiles("CC1=CC=CC(I)=C1N1C(C)=CC=C1Br |wU:7.7|")
+    metal = Chem.MolFromSmiles("[NH3]->[Pt+2](<-[NH3])(<-[Cl-])<-[Cl-]")
+    mol = Chem.AddHs(Chem.CombineMols(metal, atrop))
+    assert rdDistGeom.EmbedMolecule(mol, randomSeed=7) == 0
+
+    before = next(iter(stereo.axis_stereo(rx.metal(rx.cxsmiles(mol))[0].stereo_label).values()))
+    positions = mol.GetConformer().GetPositions()
+    positions[:, 0] *= -1
+    mol.GetConformer().SetPositions(positions)
+    after = next(iter(stereo.axis_stereo(rx.metal(rx.cxsmiles(mol))[0].stereo_label).values()))
+
+    assert after == {"M": "P", "P": "M"}[before]
+
+
+def test_cxsmiles_perceives_unmarked_bound_binap_axis_from_3d():
+    iso = rx.metal(_BINAP_PD, "SPL")[0]
+    assert not stereo.axis_stereo(iso.stereo_label)
+
+    geometry = rx.embed(iso, n=1, seed=7).minimize().mol
+    text = rx.cxsmiles(geometry)
+    back = rx.metal(text)
+    perceived = rx.metal(geometry, "SPL")
+
+    assert len(stereo.axis_stereo(back[0].stereo_label)) == 1
+    assert len(stereo.axis_stereo(perceived[0].stereo_label)) == 1
+    assert len(rx.embed(perceived[0], n=1, seed=7)) == 1
 
 
 def test_write_dative_returns_written_atom_order():

@@ -169,6 +169,9 @@ n_hands = rx.metal(path, stereo={"N5": "racemic"})
 all_hands = rx.metal(path, stereo="racemic")
 ```
 
+Native atropisomer CXSMILES (`wU`/`wD`, reported as `M`/`P`) round-trips and enumerates with metal
+arrangements. Alkene `E`/`Z` remains independent of an η² face.
+
 `.summary(details=True)` adds trans pairs or axial/equatorial sites and distinguishes graph-non-equivalent
 same-element donors. `center="Mn"` enumerates only Mn and retains the other spheres.
 

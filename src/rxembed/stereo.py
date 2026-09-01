@@ -1,13 +1,8 @@
-"""Ligand-stereo load-in: expand a `Mol`'s UNDEFINED stereocentres into the distinct species to embed.
-
-The embed-side half of stereochemistry: graph-only (RDKit's `EnumerateStereoisomers` over the
-unspecified elements), metal-safe (the centre's handedness is the coordination-isomer path's job). The
-conformer-side half, the coordinate-derived chirality fingerprint that filters embedded conformers,
-is perception-driven and stays with the consumer (`rxembed.stereo`).
-"""
+"""Expand undefined ligand stereo, including native atrop tags RDKit does not enumerate."""
 
 from __future__ import annotations
 
+import itertools
 import re
 
 from rdkit import Chem
@@ -28,6 +23,8 @@ from .utils import (
 )
 
 _MIN_POINT_BRANCHES = 3
+_ATROP_STEREO = (Chem.BondStereo.STEREOATROPCW, Chem.BondStereo.STEREOATROPCCW)
+_ATROP_WEDGE = (Chem.BondDir.BEGINWEDGE, Chem.BondDir.BEGINDASH)
 
 
 def point_stereo(label):
@@ -40,8 +37,18 @@ def point_stereo(label):
     }
 
 
-def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
-    """Build an atom-qualified configuration tag, e.g. ``'C1:S'`` or ``'C1:R,C3:S,C5=C6:E'``.
+def axis_stereo(label):
+    """Return native M/P atropisomer descriptors keyed by their axis atom pair."""
+    return {
+        tuple(sorted((int(match.group(1)), int(match.group(2))))): match.group(3)
+        for part in label.split(",")
+        if label
+        if (match := re.fullmatch(r"[A-Z][a-z]?(\d+)-[A-Z][a-z]?(\d+):(M|P)", part))
+    }
+
+
+def _stereo_label(mol, atom_centers, bond_centers, atrop_centers=(), cap_to_metal=None):
+    """Build an atom-qualified configuration tag, e.g. ``'C1:R,C3=C4:E,C5-C6:M'``.
 
     CIP R/S where RDKit assigns it (falls back to the raw CW/CCW tag for a centre it won't CIP-rank, e.g. some
     P), plus E/Z for each enumerated double bond. Keyed only on the *enumerated* atoms/bonds so distinct
@@ -72,7 +79,8 @@ def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
     stated_bonds = {
         b.GetIdx(): (b.GetStereo(), tuple(b.GetStereoAtoms()))
         for b in mol.GetBonds()
-        if b.GetStereo() != Chem.BondStereo.STEREONONE
+        if b.GetBondType() == Chem.BondType.DOUBLE
+        and b.GetStereo() != Chem.BondStereo.STEREONONE
         and len(b.GetStereoAtoms()) == _STEREO_REFS
         and len(set(b.GetStereoAtoms())) == _STEREO_REFS
     }
@@ -101,7 +109,32 @@ def _stereo_label(mol, atom_centers, bond_centers, cap_to_metal=None):
         if tag:
             begin, end = b.GetBeginAtom(), b.GetEndAtom()
             parts.append(f"{begin.GetSymbol()}{begin.GetIdx()}={end.GetSymbol()}{end.GetIdx()}:{tag}")
+    for i, j in atrop_centers:
+        bond = mol.GetBondBetweenAtoms(i, j)
+        if bond is None or bond.GetStereo() not in _ATROP_STEREO:
+            continue
+        Chem.AssignCIPLabels(mol, bondsToLabel=[bond.GetIdx()])
+        code = bond.GetPropsAsDict().get("_CIPCode")
+        if code not in {"M", "P"}:
+            raise ValueError(f"RDKit could not assign M/P to atropisomer bond {i}-{j}")
+        first, second = sorted((i, j))
+        left, right = mol.GetAtomWithIdx(first), mol.GetAtomWithIdx(second)
+        parts.append(f"{left.GetSymbol()}{first}-{right.GetSymbol()}{second}:{code}")
     return ",".join(parts)
+
+
+def _label_item(part):
+    """Parse one indexed ligand-stereo label into its selector fields."""
+    if match := re.fullmatch(r"([A-Z][a-z]?)(\d+):(R|S|CW|CCW)", part):
+        symbol, index, code = match.groups()
+        return "point", (symbol,), code, part, f"{index}{code}"
+    if match := re.fullmatch(r"([A-Z][a-z]?)(\d+)=([A-Z][a-z]?)(\d+):(E|Z)", part):
+        left, i, right, j, code = match.groups()
+        return "bond", tuple(sorted((left, right))), code, part, f"{i}={j}:{code}"
+    if match := re.fullmatch(r"([A-Z][a-z]?)(\d+)-([A-Z][a-z]?)(\d+):(M|P)", part):
+        left, i, right, j, code = match.groups()
+        return "axis", tuple(sorted((left, right))), code, part, f"{i}-{j}:{code}"
+    return None
 
 
 def matches_stereo(label, selector):
@@ -110,16 +143,7 @@ def matches_stereo(label, selector):
         return True
     if "," in selector:
         return all(matches_stereo(label, part.strip()) for part in selector.split(","))
-    items = []
-    for part in label.split(",") if label else ():
-        point = re.fullmatch(r"([A-Z][a-z]?)(\d+):(R|S|CW|CCW)", part)
-        bond = re.fullmatch(r"([A-Z][a-z]?)(\d+)=([A-Z][a-z]?)(\d+):(E|Z)", part)
-        if point:
-            symbol, index, code = point.groups()
-            items.append(("point", (symbol,), code, part, f"{index}{code}"))
-        elif bond:
-            left, i, right, j, code = bond.groups()
-            items.append(("bond", tuple(sorted((left, right))), code, part, f"{i}={j}:{code}"))
+    items = [item for part in label.split(",") if (item := _label_item(part)) is not None] if label else []
     if selector in {item[3] for item in items} | {item[4] for item in items}:
         return True
     if selector == ",".join(item[4] for item in items):
@@ -130,10 +154,14 @@ def matches_stereo(label, selector):
         kind, wanted = "point", selector
     elif selector in {"E", "Z"}:
         kind, wanted = "bond", selector
+    elif selector in {"M", "P"}:
+        kind, wanted = "axis", selector
     elif match := re.fullmatch(r"([A-Z][a-z]?):(R|S|CW|CCW)", selector):
         kind, symbols, wanted = "point", (match.group(1),), match.group(2)
     elif match := re.fullmatch(r"([A-Z][a-z]?)=([A-Z][a-z]?):(E|Z)", selector):
         kind, symbols, wanted = "bond", tuple(sorted(match.group(1, 2))), match.group(3)
+    elif match := re.fullmatch(r"([A-Z][a-z]?)-([A-Z][a-z]?):(M|P)", selector):
+        kind, symbols, wanted = "axis", tuple(sorted(match.group(1, 2))), match.group(3)
     if kind is None:
         return False
     candidates = [item for item in items if item[0] == kind and (symbols is None or item[1] == symbols)]
@@ -142,6 +170,88 @@ def matches_stereo(label, selector):
             f"stereo={selector!r} is ambiguous for {label!r}; use one of {[item[3] for item in candidates]}"
         )
     return len(candidates) == 1 and candidates[0][2] == wanted
+
+
+def _clear_atrop(mol):
+    """Clear native atropisomer tags and their signaling wedges; return the axis atom pairs."""
+    axes = set()
+    for bond in mol.GetBonds():
+        if bond.GetStereo() not in _ATROP_STEREO:
+            continue
+        axes.add(tuple(sorted((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))))
+        bond.SetStereo(Chem.BondStereo.STEREONONE)
+        if bond.HasProp("_CIPCode"):
+            bond.ClearProp("_CIPCode")
+        for atom in (bond.GetBeginAtom(), bond.GetEndAtom()):
+            for adjacent in atom.GetBonds():
+                if adjacent.GetIdx() != bond.GetIdx() and adjacent.GetBondDir() in _ATROP_WEDGE:
+                    adjacent.SetBondDir(Chem.BondDir.NONE)
+    return axes
+
+
+def _assign_atrop_from_3d(mol, atrop_centers):
+    """Assign selected native atrop bonds from 3D coordinates through RDKit's MolBlock parser."""
+    if not atrop_centers:
+        return
+    probe = Chem.Mol(mol)
+    for pair in atrop_centers:
+        probe.GetBondBetweenAtoms(*pair).SetStereo(Chem.BondStereo.STEREOATROPCW)
+    block = Chem.MolToMolBlock(probe, confId=probe.GetConformer().GetId(), includeStereo=True)
+    perceived = Chem.MolFromMolBlock(block, sanitize=False, removeHs=False)
+    if perceived is None or not perceived.GetConformer().Is3D():
+        raise ValueError("RDKit could not perceive atropisomer stereo from the 3D MolBlock")
+    for pair in atrop_centers:
+        tag = perceived.GetBondBetweenAtoms(*pair).GetStereo()
+        if tag not in _ATROP_STEREO:
+            raise ValueError(f"RDKit could not perceive atropisomer axis {pair} from 3D coordinates")
+        bond = mol.GetBondBetweenAtoms(*pair)
+        bond.SetStereo(tag)
+        if bond.HasProp("_CIPCode"):
+            bond.ClearProp("_CIPCode")
+
+
+def _metal_closed_rings(mol, metals):
+    """Return atom and bond sets for rings visible after treating dative bonds as single."""
+    up = Chem.RWMol(mol)
+    for bond in up.GetBonds():
+        if bond.GetBondType() == Chem.BondType.DATIVE:
+            bond.SetBondType(Chem.BondType.SINGLE)
+    up = up.GetMol()
+    Chem.FastFindRings(up)
+    return [
+        (set(atoms), set(bonds))
+        for atoms, bonds in zip(up.GetRingInfo().AtomRings(), up.GetRingInfo().BondRings(), strict=True)
+        if set(metals) & set(atoms)
+    ]
+
+
+def _coordination_atrop_bonds(mol, metals, work):
+    """Return native-eligible, ortho-blocked axes inside a metal-closed chelate."""
+    ring_bonds = set().union(*(bonds for _atoms, bonds in _metal_closed_rings(mol, metals))) if metals else set()
+    axes = []
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if (
+            bond.GetBondType() != Chem.BondType.SINGLE
+            or not all(atom.GetIsAromatic() for atom in (bond.GetBeginAtom(), bond.GetEndAtom()))
+            or bond.GetIdx() not in ring_bonds
+            or bond.IsInRing()
+        ):
+            continue
+        if any(
+            neighbor.GetTotalNumHs(includeNeighbors=True)
+            for end in (i, j)
+            for neighbor in mol.GetAtomWithIdx(end).GetNeighbors()
+            if neighbor.GetIdx() not in (i, j)
+        ):
+            continue  # RDKit validates an axis but does not decide whether its ortho groups block rotation
+        probe = Chem.Mol(work)
+        candidate = probe.GetBondBetweenAtoms(i, j)
+        candidate.SetStereo(Chem.BondStereo.STEREOATROPCW)
+        Chem.CleanupAtropisomers(probe)
+        if candidate.GetStereo() == Chem.BondStereo.STEREOATROPCW:
+            axes.append(tuple(sorted((i, j))))
+    return axes
 
 
 def _coordination_locked_double_bonds(mol, metals):
@@ -168,13 +278,7 @@ def _coordination_locked_double_bonds(mol, metals):
         for bond in mol.GetBonds()
         if bond.GetBeginAtomIdx() in site and bond.GetEndAtomIdx() in site
     }
-    up = Chem.RWMol(mol)  # dative -> single so RDKit sees the metal ring; FastFindRings avoids a valence sanitize
-    for b in up.GetBonds():
-        if b.GetBondType() == Chem.BondType.DATIVE:
-            b.SetBondType(Chem.BondType.SINGLE)
-    up = up.GetMol()
-    Chem.FastFindRings(up)
-    metal_rings = [set(r) for r in up.GetRingInfo().AtomRings() if metals & set(r)]
+    metal_rings = _metal_closed_rings(mol, metals)
     free = Chem.RWMol(mol)  # the metal-free graph: which double bonds are still cyclic without the metal?
     for m in sorted(metals, reverse=True):
         for nb in [n.GetIdx() for n in free.GetAtomWithIdx(m).GetNeighbors()]:
@@ -188,7 +292,7 @@ def _coordination_locked_double_bonds(mol, metals):
         a, c = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
         if frozenset((a, c)) in haptic:
             continue  # an eta2 C=C keeps its ligand E/Z; coordination chooses a face, not a bond geometry
-        in_metal_ring = any({a, c} <= r for r in metal_rings)
+        in_metal_ring = any({a, c} <= atoms for atoms, _bonds in metal_rings)
         fb = free.GetBondBetweenAtoms(a, c)
         if in_metal_ring and not (fb is not None and fb.IsInRing()):  # cyclic only because of the metal
             locked.add(frozenset((a, c)))
@@ -276,11 +380,21 @@ def _build_enumeration_graph(mol, exclude):
     return work, cap_to_metal
 
 
-def _unassigned_elements(mol, exclude=(), include=(), skip_points=(), skip_bonds=False):
-    """Return ``(work, cap_to_metal, locked, elements)``: the enumeration graph and its unspecified elements."""
+def _unassigned_elements(
+    mol,
+    exclude=(),
+    include=(),
+    skip_points=(),
+    skip_bonds=False,
+    skip_atrop=False,
+    include_atrop=(),
+):
+    """Return the enumeration graph, ordinary elements, and native atropisomer axes."""
     exclude = set(exclude)
     work, cap_to_metal = _build_enumeration_graph(mol, exclude)
+    forced_atrop = {tuple(sorted(pair)) for pair in include_atrop}
     if include == "all":
+        forced_atrop.update(_clear_atrop(work))
         Chem.RemoveStereochemistry(work)
     else:
         for atom in include:
@@ -301,7 +415,13 @@ def _unassigned_elements(mol, exclude=(), include=(), skip_points=(), skip_bonds
             return not skip_bonds and frozenset((wb.GetBeginAtomIdx(), wb.GetEndAtomIdx())) not in locked
         return False
 
-    return work, cap_to_metal, locked, [e for e in Chem.FindPotentialStereo(work) if enumerable(e)]
+    atrop = set() if skip_atrop else forced_atrop
+    atrop = sorted(
+        pair
+        for pair in atrop
+        if (bond := work.GetBondBetweenAtoms(*pair)) is not None and bond.GetStereo() == Chem.BondStereo.STEREONONE
+    )
+    return work, cap_to_metal, locked, [e for e in Chem.FindPotentialStereo(work) if enumerable(e)], atrop
 
 
 def point_centres(mol, exclude=()):
@@ -320,7 +440,7 @@ def unassigned_centres(mol, exclude=()):
     The cheap predicate behind `enumerate_unassigned`: what WOULD be expanded, without expanding it. A caller
     that embeds one species (`Isomer`) uses it to refuse to pool two enantiomers silently.
     """
-    work, _caps, _locked, elements = _unassigned_elements(mol, exclude)
+    work, _caps, _locked, elements, atrop = _unassigned_elements(mol, exclude)
     out = []
     for e in elements:  # `work` only APPENDS D-caps, so every index here is a real atom of `mol`
         if e.type == Chem.StereoType.Atom_Tetrahedral:
@@ -328,70 +448,111 @@ def unassigned_centres(mol, exclude=()):
         else:
             b = work.GetBondWithIdx(e.centeredOn)
             out.append((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))
-    return out
+    return [*out, *atrop]
+
+
+def _stereo_centres(mol, n_real):
+    """Return defined point, E/Z, and native atrop centres."""
+    points = [
+        atom.GetIdx()
+        for atom in mol.GetAtoms()
+        if atom.GetIdx() < n_real
+        and atom.GetChiralTag() in {Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW}
+    ]
+    doubles = [
+        bond.GetIdx()
+        for bond in mol.GetBonds()
+        if bond.GetBondType() == Chem.BondType.DOUBLE and bond.GetStereo() != Chem.BondStereo.STEREONONE
+    ]
+    axes = [
+        tuple(sorted((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())))
+        for bond in mol.GetBonds()
+        if bond.GetStereo() in _ATROP_STEREO
+    ]
+    return points, doubles, axes
 
 
 def defined_stereo_label(mol, exclude=()):
     """Label the ligand stereo already defined on a coordinated molecule."""
     work, cap_to_metal = _build_enumeration_graph(mol, set(exclude))
-    atom_centers = [
-        atom.GetIdx()
-        for atom in work.GetAtoms()
-        if atom.GetIdx() < mol.GetNumAtoms()
-        and atom.GetChiralTag() in {Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW}
-    ]
-    bond_centers = [
-        bond.GetIdx()
-        for bond in work.GetBonds()
-        if bond.GetStereo()
-        in {
-            Chem.BondStereo.STEREOE,
-            Chem.BondStereo.STEREOZ,
-            Chem.BondStereo.STEREOTRANS,
-            Chem.BondStereo.STEREOCIS,
-        }
-    ]
-    return _stereo_label(work, atom_centers, bond_centers, cap_to_metal)
+    atom_centers, bond_centers, atrop_centers = _stereo_centres(work, mol.GetNumAtoms())
+    return _stereo_label(work, atom_centers, bond_centers, atrop_centers, cap_to_metal)
 
 
 def stereo_from_3d(mol, exclude=()):
     """Label ligand stereo measured from the first conformer."""
     if not mol.GetNumConformers():
         raise ValueError("stereo_from_3d needs a conformer")
-    work, cap_to_metal = _build_enumeration_graph(mol, set(exclude))
+    exclude = set(exclude)
+    work, cap_to_metal = _build_enumeration_graph(mol, exclude)
+    _, _, stated = _stereo_centres(work, mol.GetNumAtoms())
+    atrop_centers = sorted(set(stated) | set(_coordination_atrop_bonds(mol, exclude, work)))
     Chem.AssignStereochemistryFrom3D(work, confId=work.GetConformer().GetId(), replaceExistingTags=True)
-    atom_centers = [
-        atom.GetIdx()
-        for atom in work.GetAtoms()
-        if atom.GetIdx() < mol.GetNumAtoms()
-        and atom.GetChiralTag() in {Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW}
-    ]
-    bond_centers = [bond.GetIdx() for bond in work.GetBonds() if bond.GetStereo() != Chem.BondStereo.STEREONONE]
-    return _stereo_label(work, atom_centers, bond_centers, cap_to_metal)
+    _assign_atrop_from_3d(work, atrop_centers)
+    atom_centers, bond_centers, _ = _stereo_centres(work, mol.GetNumAtoms())
+    return _stereo_label(work, atom_centers, bond_centers, atrop_centers, cap_to_metal)
 
 
-def enumerate_unassigned(mol, cap=32, exclude=(), include=(), skip_points=(), skip_bonds=False):
-    """Enumerate stereoisomers over only the *unspecified* stereo elements (point R/S + double-bond E/Z).
+def _enumerate_atrop(work_isos, atrop_centers, cap):
+    """Expand and native-canonicalize the selected atropisomer bonds."""
+    if not atrop_centers:
+        return work_isos
+    expanded, seen = [], set()
+    for base in work_isos:
+        for tags in itertools.product(_ATROP_STEREO, repeat=len(atrop_centers)):
+            variant = Chem.Mol(base)
+            for pair, tag in zip(atrop_centers, tags, strict=True):
+                variant.GetBondBetweenAtoms(*pair).SetStereo(tag)
+            key = Chem.MolToCXSmiles(variant)
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append(variant)
+            if len(expanded) == cap:
+                return expanded
+    return expanded
+
+
+def enumerate_unassigned(
+    mol,
+    cap=32,
+    exclude=(),
+    include=(),
+    skip_points=(),
+    skip_bonds=False,
+    skip_atrop=False,
+    include_atrop=(),
+):
+    """Enumerate unspecified point, double-bond, and native atropisomer stereo.
 
     Returns ``(variants, n_unassigned, total, unresolved)``: ``variants`` a list of ``(variant_mol, label)``
     with defined centres held (`onlyUnassigned`), meso/duplicates dropped (`unique`), truncated to ``cap`` of
-    ``total``; ``unresolved`` counts elements RDKit could not enumerate -- an allene axis or a biaryl
-    atropisomer, which stay one arbitrary hand for the caller to warn about. Atom order is preserved, so
-    index-based ``fix``/``constrain`` stay valid.
+    ``total``; ``unresolved`` counts elements RDKit could not enumerate, such as an allene axis, which stays
+    one arbitrary hand for the caller to warn about. Atom order is preserved, so index-based
+    ``fix``/``constrain`` stay valid.
 
     A metal complex is safe: the metal is excluded, its handedness being the coordination-isomer path's job
     and RDKit's dative-metal stereo not order-canonical. A ligand stereocentre is still enumerated, including
     a chiral-at-P or carbanion donor that drops to degree 3 after the strip. `exclude` is the metal indices.
     """
     n_real = mol.GetNumAtoms()
-    work, cap_to_metal, locked, unassigned = _unassigned_elements(mol, exclude, include, set(skip_points), skip_bonds)
-    if not unassigned:
+    work, cap_to_metal, locked, unassigned, atrop_centers = _unassigned_elements(
+        mol,
+        exclude,
+        include,
+        set(skip_points),
+        skip_bonds,
+        skip_atrop,
+        include_atrop,
+    )
+    if not unassigned and not atrop_centers:
         return [(mol, "")], 0, 1, 0
     atom_centers = [e.centeredOn for e in unassigned if e.type == Chem.StereoType.Atom_Tetrahedral]
     bond_centers = [e.centeredOn for e in unassigned if e.type == Chem.StereoType.Bond_Double]
     opts = StereoEnumerationOptions(onlyUnassigned=True, unique=True, maxIsomers=cap)
-    total = GetStereoisomerCount(work, opts)
-    work_isos = list(EnumerateStereoisomers(work, opts))
+    total = GetStereoisomerCount(work, opts) * 2 ** len(atrop_centers)
+    work_isos = list(EnumerateStereoisomers(work, opts)) if unassigned else [work]
+    work_isos = _enumerate_atrop(work_isos, atrop_centers, cap)
 
     def graft(wv):  # copy the enumerated ligand stereo (atom parity + E/Z) onto the FULL mol; skip the D caps
         full = Chem.Mol(mol)
@@ -418,12 +579,19 @@ def enumerate_unassigned(mol, cap=32, exclude=(), include=(), skip_points=(), sk
                 if fb is not None:
                     fb.SetStereoAtoms(*b.GetStereoAtoms())
                     fb.SetStereo(b.GetStereo())
+        for pair in atrop_centers:
+            wb = wv.GetBondBetweenAtoms(*pair)
+            fb = full.GetBondBetweenAtoms(*pair)
+            if wb is not None and fb is not None:
+                fb.SetStereo(wb.GetStereo())
         return full
 
-    variants = [(graft(wv), _stereo_label(wv, atom_centers, bond_centers, cap_to_metal)) for wv in work_isos]
+    variants = [
+        (graft(wv), _stereo_label(wv, atom_centers, bond_centers, atrop_centers, cap_to_metal)) for wv in work_isos
+    ]
     probe = work_isos[0] if work_isos else work  # centres still UNSPECIFIED after enumeration = axial (allene)
     Chem.AssignStereochemistry(probe, cleanIt=True, force=True)
     unresolved = sum(
         1 for i in atom_centers if probe.GetAtomWithIdx(i).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
     ) + sum(1 for b in bond_centers if probe.GetBondWithIdx(b).GetStereo() == Chem.BondStereo.STEREONONE)
-    return variants, len(unassigned), total, unresolved
+    return variants, len(unassigned) + len(atrop_centers), total, unresolved
