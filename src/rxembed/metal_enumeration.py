@@ -50,8 +50,10 @@ def _ligand_stereo_request(mol, stereo):
     default_mode = stereo.get("default", source_default) if isinstance(stereo, dict) else stereo
     point_mode = stereo.get("point", default_mode) if isinstance(stereo, dict) else stereo
     ez_mode = stereo.get("ez", default_mode) if isinstance(stereo, dict) else stereo
+    axial_mode = stereo.get("axial", default_mode) if isinstance(stereo, dict) else stereo
     point_mode = "preserve" if point_mode == "all" else point_mode
     ez_mode = "preserve" if ez_mode == "all" else ez_mode
+    axial_mode = "preserve" if axial_mode == "all" else axial_mode
     exact = {}
     if isinstance(stereo, dict):
         for selector, mode in stereo.items():
@@ -78,7 +80,7 @@ def _ligand_stereo_request(mol, stereo):
             skip.add(index)
         else:
             skip.discard(index)
-    return has_geometry, point_mode, ez_mode, exact, clear, skip
+    return has_geometry, point_mode, ez_mode, axial_mode, exact, clear, skip
 
 
 def _clear_ez(mol):
@@ -97,18 +99,22 @@ def _clear_ez(mol):
     return changed
 
 
-def _geometry_stereo_variants(mol, variants, stereo, point_mode, ez_mode, exact):
+def _geometry_stereo_variants(mol, variants, stereo, point_mode, ez_mode, axial_mode, exact):
     """Keep the requested ligand configurations relative to an input geometry."""
     measured = (
         _stereo.stereo_from_3d(mol, exclude=metal_indices(mol))
         if mol.GetNumConformers()
         else _stereo.defined_stereo_label(mol, exclude=metal_indices(mol))
     )
+    measured_axes = _stereo.axis_stereo(measured)
 
     def keep(label):
         for part in label.split(",") if label else ():
             point = re.fullmatch(r"[A-Z][a-z]?(\d+):(R|S|CW|CCW)", part)
-            mode = exact.get(int(point.group(1)), point_mode) if point else ez_mode
+            axis = re.fullmatch(r"[A-Z][a-z]?(\d+)-[A-Z][a-z]?(\d+):(M|P)", part)
+            mode = exact.get(int(point.group(1)), point_mode) if point else axial_mode if axis else ez_mode
+            if axis and tuple(sorted(map(int, axis.group(1, 2)))) not in measured_axes:
+                continue  # an inferred axis has no reference hand to preserve or invert
             same = _stereo.matches_stereo(measured, part)
             if mode == "preserve" and not same:
                 return False
@@ -137,10 +143,14 @@ def _haptic_stereo_mode(stereo, has_geometry):
 
 def _ligand_stereo_variants(mol, stereo):
     """Return ligand variants, their haptic mode, and enumeration counts."""
-    has_geometry, point_mode, ez_mode, exact, clear, skip = _ligand_stereo_request(mol, stereo)
+    has_geometry, point_mode, ez_mode, axial_mode, exact, clear, skip = _ligand_stereo_request(mol, stereo)
     source = mol
     mol = Chem.Mol(mol)
     changed = False
+    if has_geometry:
+        axes = _stereo.axis_stereo(_stereo.stereo_from_3d(mol, exclude=metal_indices(mol)))
+        _stereo._assign_atrop_from_3d(mol, axes)
+        changed |= bool(axes)
     for index in clear:
         atom = mol.GetAtomWithIdx(index)
         changed |= atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
@@ -148,13 +158,20 @@ def _ligand_stereo_variants(mol, stereo):
     skip_bonds = ez_mode == "free"
     if ez_mode in ("racemic", "invert"):
         changed |= _clear_ez(mol)
+    include_atrop = _stereo._clear_atrop(mol) if axial_mode in ("racemic", "invert") else set()
+    changed |= bool(include_atrop)
     variants, n_unassigned, _total, unresolved = _stereo.enumerate_unassigned(
-        mol, exclude=set(metal_indices(mol)), skip_points=skip, skip_bonds=skip_bonds
+        mol,
+        exclude=set(metal_indices(mol)),
+        skip_points=skip,
+        skip_bonds=skip_bonds,
+        skip_atrop=axial_mode == "free",
+        include_atrop=include_atrop,
     )
     if not n_unassigned:
         variant = mol if changed else source
         variants = [(variant, _stereo.defined_stereo_label(variant, exclude=metal_indices(variant)))]
-    variants = _geometry_stereo_variants(source, variants, stereo, point_mode, ez_mode, exact)
+    variants = _geometry_stereo_variants(source, variants, stereo, point_mode, ez_mode, axial_mode, exact)
     return variants, _haptic_stereo_mode(stereo, has_geometry), n_unassigned, unresolved
 
 
@@ -708,7 +725,7 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo=None, st
             out.append(iso)
     if n_unassigned:
         logger.info(
-            "metal: %d ligand stereo element(s) -> coordination x %d stereoisomer(s) = %d candidate(s)",
+            "metal: %d unassigned ligand stereo element(s) -> %d ligand variant(s) -> %d candidate(s)",
             n_unassigned,
             len(variants),
             len(out),

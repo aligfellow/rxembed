@@ -100,6 +100,14 @@ def test_geometry_rebases_orphaned_ez_flag():
     assert 3 not in list(bond.GetStereoAtoms())
 
 
+def test_bond_repair_leaves_native_atropisomer_stereo_alone():
+    mol = Chem.MolFromSmiles("CC1=CC=CC(I)=C1N1C(C)=CC=C1Br |wU:7.7|")
+    axis = next(bond for bond in mol.GetBonds() if bond.GetStereo() == Chem.BondStereo.STEREOATROPCCW)
+
+    assert repair_bond_stereo(mol) == 0
+    assert axis.GetStereo() == Chem.BondStereo.STEREOATROPCCW
+
+
 # ---------------------------------------------------------------------------------------------------------
 # the chiral tag is a parity over the atom's own bond order (`bond_removal_mirrors` / `remove_bond`)
 # ---------------------------------------------------------------------------------------------------------

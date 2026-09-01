@@ -618,6 +618,7 @@ def test_mirror_freedom_depends_on_metal_inversion():
     assert emb._mirror_is_free(_mol("C/C=C/CO")), "E/Z is reflection-invariant and must not block the mirror"
     assert not emb._mirror_is_free(_mol("C[C@H](N)CO"))
     assert not emb._mirror_is_free(_mol("CC(N)CO")), "an sp3 centre inverts whether or not it is assigned"
+    assert not emb._mirror_is_free(_mol("CC1=CC=CC(I)=C1N1C(C)=CC=C1Br |wU:7.7|"))
 
 
 def test_stereocentre_preserves_metal_hand_and_energies():

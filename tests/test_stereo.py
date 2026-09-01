@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from rdkit import Chem
+from rdkit.Chem import rdDistGeom
 
 from rxembed import stereo
 from rxembed.metal_core import metal_indices
@@ -15,6 +16,7 @@ _ALPHA_DIIMINE_NI = (
     "O=C1[O-]->[Ni+2]2(<-[N](=C3C(=[N]->2c2cccc4ccccc24)c2cccc4cccc3c24)c2cccc3ccccc23)<-[N-](c2ccccc2)C1c1ccccc1"
 )
 _ETA2_PT = "C[CH]1=[CH](F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1"
+_NATIVE_ATROP = "CC1=CC=CC(I)=C1N1C(C)=CC=C1Br |wU:7.7|"
 
 
 def _mol(smiles):
@@ -69,6 +71,7 @@ def test_stereo_selectors_are_concise_only_when_unambiguous():
     assert stereo.matches_stereo("C1:R,N3:S", "1R")
     assert stereo.matches_stereo("C3=C4:E", "C=C:E")
     assert stereo.matches_stereo("C3=C4:E", "E")
+    assert stereo.matches_stereo("C5-C6:M", "M")
     with pytest.raises(ValueError, match=r"use one of.*C1:R.*C3:S"):
         stereo.matches_stereo("C1:R,C3:S", "C:R")
     with pytest.raises(ValueError, match=r"use one of.*C1:R.*N3:S"):
@@ -104,7 +107,7 @@ def test_stereo_cap_reports_uncapped_total():
 
 
 # ---------------------------------------------------------------------------------------------------------
-# axial chirality: RDKit cannot encode it, so it is REPORTED rather than faked
+# axial chirality
 # ---------------------------------------------------------------------------------------------------------
 
 
@@ -113,6 +116,30 @@ def test_allene_axis_is_unresolved_without_question_label():
     assert n_unassigned == 2
     assert unresolved == 2
     assert [label for _v, label in variants] == [""], "an unresolved centre must be dropped from the label"
+
+
+def test_stated_native_atrop_axis_is_racemized_and_measured_from_3d():
+    mol = _mol(_NATIVE_ATROP)
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(mol, include="all")
+
+    assert (len(variants), n_unassigned, total, unresolved) == (2, 1, 2, 0)
+    assert {label.rsplit(":", 1)[-1] for _variant, label in variants} == {"M", "P"}
+
+    embedded = Chem.AddHs(_mol(_NATIVE_ATROP))
+    assert rdDistGeom.EmbedMolecule(embedded, randomSeed=7) == 0
+    before = stereo.axis_stereo(stereo.stereo_from_3d(embedded))
+    positions = embedded.GetConformer().GetPositions()
+    positions[:, 0] *= -1
+    embedded.GetConformer().SetPositions(positions)
+    after = stereo.axis_stereo(stereo.stereo_from_3d(embedded))
+
+    assert len(before) == 1
+    pair, code = next(iter(before.items()))
+    assert after[pair] == {"M": "P", "P": "M"}[code]
+
+
+def test_atrop_axis_must_be_stated():
+    assert _labels(_mol(_NATIVE_ATROP.split(" |", 1)[0])) == [""]
 
 
 # ---------------------------------------------------------------------------------------------------------

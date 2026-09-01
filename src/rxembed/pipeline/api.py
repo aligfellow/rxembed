@@ -57,8 +57,8 @@ def embed(
     is sugar for a coords-``fix``: ``(reference, SMARTS_or_map)``. A SMARTS matches the target and a Mol or
     Ensemble reference; an .xyz path or (N,3) array needs ``{target_i: ref_i}``.
 
-    ``stereo=`` governs point R/S and double-bond E/Z (meso dropped, chiral-at-P included, metal never
-    enumerated):
+    ``stereo=`` governs point R/S, double-bond E/Z, and native atropisomer M/P (meso dropped, chiral-at-P
+    included, metal never enumerated):
 
     - omitted: enumerate only stereo left undefined in a graph; preserve the measured state of a geometry.
     - ``'racemic'``: enumerate every configurable graph element, including defined ones.

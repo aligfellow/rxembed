@@ -191,7 +191,8 @@ def repair_bond_stereo(mol) -> int:
     stated = {
         b.GetIdx(): (b.GetStereo(), tuple(b.GetStereoAtoms()))
         for b in mol.GetBonds()
-        if b.GetStereo() != Chem.BondStereo.STEREONONE
+        if b.GetBondType() == Chem.BondType.DOUBLE
+        and b.GetStereo() != Chem.BondStereo.STEREONONE
         and len(b.GetStereoAtoms()) == _STEREO_REFS
         and len(set(b.GetStereoAtoms())) == _STEREO_REFS
     }
@@ -203,7 +204,9 @@ def repair_bond_stereo(mol) -> int:
     orphaned = [
         b
         for b in mol.GetBonds()
-        if b.GetStereo() != Chem.BondStereo.STEREONONE and len(b.GetStereoAtoms()) != _STEREO_REFS
+        if b.GetBondType() == Chem.BondType.DOUBLE
+        and b.GetStereo() != Chem.BondStereo.STEREONONE
+        and len(b.GetStereoAtoms()) != _STEREO_REFS
     ]
     if not orphaned:
         return 0

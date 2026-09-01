@@ -1,8 +1,8 @@
 """Read and write canonical ionic-dative metal SMILES.
 
-Plain dative SMILES carries constitution and native ligand stereo. CX ``atomProp`` notes add canonical
-polyhedron slots and haptic winding that plain SMILES cannot express. Notes address the atom order just
-written, so parsing and writing share this module; the slot grammar itself belongs to `metal_polyhedron`.
+Plain dative SMILES carries constitution, point stereo, and E/Z where its graph permits. CX fields add native
+atropisomer stereo, canonical polyhedron slots, and haptic winding. Notes address the atom order just written,
+so parsing and writing share this module; the slot grammar itself belongs to `metal_polyhedron`.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from .metal_core import (
     metal_indices,
 )
 from .metal_polyhedron import SLOT_BOND_PROP, canonical_slots, read_slot_notes, record, slot_note, vertex_dirs
-from .stereo import defined_stereo_label, point_stereo, stereo_from_3d
+from .stereo import _ATROP_STEREO, axis_stereo, defined_stereo_label, point_stereo, stereo_from_3d
 from .utils import assign_stereo_from_3d, mirror_tag, remove_bond
 
 logger = logging.getLogger("rxembed.metal")  # spelled out, not __name__: the name `set_verbose` configures
@@ -117,10 +117,19 @@ def parse_smiles(smi):
     params.removeHs = False
     mol = Chem.MolFromSmiles(smi, params)
     if mol is not None:
+        raw = Chem.Mol(mol)
         try:
             Chem.SanitizeMol(mol)
         except (RuntimeError, ValueError):
-            mol = None
+            try:
+                rw = Chem.RWMol(raw)
+                rw.UpdatePropertyCache(strict=False)
+                _donate_to_metal(rw)
+                mol = rw.GetMol()
+                Chem.SanitizeMol(mol)
+                logger.info("parse: normalized invalid covalent metal bonds to dative")
+            except (RuntimeError, ValueError):
+                mol = None
     if mol is None:
         raise ValueError(f"could not parse SMILES: {smi!r}")
     Chem.SetBondStereoFromDirections(mol)
@@ -366,6 +375,50 @@ def _same_bond_stereo(left, right):
     return (left in _E_BOND and right in _E_BOND) or (left in _Z_BOND and right in _Z_BOND)
 
 
+def _atrop_code(mol, bond):
+    """Return RDKit's sequence-rule descriptor for one assigned atropisomer bond."""
+    Chem.AssignCIPLabels(mol, bondsToLabel=[bond.GetIdx()])
+    return bond.GetPropsAsDict().get("_CIPCode")
+
+
+def _atrop_bond_stereo(core, stereo_label, at):
+    """Return the native CX wU/wD field retaining every assigned atropisomer axis."""
+    axes = axis_stereo(stereo_label)
+    if not axes:
+        return []
+    plain = parse_smiles(core)
+    targets = []
+    for (i, j), target in axes.items():
+        if i not in at or j not in at:
+            raise ValueError(f"could not name atropisomer stereo on bond {i}-{j}")
+        mapped = (at[i], at[j])
+        if plain.GetBondBetweenAtoms(*mapped) is None:
+            raise ValueError(f"could not locate atropisomer bond {i}-{j} in the written CXSMILES")
+        for tag in (Chem.BondStereo.STEREOATROPCW, Chem.BondStereo.STEREOATROPCCW):
+            candidate = Chem.Mol(plain)
+            bond = candidate.GetBondBetweenAtoms(*mapped)
+            bond.SetStereo(tag)
+            Chem.CleanupAtropisomers(candidate)
+            if bond.GetStereo() in _ATROP_STEREO and _atrop_code(candidate, bond) == target:
+                plain = candidate
+                targets.append((mapped, target))
+                break
+        else:
+            raise ValueError(f"could not retain atropisomer stereo on bond {i}-{j}")
+    params = Chem.SmilesWriteParams()
+    params.canonical = False  # CX bond indices must address the already-canonical `core` traversal
+    native = Chem.MolToCXSmiles(plain, params, int(Chem.CXSmilesFields.CX_BOND_ATROPISOMER))
+    block = native.partition("|")[2].rpartition("|")[0]
+    if not block:
+        raise ValueError("RDKit did not write the assigned atropisomer stereo")
+    back = parse_smiles(f"{core} |{block}|")
+    for mapped, target in targets:
+        bond = back.GetBondBetweenAtoms(*mapped)
+        if bond is None or bond.GetStereo() not in _ATROP_STEREO or _atrop_code(back, bond) != target:
+            raise ValueError("could not retain atropisomer stereo with native CX wU/wD fields")
+    return [block]
+
+
 def write_dative(mol, stereo_label=None):
     """Return canonical dative SMILES and its original-atom to output-position map.
 
@@ -373,6 +426,8 @@ def write_dative(mol, stereo_label=None):
     graph; it writes the standard CX ``c:``/``t:`` bond field.
     """
     smi, at, _bonds = _write_dative(mol, stereo_label)
+    if any(bond.GetStereo() in _ATROP_STEREO for bond in mol.GetBonds()):
+        raise ValueError("plain dative SMILES cannot retain atropisomer stereo; use cxsmiles()")
     back = parse_smiles(smi)
     for bond in mol.GetBonds():
         if bond.GetStereo() not in _E_BOND | _Z_BOND or not {bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()} <= at.keys():
@@ -523,6 +578,12 @@ def cxsmiles(source):
     metals = metal_indices(complexed)
     if not metals:
         raise ValueError("no transition metal found")
+    if iso is not None:
+        ligand_stereo = iso.stereo_label
+    elif complexed.GetNumConformers():
+        ligand_stereo = stereo_from_3d(complexed, metals)
+    else:
+        ligand_stereo = defined_stereo_label(complexed, metals)
     bound = {
         m: {n.GetIdx() for n in complexed.GetAtomWithIdx(m).GetNeighbors() if n.GetIdx() not in metals} for m in metals
     }
@@ -533,7 +594,7 @@ def cxsmiles(source):
     )
     if {state.atom for _record, state in records} != set(metals):
         raise ValueError("the isomer does not carry one state per metal")
-    core, at, bond_positions = _write_dative(complexed, iso.stereo_label if iso is not None else None)
+    core, at, bond_positions = _write_dative(complexed, ligand_stereo)
     centre_notes = {}
     for record_iso, state in records:
         centre_notes[state.atom] = _arrangement_notes(record_iso, state, at)
@@ -555,5 +616,9 @@ def cxsmiles(source):
     # in a depiction and survives a round trip through `MolToCXSmiles` without special handling. Atom index
     # order is not a choice either; RDKit re-emits the block sorted by index whatever order it was built in.
     block = ":".join(f"{at[a]}.atomNote.{value}" for a, value in sorted(notes.items(), key=lambda x: at[x[0]]))
-    fields = [f"atomProp:{block}", *_haptic_bond_stereo(core, records, at, bond_positions)]
+    fields = [
+        f"atomProp:{block}",
+        *_haptic_bond_stereo(core, records, at, bond_positions),
+        *_atrop_bond_stereo(core, ligand_stereo, at),
+    ]
     return f"{core} |{','.join(fields)}|"
