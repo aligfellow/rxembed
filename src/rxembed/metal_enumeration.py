@@ -6,7 +6,6 @@ import itertools
 import re
 
 from rdkit import Chem
-from rdkit.Chem import GetPeriodicTable
 
 from . import metal_core as _core
 from . import metal_isomer as _isomer
@@ -29,7 +28,8 @@ from .metal_core import (
     surrogate_all_metals,
     surrogate_metal,
 )
-from .metal_distance import ff_terms
+from .metal_distance import delocalised_charges, ff_terms, ml_distance
+from .metal_donor_orient import _stripped_hybridisation
 from .metal_polyhedron import (
     POLYHEDRA,
     SLOT_BOND_PROP,
@@ -39,7 +39,6 @@ from .metal_polyhedron import (
     resolve_geometry,
 )
 
-_PT = GetPeriodicTable()
 _MULTI_METAL = 2
 
 
@@ -320,15 +319,33 @@ def _isomers_for_geometry(
     if frozen_donors and sites == n:  # pin each frozen donor at its input vertex, then generate every
         perms = _frozen_permutations(base, m, padded, geom, frozen_donors, sites)  # free-donor arrangement
     real_donors = base_iso.donors
-    roles = _isomer.isomer_roles(base_iso)
     base_cons = compose(retain, fix_cons)
+    if _slots._has_tether(padded, _core._frag_map(base), haptic):
+        if lengths == "input":
+            conf = source.GetConformer()
+            metal_position = conf.GetAtomPosition(m)
+            donor_lengths = {d: metal_position.Distance(conf.GetAtomPosition(d)) for d in real_donors}
+        else:
+            donor_set = set(real_donors)
+            charges = delocalised_charges(source)
+            hyb = _stripped_hybridisation(source)
+            donor_lengths = {
+                d: ml_distance(source, m, d, real_z, donor_set, charges=charges, hyb=hyb) for d in real_donors
+            }
+        for d in real_donors:
+            window = base_cons.distances.get((min(m, d), max(m, d)))
+            if window is not None:
+                donor_lengths[d] = 0.5 * sum(window)
+    else:
+        donor_lengths = {}
+    roles = _isomer.isomer_roles(base_iso)
     out = []
     for order in _slots.distinct_vertex_orderings(
         base,
         padded,
         geom,
+        donor_lengths,
         perms=perms,
-        r_metal=_PT.GetRcovalent(real_z),
         haptic=haptic,
         coordination=roles,
     ):

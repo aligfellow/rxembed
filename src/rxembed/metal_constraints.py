@@ -126,9 +126,9 @@ def coordination(
 ):
     """Build one metal state's distance, angle, floor and umbrella constraints.
 
-    Inter-ligand pairs follow the ideal polyhedron; cis chelates use calibrated ring-size bite windows and
-    trans chelates remain wide. Chemistry is compiled before `_drop_graft_owned` removes only complete terms
-    already determined by `fix`. `source` preserves input-length measurements while `mol` supplies topology.
+    Inter-ligand pairs and trans chelates follow the ideal polyhedron; cis chelates use calibrated ring-size bite
+    windows. Chemistry is compiled before `_drop_graft_owned` removes only complete terms already determined by
+    `fix`. `source` preserves input-length measurements while `mol` supplies topology.
     """
     frag = _frag_map(mol)  # same ligand = same fragment
     poly = POLYHEDRA[resolve_geometry(geometry)]
@@ -205,10 +205,8 @@ def coordination(
             if bite is not None:
                 c.angles[(od[i], metal, od[j])] = bite
             continue
-        # inter-ligand pairs (±8°) and any *trans*-assigned chelate (kept wide, ±25°) are held: forcing a
-        # trans span makes an unreachable chelate (an en placed trans) tear -> dropped by `bonding_ok`, the
-        # embed-time safety net for anything the `isomers` span filter doesn't pre-drop.
-        pad = 25.0 if intra else 8.0
+        # Trans feasibility belongs to slot enumeration; a retained or explicitly stated pair keeps the shape.
+        pad = 8.0
         c.angles[(od[i], metal, od[j])] = (max(0.0, a - pad), min(180.0, a + pad))
     # NB an η² π bond needs no hold of its own: the face is a centroid vertex, so one axial pull plus the cone
     # pins both π atoms at the face radius. Two separate M-donor pulls tore C≡C from 1.2 to 1.7 Å.

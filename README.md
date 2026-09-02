@@ -130,6 +130,10 @@ all_confs = rx.embed("CCCN->[Pd+2](<-[Cl-])(<-[Cl-])<-NCCC", metal="SPL", n=10)
 `rx.metal` accepts SMILES, `.xyz`, or `Mol` and returns distinct arrangements. Write ionic dative SMILES with
 donor-to-metal arrows and charged anionic ligands; neutral/covalent SMILES are also accepted as input.
 
+For tethered sigma donors, `rx.metal` rejects an arrangement when the ligand's distance-geometry upper bound is
+shorter than the required donor separation. Embedding can still fail when the full set of metal distances and
+angles is inconsistent, and successful arrangements should be checked with an appropriate energy method.
+
 Use `rx.metal` when you want to inspect and select the isomer yourself. The `metal="SPL"` shortcut embeds every
 enumerated isomer; `n` applies separately to each one.
 

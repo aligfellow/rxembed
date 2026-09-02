@@ -50,29 +50,54 @@ def test_three_plus_one_square_planar_has_no_false_cis_trans_label():
 )
 def test_ordering_dedup_respects_donor_symmetry(smiles, donors, expected):
     mol = Chem.MolFromSmiles(smiles)
-    assert len(slots.distinct_vertex_orderings(mol, donors, "square_planar")) == expected
+    assert len(slots.distinct_vertex_orderings(mol, donors, "square_planar", dict.fromkeys(donors, 2.0))) == expected
 
 
-def test_short_chelate_excludes_trans():
+def test_amidate_tether_excludes_trans_pair():
     smiles = "CC(C)(C)[N]1=[CH](Cc2ccccc2)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1"
-    short = 0
+    amidate = 0
     for iso, left, right, angle in _same_ligand_vertex_angles(rx.metal(smiles, "square_planar")):
-        if Chem.GetDistanceMatrix(iso.mol)[left][right] <= 4:
-            short += 1
+        atoms = [iso.mol.GetAtomWithIdx(i) for i in (left, right) if i < iso.mol.GetNumAtoms()]
+        if (
+            len(atoms) == 2
+            and {atom.GetSymbol() for atom in atoms} == {"N", "O"}
+            and all(atom.GetFormalCharge() == -1 for atom in atoms)
+        ):
+            amidate += 1
             assert angle < slots.CHELATE_SPAN_ANGLE
-    assert short, "the span filter was not exercised"
+    assert amidate, "the amidate span filter was not exercised"
 
 
-def test_flexible_chelate_may_span_trans_but_short_chelate_may_not():
-    smiles = (
-        "Cc1cc(C)c(N2C=CN3CCN4C=CN(c5c(C)cc(C)cc5C)[C]4->[Ni+2]4(<-[O-]C(=O)C(c5ccccc5)[N-]->4c4ccccc4)<-[C]32)c(C)c1"
-    )
-    short = 0
-    for iso, left, right, angle in _same_ligand_vertex_angles(rx.metal(smiles, "square_planar")):
-        if Chem.GetDistanceMatrix(iso.mol)[left][right] <= 4:
-            short += 1
-            assert angle < slots.CHELATE_SPAN_ANGLE
-    assert short, "the span filter was not exercised"
+@pytest.mark.parametrize(
+    ("linker", "expected"),
+    [("CC", {"cis"}), ("CCCC", {"cis", "trans"})],
+    ids=("short", "long"),
+)
+def test_chelate_span_follows_backbone_reach(linker, expected):
+    smiles = f"N1{linker}N->[Pd+2](<-[Cl-])(<-[Cl-])<-1"
+    assert {iso.label for iso in rx.metal(smiles, "square_planar", stereo="free")} == expected
+
+
+def test_chelate_span_uses_metal_donor_targets():
+    mol = Chem.MolFromSmiles("NCCCN.[Cl-].[Cl-]")
+    donors = [0, 4, 5, 6]
+
+    def labels(length):
+        orderings = slots.distinct_vertex_orderings(mol, donors, "square_planar", dict.fromkeys(donors, length))
+        return {slots.order_label(mol, donors, "square_planar", order) for order in orderings}
+
+    assert labels(1.8) == {"cis", "trans"}
+    assert labels(2.0) == {"cis"}
+
+
+def test_haptic_tether_reach_is_atom_order_invariant():
+    mol = rx.parse_smiles("[N]1=[CH](CCC[NH2]->2)->[Ni+2]2(<-[Cl-])(<-[Cl-])<-1")
+    renumbered = Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))
+
+    def labels(graph):
+        return {iso.label for iso in rx.metal(graph, "square_planar", stereo="free")}
+
+    assert labels(mol) == labels(renumbered) == {"cis", "trans"}
 
 
 def test_t_shape_seats_its_trans_pair_first():

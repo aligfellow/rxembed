@@ -6,7 +6,7 @@ import math
 
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import GetPeriodicTable, rdDistGeom
+from rdkit.Chem import rdDistGeom
 
 from .metal_core import (
     VACANT,
@@ -26,13 +26,17 @@ from .metal_polyhedron import (
 )
 from .metal_stereo import site_classes
 
-_PT = GetPeriodicTable()
 TRANS_ANGLE = 150  # same-element donor pairs beyond this are trans
 _PAIR = 2
 _TRIAD = 3
 _COLINEAR_TOL = 0.5
-_SPAN_TOL = 0.1  # Å slack drops a short chelate forced trans while a real long backbone passes
-# At 0.2 Å the amidate-trans phantom returns.
+_SPAN_TOL = 0.1  # Å numerical slack on the bounds-matrix reach comparison
+
+
+def _has_tether(donors, frag, haptic=None):
+    """Return whether two coordination vertices belong to the same ligand fragment."""
+    atoms = [_vertex_atom(haptic, donor) for donor in donors if donor != VACANT]
+    return len(atoms) != len({frag[atom] for atom in atoms})
 
 
 def _octahedral_triad(mol, od, haptic=None):
@@ -141,7 +145,7 @@ def _central_trans(od, frag, dmat, dirs, haptic=None):
     The central donor is the one on the backbone path between the other two (``d(a,c)+d(c,b)==d(a,b)``), which
     a pincer cannot do: central is cis to both arms in every real mer/fac. A flexible chelate can stretch to
     ~155° without a formally torn bond, so this drops it at enumeration rather than leaving it to `bonding_ok`.
-    A haptic vertex is resolved to its ring atom so its backbone path is real.
+    A haptic face has no single backbone atom, so triads containing one defer to embedding.
     """
     ra = [_vertex_atom(haptic, d) if d != VACANT else VACANT for d in od]  # vertex -> representative real atom
     by_frag = {}
@@ -151,6 +155,8 @@ def _central_trans(od, frag, dmat, dirs, haptic=None):
     for ps in by_frag.values():
         if len(ps) != _TRIAD:
             continue
+        if any(od[p] in (haptic or {}) for p in ps):
+            continue  # a face has no single atom on the backbone path; let embedding validate it
         for ci in range(3):
             c, a, b = ps[ci], ps[(ci + 1) % 3], ps[(ci + 2) % 3]
             if abs(dmat[ra[a]][ra[c]] + dmat[ra[c]][ra[b]] - dmat[ra[a]][ra[b]]) < _COLINEAR_TOL:  # c is central
@@ -204,7 +210,7 @@ def _donor_faces_metal(mol, d, *, other, d_md, d_mo, need, bm, hyb, donors):
     return True
 
 
-def _chelate_span_ok(mol, od, *, frag, dirs, bm, r_metal, hyb, donors, haptic=None):
+def _chelate_span_ok(mol, od, *, frag, dirs, bm, donor_lengths, hyb, donors, haptic=None):
     """Reject wide chelate assignments that cannot span and donate.
 
     The ligand bounds matrix and law of cosines test donor separation; `_donor_faces_metal` tests orientation.
@@ -215,34 +221,30 @@ def _chelate_span_ok(mol, od, *, frag, dirs, bm, r_metal, hyb, donors, haptic=No
     for p in range(len(od)):
         for q in range(p + 1, len(od)):
             a, b = od[p], od[q]
-            # A haptic centroid is bond-less, so resolve each vertex to a representative ring atom and let the
-            # same-ligand test, the covalent reach and the backbone bounds all read the face's real chemistry.
-            # Otherwise a face tethered to a co-donor reads as a separate ligand and its trans is never dropped.
-            ra, rb = _vertex_atom(haptic, a), _vertex_atom(haptic, b)
+            if a in (haptic or {}) or b in (haptic or {}):
+                continue  # a face has no single M-donor length or backbone endpoint; let embedding validate it
+            ra, rb = a, b
             if VACANT in (a, b) or frag[ra] != frag[rb]:  # only a same-ligand (chelate) pair
                 continue
             theta = _vertex_angle(dirs[p], dirs[q])
             if theta < CHELATE_SPAN_ANGLE:  # cis / adjacent -> the chelate folds in, always feasible
                 continue
-            d_ma = r_metal + _PT.GetRcovalent(mol.GetAtomWithIdx(ra).GetAtomicNum())  # real M-donor covalent sums,
-            d_mb = r_metal + _PT.GetRcovalent(mol.GetAtomWithIdx(rb).GetAtomicNum())  # not a fixed 2.0 (Pd-N ~2.1)
+            d_ma, d_mb = donor_lengths[ra], donor_lengths[rb]
             need = math.sqrt(d_ma**2 + d_mb**2 - 2 * d_ma * d_mb * math.cos(math.radians(theta)))  # law of cosines
             if _reach(bm, ra, rb) < need - _SPAN_TOL:  # backbone can't reach
                 return False
-            # The orientation test asks whether the donor can still aim its lone pair at the metal, which is
-            # meaningless for a haptic face: it donates a π face and has no axis, so a centroid abstains.
-            if a not in (haptic or {}) and not _donor_faces_metal(
+            if not _donor_faces_metal(
                 mol, ra, other=rb, d_md=d_ma, d_mo=d_mb, need=need, bm=bm, hyb=hyb, donors=donors
             ):
                 return False
-            if b not in (haptic or {}) and not _donor_faces_metal(
+            if not _donor_faces_metal(
                 mol, rb, other=ra, d_md=d_mb, d_mo=d_ma, need=need, bm=bm, hyb=hyb, donors=donors
             ):
                 return False
     return True
 
 
-def _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, coordination=()):
+def _distinct_orderings(mol, donors, geometry, perms, dirs, donor_lengths, haptic, coordination=()):
     """Deduplicate reachable slot assignments by constitutional signature.
 
     Canonical vertex classes and same-ligand path lengths distinguish candidates under proper rotations.
@@ -250,6 +252,7 @@ def _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, coo
     """
     frag = _frag_map(mol)  # same ligand = same fragment
     real_donors = [d for d in donors if d != VACANT]
+    tethered = _has_tether(donors, frag, haptic)
     classes = site_classes(mol, donors, haptic, coordination)
     # Separate equivalent monodentates have one arrangement in every geometry, so skip the factorial pool.
     if (
@@ -261,17 +264,21 @@ def _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, coo
     ):
         return [tuple(range(len(donors)))]
     perms = perms if perms is not None else isomer_permutations(geometry)
-    dmat = Chem.GetDistanceMatrix(mol)  # topological (bond-count) distances
-    bm = _span_bounds(mol)
-    hyb = _stripped_hybridisation(mol)  # the fold ruler's own (element, hyb) class: graph-only, no coords
-    pairs = [(p, q) for p in range(len(dirs)) for q in range(p + 1, len(dirs))]
+    dmat = Chem.GetDistanceMatrix(mol) if tethered else None  # topological (bond-count) distances
+    bm = _span_bounds(mol) if tethered else None
+    hyb = _stripped_hybridisation(mol) if tethered else {}
+    pairs = [(p, q) for p in range(len(dirs)) for q in range(p + 1, len(dirs))] if tethered else ()
     rotations = point_group(tuple(map(tuple, dirs)))[0]
 
     def link(od, p, q):  # intra-ligand bond distance of a same-ligand pair
-        a, b = _vertex_atom(haptic, od[p]), _vertex_atom(haptic, od[q])  # resolve a centroid to its ring atom
-        if VACANT in (od[p], od[q]) or frag[a] != frag[b]:  # distinguishes a chelate's central from its
+        if not tethered or VACANT in (od[p], od[q]):
+            return -1
+        left = (haptic or {}).get(od[p], (od[p],))
+        right = (haptic or {}).get(od[q], (od[q],))
+        if frag[left[0]] != frag[right[0]]:  # distinguishes a chelate's central from its
             return -1  # terminal donor; -1 for different ligands or a vacancy
-        return int(dmat[a][b])
+        assert dmat is not None
+        return min(int(dmat[a][b]) for a in left for b in right)
 
     def donor_class(d):
         return ("vacant",) if d == VACANT else ("donor", classes[d])
@@ -279,10 +286,18 @@ def _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, coo
     seen, out = set(), []
     for order in perms:
         od = [donors[k] for k in order]  # od[position] = donor atom (or VACANT) at that polyhedron vertex
-        if _central_trans(od, frag, dmat, dirs, haptic):  # a tridentate's central donor trans to its own arm
+        if tethered and _central_trans(od, frag, dmat, dirs, haptic):  # central donor trans to its own arm
             continue
-        if not _chelate_span_ok(
-            mol, od, frag=frag, dirs=dirs, bm=bm, r_metal=r_metal, hyb=hyb, donors=real_donors, haptic=haptic
+        if tethered and not _chelate_span_ok(
+            mol,
+            od,
+            frag=frag,
+            dirs=dirs,
+            bm=bm,
+            donor_lengths=donor_lengths,
+            hyb=hyb,
+            donors=real_donors,
+            haptic=haptic,
         ):  # can't span/donate trans
             continue
         links = {pair: link(od, *pair) for pair in pairs}
@@ -299,9 +314,10 @@ def _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, coo
     return out
 
 
-def distinct_vertex_orderings(mol, donors, geometry, perms=None, r_metal=1.4, haptic=None, coordination=()):
+def distinct_vertex_orderings(mol, donors, geometry, donor_lengths, perms=None, haptic=None, coordination=()):
     """Enumerate distinct coordination isomers: every distinct vertex arrangement, minimally pre-filtered.
 
+    `donor_lengths` carries the same M-donor targets used to construct the eventual embedding constraints.
     Dedup and the two feasibility pre-filters live in `_distinct_orderings`. `perms` overrides the candidate
     vertex orderings (default ``isomer_permutations(geometry)``); a ``fix=`` enumeration passes the subset that
     keeps each frozen donor pinned to its input vertex.
@@ -309,4 +325,4 @@ def distinct_vertex_orderings(mol, donors, geometry, perms=None, r_metal=1.4, ha
     dirs = vertex_dirs(geometry)
     if dirs is None:
         return perms
-    return _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, coordination)
+    return _distinct_orderings(mol, donors, geometry, perms, dirs, donor_lengths, haptic, coordination)

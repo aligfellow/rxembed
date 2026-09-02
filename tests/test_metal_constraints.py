@@ -280,6 +280,11 @@ def test_chelate_bite_is_not_reported_as_a_steric_clash():
         assert not [v for v in rep.violations if v.kind == "clash"], rep.summary()
 
 
+def test_reachable_trans_chelate_embeds():
+    iso = rx.metal("[Pd+2]1(<-[Cl-])(<-[Cl-])<-NCCCCN->1", "square_planar").filter(label="trans").select()
+    assert rx.embed(iso, n=1, seed=1).n == 1
+
+
 def test_side_on_eta2_ligand_embeds_geometry_clean():
     smi = "COC(=O)[C]12->[Ni+2]3(<-[O-]C(=O)C(c4ccccc4)[N-]->3c3ccccc3)<-[C]=1(C(=O)OC)C2(C)C(C)(C)C"
     ens = rx.embed(rx.metal(smi, "square_planar")[0], n=1).minimize()
