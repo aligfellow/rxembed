@@ -355,7 +355,7 @@ def chelate_edges(mol, vertices, haptic=None):
     )
 
 
-def chirality_of(mol, geometry, vertices, haptic=None, coordination=()):
+def chirality_of(mol, geometry, vertices, haptic=None, coordination=(), *, classes=None, edges=None):
     """Return the canonical metal-centre hand, or empty when achiral or undecidable.
 
     The point-group parity is computed from canonical site classes plus the chelate-bite graph, so atom order,
@@ -367,8 +367,8 @@ def chirality_of(mol, geometry, vertices, haptic=None, coordination=()):
     return _poly.handedness(
         dirs,
         list(vertices),
-        site_classes(mol, vertices, haptic, coordination),
-        chelate_edges(mol, vertices, haptic),
+        site_classes(mol, vertices, haptic, coordination) if classes is None else classes,
+        chelate_edges(mol, vertices, haptic) if edges is None else edges,
     )
 
 

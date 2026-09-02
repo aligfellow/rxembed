@@ -320,7 +320,8 @@ def _isomers_for_geometry(
         perms = _frozen_permutations(base, m, padded, geom, frozen_donors, sites)  # free-donor arrangement
     real_donors = base_iso.donors
     base_cons = compose(retain, fix_cons)
-    if _slots._has_tether(padded, _core._frag_map(base), haptic):
+    tethered = _slots._has_tether(padded, _core._frag_map(base), haptic)
+    if tethered:
         if lengths == "input":
             conf = source.GetConformer()
             metal_position = conf.GetAtomPosition(m)
@@ -339,6 +340,8 @@ def _isomers_for_geometry(
     else:
         donor_lengths = {}
     roles = _isomer.isomer_roles(base_iso)
+    classes = _coord_stereo.site_classes(base, padded, haptic, roles)
+    edges = None if tethered else ()
     out = []
     for order in _slots.distinct_vertex_orderings(
         base,
@@ -348,9 +351,10 @@ def _isomers_for_geometry(
         perms=perms,
         haptic=haptic,
         coordination=roles,
+        classes=classes,
     ):
         od = [padded[k] for k in order]  # vertex -> donor atom, haptic centroid, or VACANT
-        hand = _coord_stereo.chirality_of(base, geom, od, haptic, roles)
+        hand = _coord_stereo.chirality_of(base, geom, od, haptic, roles, classes=classes, edges=edges)
         winding = _isomer.measured_haptic_windings(base, m, real_donors, haptic)
         active = _core.from_vertices(m, base_iso.real_z, base_iso.real_q, geom, od, haptic, winding.items(), hand)
         centres = (active, *(centre for centre in base_iso.centres if centre.atom != m))

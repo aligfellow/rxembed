@@ -528,14 +528,17 @@ def handedness(dirs, order, donor_class, chelate_edges=frozenset()):
     edges = [tuple(e) for e in chelate_edges]
 
     def form(q):  # the decorated arrangement in the frame `q`: (per-vertex labels, chelate bite edges)
-        verts = tuple(label[q.index(v)] for v in range(n))
+        verts = [None] * n
+        for source, target in enumerate(q):
+            verts[target] = label[source]
         bites = tuple(sorted(tuple(sorted((q[a], q[b]))) for a, b in edges))
-        return verts, bites
+        return tuple(verts), bites
 
-    base = form(tuple(range(n)))
-    if any(form(q) == base for q in refl):  # a mirror fixes labels AND bites -> no handedness
+    forms = {q: form(q) for q in rot | refl}
+    base = forms[tuple(range(n))]
+    if any(forms[q] == base for q in refl):  # a mirror fixes labels AND bites -> no handedness
         return ""
-    q_star = min(rot | refl, key=form)  # the canonicalising frame; its parity is the sign
+    q_star = min(forms, key=lambda q: forms[q])  # the canonicalising frame; its parity is the sign
     return DELTA if q_star in rot else LAMBDA
 
 

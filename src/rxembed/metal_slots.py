@@ -244,7 +244,7 @@ def _chelate_span_ok(mol, od, *, frag, dirs, bm, donor_lengths, hyb, donors, hap
     return True
 
 
-def _distinct_orderings(mol, donors, geometry, perms, dirs, donor_lengths, haptic, coordination=()):
+def _distinct_orderings(mol, donors, geometry, perms, dirs, donor_lengths, haptic, coordination=(), *, classes=None):
     """Deduplicate reachable slot assignments by constitutional signature.
 
     Canonical vertex classes and same-ligand path lengths distinguish candidates under proper rotations.
@@ -253,7 +253,7 @@ def _distinct_orderings(mol, donors, geometry, perms, dirs, donor_lengths, hapti
     frag = _frag_map(mol)  # same ligand = same fragment
     real_donors = [d for d in donors if d != VACANT]
     tethered = _has_tether(donors, frag, haptic)
-    classes = site_classes(mol, donors, haptic, coordination)
+    classes = site_classes(mol, donors, haptic, coordination) if classes is None else classes
     # Separate equivalent monodentates have one arrangement in every geometry, so skip the factorial pool.
     if (
         perms is None
@@ -263,6 +263,8 @@ def _distinct_orderings(mol, donors, geometry, perms, dirs, donor_lengths, hapti
         and len({frag[donor] for donor in donors}) == len(donors)
     ):
         return [tuple(range(len(donors)))]
+    if perms is None and not tethered and VACANT not in donors and len(set(classes.values())) == len(donors):
+        return isomer_permutations(geometry)
     perms = perms if perms is not None else isomer_permutations(geometry)
     dmat = Chem.GetDistanceMatrix(mol) if tethered else None  # topological (bond-count) distances
     bm = _span_bounds(mol) if tethered else None
@@ -314,7 +316,9 @@ def _distinct_orderings(mol, donors, geometry, perms, dirs, donor_lengths, hapti
     return out
 
 
-def distinct_vertex_orderings(mol, donors, geometry, donor_lengths, perms=None, haptic=None, coordination=()):
+def distinct_vertex_orderings(
+    mol, donors, geometry, donor_lengths, perms=None, haptic=None, coordination=(), *, classes=None
+):
     """Enumerate distinct coordination isomers: every distinct vertex arrangement, minimally pre-filtered.
 
     `donor_lengths` carries the same M-donor targets used to construct the eventual embedding constraints.
@@ -325,4 +329,4 @@ def distinct_vertex_orderings(mol, donors, geometry, donor_lengths, perms=None, 
     dirs = vertex_dirs(geometry)
     if dirs is None:
         return perms
-    return _distinct_orderings(mol, donors, geometry, perms, dirs, donor_lengths, haptic, coordination)
+    return _distinct_orderings(mol, donors, geometry, perms, dirs, donor_lengths, haptic, coordination, classes=classes)
