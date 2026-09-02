@@ -451,7 +451,7 @@ def _site_keys(iso, vertices, haptic, winding):
     The `Isomer` owns the winding. A geometry measured by `from_geometry` has already stored it; a vertex-only
     isomer honestly leaves it empty.
     """
-    classes = _coord_stereo.site_classes(iso.mol, vertices, haptic, _isomer.isomer_roles(iso))
+    classes = _coord_stereo.site_classes(iso._graph, vertices, haptic, _isomer.isomer_roles(iso))
     keys = []
     for d in vertices:
         if d == VACANT:
@@ -509,7 +509,7 @@ def _rebuild(iso):
     """
     faces = [site.atoms for state in iso.centres for site in state.vertices if isinstance(site, HapticSite)]
     ring = {atom for face in faces for atom in face}
-    whole = connect_metal(iso.restore(Chem.Mol(iso.mol)), [b for b in iso.donor_bonds if b[0] in ring])
+    whole = connect_metal(iso.restore(Chem.Mol(iso._graph)), [b for b in iso.donor_bonds if b[0] in ring])
     return connect_metal(whole, [b for b in iso.donor_bonds if b[0] not in ring], order=Chem.BondType.SINGLE)
 
 
@@ -522,7 +522,7 @@ def _haptic_bond_stereo(core, records, at, bonds):
         for face in haptic.values():
             if len(face) != _ETA2:
                 continue
-            source = iso.mol.GetBondBetweenAtoms(*face)
+            source = iso._graph.GetBondBetweenAtoms(*face)
             if source is None or source.GetStereo() not in _E_BOND | _Z_BOND:
                 continue
             key = frozenset(at[a] for a in face)
@@ -554,7 +554,7 @@ def _arrangement_notes(iso, state, at):
             f"no polyhedron template for {state.geometry!r}, so there is no slot scheme to write and the "
             f"arrangement would be lost silently; add a POLYHEDRA row for this coordination number"
         )
-    work = iso.mol
+    work = iso._graph
     vertices, haptic, winding, _donors = materialized_state(iso, state)
     keys = _site_keys(iso, vertices, haptic, winding)
     bites = _coord_stereo.chelate_edges(work, vertices, haptic)

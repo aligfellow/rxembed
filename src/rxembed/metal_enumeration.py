@@ -264,7 +264,7 @@ def _select_geometries(base, m, donors, haptic, geometry, n):
 def _frozen_permutations(base, m, padded, geom, frozen_donors, sites):
     """Generate every free-donor vertex permutation with each frozen donor pinned at its input vertex.
 
-    Returns the explicit permutation list, bypassing the symmetry-reduced canned `isomer_permutations`, which
+    Returns the explicit permutation list, bypassing the symmetry-reduced `isomer_permutations`, which
     would miss the representative ordering a valid frozen isomer needs; or ``None`` if the input vertex
     ordering can't be read.
     """
@@ -306,7 +306,7 @@ def _isomers_for_geometry(
     graft_ref=None,
 ):
     """Enumerate every distinct `Isomer` of one polyhedron `geom` (frozen core held, spectators retained)."""
-    base, m, real_z = base_iso.mol, base_iso.metal, base_iso.real_z
+    base, m, real_z = base_iso._graph, base_iso.metal, base_iso.real_z
     n = len(donors)
     sites = n_sites(geom)
     if n > sites:
@@ -347,6 +347,7 @@ def _isomers_for_geometry(
                 lengths=lengths,
                 graft_ref=graft_ref,
                 stereo_ref=ref_sig,
+                shared_mol=True,
             )
         )
     if not out:  # every candidate ordering was rejected: silence here reads as "this geometry has no isomers"
@@ -427,13 +428,13 @@ def _stated_windings(iso, windings):
     stated = iso.haptic_winding
     if not windings:
         return stated
-    ranks = _coord_stereo.donor_classes(iso.mol, iso.donors)
+    ranks = _coord_stereo.donor_classes(iso._graph, iso.donors)
     for slot, winding in windings.items():
         donor = iso.vertices[slot]
         face = iso.haptic.get(donor)
         if face is None:
             raise ValueError(f"slot s{slot}{winding} states haptic winding, but that slot is not a haptic face")
-        if not _coord_stereo.face_has_orientation(iso.mol, face, ranks):
+        if not _coord_stereo.face_has_orientation(iso._graph, face, ranks):
             raise ValueError(f"slot s{slot}{winding} states orientation on a mirror-symmetric face")
         stated[donor] = winding
     return stated
@@ -455,7 +456,7 @@ def _validate_stated_chirality(iso, chirality):
 def _possible_stated_hands(iso):
     """Return metal hands possible before the canonical writer's tied-site pairing."""
     roles = _isomer.isomer_roles(iso)
-    classes = _coord_stereo.site_classes(iso.mol, iso.vertices, iso.haptic, roles)
+    classes = _coord_stereo.site_classes(iso._graph, iso.vertices, iso.haptic, roles)
     groups = {}
     for position, donor in enumerate(iso.vertices):
         if donor == VACANT:
@@ -468,7 +469,7 @@ def _possible_stated_hands(iso):
         for positions, donors in zip(groups.values(), assignment, strict=True):
             for position, donor in zip(positions, donors, strict=True):
                 vertices[position] = donor
-        hands.add(_coord_stereo.chirality_of(iso.mol, iso.geometry, vertices, iso.haptic, roles))
+        hands.add(_coord_stereo.chirality_of(iso._graph, iso.geometry, vertices, iso.haptic, roles))
     return hands
 
 
@@ -533,11 +534,11 @@ def _with_fix(iso, fix):
     """Compose a geometric fix onto an already stated coordination identity."""
     if not fix:
         return iso
-    cons, graft_ref = resolve_core(iso.mol, fix=fix, has_geometry=bool(iso.mol.GetNumConformers()))
+    cons, graft_ref = resolve_core(iso._graph, fix=fix, has_geometry=bool(iso._graph.GetNumConformers()))
     if not isinstance(fix, dict):
         graft_ref = {}
     return _isomer.Isomer._from_state(
-        iso.mol,
+        iso._graph,
         iso.centres,
         iso.donor_bonds,
         constraints=compose(iso._base_cons, cons),
@@ -552,11 +553,11 @@ def _with_fix(iso, fix):
 def _winding_variants(iso, state):
     """Return the symmetry-distinct assignments of one state's undefined haptic windings."""
     vertices, haptic, stored, donors = _core.materialized_state(iso, state)
-    ranks = _coord_stereo.donor_classes(iso.mol, donors)
+    ranks = _coord_stereo.donor_classes(iso._graph, donors)
     faces = [
         dummy
         for dummy, face in haptic.items()
-        if dummy not in stored and _coord_stereo.face_has_orientation(iso.mol, face, ranks)
+        if dummy not in stored and _coord_stereo.face_has_orientation(iso._graph, face, ranks)
     ]
     if not faces:
         return [state]
@@ -673,6 +674,7 @@ def _enumerate_all_centers(mol, geometry, fix, haptic_mode, stereo_ref, lengths)
                 lengths=lengths,
                 graft_ref=graft_ref,
                 stereo_ref=stereo_ref,
+                shared_mol=True,
             )
         )
     return out
@@ -716,11 +718,13 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo=None, st
             tag_source = Chem.Mol(variant)
             tag_source.RemoveAllConformers()
             tag_source, _metal_info = surrogate_all_metals(tag_source)
+        if tag_source is not None and built:
+            shared = Chem.Mol(built[0]._graph)
+            for donor in point:
+                shared.GetAtomWithIdx(donor).SetChiralTag(tag_source.GetAtomWithIdx(donor).GetChiralTag())
+            for iso in built:
+                iso._mol, iso._shared_mol = None, shared
         for iso in built:
-            if tag_source is not None:
-                iso.mol = Chem.Mol(iso.mol)
-                for donor in point:
-                    iso.mol.GetAtomWithIdx(donor).SetChiralTag(tag_source.GetAtomWithIdx(donor).GetChiralTag())
             iso.stereo_label = label
             out.append(iso)
     if n_unassigned:
@@ -777,7 +781,7 @@ def _enumerate_coordination(mol, geometry, center, fix, haptic_mode, stereo_ref,
         retain = Constraints()
     else:
         base_iso, donors, haptic, retain = _prepare_spectators(mol, metals, center)
-        base, m = base_iso.mol, base_iso.metal
+        base, m = base_iso._graph, base_iso.metal
     source = strip_phantoms(Chem.Mol(base), set(haptic))
     lengths = _isomer.length_source(source, lengths)  # once per molecule, not per ordering
     fix_cons = Constraints()

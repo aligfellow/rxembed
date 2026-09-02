@@ -115,10 +115,32 @@ def test_new_records_separate_same_cn_neighbors():
 
 
 def test_full_point_group_is_rotations_times_reflection():
+    expected_rotations = {
+        "monocoordinate": 1,
+        "linear": 2,
+        "trigonal_planar": 6,
+        "t_shape": 2,
+        "trigonal_pyramidal": 3,
+        "square_planar": 8,
+        "tetrahedral": 12,
+        "seesaw": 2,
+        "trigonal_bipyramidal": 6,
+        "square_pyramidal": 4,
+        "octahedral": 24,
+        "trigonal_prismatic": 6,
+        "pentagonal_bipyramidal": 10,
+        "capped_octahedral": 3,
+        "capped_trigonal_prismatic": 2,
+        "square_antiprism": 8,
+        "dodecahedral": 4,
+    }
+    assert set(expected_rotations) == set(POLYHEDRA)
     for name, rec in POLYHEDRA.items():
         rot, refl = point_group(tuple(map(tuple, rec.vertex_dirs)))
         assert rot == rotation_group(name), f"{name}: rotation_group is not point_group's proper half"
-        assert len(rot) == len(refl) > 0, f"{name}: {len(rot)} rotations against {len(refl)} reflections"
+        assert len(rot) == len(refl) == expected_rotations[name], (
+            f"{name}: {len(rot)} rotations against {len(refl)} reflections, expected {expected_rotations[name]}"
+        )
         g = min(refl)
         assert {tuple(g[q[v]] for v in range(rec.cn)) for q in rot} == refl, f"{name}: refl is not g o rot"
         assert (min(refl) == tuple(range(rec.cn))) == rec.planar, f"{name}: planarity disagrees with rot & refl"
@@ -126,12 +148,13 @@ def test_full_point_group_is_rotations_times_reflection():
 
 def test_isomer_permutations_are_complete_proper_orbit_representatives():
     for name, rec in POLYHEDRA.items():
-        if rec.permutations is None:
-            continue
         rotations = rotation_group(name)
-        orbits = [{tuple(order[q[v]] for v in range(rec.cn)) for q in rotations} for order in isomer_permutations(name)]
-        assert len(set().union(*orbits)) == sum(map(len, orbits)), f"{name}: duplicate proper-rotation orbit"
-        assert set().union(*orbits) == set(itertools.permutations(range(rec.cn))), f"{name}: incomplete pool"
+        covered = set()
+        for order in isomer_permutations(name):
+            orbit = {tuple(order[q[v]] for v in range(rec.cn)) for q in rotations}
+            assert covered.isdisjoint(orbit), f"{name}: duplicate proper-rotation orbit"
+            covered.update(orbit)
+        assert covered == set(itertools.permutations(range(rec.cn))), f"{name}: incomplete pool"
 
 
 def test_seat_properly_excludes_reflection():

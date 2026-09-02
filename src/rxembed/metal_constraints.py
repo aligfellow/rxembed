@@ -180,7 +180,17 @@ def coordination(
         _orient_donor(mol, metal, d, real_od, c)
         # cap an sp2 donor's metal at the donor's own sp2 plane: the improper the stripped bond removed.
         _coplanar_donor(mol, metal, d, c)
-    for i, j, a in poly.resolved_angles:
+    angle_rows = list(poly.resolved_angles)
+    stated_pairs = {frozenset((i, j)) for i, j, _a in angle_rows}
+    if metal not in frozen:  # fixed donors do not fix their angle about a free metal
+        for i, j in itertools.combinations(range(len(od)), 2):
+            if (
+                VACANT not in (od[i], od[j])
+                and frozenset((i, j)) not in stated_pairs
+                and _graft_owns((od[i], od[j]), frozen, haptic)
+            ):
+                angle_rows.append((i, j, _vertex_angle(poly.vertex_dirs[i], poly.vertex_dirs[j])))
+    for i, j, a in angle_rows:
         if (
             od[i] == VACANT or od[j] == VACANT
         ):  # an angle to an empty vertex is unconstrained. NB a shape reached AS a vacancy is stated more weakly than

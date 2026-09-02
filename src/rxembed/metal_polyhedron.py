@@ -12,7 +12,6 @@ import math
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from itertools import permutations
 
 import numpy as np
 
@@ -40,17 +39,16 @@ class Polyhedron:
     """Describe one coordination geometry and its hand-authored constraints.
 
     `vertex_dirs` defines slots. `angles` may be the measured minimal subset; ``None`` derives every pair.
-    `permutations=None` means no canned isomer list. `planar` is a perception constraint that separates the
-    CN3 plane from the pyramid without a fitted angle boundary.
+    `planar` is a perception constraint that separates the CN3 plane from the pyramid without a fitted angle
+    boundary.
     """
 
     name: str
     default_rank: int  # preference within the CN (0 == the default polyhedron)
     vertex_dirs: tuple
     angles: tuple | None  # hand-authored subset; None -> derive from vertex_dirs
-    permutations: tuple | None = None  # None -> no canned isomer list
     planar: bool = False  # metal and vertices coplanar by definition, and the `classify_geometry` filter
-    geometric_isomerism: bool = True  # False -> one arrangement only, no cis/trans label
+    geometric_isomerism: bool = True  # False -> no cis/trans label; distinct metal hands may still exist
     code: str = ""  # 3-letter spelling, accepted wherever a geometry name is (`resolve_geometry`).
     site_groups: tuple = ()  # optional conventional display groups: ((name, vertex indices), ...)
     # Not the IUPAC polyhedral symbol, which differs for most rows: TPY here is the CN3 pyramid, and other
@@ -82,119 +80,6 @@ class Polyhedron:
             return self.angles
         v = self.vertex_dirs
         return tuple((i, j, _vertex_angle(v[i], v[j])) for i in range(len(v)) for j in range(i + 1, len(v)))
-
-
-_TBP_ISOMERS = (
-    (0, 1, 2, 3, 4),
-    (0, 2, 1, 3, 4),
-    (0, 3, 1, 2, 4),
-    (0, 4, 1, 2, 3),
-    (1, 2, 0, 3, 4),
-    (1, 3, 0, 2, 4),
-    (1, 4, 0, 2, 3),
-    (2, 3, 0, 1, 4),
-    (2, 4, 0, 1, 3),
-    (3, 4, 0, 1, 2),
-)
-# C4v, so 5!/8 = 15 arrangements. Two orderings are one isomer iff `q[k] == p[g[k]]` for a template symmetry;
-# by that test the previous list named only 10, five entries repeating an earlier one. The last five below
-# replace them. Every other canned list here passes the same check unchanged.
-_SPY_ISOMERS = (
-    (0, 1, 2, 3, 4),
-    (0, 1, 3, 2, 4),
-    (1, 0, 2, 3, 4),
-    (1, 0, 3, 2, 4),
-    (2, 1, 0, 3, 4),
-    (2, 1, 3, 0, 4),
-    (3, 1, 2, 0, 4),
-    (3, 1, 0, 2, 4),
-    (4, 1, 2, 3, 0),
-    (4, 1, 3, 2, 0),
-    (0, 1, 2, 4, 3),
-    (1, 0, 2, 4, 3),
-    (2, 0, 1, 3, 4),
-    (3, 0, 1, 2, 4),
-    (4, 0, 2, 1, 3),
-)
-_OCT_ISOMERS = (
-    (0, 1, 2, 3, 4, 5),
-    (0, 1, 2, 4, 3, 5),
-    (0, 1, 2, 5, 3, 4),
-    (0, 2, 1, 3, 4, 5),
-    (0, 2, 1, 4, 3, 5),
-    (0, 2, 1, 5, 3, 4),
-    (0, 3, 2, 1, 4, 5),
-    (0, 3, 2, 4, 1, 5),
-    (0, 3, 2, 5, 1, 4),
-    (0, 4, 2, 3, 1, 5),
-    (0, 4, 2, 1, 3, 5),
-    (0, 4, 2, 5, 3, 1),
-    (0, 5, 2, 3, 4, 1),
-    (0, 5, 2, 4, 3, 1),
-    (0, 5, 2, 1, 3, 4),
-)
-_TPR_ISOMERS = (
-    (0, 1, 2, 3, 4, 5),
-    (0, 1, 2, 3, 5, 4),
-    (0, 1, 2, 4, 3, 5),
-    (0, 1, 2, 4, 5, 3),
-    (0, 1, 2, 5, 3, 4),
-    (0, 1, 2, 5, 4, 3),
-    (0, 1, 3, 2, 4, 5),
-    (0, 1, 3, 2, 5, 4),
-    (0, 1, 3, 4, 2, 5),
-    (0, 1, 3, 4, 5, 2),
-    (0, 1, 3, 5, 2, 4),
-    (0, 1, 3, 5, 4, 2),
-    (0, 1, 4, 2, 3, 5),
-    (0, 1, 4, 2, 5, 3),
-    (0, 1, 4, 3, 2, 5),
-    (0, 1, 4, 3, 5, 2),
-    (0, 1, 4, 5, 2, 3),
-    (0, 1, 4, 5, 3, 2),
-    (0, 1, 5, 2, 3, 4),
-    (0, 1, 5, 2, 4, 3),
-    (0, 1, 5, 3, 2, 4),
-    (0, 1, 5, 3, 4, 2),
-    (0, 1, 5, 4, 2, 3),
-    (0, 1, 5, 4, 3, 2),
-    (0, 2, 3, 1, 4, 5),
-    (0, 2, 3, 1, 5, 4),
-    (0, 2, 3, 4, 1, 5),
-    (0, 2, 3, 4, 5, 1),
-    (0, 2, 3, 5, 1, 4),
-    (0, 2, 3, 5, 4, 1),
-    (0, 2, 4, 1, 3, 5),
-    (0, 2, 4, 1, 5, 3),
-    (0, 2, 4, 3, 1, 5),
-    (0, 2, 4, 3, 5, 1),
-    (0, 2, 4, 5, 1, 3),
-    (0, 2, 4, 5, 3, 1),
-    (0, 2, 5, 1, 3, 4),
-    (0, 2, 5, 1, 4, 3),
-    (0, 2, 5, 3, 1, 4),
-    (0, 2, 5, 3, 4, 1),
-    (0, 2, 5, 4, 1, 3),
-    (0, 2, 5, 4, 3, 1),
-    (0, 3, 4, 1, 2, 5),
-    (0, 3, 4, 1, 5, 2),
-    (0, 3, 4, 2, 1, 5),
-    (0, 3, 4, 2, 5, 1),
-    (0, 3, 4, 5, 1, 2),
-    (0, 3, 4, 5, 2, 1),
-    (0, 3, 5, 1, 2, 4),
-    (0, 3, 5, 1, 4, 2),
-    (0, 3, 5, 2, 1, 4),
-    (0, 3, 5, 2, 4, 1),
-    (0, 3, 5, 4, 1, 2),
-    (0, 3, 5, 4, 2, 1),
-    (0, 4, 5, 1, 2, 3),
-    (0, 4, 5, 1, 3, 2),
-    (0, 4, 5, 2, 1, 3),
-    (0, 4, 5, 2, 3, 1),
-    (0, 4, 5, 3, 1, 2),
-    (0, 4, 5, 3, 2, 1),
-)
 
 
 # The supported polyhedra, one record each. Insertion order is the classify_geometry tie-break;
@@ -237,7 +122,6 @@ POLYHEDRA: dict[str, Polyhedron] = {
             default_rank=1,
             vertex_dirs=((0, 0, 1), (1, 0, 0), (0, 0, -1)),  # 0,2 trans; 1 perpendicular
             angles=((0, 1, 90), (1, 2, 90), (0, 2, 180)),
-            permutations=((0, 1, 2), (1, 0, 2), (0, 2, 1)),
             planar=True,
             site_groups=(("axial", (0, 2)), ("equatorial", (1,))),
         ),
@@ -256,9 +140,6 @@ POLYHEDRA: dict[str, Polyhedron] = {
                 (-0.4714045, -0.8164966, -0.3333333),
             ),
             angles=((0, 1, 109.5), (1, 2, 109.5), (0, 2, 109.5)),  # 109.5 as `tetrahedral` spells it
-            # No canned list, as `tetrahedral` has none: the three vertices are one orbit under C3v, so there is no
-            # geometric isomerism to enumerate. Metal-centred enantiomers are not enumerated for either shape.
-            permutations=None,
             geometric_isomerism=False,
             # planar=False separates it from trigonal_planar, and deliberately not by a nearest-template
             # angle contest: on the 5 corpus CN3 centres the TPL-over-TPY margin is only +1.6°, because
@@ -270,7 +151,6 @@ POLYHEDRA: dict[str, Polyhedron] = {
             default_rank=0,
             vertex_dirs=((1, 0, 0), (0, 1, 0), (-1, 0, 0), (0, -1, 0)),  # 0,2 and 1,3 trans; 0,1 cis
             angles=((0, 2, 180), (1, 3, 180), (0, 1, 90)),
-            permutations=((0, 1, 2, 3), (0, 2, 1, 3), (0, 2, 3, 1)),
             planar=True,
         ),
         Polyhedron(
@@ -295,7 +175,6 @@ POLYHEDRA: dict[str, Polyhedron] = {
                 (-0.5, math.sqrt(3) / 2, 0),
             ),  # 0,1 axial; 2,3 equatorial 120°
             angles=((0, 1, 180), (2, 3, 120), (0, 3, 90), (1, 2, 90)),
-            permutations=((0, 1, 2, 3), (0, 2, 1, 3), (0, 3, 1, 2), (1, 2, 0, 3), (1, 3, 0, 2), (2, 3, 0, 1)),
             site_groups=(("axial", (0, 1)), ("equatorial", (2, 3))),
         ),
         Polyhedron(
@@ -304,7 +183,6 @@ POLYHEDRA: dict[str, Polyhedron] = {
             default_rank=0,
             vertex_dirs=((0, 0, 1), (0, 0, -1), (1, 0, 0), (-0.5, math.sqrt(3) / 2, 0), (-0.5, -math.sqrt(3) / 2, 0)),
             angles=((0, 1, 180), (1, 2, 90), (0, 3, 90), (2, 3, 120), (3, 4, 120), (2, 4, 120)),
-            permutations=_TBP_ISOMERS,
             site_groups=(("axial", (0, 1)), ("equatorial", (2, 3, 4))),
         ),
         # basal donors sit below the metal's equatorial plane (apex-basal ~105°, trans-basal ~150°): a real
@@ -322,7 +200,6 @@ POLYHEDRA: dict[str, Polyhedron] = {
                 (0.0, -0.965926, -0.258819),
             ),
             angles=((0, 1, 105), (0, 3, 105), (1, 3, 150), (2, 4, 150), (1, 4, 86), (2, 3, 86)),
-            permutations=_SPY_ISOMERS,
             site_groups=(("apical", (0,)), ("basal", (1, 2, 3, 4))),
         ),
         Polyhedron(
@@ -332,7 +209,6 @@ POLYHEDRA: dict[str, Polyhedron] = {
             vertex_dirs=((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)),  # trans PAIRS:
             #   0,1 / 2,3 / 4,5, unlike square_planar, where the trans partner of 0 is 2
             angles=((0, 1, 180), (2, 3, 180), (4, 5, 180), (0, 2, 90), (1, 4, 90), (3, 5, 90)),
-            permutations=_OCT_ISOMERS,
         ),
         Polyhedron(
             name="trigonal_prismatic",
@@ -349,7 +225,6 @@ POLYHEDRA: dict[str, Polyhedron] = {
             angles=None,  # DERIVED, unlike its CN6 neighbour: octahedral's minimal subset was measured to be
             #   sufficient AND better than all-pairs, and nobody has run that measurement on this record.
             #   Deriving is the honest default; a subset here would be a guess wearing octahedral's evidence.
-            permutations=_TPR_ISOMERS,
         ),
         Polyhedron(
             name="pentagonal_bipyramidal",
@@ -364,7 +239,7 @@ POLYHEDRA: dict[str, Polyhedron] = {
                 (-0.809017, -0.587785, 0),
                 (0.309017, -0.951057, 0),
             ),
-            angles=None,  # angles derived; no canned permutation list
+            angles=None,
             site_groups=(("axial", (0, 1)), ("equatorial", (2, 3, 4, 5, 6))),
         ),
         Polyhedron(
@@ -460,30 +335,6 @@ def vertex_dirs(geometry):
     return getattr(record(geometry), "vertex_dirs", None)
 
 
-@lru_cache(maxsize=None)
-def isomer_permutations(geometry):
-    """Return one candidate per proper-rotation orbit, or ``None`` if the geometry has no canned pool.
-
-    The compact tables contain one representative per full point-group orbit. A nonplanar decorated sphere
-    can be chiral, so reflect each representative once and retain it only when its proper-rotation orbit is
-    absent. Planar reflections are already proper-equivalent and add nothing.
-    """
-    polyhedron = record(geometry)
-    base = getattr(polyhedron, "permutations", None)
-    if base is None:
-        return None
-    proper, improper = point_group(polyhedron.vertex_dirs)
-    reflection = min(improper - proper, default=None)
-    if reflection is None:
-        return base
-    return base + tuple(tuple(order[reflection[v]] for v in range(len(order))) for order in base)
-
-
-def is_planar(geometry):
-    """Return True if `geometry`'s metal and vertices are coplanar by definition (unknown -> False)."""
-    return bool(getattr(record(geometry), "planar", False))
-
-
 def geometries_for_cn(n):
     """Return the supported polyhedra for coordination number `n`, best-default first (by `default_rank`)."""
     return sorted((p for p in POLYHEDRA.values() if p.cn == n), key=lambda p: p.default_rank)
@@ -551,11 +402,6 @@ def chirality_tag(chirality):
 
 
 @lru_cache(maxsize=None)
-def _perms(n):
-    return tuple(permutations(range(n)))
-
-
-@lru_cache(maxsize=None)
 def point_group(dirs):
     """Return ``(proper, improper)`` vertex permutations realised by template isometries.
 
@@ -565,7 +411,7 @@ def point_group(dirs):
     t = np.array(dirs, float)
     t = t / np.linalg.norm(t, axis=1, keepdims=True)
     n = len(t)
-    perms = np.array(_perms(n))
+    perms = np.fromiter(itertools.chain.from_iterable(itertools.permutations(range(n))), dtype=int).reshape(-1, n)
     permuted = t[perms]  # (P, n, 3)
     u, _, wt = np.linalg.svd(np.einsum("pni,nj->pij", permuted, t))  # per-perm permuted.T @ t
     sgn = np.sign(np.linalg.det(u @ wt))
@@ -587,6 +433,25 @@ def rotation_group(geometry):
     """
     dirs = vertex_dirs(geometry)
     return None if dirs is None else point_group(tuple(map(tuple, dirs)))[0]
+
+
+@lru_cache(maxsize=None)
+def isomer_permutations(geometry):
+    """Derive one candidate per proper-rotation orbit from the polyhedron vertices.
+
+    Proper rotations identify the same arrangement; reflections remain separate so enantiomers survive.
+    """
+    polyhedron = record(geometry)
+    if polyhedron is None:
+        return None
+    rotations = rotation_group(polyhedron.name)
+    seen, out = set(), []
+    for order in itertools.permutations(range(polyhedron.cn)):
+        if order in seen:
+            continue
+        out.append(order)
+        seen.update(tuple(order[q[v]] for v in range(polyhedron.cn)) for q in rotations)
+    return tuple(out)
 
 
 def seat_properly(dirs_obs, dirs, order):

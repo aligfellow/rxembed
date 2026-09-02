@@ -120,6 +120,21 @@ class Isomer:
     stereo_ref: object = None  # input-geometry chirality fingerprint (for stereo='preserve')
     stereo_label: str = ""  # ligand stereoisomer tag ('C16:R'), distinct from the metal-centre `chirality`
 
+    @property
+    def mol(self):
+        """Return this candidate's independent public molecule, copying a shared graph on first access."""
+        if self._mol is None:
+            self._mol = Chem.Mol(self._shared_mol)
+        return self._mol
+
+    @mol.setter
+    def mol(self, value):
+        self._mol = self._shared_mol = value
+
+    @property
+    def _graph(self):
+        return self._shared_mol if self._mol is None else self._mol
+
     def __init__(self, mol, geometry, sites, lengths="auto"):
         """Build a known isomer by assigning donor atom indices to polyhedron slots.
 
@@ -182,10 +197,14 @@ class Isomer:
         graft_ref=None,
         stereo_ref=None,
         stereo_label="",
+        shared_mol=False,
     ):
         """Build an isomer from real-atom states and optional pre-composed constraints."""
         iso = cls.__new__(cls)
-        iso.mol = Chem.Mol(mol)
+        if shared_mol:
+            iso._mol, iso._shared_mol = None, mol
+        else:
+            iso.mol = Chem.Mol(mol)
         iso._centres, iso.donor_bonds = tuple(centres), list(donor_bonds)
         if not iso._centres:
             raise ValueError("an Isomer needs at least one metal state")
@@ -199,7 +218,7 @@ class Isomer:
         iso._base_cons = Constraints() if constraints is None else constraints
         iso._constrained_metals = constrained_metals
         iso._lengths = lengths
-        iso._length_mol = Chem.Mol(iso.mol)
+        iso._length_mol = iso._graph if shared_mol else Chem.Mol(iso._graph)
         iso._graft_ref = dict(graft_ref or {})
         iso.stereo_ref, iso.stereo_label = stereo_ref, stereo_label
         return iso
@@ -218,7 +237,7 @@ class Isomer:
     def cons(self):
         """Compile physical coordination constraints from this immutable state."""
         return compile_constraints(
-            self.mol,
+            self._graph,
             self.centres,
             length_mol=self._length_mol,
             base=self._base_cons,
@@ -294,7 +313,8 @@ class Isomer:
         if set(by_metal) != {state.atom for state in self.centres}:
             raise ValueError("replacement metal states do not match this isomer")
         out = copy(self)
-        out.mol = Chem.Mol(self.mol)
+        if self._mol is not None:
+            out.mol = Chem.Mol(self._mol)
         out._centres = centres
         return out
 
@@ -398,21 +418,23 @@ def _state_label(iso, state):
     if not state.geometry:
         return ""
     vertices, haptic, _winding, _donors = _core.materialized_state(iso, state)
-    return _slots.order_label(iso.mol, vertices, state.geometry, range(len(vertices)), haptic)
+    return _slots.order_label(iso._graph, vertices, state.geometry, range(len(vertices)), haptic)
 
 
 def _state_arrangement(iso, state):
     """Format one centre's readable per-vertex ligand arrangement."""
     vertices, haptic, winding, donors = _core.materialized_state(iso, state)
-    descriptors = _coord_stereo.face_descriptors(iso.mol, donors, haptic, winding)
-    base_labels = [_site_symbol(iso.mol, donor, haptic, winding, descriptors) for donor in vertices]
+    descriptors = _coord_stereo.face_descriptors(iso._graph, donors, haptic, winding)
+    base_labels = [_site_symbol(iso._graph, donor, haptic, winding, descriptors) for donor in vertices]
     labels = list(base_labels)
-    classes = _coord_stereo.site_classes(iso.mol, vertices, haptic, isomer_roles(iso))
+    classes = _coord_stereo.site_classes(iso._graph, vertices, haptic, isomer_roles(iso))
     for position, donor in enumerate(vertices):
-        same = [i for i, label in enumerate(base_labels) if label == base_labels[position]]
-        if donor in haptic and len({classes[vertices[i]] for i in same}) > 1:
+        if donor not in haptic:
+            continue
+        same_shape = [site for site, face in haptic.items() if len(face) == len(haptic[donor])]
+        if len({classes[site] for site in same_shape}) > 1:
             anchor = min(haptic[donor])
-            labels[position] += f"@{iso.mol.GetAtomWithIdx(anchor).GetSymbol()}{anchor}"
+            labels[position] += f"@{iso._graph.GetAtomWithIdx(anchor).GetSymbol()}{anchor}"
     return " ".join(labels)
 
 
@@ -429,19 +451,21 @@ def _site_symbol(mol, donor, haptic, winding, descriptors):
 def winding_signature(iso, state, winding):
     """Return canonical-slot identity for one centre's haptic winding assignment."""
     vertices, haptic, _stored, _donors = _core.materialized_state(iso, state)
-    classes = _coord_stereo.site_classes(iso.mol, vertices, haptic, isomer_roles(iso))
+    classes = _coord_stereo.site_classes(iso._graph, vertices, haptic, isomer_roles(iso))
     keys = [
         None if donor == VACANT else (classes[donor], winding.get(donor, "") if donor in haptic else "")
         for donor in vertices
     ]
-    slots = canonical_slots(vertex_dirs(state.geometry), keys, _coord_stereo.chelate_edges(iso.mol, vertices, haptic))
+    slots = canonical_slots(
+        vertex_dirs(state.geometry), keys, _coord_stereo.chelate_edges(iso._graph, vertices, haptic)
+    )
     return tuple(key for _slot, key in sorted(zip(slots, keys, strict=True)))
 
 
 def _state_haptic_configuration(iso, state):
     """Return rac/meso for one interchangeable pair of named haptic faces."""
     _vertices, haptic, winding, donors = _core.materialized_state(iso, state)
-    descriptors = _coord_stereo.face_descriptors(iso.mol, donors, haptic, winding)
+    descriptors = _coord_stereo.face_descriptors(iso._graph, donors, haptic, winding)
     windings = {d: w for d, w in winding.items() if len(haptic.get(d, ())) >= _HAPTIC_FACE_MIN}
     faces = [d for d in descriptors if d in windings]
     if len(faces) != _PAIR or set(faces) != set(windings):
@@ -629,21 +653,21 @@ def _print_details(iso):
         if state.geometry not in POLYHEDRA:
             continue
         vertices, haptic, winding, donors = _core.materialized_state(iso, state)
-        descriptors = _coord_stereo.face_descriptors(iso.mol, donors, haptic, winding)
+        descriptors = _coord_stereo.face_descriptors(iso._graph, donors, haptic, winding)
         metal_symbol = _PT.GetElementSymbol(state.atomic_num)
         prefix = f"       {metal_symbol}{state.atom}"
         polyhedron = POLYHEDRA[state.geometry]
         if polyhedron.site_groups:
             groups = []
             for name, positions in polyhedron.site_groups:
-                labels = (_site_symbol(iso.mol, vertices[v], haptic, winding, descriptors) for v in positions)
+                labels = (_site_symbol(iso._graph, vertices[v], haptic, winding, descriptors) for v in positions)
                 groups.append(f"{name}: {' '.join(labels)}")
             print(f"{prefix} {'; '.join(groups)}")
         else:
             dirs = polyhedron.vertex_dirs
             pairs = [
-                f"{_site_symbol(iso.mol, vertices[a], haptic, winding, descriptors)}-"
-                f"{_site_symbol(iso.mol, vertices[b], haptic, winding, descriptors)}"
+                f"{_site_symbol(iso._graph, vertices[a], haptic, winding, descriptors)}-"
+                f"{_site_symbol(iso._graph, vertices[b], haptic, winding, descriptors)}"
                 for a in range(len(dirs))
                 for b in range(a + 1, len(dirs))
                 if _vertex_angle(dirs[a], dirs[b]) >= _slots.TRANS_ANGLE
@@ -653,17 +677,17 @@ def _print_details(iso):
 
         if len(haptic) > 1:
             faces = [
-                f"{_site_symbol(iso.mol, dummy, haptic, winding, descriptors)}({','.join(map(str, face))})"
+                f"{_site_symbol(iso._graph, dummy, haptic, winding, descriptors)}({','.join(map(str, face))})"
                 for dummy, face in haptic.items()
             ]
             print(f"{prefix} faces: {', '.join(faces)}")
 
         ring_atoms = {atom for face in haptic.values() for atom in face}
         donors = [donor for donor in donors if donor not in ring_atoms]
-        classes = _coord_stereo.donor_classes(iso.mol, donors)
+        classes = _coord_stereo.donor_classes(iso._graph, donors)
         by_symbol = {}
         for donor in donors:
-            by_symbol.setdefault(iso.mol.GetAtomWithIdx(donor).GetSymbol(), []).append(donor)
+            by_symbol.setdefault(iso._graph.GetAtomWithIdx(donor).GetSymbol(), []).append(donor)
         ambiguous = {
             donor
             for same_element in by_symbol.values()
@@ -671,8 +695,8 @@ def _print_details(iso):
             for donor in same_element
         }
         for donor in sorted(ambiguous):
-            label = _site_symbol(iso.mol, donor, haptic, winding, descriptors)
-            print(f"{prefix} {label}: {_ligand_smiles(iso.mol, donor)}")
+            label = _site_symbol(iso._graph, donor, haptic, winding, descriptors)
+            print(f"{prefix} {label}: {_ligand_smiles(iso._graph, donor)}")
 
 
 class IsomerSet(list):
@@ -748,7 +772,7 @@ class IsomerSet(list):
             if isinstance(haptic, dict):
                 for state in states(i):
                     _vertices, faces, winding, donors = _core.materialized_state(i, state)
-                    descriptors = _coord_stereo.face_descriptors(i.mol, donors, faces, winding)
+                    descriptors = _coord_stereo.face_descriptors(i._graph, donors, faces, winding)
                     if all(
                         len(matches := [dummy for dummy, face in faces.items() if atom in face]) == 1
                         and descriptors.get(matches[0]) == aliases.get(wanted, wanted)
@@ -761,7 +785,7 @@ class IsomerSet(list):
                 _vertices, faces, winding, donors = _core.materialized_state(i, state)
                 if _state_haptic_configuration(i, state) == wanted:
                     return True
-                descriptors = _coord_stereo.face_descriptors(i.mol, donors, faces, winding)
+                descriptors = _coord_stereo.face_descriptors(i._graph, donors, faces, winding)
                 if wanted in {"Rₚ", "Sₚ"} and len(descriptors) > 1:
                     anchors = [min(faces[dummy]) for dummy in descriptors]
                     raise ValueError(

@@ -139,8 +139,9 @@ def test_bis_en_octahedral_has_three_stereoisomers():
         ("trigonal_bipyramidal", "[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])(<-N)<-O", 10),
         ("square_pyramidal", "[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])(<-N)<-O", 15),
         ("octahedral", "[O+]#[C-]->[Co+3](<-[F-])(<-[Cl-])(<-[Br-])(<-N)<-O", 15),
+        ("trigonal_prismatic", "O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", 60),
     ],
-    ids=["seesaw", "TBP", "square-pyramidal", "octahedral"],
+    ids=["seesaw", "TBP", "square-pyramidal", "octahedral", "trigonal-prismatic"],
 )
 def test_chiral_polyhedra_enumerate_both_hands(geometry, smiles, per_hand):
     isos = rx.metal(smiles, geometry, stereo="free")
@@ -239,14 +240,6 @@ def test_asymmetric_nn_complex_keeps_both_substrate_orientations_per_stereoisome
     assert {len(arrangements) for arrangements in by_stereo.values()} == {2}
 
 
-# --- enumeration: arrangements the ligands cannot reach -------------------------------------------------
-
-
-def test_untabulated_single_ordering_is_retained():
-    isos = rx.metal("Cl[Mo](Cl)(Cl)(Cl)(Cl)(Cl)Cl")  # homoleptic MoCl7: one ordering, no haptic face
-    assert isos[0].geometry == "pentagonal_bipyramidal"
-
-
 def test_eta2_pair_passes_orientation_screen():
     smi = (
         "CC(C)c1cccc(C(C)C)c1-n1cc[n+](-c2c(C(C)C)cccc2C(C)C)[c-]1->[Rh+]123(<-[C-]#[O+])"
@@ -255,25 +248,37 @@ def test_eta2_pair_passes_orientation_screen():
     assert len(rx.metal(smi)) > 0
 
 
-# --- the "no permutations tabulated" info-log: only when an arrangement is really lost -------------------
-
-_PERM_WARN = "no isomer permutations tabulated"  # the stable substring of the guard's info-log
+# --- vertex-derived permutation pools -------------------------------------------------------------------
 
 
-def test_untabulated_single_arrangement_is_quiet(caplog):
-    with caplog.at_level("INFO", logger="rxembed.metal"):
-        isos = rx.metal(ferrocene())
-    assert isos, "the single ordering must still come back"
-    assert isos[0].geometry == "linear"
-    assert not any(_PERM_WARN in r.message for r in caplog.records), caplog.text
+def test_derived_single_ordering_is_retained():
+    isos = rx.metal("Cl[Mo](Cl)(Cl)(Cl)(Cl)(Cl)Cl")  # homoleptic MoCl7: one ordering, no haptic face
+    assert isos[0].geometry == "pentagonal_bipyramidal"
 
 
-def test_four_distinct_tetrahedral_donors_warn(caplog):
-    with caplog.at_level("INFO", logger="rxembed.metal"):
-        isos = rx.metal(tetrahedral_four_distinct(), "tetrahedral")
-    assert isos, "the single ordering must still come back"
-    assert isos[0].geometry == "tetrahedral"
-    assert any(_PERM_WARN in r.message for r in caplog.records), caplog.text
+def test_four_distinct_tetrahedral_donors_define_both_hands():
+    isos = rx.metal(tetrahedral_four_distinct(), "tetrahedral")
+    assert Counter(iso.chirality for iso in isos) == {"delta": 1, "lambda": 1}
+
+
+def test_trigonal_prismatic_pair_keeps_triangle_and_vertical_edges_distinct():
+    assert len(rx.metal("N->[Co+2](<-N)(<-N)(<-N)(<-O)<-O", "TPR")) == 4
+
+
+def test_high_coordination_homoleptic_model_is_one_arrangement():
+    isos = rx.metal("O->[La+3](<-O)(<-O)(<-O)(<-O)(<-O)(<-O)<-O", "DOD")
+    assert len(isos) == 1
+    assert isos[0].geometry == "dodecahedral"
+
+
+def test_high_coordination_candidates_defer_their_public_molecule_copy():
+    isos = rx.metal("O->[La+3](<-N)(<-P)(<-S)(<-[F-])(<-[Cl-])(<-[Br-])<-[I-]", "DOD")
+    assert len(isos) == 10_080
+    assert all(iso._mol is None for iso in isos)
+    assert len({id(iso._graph) for iso in isos}) == 1
+    assert "DOD" in str(isos[2])
+    assert "DOD" in rx.cxsmiles(isos[2])
+    assert isos[2]._mol is None
 
 
 # --- the template graft over a coordination sphere -------------------------------------------------------

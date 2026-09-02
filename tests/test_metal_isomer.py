@@ -308,7 +308,7 @@ def _ideal_sphere(geometry, symbol, scramble):
     return mol
 
 
-def test_untabulated_shape_uses_polyhedron():
+def test_derived_shape_uses_polyhedron():
     geometry = "square_antiprism"
     mol = _ideal_sphere(geometry, "F", (5, 2, 7, 0, 3, 6, 1, 4))
     retained = isomer.from_geometry(mol)

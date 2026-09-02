@@ -141,7 +141,7 @@ def materialized_states(mol, centres):
 def materialized_state(iso, state):
     """Return transient vertices, haptic faces, windings and donors for one state."""
     centres = tuple(state if current.atom == state.atom else current for current in iso.centres)
-    return materialized_states(iso.mol, centres)[state.atom]
+    return materialized_states(iso._graph, centres)[state.atom]
 
 
 def state_with_winding(state, vertices, winding):

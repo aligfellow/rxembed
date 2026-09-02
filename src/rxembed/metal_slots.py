@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import itertools
 import math
 
 import numpy as np
@@ -13,21 +12,19 @@ from .metal_core import (
     VACANT,
     _frag_map,
     _vertex_atom,
-    logger,
 )
 from .metal_donor_orient import _FOLD_WINDOW, _stripped_hybridisation, donation_axis
 from .metal_polyhedron import (
     CHELATE_SPAN_ANGLE,
     POLYHEDRA,
     _fit_trace,
-    _seat_by_alignment,
     _vertex_angle,
-    describe,
     isomer_permutations,
+    point_group,
     seat_properly,
     vertex_dirs,
 )
-from .metal_stereo import chirality_of, site_classes
+from .metal_stereo import site_classes
 
 _PT = GetPeriodicTable()
 TRANS_ANGLE = 150  # same-element donor pairs beyond this are trans
@@ -78,7 +75,7 @@ def order_label(mol, donors, geometry, order, haptic=None):
     if dirs is None:
         return f"isomer{order}"
     if not POLYHEDRA[geometry].geometric_isomerism:
-        return ""  # no cis/trans distinction for this geometry: a single arrangement
+        return ""  # no cis/trans distinction for this geometry
     od = [donors[k] for k in order]
     if geometry == "octahedral":
         tri = _octahedral_triad(mol, od, haptic)
@@ -122,6 +119,7 @@ def input_ordering(mol, metal, donors, geometry):
 
     Orthogonal Procrustes finds ``donors[order[slot]]``. Reflection is allowed for the fit, then
     `seat_properly` restores the correct hand. Frozen donors therefore retain their realised slots.
+    The fit searches proper-rotation orbit representatives exactly without constructing isomers.
     """
     dirs_ref = vertex_dirs(geometry)
     if dirs_ref is None or mol.GetNumConformers() == 0 or len(donors) != len(dirs_ref):
@@ -130,14 +128,10 @@ def input_ordering(mol, metal, donors, geometry):
     dd = np.array([np.zeros(3) if d == VACANT else pos[d] - pos[metal] for d in donors], float)
     dd /= np.where((norm := np.linalg.norm(dd, axis=1, keepdims=True)) > 0, norm, 1.0)
     v_ideal = np.array(dirs_ref, float)
-    canned = isomer_permutations(geometry)
-    if canned is None:  # no canned list (CN7/8): searching only the identity would seat donors in PERCEPTION
-        return seat_properly(dd, dirs_ref, _seat_by_alignment(dd, v_ideal))  # order, not a seating at all
-    best_score, best_order = -1.0, list(range(len(donors)))
-    for order in canned:
-        score = _fit_trace(dd[list(order)].T @ v_ideal)  # best alignment; see `_fit_trace` on reflections
-        if score > best_score:
-            best_score, best_order = score, order
+    best_order = max(
+        isomer_permutations(geometry),
+        key=lambda order: _fit_trace(dd[list(order)].T @ v_ideal),
+    )
     return seat_properly(dd, dirs_ref, best_order)
 
 
@@ -248,20 +242,30 @@ def _chelate_span_ok(mol, od, *, frag, dirs, bm, r_metal, hyb, donors, haptic=No
     return True
 
 
-def _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, coordination=(), *, limit=None):
+def _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, coordination=()):
     """Deduplicate reachable slot assignments by constitutional signature.
 
-    Pair classes, ideal angles, same-ligand path lengths and metal hand distinguish candidates. Central-trans
-    tridentates and unreachable wide chelates are removed; `limit` permits an early ambiguity check.
+    Canonical vertex classes and same-ligand path lengths distinguish candidates under proper rotations.
+    Central-trans tridentates and unreachable wide chelates are removed.
     """
     frag = _frag_map(mol)  # same ligand = same fragment
-    dmat = Chem.GetDistanceMatrix(mol)  # topological (bond-count) distances
     real_donors = [d for d in donors if d != VACANT]
     classes = site_classes(mol, donors, haptic, coordination)
+    # Separate equivalent monodentates have one arrangement in every geometry, so skip the factorial pool.
+    if (
+        perms is None
+        and VACANT not in donors
+        and not haptic
+        and len(set(classes.values())) == 1
+        and len({frag[donor] for donor in donors}) == len(donors)
+    ):
+        return [tuple(range(len(donors)))]
+    perms = perms if perms is not None else isomer_permutations(geometry)
+    dmat = Chem.GetDistanceMatrix(mol)  # topological (bond-count) distances
     bm = _span_bounds(mol)
     hyb = _stripped_hybridisation(mol)  # the fold ruler's own (element, hyb) class: graph-only, no coords
     pairs = [(p, q) for p in range(len(dirs)) for q in range(p + 1, len(dirs))]
-    angle = {(p, q): _vertex_angle(dirs[p], dirs[q]) for p, q in pairs}  # a vertex-pair's angle is donor-independent
+    rotations = point_group(tuple(map(tuple, dirs)))[0]
 
     def link(od, p, q):  # intra-ligand bond distance of a same-ligand pair
         a, b = _vertex_atom(haptic, od[p]), _vertex_atom(haptic, od[q])  # resolve a centroid to its ring atom
@@ -281,18 +285,17 @@ def _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, coo
             mol, od, frag=frag, dirs=dirs, bm=bm, r_metal=r_metal, hyb=hyb, donors=real_donors, haptic=haptic
         ):  # can't span/donate trans
             continue
-        sig = tuple(
-            sorted(
-                (tuple(sorted((donor_class(od[p]), donor_class(od[q])))), link(od, p, q), angle[(p, q)])
-                for p, q in pairs
+        links = {pair: link(od, *pair) for pair in pairs}
+        sig = min(
+            (
+                tuple(donor_class(od[q[v]]) for v in range(len(dirs))),
+                tuple(links[tuple(sorted((q[p], q[r])))] for p, r in pairs),
             )
+            for q in rotations
         )
-        sig = (sig, chirality_of(mol, geometry, od, haptic, coordination))
         if sig not in seen:
             seen.add(sig)
             out.append(order)
-            if limit is not None and len(out) >= limit:
-                break
     return out
 
 
@@ -304,22 +307,6 @@ def distinct_vertex_orderings(mol, donors, geometry, perms=None, r_metal=1.4, ha
     keeps each frozen donor pinned to its input vertex.
     """
     dirs = vertex_dirs(geometry)
-    if perms is None and isomer_permutations(geometry) is None:  # CN7/8, tetrahedral and linear have no
-        # canned list, so the input ordering is the only candidate. Warn only where that loses something: a
-        # linear or all-identical geometry has exactly one arrangement and the warning would be noise.
-        orbit = itertools.permutations(range(len(donors)))
-        if (
-            dirs is not None
-            and len(_distinct_orderings(mol, donors, geometry, orbit, dirs, r_metal, haptic, coordination, limit=2)) > 1
-        ):
-            logger.info(
-                "metal[%s]: no isomer permutations tabulated; enumerating the input ordering only",
-                describe(geometry),
-            )
-        # Unfiltered: with a single ordering there is nothing to prefer it over, so filtering could only
-        # return empty and make `rx.metal(...)[0]` raise. `bonding_ok` and the geometry gate judge it.
-        return [list(range(len(donors)))]
-    perms = perms if perms is not None else isomer_permutations(geometry)
     if dirs is None:
         return perms
     return _distinct_orderings(mol, donors, geometry, perms, dirs, r_metal, haptic, coordination)
