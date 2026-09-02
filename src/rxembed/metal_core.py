@@ -16,7 +16,7 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 from rdkit.Geometry import Point3D
 
-from .constraints import add_distance, add_pairwise_shape
+from .constraints import add_pairwise_shape
 from .metal_polyhedron import (
     POLYHEDRA,
     fit_residual,
@@ -174,7 +174,6 @@ def metal_index(mol):
 
 
 _MIN_STEREO_NEIGHBOURS = 3  # a tetrahedral stereocentre needs >=3 explicit neighbours (else ETKDG raises)
-_TETRAVALENT = 4  # a fully-substituted (already degree-4) donor is not a candidate for the D-cap chirality hold
 
 
 def _clear_labile_donor_stereo(atom):
@@ -188,37 +187,22 @@ def _clear_labile_donor_stereo(atom):
         atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
 
 
-def _labile_donors(mol, donors):
-    """Return the metal-bound donors the surrogate can't hold natively: sp3 C or N with a chiral tag.
-
-    A carbanion-C or amine-N donor is a stereocentre only while metal-bound. The surrogate strips that bond,
-    so it becomes a bare degree-3 centre RDKit and UFF will invert. A heavy pnictogen (P/As/Sb) stays
-    configurationally stable at degree 3 and is excluded. `donors` may be empty, since a `from_surrogate`
-    isomer from the frozen-core path does not track them, and then there are no labile donors.
-    """
-    return [
-        d
-        for d in (donors or ())
-        if mol.GetAtomWithIdx(d).GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
-        and mol.GetAtomWithIdx(d).GetAtomicNum() in (6, 7)
-        and mol.GetAtomWithIdx(d).GetTotalDegree() < _TETRAVALENT
-    ]
-
-
-def donor_chirality_sign(mol, cid, donor):
+def donor_chirality_sign(mol, cid, donor, references=()):
     """Geometric hand (+1 / -1, or None) of a donor: the signed volume of its first three neighbours.
 
-    Neighbour order is stable for a fixed mol, so the sign is comparable across that mol's conformers. Used
-    to cull a conformer whose labile donor inverted, via a relax, re-embed or mc stray, off its enumerated hand.
+    ``references`` supplies stripped metal neighbours. With four carriers the fourth, rather than the centre,
+    is the volume origin, so a bridge is measured as the actual tetrahedron. Neighbour and reference order is
+    stable for a fixed mol, making the sign comparable across its conformers.
 
-    The sign is RDKit's own convention, negative for `CHI_TETRAHEDRAL_CW`, and holds at degree 3 as at degree
-    4 (the fourth reference is then the centre itself, which leaves the triple product unchanged).
+    Without extra references the sign is RDKit's own convention, negative for `CHI_TETRAHEDRAL_CW`.
     """
     nbrs = [n.GetIdx() for n in mol.GetAtomWithIdx(donor).GetNeighbors()]
+    nbrs.extend(int(i) for i in references if int(i) not in nbrs)
     if len(nbrs) < _MIN_STEREO_NEIGHBOURS:
         return None
     conf = mol.GetConformer(cid)
-    p = np.array([list(conf.GetAtomPosition(i)) for i in [donor, nbrs[0], nbrs[1], nbrs[2]]])
+    origin = nbrs[3] if len(nbrs) > _MIN_STEREO_NEIGHBOURS else donor
+    p = np.array([list(conf.GetAtomPosition(i)) for i in [origin, nbrs[0], nbrs[1], nbrs[2]]])
     v = float(np.dot(np.cross(p[1] - p[0], p[2] - p[0]), p[3] - p[0]))
     return int(np.sign(v)) if abs(v) > 1e-6 else None  # noqa: PLR2004  a near-planar centre has no hand
 
@@ -266,96 +250,6 @@ def _basis_is_ambiguous(mol, donor, metal) -> bool:
     if bond is None or bond.GetBondType() != Chem.BondType.DATIVE or bond.GetBeginAtomIdx() != int(donor):
         return False
     return bond_removal_mirrors(mol.GetAtomWithIdx(int(donor)), int(metal))
-
-
-_DUMMY_M_LO, _DUMMY_M_HI = 0.8, 1.8  # Å: pin the hold-dummy D near the metal (~ the coordinate-bond / lone-pair side)
-
-
-def _shift_phantoms(cons, offset):
-    """Shift every reserved haptic-centroid index by ``offset`` and re-key its constraint fields.
-
-    Two transients are appended from the real atom count, a haptic centroid dummy and a labile donor's D-cap,
-    but `materialise_phantoms` requires the centroid keys to be the consecutive block after that count, so
-    whichever is appended second collides. This makes the caps take the low indices and the centroid block
-    slide above them, so haptic centroids and donor-chirality caps can coexist.
-    """
-    if not cons.haptic or not offset:
-        return
-    old = set(cons.haptic)
-    bump = {i: i + offset for i in old}  # every reserved index moves; a real atom index never does
-
-    def key(k):
-        return tuple(bump.get(i, i) for i in k)
-
-    cons.haptic = {bump[d]: ring for d, ring in cons.haptic.items()}
-    cons.phantoms = frozenset(bump[p] for p in cons.phantoms)
-    for name in ("distances", "pulls", "floors", "dg_floors"):
-        setattr(cons, name, {key(k): v for k, v in getattr(cons, name).items()})
-    cons.angles = {key(k): v for k, v in cons.angles.items()}
-
-
-def _hold_donor_chirality(mol, metal, donors, cons):
-    """Cap each labile (sp3 C/N) metal-bound donor carrying a chiral tag with a dummy D, so the hand is enforced.
-
-    A degree-3 carbanion or amine donor has no M-C bond in the surrogate, so RDKit and UFF do not perceive a
-    stereocentre and its two enumerated hands relax to the same geometry. Neutralising its charge and adding a
-    4th bond to a deuterium makes it a proper tetrahedral centre in the same appended-D basis the enumeration
-    labelled it. With conformers (relax/mc) each D goes at the 4th vertex of that conformer's hand; without
-    them, on the initial embed, the hand comes from ETKDG and the tag. A (metal, D) distance pins D on the
-    coordinate-bond side, without which ETKDG thrashes ~200x slower, and `_release_donor_chirality` drops that
-    key. Returns ``(capped_mol, held)``.
-    """
-    labile = _labile_donors(mol, donors)
-    if not labile:  # the common case: no carbanion/amine stereocentre, so skip the RWMol copy and sanitize
-        return mol, []
-    _shift_phantoms(cons, len(labile))  # the caps append HERE, so the haptic block reserved after them moves up
-    rw = Chem.RWMol(mol)
-    held = []
-    for d in labile:
-        a = rw.GetAtomWithIdx(d)
-        held.append((None, d, a.GetFormalCharge()))
-        a.SetFormalCharge(0)  # neutralise: a 4th bond on an anion would be hypervalent
-        a.SetNoImplicit(True)
-        dm = rw.AddAtom(Chem.Atom(1))
-        rw.GetAtomWithIdx(dm).SetIsotope(2)  # deuterium: distinct from any real H, lowest CIP priority
-        rw.AddBond(d, dm, Chem.BondType.SINGLE)
-        add_distance(cons.distances, metal, dm, _DUMMY_M_LO, _DUMMY_M_HI)  # pin D near M -> fast, correct ETKDG place
-        held[-1] = (dm, d, held[-1][2])
-    out = rw.GetMol()
-    Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
-    for conf in out.GetConformers():  # place each D at the 4th vertex of this conformer's current hand
-        for dm, d, _q in held:
-            pd = np.array(conf.GetAtomPosition(d))
-            nbrs = [n.GetIdx() for n in out.GetAtomWithIdx(d).GetNeighbors() if n.GetIdx() != dm][:3]
-            units = [(v := np.array(conf.GetAtomPosition(i)) - pd) / (np.linalg.norm(v) or 1.0) for i in nbrs]
-            fourth = -sum(units)  # opposite the three real substituents (~ the lone-pair / M direction)
-            conf.SetAtomPosition(dm, Point3D(*(pd + fourth / (np.linalg.norm(fourth) or 1.0))))
-    return out, held
-
-
-def _release_donor_chirality(mol, held, cons):
-    """Remove the hold dummy D's + their ``(metal, D)`` cons keys, restore donor charges, keep the tag.
-
-    Dropping the cons key is critical: `cons` is the Ensemble's, reused by minimize, replacement and MC, and a
-    distance to a now-removed atom would index past the mol (an IndexError in the bounds matrix).
-    """
-    if not held:
-        return mol
-    dummies = {dm for dm, _d, _q in held}
-    for key in [k for k in cons.distances if k[0] in dummies or k[1] in dummies]:
-        del cons.distances[key]
-    rw = Chem.RWMol(mol)
-    for dm in sorted(dummies, reverse=True):  # high indices first so the remaining atoms don't shift
-        rw.RemoveAtom(dm)
-    for _dm, d, q in held:
-        rw.GetAtomWithIdx(d).SetFormalCharge(q)
-    out = rw.GetMol()
-    donor_tags = {d: out.GetAtomWithIdx(d).GetChiralTag() for _dm, d, _q in held}  # sanitize drops the now-degree-3
-    Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
-    for d, t in donor_tags.items():  # carbanion/amine tag -> keep it so the next hold (relax, re-embed, mc) fires
-        out.GetAtomWithIdx(d).SetChiralTag(t)
-    _shift_phantoms(cons, -len(held))
-    return out
 
 
 def surrogate_metal(mol):
@@ -631,12 +525,8 @@ def materialise_phantoms(mol, haptic):
     if not haptic:
         return mol
     base_n = mol.GetNumAtoms()  # dummies are appended, so their reserved keys are the next consecutive indices
-    if sorted(haptic) != list(range(base_n, base_n + len(haptic))):  # another transient was appended first
-        raise ValueError(
-            f"haptic centroid indices {sorted(haptic)} are not the {len(haptic)} indices after {base_n} atoms: "
-            f"another transient atom (a donor-chirality D-cap?) was appended first, and a haptic face cannot "
-            f"compose with a carbanion/amine-donor chirality hold"
-        )
+    if sorted(haptic) != list(range(base_n, base_n + len(haptic))):
+        raise ValueError(f"haptic centroid indices {sorted(haptic)} are not consecutive after {base_n} real atoms")
     rw = Chem.RWMol(mol)
     for _dummy in sorted(haptic):
         a = rw.GetAtomWithIdx(rw.AddAtom(Chem.Atom(SURROGATE)))

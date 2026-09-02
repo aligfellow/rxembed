@@ -495,9 +495,9 @@ def test_tagged_chiral_amine_donor_stays_in_the_smiles_core():
     assert {rx.metal(text)[0].stereo_label.rsplit(":", 1)[1] for text in hands.values()} == {"R", "S"}
     assert all(rx.cxsmiles(rx.metal(text)[0]) == text for text in hands.values())
 
-    # Seed 2 makes restrained UFF cross the amine inversion barrier; rxembed keeps the correct DG seed.
-    realised = rx.embed(rx.metal("[Pd](Cl)(Cl)(Cl)([N@H](C)O)", "square_planar")[0], n=1, seed=2).minimize().mol
-    assert rx.cxsmiles(realised) == hands["N4:R"]
+    for text in hands.values():
+        realised = rx.embed(rx.metal(text)[0], n=1, seed=2).minimize().mol
+        assert rx.cxsmiles(realised) == text
 
 
 def test_embedded_phosphorus_stays_in_the_smiles_core():

@@ -2,23 +2,26 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import pathlib
 from importlib.util import find_spec
 
 import numpy as np
 import pytest
-from rdkit import Chem
+from rdkit import Chem, rdBase
 from rdkit.Chem import rdDistGeom
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
-from rxembed import core
+from rxembed import core, stereo
 from rxembed import metal_core as _metal
 from rxembed.metal_core import classify_geometry, geometry_for
 from rxembed.metal_polyhedron import POLYHEDRA, describe
 from rxembed.pipeline.perceive import read_xyz
 from rxembed.relax import bonding_ok
+
+emb = importlib.import_module("rxembed.embed")
 
 _MN_H2 = "examples/structures/mn-h2.xyz"  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
 _MN_H2_RC = [1, 5, 63, 64, 65, 66]  # its reacting core
@@ -271,7 +274,7 @@ def test_core_embed_returns_connected_copy():
         assert np.allclose(ens._mol.GetConformer(cid).GetPositions(), out.GetConformer(cid).GetPositions())
 
 
-# --- the metal-bound donor stereocentre hold (`_hold_donor_chirality` / `_release_donor_chirality`) -------
+# --- metal-bound donor stereochemistry ------------------------------------------------------------------
 
 _CARBANION_NI = "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)N(c1ccccc1)[CH-]->2c1ccccc1"
 _CARBANION_C = 23  # the metal-bound sp3 carbanion donor: a stereocentre only WHILE bound
@@ -291,8 +294,8 @@ def test_metal_bound_carbanion_embeds_both_hands():
     for iso in en:
         e = rx.embed(iso, n=1).minimize()
         assert e.n >= 1
-        assert e.mol.GetNumAtoms() == 65  # the dummy deuterium is removed after embed + relax
-        assert not any(a.GetIsotope() == 2 for a in e.mol.GetAtoms())  # no leaked D
+        assert e.mol.GetNumAtoms() == 65  # embedding does not append a transient atom
+        assert not any(a.GetIsotope() == 2 for a in e.mol.GetAtoms())
         assert any(a.GetSymbol() == "Ni" for a in e.mol.GetAtoms())  # the surrogate is switched back
         signs = {np.sign(_chirality_volume(e.mol, i, _CARBANION_C)) for i in e.ids}
         assert len(signs) == 1  # every conformer of this isomer has the same donor hand
@@ -396,10 +399,10 @@ def test_multimetal_surrogate_preserves_hand():
     assert every.GetAtomWithIdx(donor).GetChiralTag() == one.GetAtomWithIdx(donor).GetChiralTag()
 
 
-def test_d_capped_donor_path_is_not_double_corrected():
+def test_metal_referenced_donor_path_is_not_double_corrected():
     for iso in rx.metal(_CARBANION_NI, "square_planar"):
         order = [b.GetOtherAtomIdx(_CARBANION_C) for b in iso.mol.GetAtomWithIdx(_CARBANION_C).GetBonds()]
-        assert len(order) == _metal._MIN_STEREO_NEIGHBOURS, "the donor is not the capped degree-3 case"
+        assert len(order) == _metal._MIN_STEREO_NEIGHBOURS, "the donor is not the stripped degree-3 case"
         tag = iso.mol.GetAtomWithIdx(_CARBANION_C).GetChiralTag()
         assert tag in _TETRAHEDRAL, "the carbanion lost its tag, so this asserts nothing"
         e = rx.embed(iso, n=2, seed=0xF00D).minimize()
@@ -407,11 +410,107 @@ def test_d_capped_donor_path_is_not_double_corrected():
             assert _hand(e.mol, _CARBANION_C, order, int(cid)) == tag
 
 
-def test_donor_charge_is_restored_after_the_hold():
-    # the hold NEUTRALISES the carbanion during the embed (a -1 C can't take a 4th bond) then RESTORES it;
-    # a leak would corrupt the donor charge, and the total charge sent to xtb downstream.
+def test_donor_charge_is_unchanged_by_embedding():
+    # The temporary dative bond must not change the charge sent to a downstream calculator.
     for iso in rx.metal(_CARBANION_NI, "square_planar"):
         assert rx.embed(iso, n=1).mol.GetAtomWithIdx(_CARBANION_C).GetFormalCharge() == -1
+
+
+def test_direct_isomer_constructor_protects_a_tagged_amine_from_cleanup(monkeypatch):
+    source = Chem.AddHs(rx.parse_smiles("[Pd](Cl)(Cl)(Cl)([N@H](C)O)"))
+    expected = stereo.defined_stereo_label(source, {0})
+    iso = rx.Isomer(source, "SPL", [1, 2, 3, 4])
+    conformers = core.embed(iso, n=1, seed=2)
+
+    assert iso.stereo_label == ""
+    assert iso.mol.GetAtomWithIdx(4).GetChiralTag() in _TETRAHEDRAL
+    assert emb._stereo_donor_bonds(iso.mol, iso) == [(4, 0)]
+
+    def reflect(mol, _cons, *, conf_ids, max_iters, _statuses=None, **_kwargs):
+        for cid in conf_ids:
+            if max_iters:
+                positions = mol.GetConformer(cid).GetPositions()
+                positions[:, 0] *= -1.0
+                mol.GetConformer(cid).SetPositions(positions)
+            if _statuses is not None:
+                _statuses[cid] = 0
+        return np.zeros(len(conf_ids))
+
+    monkeypatch.setattr(emb, "restrained_uff", reflect)
+    conformers._relax_constrained(emb.BASE_STIFFNESS, max_iters=10)
+
+    assert conformers.unrelaxed == conformers.ids
+    assert {
+        stereo.stereo_from_3d(Chem.Mol(conformers.mol, False, int(cid)), exclude={iso.metal}) for cid in conformers.ids
+    } == {expected}
+
+
+def test_pipeline_tracks_a_tagged_amine_from_the_direct_constructor():
+    source = Chem.AddHs(rx.parse_smiles("[Pd](Cl)(Cl)(Cl)([N@H](C)O)"))
+    iso = rx.Isomer(source, "SPL", [1, 2, 3, 4])
+
+    ensemble = rx.embed(iso, n=1, seed=2)
+
+    assert set(ensemble._donor_hand) == {4}
+
+
+def test_geometry_label_restores_an_unspecified_amine_tag():
+    from rxembed.metal_isomer import from_geometry
+
+    mol = Chem.AddHs(rx.parse_smiles("[Pd+2](<-[Cl-])(<-[Cl-])(<-[Cl-])<-[N@H](C)O"))
+    with rdBase.BlockLogs():
+        assert rdDistGeom.EmbedMolecule(mol, randomSeed=2) == 0
+    donor = 4
+    mol.GetAtomWithIdx(donor).SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+
+    iso = from_geometry(mol)
+    assert iso.stereo_label == "N4:R"
+    assert iso.mol.GetAtomWithIdx(donor).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+
+    embedded = core.embed(iso, n=2, seed=2, prune_rms=-1).minimize()
+    metals = set(_metal.metal_indices(embedded.mol))
+
+    assert embedded.unrelaxed == []
+    assert embedded.mol.GetAtomWithIdx(donor).GetChiralTag() in _TETRAHEDRAL
+    assert stereo.defined_stereo_label(embedded.mol, metals) == iso.stereo_label
+    assert {stereo.stereo_from_3d(Chem.Mol(embedded.mol, False, int(cid)), exclude=metals) for cid in embedded.ids} == {
+        iso.stereo_label
+    }
+
+
+@pytest.mark.parametrize("tag", ["@", "@@"])
+@pytest.mark.parametrize("second_metal", ["Pt", "Pd"])
+def test_two_metal_bridge_uses_its_absolute_label_after_the_surrogate_strip(tag, second_metal):
+    mol = Chem.AddHs(rx.parse_smiles(f"C[N{tag}H](->[Pd](Cl)(Cl)Cl)->[{second_metal}](Br)(Br)Br"))
+    with rdBase.BlockLogs():
+        assert rdDistGeom.EmbedMolecule(mol, randomSeed=2) == 0
+    iso = rx.metal(mol, center="all")[0]
+    assert iso.mol.GetAtomWithIdx(1).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+
+    embedded = core.embed(iso, n=2, seed=2, prune_rms=-1).minimize()
+    metals = set(_metal.metal_indices(embedded.mol))
+    donor = embedded.mol.GetAtomWithIdx(1)
+
+    assert embedded.unrelaxed == []
+    assert donor.GetChiralTag() in _TETRAHEDRAL
+    assert stereo.defined_stereo_label(embedded.mol, metals) == iso.stereo_label
+    assert {stereo.stereo_from_3d(Chem.Mol(embedded.mol, False, int(cid)), exclude=metals) for cid in embedded.ids} == {
+        iso.stereo_label
+    }
+
+
+def test_bridge_stereo_forbids_global_metal_hand_reflection(monkeypatch):
+    mol = Chem.AddHs(rx.parse_smiles("C[N@H](->[Co](F)(Cl)Br)->[Pt](Br)(Br)Br"))
+    with rdBase.BlockLogs():
+        assert rdDistGeom.EmbedMolecule(mol, randomSeed=2) == 0
+    iso = rx.metal(mol, center="all")[0]
+    assert iso.chirality
+    assert iso.stereo_label
+    assert iso.mol.GetAtomWithIdx(1).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+
+    monkeypatch.setattr(emb, "_reflect", lambda *_args: pytest.fail("reflection inverted hidden bridge stereo"))
+
+    assert core.embed(iso, n=1, seed=0, prune_rms=-1).ids
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -473,50 +572,6 @@ def test_surrogate_accepts_all_readable_metals():
         except Exception as exc:
             rejected.append((path.rsplit("/", 1)[-1], type(exc).__name__))
     assert rejected == [], f"surrogate_metal() rejects structures the reader accepted: {rejected}"
-
-
-def test_haptic_face_and_chirality_cap_compose():
-    import rxembed as rx
-    from tests.metal_fixtures import ferrocene
-
-    iso = next(iter(rx.metal(ferrocene())))
-    cons = iso.cons
-    assert cons.haptic, "fixture must carry a haptic face"
-    state = iso.centres
-    before = sorted(cons.haptic)
-
-    _metal._shift_phantoms(cons, 2)  # as if two D-caps had been appended ahead of the centroids
-    after = sorted(cons.haptic)
-    assert after == [i + 2 for i in before]
-    assert sorted(cons.phantoms) == after, "phantoms must move with haptic"
-    # the COMPLETENESS CHECK: no field may still name an old index. This is what stops a future field from
-    # being silently left behind: the same defect class as the hand-listed Constraints copies.
-    stale = set(before) - set(after)
-    for name in ("distances", "angles", "pulls", "floors", "dg_floors"):
-        for k in getattr(cons, name):
-            assert not (stale & set(k)), f"{name} still names a pre-shift dummy index {k}"
-    assert iso.centres == state, "transient index shifts must not alter real-atom metal identity"
-
-
-def test_release_chirality_restores_phantom_indices():
-    iso = next(i for i in rx.metal(_CARBANION_NI, "square_planar") if i.stereo_label)
-    mol, cons = iso.mol, iso.cons.copy()
-    phantom = mol.GetNumAtoms()
-    cons.haptic = {phantom: (0, 1)}
-    cons.phantoms = frozenset({phantom})
-
-    for _ in range(2):
-        mol, held = _metal._hold_donor_chirality(mol, iso.metal, iso.donors, cons)
-        mol = _metal._release_donor_chirality(mol, held, cons)
-        assert sorted(cons.haptic) == [phantom]
-
-    _metal.materialise_phantoms(mol, cons.haptic)
-
-
-# No shipped fixture carries BOTH a haptic face and a labile donor, so the end-to-end version of the test
-# above skipped in every environment it ever ran in. The composition itself is pinned by
-# `test_haptic_face_and_chirality_cap_compose`; the real structures (COJKAO, ILONON, NUKHEG, the
-# TiCat series; 14 in tmQM) are swept by `benchmark/`, where the corpus is in scope.
 
 
 def test_ligands_reports_denticity_per_metal():

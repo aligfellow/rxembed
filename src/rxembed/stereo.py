@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 import re
 
-from rdkit import Chem
+from rdkit import Chem, rdBase
 from rdkit.Chem.EnumerateStereoisomers import (
     EnumerateStereoisomers,
     GetStereoisomerCount,
@@ -23,6 +23,8 @@ from .utils import (
 )
 
 _MIN_POINT_BRANCHES = 3
+_MIN_BRIDGE_METALS = 2
+_ISOTOPE_ELEMENT_STRIDE = 128  # exceeds the periodic table, so equal-element bridge caps stay distinct
 _ATROP_STEREO = (Chem.BondStereo.STEREOATROPCW, Chem.BondStereo.STEREOATROPCCW)
 _ATROP_WEDGE = (Chem.BondDir.BEGINWEDGE, Chem.BondDir.BEGINDASH)
 
@@ -47,7 +49,33 @@ def axis_stereo(label):
     }
 
 
-def _stereo_label(mol, atom_centers, bond_centers, atrop_centers=(), cap_to_metal=None):
+def apply_point_stereo(mol, label, centers):
+    """Apply absolute point labels as local tags in ``mol``'s current full-graph bond order."""
+    centers = set(centers)
+    for idx, wanted in point_stereo(label).items():
+        if idx not in centers:
+            continue
+        atom = mol.GetAtomWithIdx(idx)
+        if wanted in {"CW", "CCW"}:
+            atom.SetChiralTag(
+                Chem.ChiralType.CHI_TETRAHEDRAL_CW if wanted == "CW" else Chem.ChiralType.CHI_TETRAHEDRAL_CCW
+            )
+            if atom.HasProp("_CIPCode"):
+                atom.ClearProp("_CIPCode")
+            continue
+        atom.SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW)
+        if atom.HasProp("_CIPCode"):
+            atom.ClearProp("_CIPCode")
+        Chem.AssignCIPLabels(mol, atomsToLabel=[idx])
+        actual = atom.GetPropsAsDict().get("_CIPCode")
+        if actual not in {"R", "S"}:
+            raise ValueError(f"could not apply {wanted} ligand stereo at atom {idx} on the coordinated graph")
+        if actual != wanted:
+            atom.SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+        atom.ClearProp("_CIPCode")
+
+
+def _stereo_label(mol, atom_centers, bond_centers, atrop_centers=(), cap_to_metal=None, point_codes=None):
     """Build an atom-qualified configuration tag, e.g. ``'C1:R,C3=C4:E,C5-C6:M'``.
 
     CIP R/S where RDKit assigns it (falls back to the raw CW/CCW tag for a centre it won't CIP-rank, e.g. some
@@ -89,13 +117,18 @@ def _stereo_label(mol, atom_centers, bond_centers, atrop_centers=(), cap_to_meta
         bond = mol.GetBondWithIdx(idx)
         bond.SetStereoAtoms(*refs)
         bond.SetStereo(tag)
+    point_codes = point_codes or {}
     parts = []
     for idx in atom_centers:
         a = mol.GetAtomWithIdx(idx)
-        code = a.GetPropsAsDict().get("_CIPCode") or {
-            Chem.ChiralType.CHI_TETRAHEDRAL_CW: "CW",
-            Chem.ChiralType.CHI_TETRAHEDRAL_CCW: "CCW",
-        }.get(a.GetChiralTag())
+        code = (
+            point_codes.get(idx)
+            or a.GetPropsAsDict().get("_CIPCode")
+            or {
+                Chem.ChiralType.CHI_TETRAHEDRAL_CW: "CW",
+                Chem.ChiralType.CHI_TETRAHEDRAL_CCW: "CCW",
+            }.get(a.GetChiralTag())
+        )
         if code:  # an unresolved centre (an allene axis RDKit can't set) is dropped, never given a '?' tag
             parts.append(f"{a.GetSymbol()}{idx}:{code}")
     for bidx in bond_centers:
@@ -121,6 +154,47 @@ def _stereo_label(mol, atom_centers, bond_centers, atrop_centers=(), cap_to_meta
         left, right = mol.GetAtomWithIdx(first), mol.GetAtomWithIdx(second)
         parts.append(f"{left.GetSymbol()}{first}-{right.GetSymbol()}{second}:{code}")
     return ",".join(parts)
+
+
+def _point_cip_codes(mol, centers):
+    """Return absolute R/S labels that RDKit can assign on the current full graph."""
+    codes = {}
+    for idx in centers:
+        probe = Chem.Mol(mol)
+        atom = probe.GetAtomWithIdx(idx)
+        if atom.HasProp("_CIPCode"):
+            atom.ClearProp("_CIPCode")
+        try:
+            with rdBase.BlockLogs():
+                Chem.AssignCIPLabels(probe, atomsToLabel=[idx])
+        except RuntimeError:
+            continue
+        if (code := atom.GetPropsAsDict().get("_CIPCode")) in {"R", "S"}:
+            codes[idx] = code
+    return codes
+
+
+def _bridge_point_cip_codes(full, work, centers, cap_to_metal):
+    """Return full-sphere CIP labels only where two metal caps stand in for one donor."""
+    bridges = [
+        idx
+        for idx in centers
+        if sum(work.GetBondBetweenAtoms(idx, cap) is not None for cap in cap_to_metal) >= _MIN_BRIDGE_METALS
+    ]
+    return _point_cip_codes(full, bridges)
+
+
+def _graft_point_tags(full, work, centers, cap_to_metal):
+    """Copy enumerated point tags from the capped graph onto the coordinated graph."""
+    centers = set(centers)
+    for atom in work.GetAtoms():
+        if atom.GetIdx() >= full.GetNumAtoms() or atom.GetIdx() not in centers:
+            continue
+        tag = atom.GetChiralTag()
+        for cap_idx, (_z, _donated, mirrored) in cap_to_metal.items():
+            if mirrored and work.GetBondBetweenAtoms(atom.GetIdx(), cap_idx) is not None:
+                tag = mirror_tag(tag)
+        full.GetAtomWithIdx(atom.GetIdx()).SetChiralTag(tag)
 
 
 def _label_item(part):
@@ -337,6 +411,17 @@ def _build_enumeration_graph(mol, exclude):
     # Disconnect each metal first: a metal-bound donor is a stereocentre only while bound, so RDKit would
     # enumerate hands the surrogate cannot hold.
     cap_to_metal = {}
+    metal_neighbors = {
+        atom.GetIdx(): [n.GetIdx() for n in atom.GetNeighbors() if n.GetIdx() in exclude] for atom in mol.GetAtoms()
+    }
+    stereogenic_bridges = set()
+    for donor, metals in metal_neighbors.items():
+        if len(metals) < _MIN_BRIDGE_METALS:
+            continue
+        probe = Chem.Mol(mol)
+        probe.GetAtomWithIdx(donor).SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW)
+        if donor in _point_cip_codes(probe, [donor]):
+            stereogenic_bridges.add(donor)
     work = Chem.RWMol(mol)
     for mi in sorted(exclude):
         z_metal = mol.GetAtomWithIdx(mi).GetAtomicNum()
@@ -357,6 +442,7 @@ def _build_enumeration_graph(mol, exclude):
             # phantom R/S centre when RDKit parses a fully dative Cp ring as locally sp3.
             if (
                 nb not in haptic
+                and (len(metal_neighbors[nb]) < _MIN_BRIDGE_METALS or nb in stereogenic_bridges)
                 and donor.GetDegree() + donor.GetTotalNumHs() >= _MIN_POINT_BRANCHES
                 and (donor.GetHybridization() == Chem.HybridizationType.SP3 or sigma_only)
                 and donor.GetTotalNumHs() <= 1
@@ -365,7 +451,9 @@ def _build_enumeration_graph(mol, exclude):
                     atom = work.GetAtomWithIdx(nb)
                     atom.SetChiralTag(mirror_tag(atom.GetChiralTag()))
                 d = work.AddAtom(Chem.Atom(1))
-                work.GetAtomWithIdx(d).SetIsotope(2 + z_metal)  # preserve equal/different metal identity
+                same_element = [m for m in metal_neighbors[nb] if mol.GetAtomWithIdx(m).GetAtomicNum() == z_metal]
+                isotope = 2 + z_metal + _ISOTOPE_ELEMENT_STRIDE * same_element.index(mi)
+                work.GetAtomWithIdx(d).SetIsotope(isotope)
                 work.AddBond(nb, d, Chem.BondType.SINGLE)
                 work.GetAtomWithIdx(nb).SetNoImplicit(True)
                 cap_to_metal[d] = (z_metal, donated, replacement_mirrors)
@@ -476,7 +564,16 @@ def defined_stereo_label(mol, exclude=()):
     """Label the ligand stereo already defined on a coordinated molecule."""
     work, cap_to_metal = _build_enumeration_graph(mol, set(exclude))
     atom_centers, bond_centers, atrop_centers = _stereo_centres(work, mol.GetNumAtoms())
-    return _stereo_label(work, atom_centers, bond_centers, atrop_centers, cap_to_metal)
+    full = Chem.Mol(mol)
+    _graft_point_tags(full, work, atom_centers, cap_to_metal)
+    return _stereo_label(
+        work,
+        atom_centers,
+        bond_centers,
+        atrop_centers,
+        cap_to_metal,
+        _bridge_point_cip_codes(full, work, atom_centers, cap_to_metal),
+    )
 
 
 def stereo_from_3d(mol, exclude=()):
@@ -490,7 +587,16 @@ def stereo_from_3d(mol, exclude=()):
     Chem.AssignStereochemistryFrom3D(work, confId=work.GetConformer().GetId(), replaceExistingTags=True)
     _assign_atrop_from_3d(work, atrop_centers)
     atom_centers, bond_centers, _ = _stereo_centres(work, mol.GetNumAtoms())
-    return _stereo_label(work, atom_centers, bond_centers, atrop_centers, cap_to_metal)
+    full = Chem.Mol(mol)
+    _graft_point_tags(full, work, atom_centers, cap_to_metal)
+    return _stereo_label(
+        work,
+        atom_centers,
+        bond_centers,
+        atrop_centers,
+        cap_to_metal,
+        _bridge_point_cip_codes(full, work, atom_centers, cap_to_metal),
+    )
 
 
 def _enumerate_atrop(work_isos, atrop_centers, cap):
@@ -556,18 +662,8 @@ def enumerate_unassigned(
 
     def graft(wv):  # copy the enumerated ligand stereo (atom parity + E/Z) onto the FULL mol; skip the D caps
         full = Chem.Mol(mol)
-        for a in wv.GetAtoms():
-            if a.GetIdx() >= n_real or a.GetIdx() not in atom_centers:
-                continue
-            fa = full.GetAtomWithIdx(a.GetIdx())
-            # `work` is `mol` with each M-donor bond removed, so a tag enumerated there is in the STRIPPED
-            # bond order; writing it back across a bond the full mol still has is the inverse re-basing. The
-            # D cap does not enter it: appended last, it stands in the slot the metal's removal vacated.
-            tag = a.GetChiralTag()
-            for cap_idx, (_z, _donated, mirrored) in cap_to_metal.items():
-                if mirrored and wv.GetBondBetweenAtoms(a.GetIdx(), cap_idx) is not None:
-                    tag = mirror_tag(tag)
-            fa.SetChiralTag(tag)
+        # `work` is `mol` with each M-donor bond removed, so its tags must be re-based onto the full bond order.
+        _graft_point_tags(full, wv, atom_centers, cap_to_metal)
         for b in wv.GetBonds():
             i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
             # skip a coordination-locked bond: its `work` stereo is the arbitrary lock value, not a real hand;
@@ -586,9 +682,18 @@ def enumerate_unassigned(
                 fb.SetStereo(wb.GetStereo())
         return full
 
-    variants = [
-        (graft(wv), _stereo_label(wv, atom_centers, bond_centers, atrop_centers, cap_to_metal)) for wv in work_isos
-    ]
+    variants = []
+    for wv in work_isos:
+        full = graft(wv)
+        label = _stereo_label(
+            wv,
+            atom_centers,
+            bond_centers,
+            atrop_centers,
+            cap_to_metal,
+            _bridge_point_cip_codes(full, wv, atom_centers, cap_to_metal),
+        )
+        variants.append((full, label))
     probe = work_isos[0] if work_isos else work  # centres still UNSPECIFIED after enumeration = axial (allene)
     Chem.AssignStereochemistry(probe, cleanIt=True, force=True)
     unresolved = sum(

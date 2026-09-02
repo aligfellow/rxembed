@@ -20,7 +20,12 @@ import rxembed.metal_isomer as _isomer
 import rxembed.metal_polyhedron as _poly
 from rxembed.constraints import Constraints, compose_soft, resolve_atom, resolve_core
 from rxembed.constraints import template_to_fix as _core_template_to_fix
-from rxembed.embed import prepare, require_seed_count, seed_conformers  # module functions, not the package facade
+from rxembed.embed import (  # module functions, not the package facade
+    _stereo_donor_bonds,
+    prepare,
+    require_seed_count,
+    seed_conformers,
+)
 from rxembed.metal_core import VACANT
 from rxembed.metal_smiles import parse_smiles
 from rxembed.stereo import enumerate_unassigned
@@ -193,9 +198,15 @@ def _execute(spec, *, fix, constrain, contacts, n, seed, threads, knowledge, kee
         for donor, metal_idx in iso.donor_bonds:
             ens.sphere.setdefault(metal_idx, []).append(donor)
         if ids:
-            donors = sorted({d for d, _metal_idx in iso.donor_bonds})
+            donors = sorted({donor for donor, _metal_idx in _stereo_donor_bonds(mol, iso)})
             ens._donor_hand = {
-                d: _metal.donor_chirality_sign(mol, ids[0], d) for d in _metal._labile_donors(mol, donors)
+                d: _metal.donor_chirality_sign(
+                    mol,
+                    ids[0],
+                    d,
+                    [metal for donor, metal in iso.donor_bonds if donor == d],
+                )
+                for d in donors
             }
     return ens
 

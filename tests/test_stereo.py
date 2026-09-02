@@ -168,6 +168,20 @@ def test_defined_donor_stereo_keeps_replacement_parity_and_bond_type(smiles, exp
     assert stereo.defined_stereo_label(mol, metal_indices(mol)) == expected
 
 
+def test_absolute_donor_label_reapplies_across_a_metal_priority_crossover():
+    expected = {
+        "Ni": Chem.ChiralType.CHI_TETRAHEDRAL_CW,  # Br outranks Ni
+        "Pd": Chem.ChiralType.CHI_TETRAHEDRAL_CCW,  # Pd outranks Br
+    }
+    for metal, tag in expected.items():
+        mol = parse_smiles(f"C[CH-](Br)->[{metal}+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
+
+        stereo.apply_point_stereo(mol, "C1:R", {1})
+
+        assert mol.GetAtomWithIdx(1).GetChiralTag() == tag
+        assert stereo.defined_stereo_label(mol, metal_indices(mol)) == "C1:R"
+
+
 def test_ph3_donor_is_not_made_stereogenic_by_the_metal_cap():
     mol, metals = _with_metals("[PH3]->[Pt](Cl)(Cl)Cl")
     variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
@@ -222,3 +236,20 @@ def test_multimetal_donor_enumeration_replays_sequential_parity():
 
     assert {label for _, label in variants} == {"N1:R", "N1:S"}
     assert all(stereo.defined_stereo_label(variant, metals) == label for variant, label in variants)
+
+
+def test_same_element_metal_bridge_uses_the_full_ligand_spheres():
+    asymmetric = parse_smiles("C[N](->[Pd](Cl)(Cl)Cl)(->[Pd](Br)(Br)Br)O")
+    metals = set(metal_indices(asymmetric))
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(asymmetric, exclude=metals)
+
+    assert {label for _, label in variants} == {"N1:R", "N1:S"}
+    assert (n_unassigned, total, unresolved) == (1, 2, 0)
+    assert all(stereo.defined_stereo_label(variant, metals) == label for variant, label in variants)
+
+    symmetric = parse_smiles("C[N](->[Pd](Cl)(Cl)Cl)(->[Pd](Cl)(Cl)Cl)O")
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(
+        symmetric, exclude=set(metal_indices(symmetric))
+    )
+    assert [label for _, label in variants] == [""]
+    assert (n_unassigned, total, unresolved) == (0, 1, 0)

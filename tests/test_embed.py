@@ -15,6 +15,7 @@ from rdkit.Chem import rdDistGeom
 from rdkit.Chem.rdMolTransforms import GetAngleDeg, GetBondLength
 
 from rxembed import bounds as bnd
+from rxembed import metal_core as _metal
 from rxembed.constraints import FIX_ANGLE_TOL, FIX_DISTANCE_TOL, Constraints, resolve_core
 from rxembed.embed import BASE_STIFFNESS, Conformers, embed, fold_substrate, minimize
 from rxembed.metal_core import TRANSITION_METALS, coplanar
@@ -100,6 +101,13 @@ def test_numeric_fix_delivers_a_linear_three_centre_core():
         assert GetBondLength(conf, 0, 1) == pytest.approx(2.0, abs=FIX_DISTANCE_TOL)
         assert GetBondLength(conf, 1, 2) == pytest.approx(2.2, abs=FIX_DISTANCE_TOL)
         assert GetAngleDeg(conf, 0, 1, 2) == pytest.approx(178.0, abs=FIX_ANGLE_TOL)
+
+
+def test_tagged_metal_donor_embedding_does_not_print_uff_typer_noise(capfd):
+    iso = enumerate_isomers(Chem.AddHs(parse_smiles("[Pd](Cl)(Cl)(Cl)([N@H](C)O)")), "square_planar")[0]
+
+    assert embed(iso, n=1, seed=2).ids
+    assert "UFFTYPER" not in capfd.readouterr().err
 
 
 def test_numeric_fix_rejects_when_cleanup_cannot_hold_it(monkeypatch, caplog):
@@ -539,10 +547,47 @@ def test_relax_result_is_rescored_on_a_common_objective(monkeypatch):
         return result
 
     monkeypatch.setattr(emb, "restrained_uff", spy_uff)
+    monkeypatch.setattr(Conformers, "_retry_relaxation", lambda *_args, **_kwargs: 1)
     energies = confs._relax_constrained(BASE_STIFFNESS)
 
     assert calls[-1][0] == 0
     assert np.array_equal(energies, calls[-1][1])
+
+
+def test_relax_retry_rejects_an_inverted_donor_hand(monkeypatch):
+    iso = enumerate_isomers(Chem.AddHs(parse_smiles("[Pd](Cl)(Cl)(Cl)([N@H](C)O)")), "square_planar")[0]
+    confs = embed(iso, n=1, seed=2)
+    cid, donor = confs.ids[0], 4
+    seed_pos = {cid: confs._mol.GetConformer(cid).GetPositions().copy()}
+    references = [iso.metal]
+    hand = _metal.donor_chirality_sign(confs._mol, cid, donor, references)
+    inverted = []
+    confs.unrelaxed = [cid]
+
+    def reflect(mol, _cons, *, conf_ids, _statuses, **_kw):
+        for conf_id in conf_ids:
+            positions = mol.GetConformer(conf_id).GetPositions()
+            positions[:, 0] *= -1.0
+            mol.GetConformer(conf_id).SetPositions(positions)
+            _statuses[conf_id] = 0
+            inverted.append(_metal.donor_chirality_sign(mol, conf_id, donor, references))
+        return np.zeros(len(conf_ids))
+
+    monkeypatch.setattr(emb, "restrained_uff", reflect)
+    monkeypatch.setattr(Conformers, "_relax_ok", lambda _self, _cid: True)
+    confs._retry_relaxation(
+        seed_pos,
+        BASE_STIFFNESS,
+        10,
+        "minimize",
+        None,
+        {cid: {donor: (hand, references)}},
+    )
+
+    assert inverted
+    assert set(inverted) != {hand}
+    assert confs.unrelaxed == [cid]
+    assert np.array_equal(confs._mol.GetConformer(cid).GetPositions(), seed_pos[cid])
 
 
 def test_trajectory_keeps_only_the_accepted_stiffness(monkeypatch):

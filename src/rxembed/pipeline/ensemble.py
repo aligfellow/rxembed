@@ -363,7 +363,8 @@ class Ensemble(Conformers):
             if not _stereo.satisfies_spec(_stereo.signature(mol, cid), ref, spec):
                 return "wrong requested stereo"
         for donor, hand in self._donor_hand.items():
-            if hand is not None and _metal.donor_chirality_sign(owner._mol, cid, donor) != hand:
+            references = [metal for d, metal in owner.iso.donor_bonds if d == donor] if owner.iso is not None else []
+            if hand is not None and _metal.donor_chirality_sign(owner._mol, cid, donor, references) != hand:
                 return f"wrong donor-{donor} hand"
         return None
 

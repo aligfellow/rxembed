@@ -123,7 +123,7 @@ def _stripped_hybridisation(mol) -> dict[int, Chem.HybridizationType]:
     pyramidal even when one bond is drawn double (the neutral ``S(=O)R2`` form of a sulfoxide).
 
     Expected holdout: a metal-bound ``[CH-]`` carbanion, which RDKit calls sp2 and the π-count sp3, both defensible;
-    rxembed treats it as a pyramidal stereocentre (``_hold_donor_chirality``), not gated.
+    rxembed treats it as a pyramidal stereocentre through its chiral tag and signed-volume gate, not here.
     """
     rw = Chem.RWMol(mol)
     for a in mol.GetAtoms():

@@ -16,6 +16,7 @@ from rdkit import Chem
 from . import metal_core as _metal
 from . import metal_polyhedron as _poly
 from . import metal_stereo as _metal_stereo
+from . import stereo as _stereo
 from .bounds import DEFAULT_SEED, probe_conformer, seed_coordinates, seed_count
 from .constraints import (
     FIX_ANGLE_TOL,
@@ -343,16 +344,21 @@ def _stereo_batch_size(need, bits, reflectable):
     return 2**bits * (need + 2 * (math.isqrt(need - 1) + 1))
 
 
-def _hold_donors(mol, iso, cons):
-    """Cap every labile donor carried by an isomer and return the added atoms."""
-    held = []
+def _stereo_donor_bonds(mol, iso):
+    """Return bonds that give labelled donors their full CIP reference during ETKDG."""
     if iso is None:
-        return mol, held
-    for metal in sorted({m for _d, m in iso.donor_bonds}):
-        donors = [d for d, m in iso.donor_bonds if m == metal]
-        mol, added = _metal._hold_donor_chirality(mol, metal, donors, cons)
-        held.extend(added)
-    return mol, held
+        return []
+    points = set(_stereo.point_stereo(iso.stereo_label))
+    return [
+        (donor, metal)
+        for donor, metal in iso.donor_bonds
+        if mol.GetAtomWithIdx(donor).GetAtomicNum() in (6, 7)
+        and (
+            donor in points
+            or mol.GetAtomWithIdx(donor).GetChiralTag()
+            in {Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW}
+        )
+    ]
 
 
 def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, prune_rms=0.1, threads=0, graft_ref=None):
@@ -370,16 +376,34 @@ def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, pru
     hands = sum(bool(state.hand) for state, _vertices, _haptic, _winding in targets)
     windings = sum(len(winding) for _state, _vertices, _haptic, winding in targets)
     winding_ranks, eta2_ranks = _winding_ranks(mol, targets)
+    stereo_bonds = _stereo_donor_bonds(mol, iso)
     reflectable = bool(
         len(targets) == 1
         and hands
         and not windings
         and _mirror_is_free(mol)
+        and not stereo_bonds
         and not cons.frozen
         and not cons.dihedrals
         and not targets[0][2]
     )
-    mol, held = _hold_donors(mol, iso, cons)
+    if stereo_bonds:
+        missing = {
+            donor
+            for donor, _metal_idx in stereo_bonds
+            if mol.GetAtomWithIdx(donor).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+        }
+        tags = {}
+        if missing:
+            full = Chem.Mol(mol)
+            iso.restore(full)
+            full = _metal.connect_metal(full, iso.donor_bonds)
+            _stereo.apply_point_stereo(full, iso.stereo_label, missing)
+            tags = {donor: full.GetAtomWithIdx(donor).GetChiralTag() for donor in missing}
+        iso.restore(mol)  # use the actual metal, not an isotope surrogate, as the donor's fourth reference
+        mol = _metal.connect_metal(mol, stereo_bonds)
+        for donor, tag in tags.items():
+            mol.GetAtomWithIdx(donor).SetChiralTag(tag)
     if not targets:
         ids = list(
             seed_coordinates(
@@ -423,8 +447,8 @@ def seed_conformers(mol, cons, iso, n, *, seed=DEFAULT_SEED, knowledge=True, pru
                         break
         mol = kept
         ids = [conf.GetId() for conf in mol.GetConformers()]
-    if iso is not None:
-        mol = _metal._release_donor_chirality(mol, held, cons)  # drop the dummy D's + cons keys, restore charges
+    if stereo_bonds:
+        mol, _metals = _metal.surrogate_all_metals(mol)  # UFF still receives the bondless surrogate graph
     return mol, ids, target if targets else None
 
 
@@ -505,7 +529,16 @@ class Conformers:
         if self.iso is None:
             return mol
         self.iso.restore(mol)  # real element and formal charge, on our copy
-        return _metal.connect_metal(mol, self.iso.donor_bonds) if self.iso.donor_bonds else mol
+        if self.iso.donor_bonds:
+            mol = _metal.connect_metal(mol, self.iso.donor_bonds)
+        missing = {
+            donor
+            for donor, _metal_idx in _stereo_donor_bonds(mol, self.iso)
+            if mol.GetAtomWithIdx(donor).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+        }
+        if missing:
+            _stereo.apply_point_stereo(mol, self.iso.stereo_label, missing)
+        return mol
 
     def _store_trajectory(self, frames):
         """Store accepted cleanup frames on the restored public graph."""
@@ -618,32 +651,39 @@ class Conformers:
         """Run the shared restrained-relax and per-conformer retry policy."""
         relaxing = list(self.ids)
         seed_pos = {cid: self._mol.GetConformer(cid).GetPositions().copy() for cid in relaxing}
-        energies = self._relax_batch(stiffness, max_iters, relaxing, operation, _frames)
-        retried = self._retry_relaxation(seed_pos, stiffness, max_iters, operation, _frames)
+        donors = [d for d, _metal_idx in _stereo_donor_bonds(self._mol, self.iso)]
+        donor_bonds = self.iso.donor_bonds if self.iso is not None else []
+        donor_refs = {donor: [metal for d, metal in donor_bonds if d == donor] for donor in donors}
+        donor_hands = {
+            cid: {
+                donor: (
+                    _metal.donor_chirality_sign(self._mol, cid, donor, donor_refs[donor]),
+                    donor_refs[donor],
+                )
+                for donor in donors
+            }
+            for cid in relaxing
+        }
+        energies = self._relax_batch(stiffness, max_iters, relaxing, operation, _frames, donor_hands)
+        retried = self._retry_relaxation(seed_pos, stiffness, max_iters, operation, _frames, donor_hands)
         if energies is not None and retried:
             energies = restrained_uff(self._mol, self.cons, stiffness=stiffness, max_iters=0, conf_ids=relaxing)
         return energies
 
-    def _relax_batch(self, stiffness, max_iters, relaxing, operation, frames):
+    def _relax_batch(self, stiffness, max_iters, relaxing, operation, frames, donor_hands):
         """Relax with restrained UFF, escalating only when no conformer passes the accept gate.
 
         Return the accepted energies, or ``None`` when UFF cannot type the graph.
         """
-        # Hold a labile (carbanion/amine) donor's hand through the relax: the surrogate's bare degree-3 centre
-        # inverts under UFF. Cap it with a dummy D, release when done.
+        # UFF does not read chiral tags, so retain each labile donor's seed hand and reject an inversion.
         n_atoms = self._mol.GetNumAtoms()
         initial = self._mol.GetConformer(relaxing[0]).GetPositions().copy() if frames is not None else None
         recorded, trajectory_done = [], False
-        self._mol, hold = _hold_donors(self._mol, self.iso, self.cons)
         e, fc = None, stiffness
         try:
             retrying = set(relaxing)
             self.unrelaxed = [i for i in self.unrelaxed if i not in retrying]
             embed_pos = {c: self._mol.GetConformer(c).GetPositions().copy() for c in relaxing}
-            donor_hands = {
-                c: {donor: _metal.donor_chirality_sign(self._mol, c, donor) for _dummy, donor, _charge in hold}
-                for c in relaxing
-            }
 
             def restore(ids=relaxing):
                 for cid in ids:
@@ -696,8 +736,8 @@ class Conformers:
                 c
                 for c in relaxing
                 if any(
-                    target is not None and _metal.donor_chirality_sign(self._mol, c, donor) != target
-                    for donor, target in donor_hands[c].items()
+                    target is not None and _metal.donor_chirality_sign(self._mol, c, donor, references) != target
+                    for donor, (target, references) in donor_hands[c].items()
                 )
             ]
             if inverted:
@@ -711,9 +751,7 @@ class Conformers:
                     len(inverted),
                 )
             trajectory_done = True
-        finally:  # release the hold on every exit path, including the early UFF-failure return; the dummy D
-            if hold:  # is scaffolding for this relax alone
-                self._mol = _metal._release_donor_chirality(self._mol, hold, self.cons)
+        finally:
             if frames is not None and trajectory_done:
                 assert initial is not None
                 final = self._mol.GetConformer(relaxing[0]).GetPositions().copy()
@@ -723,11 +761,8 @@ class Conformers:
                 frames[:] = path
         return e
 
-    def _retry_relaxation(self, seed_pos, stiffness, max_iters, operation, frames):
-        """Retry each failed conformer separately; restore its seed if every stiffness fails.
-
-        Returns the number tried. The pipeline separately rejects a donor hand that changes during retry.
-        """
+    def _retry_relaxation(self, seed_pos, stiffness, max_iters, operation, frames, donor_hands):
+        """Retry each failed conformer separately; restore its seed if every stiffness fails."""
 
         def place(cid, pos):
             self._mol.GetConformer(cid).SetPositions(pos)
@@ -752,7 +787,11 @@ class Conformers:
                     )
                 except RuntimeError:  # UFF cannot build for this graph, so the seed is the best available
                     break
-                if statuses.get(cid, 1) == 0 and self._relax_ok(cid):
+                hand_ok = all(
+                    target is None or _metal.donor_chirality_sign(self._mol, cid, donor, references) == target
+                    for donor, (target, references) in donor_hands[cid].items()
+                )
+                if statuses.get(cid, 1) == 0 and self._relax_ok(cid) and hand_ok:
                     accepted = True
                     if frames is not None:
                         assert snapshots is not None
@@ -869,6 +908,7 @@ class Conformers:
             iso.chirality
             and len(targets) == 1
             and _mirror_is_free(self._mol)
+            and not _stereo_donor_bonds(self._mol, iso)
             and not self.cons.frozen
             and not self.cons.dihedrals
             and not iso.haptic

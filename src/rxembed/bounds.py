@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass
 
 import numpy as np
-from rdkit import Chem, DistanceGeometry
+from rdkit import Chem, DistanceGeometry, rdBase
 from rdkit.Chem import rdDistGeom, rdMolDescriptors
 
 from . import mechanisms as _mech
@@ -95,7 +95,15 @@ def _write(mol, cons):
     Separate from `_bounds` because smoothing repairs in place: `crossings` needs the matrix as written, and
     by the time a tolerance is reported the crossed bound has already been rewritten away.
     """
-    ctx = _mech.DGContext(mol, rdDistGeom.GetMoleculeBoundsMatrix(mol))
+    # A tagged C/N donor is temporarily reconnected to its real metal so ETKDG sees its fourth reference.
+    # Bounds generation then tries UFF typing even though no UFF force field is requested; the metal warning
+    # is expected and the later restrained-UFF path uses its own typeable surrogate graph.
+    if any(atom.GetAtomicNum() in _metal.COORDINATION_METALS for atom in mol.GetAtoms()):
+        with rdBase.BlockLogs():
+            bm = rdDistGeom.GetMoleculeBoundsMatrix(mol)
+    else:
+        bm = rdDistGeom.GetMoleculeBoundsMatrix(mol)
+    ctx = _mech.DGContext(mol, bm)
     for m in _mech.MECHANISM_ORDER:
         m._dg_windows(cons, ctx)  # WINDOW   distances, angles, planes -> candidate windows
     for m in _mech.MECHANISM_ORDER:
