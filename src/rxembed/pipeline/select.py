@@ -3,10 +3,9 @@
 Three concerns, one module: per-conformer geometric descriptors (rotatable-bond dihedrals), the single
 per-conformer latent used for both clustering and the landscape (dihedrals + NCI fingerprint + L-M-L
 angles, block-balanced), and de-duplication behind ``apply()`` (moi | rmsd | descriptor | energy).
-
-moi/rmsd/descriptor ride prism_pruner (energy-gated); ``energy`` is a prism-free near-degeneracy prune.
-All pre-sort by energy so masks stay aligned. Binding-mode *summarising* (one conformer per pose) is a
-separate concern; see ``cluster_labels`` / ``Ensemble.representatives``.
+moi/rmsd/descriptor ride prism_pruner (energy-gated); ``energy`` is a prism-free near-degeneracy prune,
+and all pre-sort by energy so masks stay aligned. Binding-mode summarising is a separate concern; see
+``cluster_labels`` / ``Ensemble.representatives``.
 """
 
 from __future__ import annotations
@@ -61,20 +60,14 @@ _MIN_DONORS = 2  # two donors are needed to define an L-M-L angle
 _EPS = 1e-9  # std floor for z-scoring
 
 
-def _norm(m):
-    return m / np.sqrt(m.var(0).sum()) if m.size and m.var(0).sum() else m
-
-
 def _metal_donors(mol, ids):
     """``(metal, its coordination sphere)``, or ``(None, None)`` when there is no metal.
 
     A bonded graph states the complete non-metal sphere directly; a bond-less wrapped Mol falls back to
-    `metal_perceive`'s covalent-radius rule. Do not intersect the two: that QA policy deliberately drops a
-    donor that leaves the shell, while a descriptor needs one stable column schema across every conformer.
-    A partially bonded sphere is therefore treated as declared, not guessed complete.
-
-    A 2.8 Å cutoff cannot serve either source: coordination distance scales with both radii, so it misses
-    long La-Se bonds and admits nearby chelate backbone atoms. `benchmark/select_sphere.py` measures the corpus.
+    `metal_perceive`'s covalent-radius rule (a flat 2.8 Å cutoff cannot serve either: it misses long La-Se
+    bonds and admits nearby chelate backbone atoms; `benchmark/select_sphere.py` measures the corpus). Do
+    not intersect the two sources: a descriptor needs one stable column schema across every conformer, so
+    a partially bonded sphere is treated as declared, not guessed complete.
     """
     m = metal_index(mol)
     if m is None:
@@ -104,13 +97,12 @@ def _metal_present(mol):
 
 
 def _interfragment_contacts(an, positions, fmap):
-    """NCI contacts whose two sites span different fragments → list of (type, frozenset(atoms), pair).
+    """NCI contacts whose two sites span different fragments -> list of (type, frozenset(atoms), pair).
 
-    `pair` is the ``(lo, hi)`` fragment-index pair the contact bridges, so an H-bond to a *substrate*
-    and an H-bond to *solvent* are distinguishable. Binding-mode semantics are *inter-molecular*:
-    intramolecular NCIs (a molecule's own H-bond) are conformational detail already carried by the
-    dihedral block and are excluded; otherwise a lone organic would be mislabelled a
-    'contact pattern'.
+    `pair` is the ``(lo, hi)`` fragment-index pair the contact bridges, so an H-bond to substrate and one
+    to solvent are distinguishable. Intramolecular NCIs are excluded (conformational detail the dihedral
+    block already carries), since binding-mode semantics are inter-molecular and a lone organic would
+    otherwise be mislabelled a 'contact pattern'.
     """
     out = []
     for n in an.detect(positions):
@@ -124,9 +116,9 @@ def _interfragment_contacts(an, positions, fmap):
 def _nci_features(mol, ids):
     """Binary inter-fragment NCI-contact fingerprint per conformer, or None when there is none to describe.
 
-    None for a single fragment, or a metal complex (the metal block defines the mode; the surrogate strips
-    coordinate bonds, so without this guard every ligand looks like a separate fragment and
-    coordination/inter-ligand contacts would pollute the latent).
+    None for a single fragment or a metal complex: the metal block defines the mode there, and the
+    surrogate strips coordinate bonds, so without this guard every ligand looks like a separate fragment
+    and coordination/inter-ligand contacts would pollute the latent.
     """
     if _metal_present(mol):
         return None
@@ -146,18 +138,11 @@ def _nci_features(mol, ids):
 def _relpose_features(mol, ids):
     """Relative-pose block: where each fragment sits relative to the anchor (largest) fragment.
 
-    The inter-fragment rigid-body DOF the dihedral block cannot see, and the reason a benzene...water
-    ensemble's distinct encounter geometries otherwise collapse to one mode. Each non-anchor fragment
-    contributes its centroid-anchor-centroid distance, the sorted distances from the anchor's heavy atoms to
-    that centroid (where it sits *around* the anchor), and the sorted distances from its own heavy atoms to
-    the anchor centroid (how it is *oriented*).
-
-    Distance-only, so it is frame-free and respects the anchor's symmetry; identical non-anchor fragments are
-    ordered canonically, so relabelling them cannot split one pose in two. Columns are z-scored so a mobile
-    fragment does not swamp a quiet one. Limitation: pure distances cannot tell the two faces of an
-    *asymmetric planar* anchor apart, which the NCI fingerprint resolves once a contact forms.
-
-    None for a single fragment, or a metal, whose relative pose IS the L-M-L block.
+    The inter-fragment rigid-body degrees of freedom the dihedral block cannot see (without it, a
+    benzene-water ensemble's distinct encounter geometries collapse to one mode). Distance-only, so it is
+    frame-free and respects the anchor's symmetry, though it cannot tell the two faces of an asymmetric
+    planar anchor apart (the NCI fingerprint resolves that once a contact forms). None for a single
+    fragment or a metal, whose relative pose is the L-M-L block.
     """
     if _metal_present(mol):
         return None
@@ -175,12 +160,12 @@ def _relpose_features(mol, ids):
     others = [i for i in range(len(frags)) if i != anchor]
     groups = [[o for o in others if smi[o] == s] for s in sorted({smi[o] for o in others})]  # fixed order
 
-    def sub(pos, ac, o):  # one non-anchor fragment's relative-pose descriptor
+    def sub(pos, ac, o):
         oc = pos[hf[o]].mean(0)
         return [
             float(np.linalg.norm(oc - ac)),
-            *sorted(float(np.linalg.norm(pos[a] - oc)) for a in a_atoms),  # around the anchor
-            *sorted(float(np.linalg.norm(pos[h] - ac)) for h in hf[o]),  # its orientation
+            *sorted(float(np.linalg.norm(pos[a] - oc)) for a in a_atoms),
+            *sorted(float(np.linalg.norm(pos[h] - ac)) for h in hf[o]),
         ]
 
     rows = []
@@ -189,22 +174,21 @@ def _relpose_features(mol, ids):
         ac = pos[a_atoms].mean(0)
         feat = []
         for grp in groups:
-            feat += [x for s in sorted(sub(pos, ac, o) for o in grp) for x in s]  # canonical within group
+            feat += [x for s in sorted(sub(pos, ac, o) for o in grp) for x in s]
         rows.append(feat)
     mat = np.array(rows, float)
     sd = mat.std(0)
     sd[sd < _EPS] = 1.0
-    return (mat - mat.mean(0)) / sd  # z-score so no single column dominates
+    return (mat - mat.mean(0)) / sd
 
 
 def _blocks(mol, ids, nci=True):
     """Build the latent as a list of (name, array) blocks, in concatenation order.
 
-    Always ``'dihedral'`` (rotatable-bond sin/cos); ``'metal'`` (L-M-L angles) iff a transition metal
-    with detectable donors is present; ``'relpose'`` (inter-fragment relative pose) iff a multi-fragment
-    non-metal complex, so distinct encounter geometries don't collapse; ``'nci'`` (binary inter-fragment
-    contact fingerprint) iff ``nci`` and any inter-fragment contact is detected. Used by both
-    ``feature_matrix`` (the numbers) and ``active_feature_kinds`` (which kinds are live).
+    Always ``'dihedral'`` (rotatable-bond sin/cos); ``'metal'`` (L-M-L angles) iff a transition metal with
+    detectable donors is present; ``'relpose'`` (inter-fragment relative pose) iff a multi-fragment
+    non-metal complex; ``'nci'`` (binary inter-fragment contact fingerprint) iff ``nci`` and any contact is
+    detected. Used by both ``feature_matrix`` (the numbers) and ``active_feature_kinds`` (which are live).
     """
     quads = rotatable_quads(mol)
     blocks = [("dihedral", np.array([dihedrals(mol, i, quads) for i in ids]))]
@@ -224,7 +208,10 @@ def _blocks(mol, ids, nci=True):
 def feature_matrix(mol, ids, nci=True):
     """Per-conformer latent: dihedrals (+ NCI fingerprint) (+ metal L-M-L angles), block-balanced."""
     blocks = _blocks(mol, ids, nci)
-    return np.hstack([_norm(b) for _, b in blocks]) if len(blocks) > 1 else blocks[0][1]
+    if len(blocks) == 1:
+        return blocks[0][1]
+    normed = [b / np.sqrt(b.var(0).sum()) if b.size and b.var(0).sum() else b for _, b in blocks]
+    return np.hstack(normed)
 
 
 # what each latent block means when it is the most specific one present: the "mode" kind
@@ -239,11 +226,10 @@ _MODE_KIND = {
 def active_feature_kinds(mol, ids, nci=True):
     """Names of the latent blocks live for this ensemble, e.g. ``['dihedral', 'relpose', 'nci']``.
 
-    The honest answer to "what is clustering/representatives actually separating here?".
-
-    Cheap: detects block *presence* (a metal with donors; multi-fragment → relative pose; any inter-
-    fragment contact across the ensemble, short-circuiting on the first hit) without materialising the
-    full per-conformer matrix, but agrees with what ``feature_matrix`` concatenates.
+    The honest answer to "what is clustering/representatives actually separating here?". Cheap: detects
+    block presence (a metal with donors; multi-fragment -> relative pose; any inter-fragment contact
+    across the ensemble, short-circuiting on the first hit) without materialising the full per-conformer
+    matrix, but agrees with what ``feature_matrix`` concatenates.
     """
     blocks = ["dihedral"]
     if _metal_present(mol):
@@ -278,11 +264,11 @@ def mode_kind(mol, ids, nci=True):
 def mode_signature(mol, ids, nci=True):
     """Per-conformer discrete binding-mode signature (hashable), or ``None`` when there is no such block.
 
-    ``None`` for a plain organic (then 'modes' are purely torsional families and noise is just sampling
-    scatter). Combines the NCI contact-type set and the metal coordination label, so two conformers with
-    the same signature are the same *binding* mode even if their torsions differ. Used by
-    ``Ensemble.representatives`` to recover a genuinely rare binding mode HDBSCAN flagged as noise,
-    without letting torsional scatter inflate the representative set.
+    ``None`` for a plain organic, where 'modes' are purely torsional families and noise is just sampling
+    scatter. Combines the NCI contact-type set and the metal coordination label, so two conformers with
+    the same signature are the same binding mode even if their torsions differ. ``Ensemble.representatives``
+    uses it to recover a rare binding mode HDBSCAN flagged as noise, without torsional scatter inflating
+    the representative set.
     """
     blocks = active_feature_kinds(mol, ids, nci)
     if "nci" not in blocks and "metal" not in blocks:
@@ -404,7 +390,7 @@ def energy_prune(energies, *, labels=None, energy_tol=0.05):
 
     Prism-free by design: near-degenerate energies are treated as the same minimum, no coordinates
     consulted. `energies` must be ascending-sorted; optional `labels` gates the comparison to the same
-    discrete binding mode. Returns a keep-mask aligned to input order.
+    discrete binding mode.
     """
     energies = np.asarray(energies, float)
     kept: dict = {}
@@ -447,7 +433,7 @@ def _descriptor_config():
 def descriptor_prune(coords, features, energies, *, labels=None, max_dist=1.0, energy_window=12.0):
     """Descriptor de-dup on prism's energy-sorted engine; keep-mask aligned to input order (energy-sorted).
 
-    WART: ``_run`` is a *private* prism entry point (no public API for a custom ``evaluate_sim``; prism's
+    A wart: ``_run`` is a *private* prism entry point (no public API for a custom ``evaluate_sim``; prism's
     own ``prune_by_rmsd`` also calls it). Accepted rather than reinventing prism's engine.
     """
     f = np.asarray(features, float)

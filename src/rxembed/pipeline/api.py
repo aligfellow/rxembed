@@ -10,7 +10,7 @@ import logging
 
 from rxembed.embed import BASE_STIFFNESS as _BASE_STIFFNESS
 from rxembed.metal_isomer import Isomer
-from rxembed.relax import ff_energies
+from rxembed.relax import MAX_ITERS, ff_energies
 
 from .dispatch import (
     _embed_dispatch,
@@ -27,6 +27,12 @@ logger = logging.getLogger("rxembed")
 __all__ = ["Ensemble", "EnsembleSet", "embed", "metal", "minimize", "wrap"]
 
 
+def _validate_max_iters(max_iters):
+    """Require a positive restrained-UFF iteration cap."""
+    if isinstance(max_iters, bool) or not isinstance(max_iters, int) or max_iters < 1:
+        raise ValueError("max_iters must be a positive integer")
+
+
 def embed(
     source,
     *,
@@ -38,11 +44,17 @@ def embed(
     coordinate=None,
     charge=0,
     n=None,
-    seed=0xF00D,
-    threads=0,
-    knowledge=True,
+    seed=None,
+    threads=None,
+    knowledge=None,
+    embed_params=None,
+    coplanar_14=True,
+    metal_floor_relief=True,
+    donor_orientation=True,
+    conjugation=True,
     stereo=None,
     trajectory=False,
+    max_iters=MAX_ITERS,
 ):
     """Embed conformers (optionally constrained), returning an `Ensemble`, an `EnsembleSet`, or a `list`.
 
@@ -54,8 +66,9 @@ def embed(
     requires one conformer and stores the accepted restrained-UFF cleanup in ``result.trajectory``.
 
     ``fix`` / ``constrain`` are the core verbs, documented in the `constraints` module docstring. ``template``
-    is sugar for a coords-``fix``: ``(reference, SMARTS_or_map)``. A SMARTS matches the target and a Mol or
-    Ensemble reference; an .xyz path or (N,3) array needs ``{target_i: ref_i}``.
+    is sugar for a coords-``fix``: ``(reference, SMARTS_or_map)``, matched by SMARTS or by an explicit
+    ``{target_i: ref_i}`` index map. ``contacts=`` reaches `nci_modes`; ``metal=`` / ``coordinate=`` reach
+    `rx.metal`.
 
     ``stereo=`` governs point R/S, double-bond E/Z, and native atropisomer M/P (meso dropped, chiral-at-P
     included, metal never enumerated):
@@ -65,58 +78,77 @@ def embed(
     - ``'separate'``: enumerate undefined elements as a ``list[EnsembleSet]``, one per configuration.
     - ``'free'``: one embed, stereocentres left to the ETKDG seed.
 
-    For a geometry input stereo is already 3D-defined, so ``stereo=`` instead tunes the preservation filter
-    for chirality the embed cannot keep. ``contacts=`` reaches `nci_modes`; ``metal=`` / ``coordinate=`` reach
-    `rx.metal`.
+    For a geometry input, stereo is already 3D-defined, so ``stereo=`` instead tunes the preservation filter
+    for chirality the embed cannot keep.
+
+    ``embed_params`` accepts RDKit's `EmbedParameters` directly, retaining its model on retries; rxembed
+    replaces its bounds matrix on that same object, so do not share it concurrently. Explicit ``seed`` /
+    ``threads`` override native fields, and an unset seed uses rxembed's reproducible default; use native
+    knowledge flags instead of combining them with ``knowledge``. ``coplanar_14``, ``metal_floor_relief``,
+    ``donor_orientation`` and ``conjugation`` toggle rxembed's optional coplanar-bound, floor-relief,
+    donor-fold and conjugation cleanup terms; explicit stereo and ``fix`` stay authoritative over them.
+    ``max_iters`` caps the restrained-UFF relax that publishes the geometry; it does not change the DG seed
+    or retry ladder.
     """
     if not isinstance(trajectory, bool):
         raise TypeError("trajectory must be True or False")
     if trajectory and n != 1:
         raise ValueError("trajectory=True requires n=1")
+    _validate_max_iters(max_iters)
 
-    dispatch_kw = {
-        "metal": metal,
-        "fix": fix,
-        "constrain": constrain,
-        "template": template,
-        "contacts": contacts,
-        "coordinate": coordinate,
-        "charge": charge,
-        "n": n,
-        "seed": seed,
-        "threads": threads,
-        "knowledge": knowledge,
-        "stereo": stereo,
-    }
-    result = _embed_dispatch(source, **dispatch_kw)
-    return _relax_embedded(result, trajectory)
-
-
-def _relax_embedded(result, trajectory=False):
-    """Relax every embedded candidate into its windows: the one seam `embed` returns through.
-
-    `EnsembleSet` subclasses `list`, so the plain-list branch must come last: an earlier
-    ``isinstance(…, list)`` would downgrade an EnsembleSet to a bare list.
-    """
+    result = _embed_dispatch(
+        source,
+        metal=metal,
+        fix=fix,
+        constrain=constrain,
+        template=template,
+        contacts=contacts,
+        coordinate=coordinate,
+        charge=charge,
+        n=n,
+        seed=seed,
+        threads=threads,
+        knowledge=knowledge,
+        embed_params=embed_params,
+        coplanar_14=coplanar_14,
+        metal_floor_relief=metal_floor_relief,
+        donor_orientation=donor_orientation,
+        conjugation=conjugation,
+        stereo=stereo,
+    )
+    # `EnsembleSet` subclasses `list`, so the plain-list branch must come last: an earlier
+    # ``isinstance(…, list)`` would downgrade an EnsembleSet to a bare list.
     if isinstance(result, EnsembleSet):
-        return result._map("_relax_into_windows", trajectory=trajectory)
+        return result._map("_relax_into_windows", trajectory=trajectory, max_iters=max_iters)
     if isinstance(result, Ensemble):
-        return result._relax_into_windows(trajectory=trajectory)
+        return result._relax_into_windows(trajectory=trajectory, max_iters=max_iters)
     return [
-        r._map("_relax_into_windows", trajectory=trajectory) for r in result
+        r._map("_relax_into_windows", trajectory=trajectory, max_iters=max_iters) for r in result
     ]  # stereo='separate' -> a plain list of EnsembleSet
 
 
-def minimize(source, *, fix=None, constrain=None, template=None, charge=0, stiffness=_BASE_STIFFNESS):
+def minimize(
+    source,
+    *,
+    fix=None,
+    constrain=None,
+    template=None,
+    charge=0,
+    stiffness=_BASE_STIFFNESS,
+    max_iters=MAX_ITERS,
+):
     """Relax an existing structure toward ``fix``/``constrain`` targets: the search-free companion to `embed`.
 
     Same vocabulary as `embed` but no conformer search. Wraps the input geometry, grafts any coordinate-``fix``
     core, and runs the restrained UFF pull toward the targets. Needs an input geometry: an .xyz, a Mol with a
     conformer, or a metal `Isomer` whose Mol has one.
+    ``max_iters`` controls the restrained-UFF iteration cap.
 
         rx.minimize('mol.xyz', fix={(i, j): 2.0, (i, j, k): 178})   # pull toward a linear 3-centre core
     """
     from rxembed.embed import prepare_relax
+
+    _validate_max_iters(max_iters)
 
     if isinstance(source, Isomer):
         spec, mol = source, source.mol
@@ -128,13 +160,13 @@ def minimize(source, *, fix=None, constrain=None, template=None, charge=0, stiff
         raise ValueError(
             "minimize() relaxes an existing geometry; give an .xyz or a Mol with a conformer, not a SMILES"
         )
-    if template is not None:  # the same sugar `embed` dissolves: a reference core IS a coordinate fix
+    if template is not None:  # `template` resolves exactly as it does in `embed`: a reference core becomes a fix
         # after the normalise above, so a `fix=[atoms]` list resolves against the geometry just read
         fix = _template_to_fix(template, fix, mol.GetConformer().GetPositions(), mol)
     # The surrogate / sphere-hold / graft assembly is the core's (`rxembed.embed.minimize` is the same call
     # with a `Conformers` result); this only wraps it as an `Ensemble` so the pipeline verbs chain off it.
     mol, ids, cons, iso = prepare_relax(spec, fix=fix, constrain=constrain)
-    return Ensemble(mol, ids, cons, iso).minimize(stiffness=stiffness)
+    return Ensemble(mol, ids, cons, iso).minimize(stiffness=stiffness, max_iters=max_iters)
 
 
 def wrap(mol, ids=None, *, energies=None, minimized=False):
@@ -159,5 +191,6 @@ def wrap(mol, ids=None, *, energies=None, minimized=False):
             e = ff_energies(mol, minimize=False)  # single-point, geometry untouched
             by_id = {c.GetId(): float(e[k]) for k, c in enumerate(mol.GetConformers())}
             ens.energies = {i: by_id[i] for i in ids if i in by_id}
+            ens.energy_kind = "ff"
         ens._stage = _MINIMIZED
     return ens

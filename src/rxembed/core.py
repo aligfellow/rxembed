@@ -4,7 +4,7 @@ import logging
 from importlib.metadata import PackageNotFoundError, version
 
 from .constraints import Constraints, compose, match, resolve_core
-from .embed import Conformers, embed, minimize
+from .embed import Conformers, EmbeddingError, embed, minimize
 from .metal_core import Ligand, ligands
 from .metal_enumeration import enumerate_isomers
 from .metal_isomer import Isomer, IsomerSet
@@ -32,6 +32,7 @@ except PackageNotFoundError:
 __all__ = [
     "Conformers",
     "Constraints",
+    "EmbeddingError",
     "Isomer",
     "IsomerSet",
     "Ligand",

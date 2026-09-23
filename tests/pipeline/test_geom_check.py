@@ -13,7 +13,10 @@ from rxembed import metal_distance as mdist
 from rxembed import metal_perceive as perceive
 from rxembed.pipeline import geom_check as geom
 
-_DFT = ("mn-h2", "ru-co")  # the shipped transition states the floors must accept unchanged
+_DFT = (
+    pytest.param("mn-h2", {"metal_charges": {0: 2, 1: 1}}, id="mn-h2"),
+    pytest.param("ru-co", {"bond_orders": "xyz2mol"}, id="ru-co"),
+)  # the shipped transition states the floors must accept unchanged
 _ACID_ARENE = "OC(=O)CCCCc1ccccc1"  # flexible acid + arene: the fixture for both kwarg-driven checks
 
 
@@ -90,6 +93,64 @@ def test_geometry_check_rejects_nonfinite_coordinates():
 
     assert _kinds(report) == {"coordinates"}
     assert "non-finite coordinate" in report.summary()
+
+
+def test_clashes_checks_geminal_hydrogens_but_not_h2_or_metal_hydrides():
+    methane = _reference_conformer("C", optimize=False)
+    hydrogens = [atom.GetIdx() for atom in methane.GetAtoms() if atom.GetAtomicNum() == 1]
+    methane.GetConformer().SetAtomPosition(hydrogens[1], methane.GetConformer().GetAtomPosition(hydrogens[0]))
+    assert any(v.detail == "H...H clash" for v in geom.clashes(methane, methane.GetConformer().GetPositions()))
+    assert not any(
+        v.detail == "H...H clash" for v in geom.clashes(methane, methane.GetConformer().GetPositions(), exclude={0})
+    )
+
+    for symbols, bonds in ((["H", "H"], [(0, 1)]), (["Fe", "H", "H"], [(0, 1), (0, 2)])):
+        mol, pos = _bare_sphere(symbols, bonds, [(0, 0, 0), (1, 0, 0), (1.1, 0, 0)][: len(symbols)])
+        assert not any(v.detail == "H...H clash" for v in geom.clashes(mol, pos))
+
+
+def test_planarity_ignores_a_fastfindrings_perimeter_cycle():
+    mol = _reference_conformer("c1ccc2ccccc2c1")
+    rings = [set(ring) for ring in Chem.GetSymmSSSR(mol)]
+    shared = sorted(rings[0] & rings[1])
+    moving = sorted(rings[1] - set(shared))
+    pos = mol.GetConformer().GetPositions()
+    origin = pos[shared[0]]
+    axis = pos[shared[1]] - origin
+    axis /= np.linalg.norm(axis)
+    x, y, z = axis
+    angle = 0.7
+    c, s = np.cos(angle), np.sin(angle)
+    rotation = np.array(
+        [
+            [c + x * x * (1 - c), x * y * (1 - c) - z * s, x * z * (1 - c) + y * s],
+            [y * x * (1 - c) + z * s, c + y * y * (1 - c), y * z * (1 - c) - x * s],
+            [z * x * (1 - c) - y * s, z * y * (1 - c) + x * s, c + z * z * (1 - c)],
+        ]
+    )
+    pos[moving] = origin + (pos[moving] - origin) @ rotation.T
+    Chem.FastFindRings(mol)
+    assert any(len(ring) == 10 for ring in mol.GetRingInfo().AtomRings()), "fixture premise"
+
+    violations = geom.planarity(mol, pos)
+
+    assert not any(violation.detail == "aromatic ring puckered" for violation in violations)
+
+
+def test_planarity_checks_local_fused_rings_not_their_super_ring():
+    mol = Chem.MolFromSmiles("c1c2c3cc3c12")
+    pos = np.array(
+        [[-0.5, -0.5, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-0.5, 1.5, 0.0], [1.0, 1.0, 1.0], [1.0, 0.0, 0.0]]
+    )
+    Chem.GetSymmSSSR(mol)
+    perimeter = next(ring for ring in mol.GetRingInfo().AtomRings() if len(ring) == 4)
+    points = pos[list(perimeter)]
+    rms = float(np.sqrt(np.linalg.svd(points - points.mean(0))[1][2] ** 2 / len(perimeter)))
+    assert rms > 0.1, "the super-ring must be puckered enough to expose an unfiltered global RMS gate"
+
+    violations = geom.planarity(mol, pos)
+
+    assert not any(violation.detail == "aromatic ring puckered" for violation in violations)
 
 
 # --- one deliberate break per violation kind --------------------------------------------------------------
@@ -188,6 +249,18 @@ def test_constraint_gate_rejects_an_unmeasurable_virtual_term(spec):
     assert "could not be measured" in violations[0].detail
 
 
+def test_constraint_gate_ignores_a_transient_phantom_term():
+    mol = _reference_conformer("CCC")
+    pos = mol.GetConformer().GetPositions()
+    spec = rx.Constraints(
+        distances={(0, 99): (20.0, 21.0)},
+        haptic={99: (1, 2)},
+        phantoms=frozenset({99}),
+    )
+
+    assert not geom.check_constraints(mol, pos, spec)
+
+
 # --- TS-awareness: a held core is not judged by ground-state rules ----------------------------------------
 
 
@@ -255,11 +328,13 @@ def test_overbond_gate_accepts_clean_isomers():
 def test_donor_sets_are_per_metal():
     import rxembed as rx
 
-    isos = rx.metal("examples/structures/mn-h2.xyz", "octahedral", center="Mn", fix=[1, 5, 63, 64, 65, 66])
-    ens = rx.embed(isos[0], n=1, seed=1)
+    reference = rx.read_xyz("examples/structures/mn-h2.xyz", metal_charges={0: 2, 1: 1})
+    isos = rx.metal(reference, "octahedral", center="Mn", fix=[1, 5, 63, 64, 65, 66])
+    iso = next(candidate for candidate in isos if rx.cxsmiles(candidate) == rx.cxsmiles(reference))
+    ens = rx.embed(iso, n=1, seed=1)
     assert ens.ids, "no conformer was judged: the gate was never asked anything"
     for cid in ens.ids:
-        assert not perceive.metal_overbond(ens.mol, ens.mol.GetConformer(cid).GetPositions(), isos[0].donors)
+        assert not perceive.metal_overbond(ens.mol, ens.mol.GetConformer(cid).GetPositions(), iso.donors)
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
@@ -297,7 +372,7 @@ def test_gate_catches_third_sphere_overbond():
     assert [x.kind for x in perceive.metal_overbond(mol, buried, None)] == ["metal_collapse"]
 
 
-def test_overbond_tier_counts_bonded_donors():
+def test_overbond_tier_treats_sigma_bridgehead_as_second_sphere():
     ac, pos = _bare_sphere(  # Pd | O O (donors) | C carboxyl | C methyl: the CMD/AMLA motif
         ["Pd", "O", "O", "C", "C"],
         [(1, 3), (2, 3), (3, 4)],
@@ -310,7 +385,7 @@ def test_overbond_tier_counts_bonded_donors():
     assert np.linalg.norm(tpos[2] - tpos[0]) == pytest.approx(2.554, abs=0.01)
     assert not perceive.metal_overbond(ti, tpos, [1])
 
-    assert mdist.overbond_tier(ac, [1, 2], 3) == mdist.APEX  # bonded to both donors: a chelate bite, forced
+    assert mdist.overbond_tier(ac, [1, 2], 3) == mdist.NEAR  # two sigma arms still need metal repulsion
     assert mdist.overbond_tier(ac, [1, 2], 4) == mdist.OUTER  # bonded to neither: third sphere
     assert mdist.overbond_tier(ac, [1], 3) == mdist.NEAR  # bonded to one: second sphere, floored
 
@@ -340,8 +415,8 @@ def test_second_sphere_floor_rejects_collapse_not_agostic():
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-@pytest.mark.parametrize("name", _DFT)
-def test_floors_accept_reference_geometries(name):
+@pytest.mark.parametrize(("name", "read_kw"), _DFT)
+def test_floors_accept_reference_geometries(name, read_kw):
     from rdkit.Chem import GetPeriodicTable
 
     from rxembed.constraints import Constraints
@@ -349,7 +424,7 @@ def test_floors_accept_reference_geometries(name):
     from rxembed.pipeline.perceive import read_xyz
 
     pt = GetPeriodicTable()
-    mol = read_xyz(f"examples/structures/{name}.xyz", 0)
+    mol = read_xyz(f"examples/structures/{name}.xyz", 0, **read_kw)
     pos = mol.GetConformer().GetPositions()
     metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS]
     assert metals, f"{name} carries no transition metal: the fixture exercises no floor at all"

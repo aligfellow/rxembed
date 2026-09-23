@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import itertools
+import logging
+
 import numpy as np
 from rdkit import Chem
 
 from . import metal_polyhedron as _poly
-from .metal_core import _EPS_LEN, VACANT, _frag_map, _vertex_atom
+from .metal_core import _EPS_LEN, VACANT, _frag_map, _ligand_distance_matrix, _vertex_atom, metal_indices
 from .metal_polyhedron import vertex_dirs
+from .stereo import _apply_encoded_bond_stereo, _coordination_locked_double_bonds
+from .utils import bond_removal_mirrors, flat_ranks, mirror_tag, resonance_match
 
 _MIN_STEREO_NEIGHBOURS = 3
 _ETA2 = 2
@@ -17,31 +22,37 @@ _FACE_EPS = 1e-8
 _HALF_TURN = 180
 _CIS_STEREO = {Chem.BondStereo.STEREOCIS, Chem.BondStereo.STEREOZ}
 _TRANS_STEREO = {Chem.BondStereo.STEREOTRANS, Chem.BondStereo.STEREOE}
+_RESONANCE_CLASS_CAP = 32
+_RESONANCE_LARGE_GRAPH = 40
+_RESONANCE_LARGE_CAP = 8
+# Large graphs keep exact graph classes; resonance proof is bounded to small graphs.
+logger = logging.getLogger("rxembed.metal")
 
 
-def _flat_ranks(mol):
-    """Rank the resonance-insensitive skeleton with charge, bond order and stereo removed."""
-    rw = Chem.RWMol(mol)
-    total_h = [a.GetTotalNumHs() for a in rw.GetAtoms()]
-    for bond in rw.GetBonds():
-        bond.SetBondType(Chem.BondType.SINGLE)
-        bond.SetIsAromatic(False)
-        bond.SetStereo(Chem.BondStereo.STEREONONE)
-    for atom, h in zip(rw.GetAtoms(), total_h, strict=True):
-        atom.SetFormalCharge(0)
-        atom.SetIsAromatic(False)
-        atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
-        atom.SetNumExplicitHs(h)
-        atom.SetNoImplicit(True)
-    flat = rw.GetMol()
-    flat.UpdatePropertyCache(strict=False)
-    Chem.FastFindRings(flat)
-    return list(Chem.CanonicalRankAtoms(flat, breakTies=False))
+def _resonance_cap(mol):
+    """Bound direct resonance proofs on graphs whose form count is expensive."""
+    return _RESONANCE_LARGE_CAP if mol.GetNumAtoms() > _RESONANCE_LARGE_GRAPH else _RESONANCE_CLASS_CAP
 
 
 def remove_routine_hydrogens(mol, keep=()):
     """Return a hydrogen-reduced Mol and its old-to-new atom-index mapping."""
     out, keep = Chem.Mol(mol), set(keep)
+    out.UpdatePropertyCache(strict=False)
+    point_tags = {}
+    for atom in out.GetAtoms():
+        tag = atom.GetChiralTag()
+        if tag not in {Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW}:
+            continue
+        for neighbor in atom.GetNeighbors():
+            if neighbor.GetAtomicNum() == 1 and neighbor.GetIdx() not in keep:
+                if bond_removal_mirrors(atom, neighbor.GetIdx()):
+                    tag = mirror_tag(tag)
+        point_tags[atom.GetIdx()] = tag
+    hydrogens = {
+        atom.GetIdx(): atom.GetTotalNumHs() + sum(neighbor.GetAtomicNum() == 1 for neighbor in atom.GetNeighbors())
+        for atom in out.GetAtoms()
+        if atom.GetAtomicNum() != 1
+    }
     for atom in out.GetAtoms():
         atom.SetIntProp("_rxembedOriginalIndex", atom.GetIdx())
         if atom.GetIdx() in keep and atom.GetAtomicNum() == 1 and not atom.GetIsotope():
@@ -49,42 +60,116 @@ def remove_routine_hydrogens(mol, keep=()):
             atom.SetIsotope(1)
     params = Chem.RemoveHsParameters()
     params.removeDegreeZero = True
+    params.removeDefiningBondStereo = True
+    params.showWarnings = False  # protected donor hydrides are deliberately isotope-marked and retained
     out = Chem.RemoveHs(out, params, sanitize=False)
     at = {}
+    deficits = []
     for atom in out.GetAtoms():
-        at[atom.GetIntProp("_rxembedOriginalIndex")] = atom.GetIdx()
+        original = atom.GetIntProp("_rxembedOriginalIndex")
+        at[original] = atom.GetIdx()
+        if original in point_tags:
+            atom.SetChiralTag(point_tags[original])
+        if atom.GetAtomicNum() != 1:
+            current = atom.GetTotalNumHs() + sum(neighbor.GetAtomicNum() == 1 for neighbor in atom.GetNeighbors())
+            deficits.append((atom, hydrogens[original] - current))
         atom.ClearProp("_rxembedOriginalIndex")
         if atom.HasProp("_rxembedCoordinationH"):
             atom.SetIsotope(0)
             atom.ClearProp("_rxembedCoordinationH")
+    for atom, deficit in deficits:
+        if deficit > 0:
+            atom.SetNumExplicitHs(atom.GetNumExplicitHs() + deficit)
     out.UpdatePropertyCache(strict=False)
     return out, at
 
 
+def _root_resonance_match(mol, left, right):
+    """Return whether RDKit proves that two roots map across a resonance form, plus cap status."""
+    used = {atom.GetIsotope() for atom in mol.GetAtoms()}
+    marker = next(value for value in range(1, 65536) if value not in used)
+
+    def rooted(root):
+        marked = Chem.Mol(mol)
+        marked.GetAtomWithIdx(root).SetIsotope(marker)
+        fragments = Chem.GetMolFrags(marked, asMols=True, sanitizeFrags=False)
+        return next(
+            fragment for fragment in fragments if any(atom.GetIsotope() == marker for atom in fragment.GetAtoms())
+        )
+
+    query, source = rooted(left), rooted(right)
+    return resonance_match(
+        query,
+        source,
+        flags=Chem.ALLOW_CHARGE_SEPARATION,
+        max_forms=_resonance_cap(mol),
+    )
+
+
+def _root_classes(mol, roots):
+    """Classify roots by exact symmetry, with bounded resonance coarsening on small graphs."""
+    roots = list(dict.fromkeys(roots))
+    try:
+        exact = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
+    except (RuntimeError, ValueError) as exc:
+        raise ValueError("RDKit could not canonicalize coordination-site identity") from exc
+    if mol.GetNumAtoms() > _RESONANCE_LARGE_GRAPH:
+        return {root: exact[root] for root in roots}
+    try:
+        flat = flat_ranks(mol)
+    except (RuntimeError, ValueError):
+        flat = None
+    parent = {root: root for root in roots}
+
+    def find(root):
+        while parent[root] != root:
+            parent[root] = parent[parent[root]]
+            root = parent[root]
+        return root
+
+    def merge(left, right):
+        left, right = find(left), find(right)
+        parent[max(left, right)] = min(left, right)
+
+    for left, right in itertools.combinations(roots, 2):
+        if exact[left] == exact[right]:
+            merge(left, right)
+            continue
+        if flat is None or flat[left] != flat[right]:
+            continue
+        capped = False
+        try:
+            for source, target in ((left, right), (right, left)):
+                matched, hit_cap = _root_resonance_match(mol, source, target)
+                capped |= hit_cap
+                if matched:
+                    merge(left, right)
+                    break
+        except (RuntimeError, ValueError):
+            continue
+        if capped:
+            logger.warning(
+                "coordination identity: resonance search exceeded %d forms; keeping roots %d and %d distinct",
+                _RESONANCE_CLASS_CAP,
+                left,
+                right,
+            )
+    groups = {}
+    for root in roots:
+        groups.setdefault(find(root), []).append(root)
+    labels = {group: min(exact[root] for root in members) for group, members in groups.items()}
+    return {root: labels[find(root)] for root in roots}
+
+
 def donor_classes(mol, donors):
-    """Map donor atoms to graph-symmetry classes, coarsened over resonance forms.
+    """Map donor atoms to graph or RDKit-proven resonance symmetry classes.
 
     Coordination identity follows graph automorphism, not one localized charge or bond-order assignment.
-    The resonance-flat ranking may merge perceived classes but never split them.
+    Failed resonance coarsening leaves exact classes distinct; it never falls back to element identity.
     """
-    try:
-        ranked, at = remove_routine_hydrogens(mol, donors)
-        ranks = list(Chem.CanonicalRankAtoms(ranked, breakTies=False))
-        flat = _flat_ranks(ranked)
-    except Exception:  # pragma: no cover - ranking must never make embedding fail
-        return {d: mol.GetAtomWithIdx(d).GetSymbol() for d in donors}
-    root = {}
-
-    def find(x):
-        while root.setdefault(x, x) != x:
-            x = root[x] = root[root[x]]
-        return x
-
-    for donor in donors:
-        perceived = find(("perceived", ranks[at[donor]]))
-        resonance = find(("flat", flat[at[donor]]))
-        root[max(perceived, resonance)] = min(perceived, resonance)
-    return {donor: find(("perceived", ranks[at[donor]])) for donor in donors}
+    ranked, at = remove_routine_hydrogens(mol, donors)
+    classes = _root_classes(ranked, [at[donor] for donor in donors])
+    return {donor: classes[at[donor]] for donor in donors}
 
 
 def site_classes(mol, sites, haptic=None, coordination=()):
@@ -97,17 +182,31 @@ def site_classes(mol, sites, haptic=None, coordination=()):
     occupied = [site for site in sites if site != VACANT]
     atoms = {atom for site in occupied for atom in (haptic.get(site) or (site,))}
     atoms.update(donor for donor, _metal, _atomic_num, _charge in coordination)
-    ranked, at = remove_routine_hydrogens(mol, atoms)
-    rw = Chem.RWMol(ranked)
+    rw = Chem.RWMol(mol)
     for donor, metal, atomic_num, charge in coordination:
-        if donor not in at or metal not in at:
+        if min(donor, metal) < 0 or max(donor, metal) >= mol.GetNumAtoms():
             continue
-        atom = rw.GetAtomWithIdx(at[metal])
+        atom = rw.GetAtomWithIdx(metal)
         atom.SetAtomicNum(atomic_num)
         atom.SetFormalCharge(charge)
         atom.SetIsotope(1000 + charge)
-        if rw.GetBondBetweenAtoms(at[donor], at[metal]) is None:
-            rw.AddBond(at[donor], at[metal], Chem.BondType.ZERO)
+        if rw.GetBondBetweenAtoms(donor, metal) is None:
+            rw.AddBond(donor, metal, Chem.BondType.ZERO)
+    work = rw.GetMol()
+    ring = Chem.RWMol(work)
+    for bond in ring.GetBonds():
+        if bond.GetBondType() == Chem.BondType.ZERO:
+            bond.SetBondType(Chem.BondType.SINGLE)
+    ring = ring.GetMol()
+    locked = _coordination_locked_double_bonds(ring, metal_indices(ring))
+    for pair in locked:
+        bond = work.GetBondBetweenAtoms(*pair)
+        if bond is not None:
+            bond.SetStereo(Chem.BondStereo.STEREONONE)
+    _apply_encoded_bond_stereo(work, skip=locked)
+    # Complete the donor's stereo carriers before removing H and rebasing its point tag.
+    ranked, at = remove_routine_hydrogens(work, atoms)
+    rw = Chem.RWMol(ranked)
     markers = {}
     for site in occupied:
         marker = rw.AddAtom(Chem.Atom(0))
@@ -118,20 +217,38 @@ def site_classes(mol, sites, haptic=None, coordination=()):
     marked = rw.GetMol()
     marked.UpdatePropertyCache(strict=False)
     Chem.FastFindRings(marked)
-    perceived = list(Chem.CanonicalRankAtoms(marked, breakTies=False))
-    flat = _flat_ranks(marked)
-    root = {}
+    classes = _root_classes(marked, markers.values())
+    return {site: (classes[marker],) for site, marker in markers.items()}
 
-    def find(x):
-        while root.setdefault(x, x) != x:
-            x = root[x] = root[root[x]]
-        return x
 
-    for marker in markers.values():
-        ranked_marker = find(("perceived", perceived[marker]))
-        flat_marker = find(("flat", flat[marker]))
-        root[max(ranked_marker, flat_marker)] = min(ranked_marker, flat_marker)
-    return {site: (find(("perceived", perceived[marker])),) for site, marker in markers.items()}
+def equivalent_site_assignments(classes, links=None, *, targets=None, sources=None):
+    """Yield class- and chelate-link-preserving target-to-source vertex maps."""
+    link_labels = {} if links is None else links
+    occupied = [vertex for vertex, value in enumerate(classes) if value is not None]
+    targets = occupied if targets is None else list(targets)
+    sources = occupied if sources is None else list(sources)
+    remaining, assigned = set(sources), {}
+
+    def place(position):
+        if position == len(targets):
+            yield dict(assigned)
+            return
+        target = targets[position]
+        for source in sources:
+            if source not in remaining or classes[target] != classes[source]:
+                continue
+            if any(
+                link_labels.get(frozenset((target, other))) != link_labels.get(frozenset((source, mapped)))
+                for other, mapped in assigned.items()
+            ):
+                continue
+            assigned[target] = source
+            remaining.remove(source)
+            yield from place(position + 1)
+            remaining.add(source)
+            del assigned[target]
+
+    yield from place(0)
 
 
 def _face_walk(mol, face):
@@ -190,6 +307,9 @@ def eta2_signatures(mol, face, ranks=None):
 
     Empty signatures mean the ligand graph does not define an independent, priority-orderable face choice.
     """
+    if any(mol.GetAtomWithIdx(atom).GetTotalNumHs() for atom in face):
+        mol = Chem.AddHs(mol, onlyOnAtoms=list(face))
+        ranks = None
     try:
         ranks = list(Chem.ComputeAtomCIPRanks(mol)) if ranks is None else ranks
     except (RuntimeError, ValueError):
@@ -207,6 +327,8 @@ def eta2_signatures(mol, face, ranks=None):
             return (), ()
         if bond.GetStereo() in _CIS_STEREO | _TRANS_STEREO and len(refs) == _ETA2:
             cis = bond.GetStereo() in _CIS_STEREO
+            if bond.GetBeginAtomIdx() != a:
+                refs.reverse()  # RDKit stores stereo references in bond begin/end order, not `face` order
         elif (
             bond.GetStereo() == Chem.BondStereo.STEREONONE
             and bond.IsInRing()
@@ -227,8 +349,6 @@ def eta2_signatures(mol, face, ranks=None):
             ]
         else:
             return (), ()
-        if bond.GetBeginAtomIdx() != a:
-            refs.reverse()
         ra, rb = refs
         try:
             other_a = next(n.GetIdx() for n in mol.GetAtomWithIdx(a).GetNeighbors() if n.GetIdx() not in {b, ra})
@@ -258,6 +378,15 @@ def face_has_orientation(mol, face, ranks):
     return _canonical_face_walk(mol, face, ranks) is not None
 
 
+def _face_side(normal, direction, area_scale):
+    """Return a scale-invariant side of a face, or zero for a degenerate placement."""
+    value = float(normal @ direction)
+    scale = float(area_scale * np.linalg.norm(direction))
+    if not np.isfinite(value) or not np.isfinite(scale) or scale <= 0.0 or abs(value) <= _FACE_EPS * scale:
+        return 0
+    return 1 if value > 0.0 else -1
+
+
 def face_winding(mol, pos, metal, face, ranks, eta2_ranks=None):
     """Return the canonical ``'+'`` or ``'-'`` orientation of a haptic face.
 
@@ -272,10 +401,11 @@ def face_winding(mol, pos, metal, face, ranks, eta2_ranks=None):
         signature = []
         for atom, key, ordered in _eta2_centres(mol, face, eta2_ranks, metal):
             centre = pos[atom]
-            volume = float(np.cross(pos[ordered[0]] - centre, pos[ordered[1]] - centre) @ (pos[metal] - centre))
-            if abs(volume) <= _FACE_EPS:
+            left, right = pos[ordered[0]] - centre, pos[ordered[1]] - centre
+            side = _face_side(np.cross(left, right), pos[metal] - centre, np.linalg.norm(left) * np.linalg.norm(right))
+            if not side:
                 return ""
-            signature.append((key, "si" if volume > 0 else "re"))
+            signature.append((key, "si" if side > 0 else "re"))
         signature = tuple(sorted(signature))
         mirror = tuple(sorted((key, "si" if name == "re" else "re") for key, name in signature))
         return "+" if signature < mirror else "-" if signature > mirror else ""
@@ -285,11 +415,9 @@ def face_winding(mol, pos, metal, face, ranks, eta2_ranks=None):
     sequence, closed = canonical
     centre = np.mean([pos[atom] for atom in sequence], axis=0)
     following = sequence[1:] + sequence[:1] if closed else sequence[1:]
-    circulation = sum(
-        (np.cross(pos[a] - centre, pos[b] - centre) for a, b in zip(sequence, following, strict=False)),
-        start=np.zeros(3),
-    )
-    return "+" if float(circulation @ (centre - pos[metal])) > 0 else "-"
+    terms = [np.cross(pos[a] - centre, pos[b] - centre) for a, b in zip(sequence, following, strict=False)]
+    side = _face_side(sum(terms, start=np.zeros(3)), centre - pos[metal], sum(np.linalg.norm(term) for term in terms))
+    return "+" if side > 0 else "-" if side < 0 else ""
 
 
 def face_descriptors(mol, donors, haptic, windings):
@@ -343,22 +471,34 @@ def face_descriptors(mol, donors, haptic, windings):
     return out
 
 
-def chelate_edges(mol, vertices, haptic=None):
-    """Return vertex pairs whose donors chelate through one ligand."""
+def chelate_links(mol, vertices, haptic=None, distances=None):
+    """Return same-ligand vertex pairs labelled by their shortest graph distance."""
+    haptic = haptic or {}
     frag = _frag_map(mol)
     occupied = [vertex for vertex in range(len(vertices)) if vertices[vertex] != VACANT]
-    return frozenset(
-        frozenset((a, b))
+    pairs = [
+        (a, b)
         for i, a in enumerate(occupied)
         for b in occupied[i + 1 :]
         if frag[_vertex_atom(haptic, vertices[a])] == frag[_vertex_atom(haptic, vertices[b])]
-    )
+    ]
+    if not pairs:
+        return {}
+    distances = _ligand_distance_matrix(mol) if distances is None else distances
+    return {
+        frozenset((a, b)): min(
+            int(distances[left][right])
+            for left in haptic.get(vertices[a], (vertices[a],))
+            for right in haptic.get(vertices[b], (vertices[b],))
+        )
+        for a, b in pairs
+    }
 
 
-def chirality_of(mol, geometry, vertices, haptic=None, coordination=(), *, classes=None, edges=None):
+def chirality_of(mol, geometry, vertices, haptic=None, coordination=(), *, classes=None, links=None):
     """Return the canonical metal-centre hand, or empty when achiral or undecidable.
 
-    The point-group parity is computed from canonical site classes plus the chelate-bite graph, so atom order,
+    Point-group parity uses canonical site classes plus graph-distance-labelled donor links, so atom order,
     resonance localization and proper rotation cannot change the result.
     """
     dirs = vertex_dirs(geometry)
@@ -368,7 +508,7 @@ def chirality_of(mol, geometry, vertices, haptic=None, coordination=(), *, class
         dirs,
         list(vertices),
         site_classes(mol, vertices, haptic, coordination) if classes is None else classes,
-        chelate_edges(mol, vertices, haptic) if edges is None else edges,
+        chelate_links(mol, vertices, haptic) if links is None else links,
     )
 
 

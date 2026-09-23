@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom
+from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
 from rdkit.Chem.rdMolTransforms import GetAngleDeg, GetBondLength, GetDihedralDeg, SetDihedralDeg
 
 from rxembed import relax as relax_module
@@ -15,6 +16,7 @@ from rxembed.constraints import Constraints
 from rxembed.relax import (
     FF_SURROGATE,
     UFF_GHOST,
+    _bonding_failure,
     _ff_surrogate,
     bonding_ok,
     ff_energies,
@@ -63,6 +65,7 @@ def test_stated_distance_is_not_judged_as_a_bond():
     mol = _stretch(_mol(), 1, 2, 2.4)
     assert not bonding_ok(mol, 0), "unconstrained, a 2.4 A C-Cl should read as torn"
     assert bonding_ok(mol, 0, constrained={(1, 2): (2.35, 2.45)}), "a stated pair must be exempt"
+    assert _bonding_failure(mol, 0).startswith("bond 1-2 2.400 A above")
 
 
 def test_exemption_is_per_pair_not_per_atom():
@@ -100,7 +103,66 @@ def test_max_iters_zero_scores_without_moving_an_atom():
     assert np.allclose(mol.GetConformer(0).GetPositions(), before), "max_iters=0 moved atoms"
 
 
-def test_restrained_uff_reports_optimizer_status_and_uses_the_full_cap(monkeypatch, caplog):
+@pytest.mark.parametrize("trajectory", [False, True])
+def test_restrained_energy_scores_endpoint_on_the_same_field(monkeypatch, trajectory):
+    mol = _mol()
+    cons = Constraints(distances={(1, 2): (2.35, 2.45)})
+    native_builder = rdForceFieldHelpers.UFFGetMoleculeForceField
+    built = []
+    expected = []
+    endpoints = []
+
+    def force_field(*args, **kwargs):
+        ff = native_builder(*args, **kwargs)
+        built.append(ff)
+        method = "MinimizeTrajectory" if trajectory else "Minimize"
+        native_minimize = getattr(ff, method)
+
+        def minimize(*args, **kwargs):
+            result = native_minimize(*args, **kwargs)
+            coordinates = np.asarray(ff.Positions())
+            endpoints.append(coordinates.copy())
+            expected.append(ff.CalcEnergy(tuple(coordinates)))
+            # A rejected trial can leave cached distances without changing the returned coordinates.
+            coordinates[0] += 0.5
+            trial_energy = ff.CalcEnergy(tuple(coordinates))
+            assert trial_energy != pytest.approx(expected[-1])
+            return result
+
+        setattr(ff, method, minimize)
+        return ff
+
+    monkeypatch.setattr(rdForceFieldHelpers, "UFFGetMoleculeForceField", force_field)
+    snapshots = {} if trajectory else None
+    energy = restrained_uff(mol, cons, max_iters=1, _statuses={}, _snapshots=snapshots)
+
+    assert len(built) == len(expected) == 1, "rescoring must not rebuild the anchored force field"
+    np.testing.assert_allclose(energy, expected, atol=1e-10, rtol=0)
+    np.testing.assert_array_equal(mol.GetConformer().GetPositions().ravel(), endpoints[0])
+    if trajectory:
+        assert snapshots is not None
+        assert snapshots[0]
+
+
+def test_restrained_uff_default_does_not_capture_trajectory(monkeypatch):
+    mol = _mol()
+    cons = Constraints(distances={(1, 2): (2.35, 2.45)})
+    native_builder = rdForceFieldHelpers.UFFGetMoleculeForceField
+
+    def force_field(*args, **kwargs):
+        ff = native_builder(*args, **kwargs)
+
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("default restrained UFF must not capture snapshots")
+
+        ff.MinimizeTrajectory = forbidden
+        return ff
+
+    monkeypatch.setattr(rdForceFieldHelpers, "UFFGetMoleculeForceField", force_field)
+    restrained_uff(mol, cons, max_iters=1)
+
+
+def test_restrained_uff_defers_internal_optimizer_status_to_its_acceptance_gate(monkeypatch, caplog):
     mol = _mol()
     seen = []
 
@@ -109,7 +171,9 @@ def test_restrained_uff_reports_optimizer_status_and_uses_the_full_cap(monkeypat
             seen.append(kwargs["maxIts"])
             return 1
 
-        return SimpleNamespace(Initialize=lambda: None, Minimize=minimize, CalcEnergy=lambda: 12.5)
+        return SimpleNamespace(
+            Initialize=lambda: None, Minimize=minimize, Positions=lambda: (), CalcEnergy=lambda _positions: 12.5
+        )
 
     monkeypatch.setattr(relax_module._mech, "MECHANISM_ORDER", ())
     monkeypatch.setattr(relax_module.rdForceFieldHelpers, "UFFHasAllMoleculeParams", lambda _mol: True)
@@ -120,31 +184,142 @@ def test_restrained_uff_reports_optimizer_status_and_uses_the_full_cap(monkeypat
 
     assert seen == [2000]
     assert statuses == {0: 1}
+    assert "did not converge" not in caplog.text
+
+    restrained_uff(mol, Constraints())
     assert "did not converge" in caplog.text
 
 
-@pytest.mark.parametrize("smiles", ["P=[Se]->[Li]", "P=[Se][Pd]"], ids=["dative-metal", "covalent-metal"])
-def test_selenium_uses_available_uff_type_on_private_graph(smiles):
-    mol = Chem.MolFromSmiles(smiles)
+def test_untyped_selenium_uses_a_radius_corrected_sulfur_ff_graph(caplog):
+    mol = Chem.MolFromSmiles("NC(=[Se])N")
     conf = Chem.Conformer(mol.GetNumAtoms())
-    for i, xyz in enumerate(((0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (2.5, 2.0, 0.0))):
+    for i, xyz in enumerate(((-1.2, 0.8, 0.0), (0.0, 0.0, 0.0), (2.2, 0.0, 0.0), (-1.2, -0.8, 0.0))):
         conf.SetAtomPosition(i, xyz)
     mol.AddConformer(conf)
     before = Chem.MolToSmiles(mol)
+    selenium = next(atom.GetIdx() for atom in mol.GetAtoms() if atom.GetSymbol() == "Se")
+    carbon = mol.GetAtomWithIdx(selenium).GetNeighbors()[0].GetIdx()
 
-    energies = restrained_uff(mol, Constraints(metals={2}), max_iters=5)
+    sulfur = Chem.RWMol(mol)
+    sulfur.GetAtomWithIdx(selenium).SetAtomicNum(16)
+    sulfur = sulfur.GetMol()
+    sulfur.UpdatePropertyCache(strict=False)
+    sulfur_r0 = rdForceFieldHelpers.GetUFFBondStretchParams(sulfur, carbon, selenium)[1]
+    radius_delta = Chem.GetPeriodicTable().GetRcovalent(34) - Chem.GetPeriodicTable().GetRcovalent(16)
+
+    surrogates = {}
+    with caplog.at_level("WARNING", logger="rxembed.relax"):
+        energies = restrained_uff(mol, Constraints(), max_iters=200, _surrogates=surrogates)
 
     assert np.isfinite(energies).all()
     assert Chem.MolToSmiles(mol) == before
-    assert mol.GetAtomWithIdx(1).GetHybridization() == Chem.HybridizationType.SP2
+    assert mol.GetAtomWithIdx(selenium).GetAtomicNum() == 34
+    assert surrogates == {selenium: (34, 16)}
+    assert GetBondLength(mol.GetConformer(), carbon, selenium) == pytest.approx(sulfur_r0 + radius_delta, abs=0.03)
+    assert f"Se{selenium}->S" in caplog.text
 
 
-def test_selenium_fallback_does_not_retype_nonterminal_pse():
-    mol = Chem.MolFromSmiles("P=[Se](C)->[Li]")
+def test_untyped_arsenic_uses_a_private_phosphorus_type():
+    mol = Chem.MolFromSmiles("C=[As-]")
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    conf.SetAtomPosition(0, (0.0, 0.0, 0.0))
+    conf.SetAtomPosition(1, (1.9, 0.0, 0.0))
+    mol.AddConformer(conf)
+    before = Chem.MolToSmiles(mol)
+    surrogates = {}
+
+    energies = restrained_uff(mol, Constraints(), max_iters=5, _surrogates=surrogates)
+
+    assert np.isfinite(energies).all()
+    assert Chem.MolToSmiles(mol) == before
+    assert surrogates == {1: (33, 15)}
+
+
+def test_isolated_untyped_boron_uses_a_private_carbon_type():
+    mol = Chem.MolFromSmiles("C=[B]C")
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for i, xyz in enumerate(((0.0, 0.0, 0.0), (1.5, 0.0, 0.0), (3.0, 0.0, 0.0))):
+        conf.SetAtomPosition(i, xyz)
+    mol.AddConformer(conf)
+    before = Chem.MolToSmiles(mol)
+    surrogates = {}
+
+    energies = restrained_uff(mol, Constraints(), max_iters=5, _surrogates=surrogates)
+
+    assert np.isfinite(energies).all()
+    assert Chem.MolToSmiles(mol) == before
+    assert surrogates == {1: (5, 6)}
+
+
+def test_boron_network_is_not_retyped_as_carbon():
+    mol = Chem.MolFromSmiles("C=[B]B")
     mol.AddConformer(Chem.Conformer(mol.GetNumAtoms()))
 
-    with pytest.raises(RuntimeError, match="UFF has unsupported atom types outside the fixed core"):
-        restrained_uff(mol, Constraints(metals={3}), max_iters=0)
+    assert relax_module._uff_surrogate_graph(mol, Constraints()) is None
+
+
+def test_native_uff_typing_is_not_replaced_for_a_poor_angle_objective():
+    mol = Chem.MolFromSmiles("[O-][Cl+3]([O-])([O-])[O-]")
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for i, xyz in enumerate(
+        ((1.5, 0.0, 0.0), (0.0, 0.0, 0.0), (-0.5, 1.4, 0.0), (-0.5, -0.7, 1.2), (-0.5, -0.7, -1.2))
+    ):
+        conf.SetAtomPosition(i, xyz)
+    mol.AddConformer(conf)
+    surrogates = {}
+
+    restrained_uff(mol, Constraints(), max_iters=0, _surrogates=surrogates)
+
+    assert surrogates == {}
+
+
+def test_multiple_uff_surrogates_are_groupwise_and_atom_order_invariant():
+    mol = Chem.MolFromSmiles("NC(=[Se])N.C=[As-]")
+    mol.AddConformer(Chem.Conformer(mol.GetNumAtoms()))
+    expected = {(34, 16), (33, 15)}
+
+    for candidate in (mol, Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))):
+        selected = relax_module._uff_surrogate_graph(candidate, Constraints())
+        assert selected is not None
+        _graph, _constraints, replacements = selected
+        assert set(replacements.values()) == expected
+
+
+def test_plain_ff_energy_rejects_an_incomplete_uff_objective():
+    mol = Chem.MolFromSmiles("NC(=[Se])N")
+    mol.AddConformer(Chem.Conformer(mol.GetNumAtoms()))
+
+    with pytest.raises(relax_module.UFFTypingError, match="Se2"):
+        ff_energies(mol, minimize=False)
+
+
+def test_surrogate_single_point_reports_its_private_objective_once(caplog):
+    mol = _mol("NC(=[Se])N")
+    surrogates = {}
+
+    with caplog.at_level(logging.WARNING, logger="rxembed.relax"):
+        restrained_uff(mol, Constraints(), max_iters=0, _surrogates=surrogates)
+        restrained_uff(mol, Constraints(), max_iters=0, _surrogates=surrogates)
+
+    assert caplog.text.count("private surrogate typing") == 1
+
+
+def test_invalid_constraint_is_reported_as_setup_failure():
+    mol = _mol()
+
+    with pytest.raises(relax_module.UFFOptimizationError, match="constraint setup failed"):
+        restrained_uff(mol, Constraints(distances={(0, 99): (1.0, 1.0)}), max_iters=0)
+
+
+def test_force_field_construction_failure_is_a_typing_error(monkeypatch):
+    mol = _mol()
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("bad params pointer")
+
+    monkeypatch.setattr(relax_module.rdForceFieldHelpers, "UFFGetMoleculeForceField", fail)
+    with pytest.raises(relax_module.UFFTypingError, match="construction failed: bad params pointer"):
+        restrained_uff(mol, Constraints(), max_iters=0)
 
 
 def test_restrained_uff_seats_an_antipodal_fixed_dihedral():
@@ -178,7 +353,48 @@ def test_ff_energies_excludes_constraint_penalties():
     assert restrained != pytest.approx(plain), "the restrained energy carried no constraint penalty"
 
 
-def test_force_field_minimizer_failure_rolls_back_the_batch(monkeypatch):
+@pytest.mark.parametrize(("smiles", "mmff"), [("CCCl", True), ("CB(C)C", False)])
+@pytest.mark.parametrize("threads", [1, 2])
+def test_ff_energies_scores_batch_on_its_original_field(monkeypatch, smiles, mmff, threads):
+    mol = _mol(smiles)
+    mol.GetConformer().SetId(4)
+    second = Chem.Conformer(mol.GetConformer())
+    second.SetId(9)
+    second.SetAtomPosition(0, second.GetAtomPosition(0) + Chem.rdGeometry.Point3D(0.2, 0.0, 0.0))
+    mol.AddConformer(second, assignId=False)
+    assert rdForceFieldHelpers.MMFFHasAllMoleculeParams(mol) == mmff
+    native_optimize = rdForceFieldHelpers.OptimizeMoleculeConfs
+    builder_name = "MMFFGetMoleculeForceField" if mmff else "UFFGetMoleculeForceField"
+    native_builder = getattr(rdForceFieldHelpers, builder_name)
+    built = []
+    expected, statuses = [], {}
+
+    def build(*args, **kwargs):
+        built.append(native_builder(*args, **kwargs))
+        return built[-1]
+
+    def optimize(target, objective, **kwargs):
+        assert kwargs["numThreads"] == 0
+        result = native_optimize(target, objective, **(kwargs | {"numThreads": threads}))
+        for conf, (status, _) in zip(target.GetConformers(), result, strict=True):
+            expected.append(objective.CalcEnergy(tuple(conf.GetPositions().ravel())))
+            statuses[conf.GetId()] = status
+        return [(status, float("nan")) for status, _ in result]
+
+    monkeypatch.setattr(rdForceFieldHelpers, "OptimizeMoleculeConfs", optimize)
+    monkeypatch.setattr(rdForceFieldHelpers, builder_name, build)
+    recorded = {}
+    energies = ff_energies(mol, max_iters=1, _statuses=recorded)
+
+    assert len(expected) == 2
+    assert len(built) == 1, "each endpoint must retain the initial nonbonded contribution list"
+    np.testing.assert_allclose(energies, expected, atol=1e-10, rtol=0)
+    assert recorded == statuses
+    assert set(recorded) == {4, 9}
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+def test_force_field_minimizer_failure_rolls_back_the_batch(monkeypatch, error_type):
     mol = _mol()
     failed = mol.AddConformer(Chem.Conformer(mol.GetConformer()), assignId=True)
     before = {c.GetId(): c.GetPositions().copy() for c in mol.GetConformers()}
@@ -189,16 +405,19 @@ def test_force_field_minimizer_failure_rolls_back_the_batch(monkeypatch):
         def diverge(**kwargs):
             target.GetConformer(conf_id).SetAtomPosition(0, (99.0, 99.0, 99.0))
             if conf_id == failed:
-                raise RuntimeError("BFGS diverged")
+                raise error_type("BFGS diverged")
             return 0
 
-        return SimpleNamespace(Initialize=lambda: None, Minimize=diverge, CalcEnergy=lambda: 12.5)
+        return SimpleNamespace(
+            Initialize=lambda: None, Minimize=diverge, Positions=lambda: (), CalcEnergy=lambda _positions: 12.5
+        )
 
     monkeypatch.setattr(relax_module._mech, "MECHANISM_ORDER", ())
     monkeypatch.setattr(relax_module.rdForceFieldHelpers, "UFFHasAllMoleculeParams", lambda mol: True)
     monkeypatch.setattr(relax_module.rdForceFieldHelpers, "UFFGetMoleculeForceField", force_field)
 
-    with pytest.raises(RuntimeError, match="UFF minimization failed: BFGS diverged"):
+    expected = relax_module.UFFOptimizationError if error_type is RuntimeError else error_type
+    with pytest.raises(expected, match="BFGS diverged"):
         restrained_uff(mol, Constraints())
     for cid, positions in before.items():
         assert np.array_equal(mol.GetConformer(cid).GetPositions(), positions), (
@@ -209,9 +428,10 @@ def test_force_field_minimizer_failure_rolls_back_the_batch(monkeypatch):
 def test_untypable_fixed_core_still_relaxes_periphery(caplog):
     mol = _sn2()
     before = mol.GetConformer().GetPositions().copy()
+    retyped = set()
 
     with caplog.at_level("WARNING", logger="rxembed.relax"):
-        energies = restrained_uff(mol, Constraints(frozen={0, 1, 2}))
+        energies = restrained_uff(mol, Constraints(frozen={0, 1, 2}), _retyped=retyped)
 
     after = mol.GetConformer().GetPositions()
     assert np.isfinite(energies).all()
@@ -223,7 +443,8 @@ def test_untypable_fixed_core_still_relaxes_periphery(caplog):
     )
     assert mol.GetNumBonds() == 5, "the public graph was replaced by the force-field copy"
     assert all(b.GetBondType() == Chem.BondType.SINGLE for b in mol.GetBonds())
-    assert "retyped 1 fixed-core bond(s) as outward dative edges" in caplog.text
+    assert retyped == {(1, 2)}
+    assert "private fixed-core dative typing for C1->Cl2" in caplog.text
 
 
 def test_fallback_skips_untypable_candidate_bonds():
@@ -245,7 +466,7 @@ def test_fallback_retypes_multiple_reactive_centres(caplog):
 
     with caplog.at_level("WARNING", logger="rxembed.relax"):
         assert np.isfinite(restrained_uff(mol, Constraints(frozen=frozen))).all()
-    assert "retyped 2 fixed-core bond(s)" in caplog.text
+    assert caplog.text.count("->Cl") == 2
 
 
 def test_haptic_phantom_composes_with_core_fallback():
@@ -274,3 +495,20 @@ def test_ff_surrogate_preserves_atom_indices():
     assert out.GetAtomWithIdx(0).GetAtomicNum() == FF_SURROGATE
     assert out.GetAtomWithIdx(1).GetAtomicNum() == UFF_GHOST
     assert out.GetAtomWithIdx(0).GetDegree() == mol.GetAtomWithIdx(0).GetDegree()
+
+
+@pytest.mark.parametrize("bond_type", [Chem.BondType.ZERO, Chem.BondType.UNSPECIFIED])
+def test_ff_surrogate_removes_only_private_zero_order_contacts(bond_type):
+    mol = _mol("C.O")
+    rw = Chem.RWMol(mol)
+    rw.AddBond(0, 1, bond_type)
+    mol = rw.GetMol()
+    before = mol.GetConformer().GetPositions().copy()
+
+    out = _ff_surrogate(mol, set())
+
+    assert out.GetNumAtoms() == mol.GetNumAtoms()
+    assert out.GetBondBetweenAtoms(0, 1) is None
+    assert mol.GetBondBetweenAtoms(0, 1).GetBondType() == bond_type
+    assert np.array_equal(out.GetConformer().GetPositions(), before)
+    assert np.isfinite(restrained_uff(mol, Constraints(), max_iters=0)).all()

@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+from pathlib import Path
 
 import rxembed
 from rxembed import core
@@ -21,6 +22,15 @@ def _stderr_of(prelude=""):
         [sys.executable, "-c", _DEGRADES.format(prelude=prelude)], capture_output=True, text=True, check=True
     )
     return run.stderr
+
+
+def test_editable_install_loads_this_checkout():
+    """An editable install pointing at a deleted scratch worktree runs stale code silently."""
+    this_checkout_src = Path(__file__).resolve().parent.parent / "src" / "rxembed"
+    loaded_from = Path(rxembed.__file__).resolve()
+    assert loaded_from.is_relative_to(this_checkout_src), (
+        f"rxembed imported from {loaded_from}, outside this checkout's {this_checkout_src}"
+    )
 
 
 def test_public_and_engine_surfaces():

@@ -59,9 +59,9 @@ def metal_overbond(mol, pos, donors=None, margin: float | None = None) -> list[V
     atom enters the radius, re-classifies as a donor, and is then asked the donor's question instead of its
     own. ``donors=None`` falls back to perception only for a genuinely unknown sphere.
 
-    Non-donors are floored by ``overbond_tier``: an APEX bite is forced and exempt, a second-sphere atom gets
-    a ratio loose enough for a real β-agostic contact, and the rest the covalent sum + margin, below the FF's
-    own floor so a floored relax never trips this. An *undeclared* H is skipped.
+    Non-donors are floored by ``overbond_tier``: a haptic-backed APEX is forced and exempt, a sigma-backed
+    second-sphere atom gets a ratio loose enough for a real β-agostic contact, and the rest the covalent sum
+    plus margin, below the FF's own floor so a floored relax never trips this. An *undeclared* H is skipped.
     """
     margin = OUTER_REPORT_MARGIN if margin is None else margin
     out: list[Violation] = []
@@ -79,7 +79,7 @@ def metal_overbond(mol, pos, donors=None, margin: float | None = None) -> list[V
                 continue  # an undeclared H: a beta-agostic contact reaches this distance and is not an over-bond
             else:
                 tier = overbond_tier(mol, sphere, i)
-                if tier == APEX:  # a chelate bite apex / eta-n backbone: not free to collapse, never flagged
+                if tier == APEX:  # a haptic-backed scaffold is fixed by its face geometry
                     continue
                 floor, what = (NEAR_REPORT_RATIO * r_sum if tier == NEAR else r_sum + margin), "non-donor"
             d = float(np.linalg.norm(pos[i] - pos[m]))
@@ -169,14 +169,15 @@ def donor_fold(mol, conf_id: int = -1, *, donors=None, frozen=frozenset()) -> Fo
 
 
 def donor_orientation(mol, pos, donors=None, frozen=frozenset()) -> list[Violation]:
-    """Ligands folded back over the metal: the one gate that asks where a ligand points, not where it is.
+    """Report donor angles below their class-specific empirical floors.
 
     ``metal_overbond`` is blind to the commonest fold, a short D-X bond being unable to reach the over-bond
     floor even swung fully side-on (a carbonyl bent to a right angle holds its O at 2.13 Å over a 2.04 Å
     floor). So this reads the M-D-X angle, which folding collapses. The floor per class is the 0.5th
     percentile of 721 crystal donations minus 5°, keyed on (element, hybridisation) because a thiolate donates
-    at 103° where a carboxylate donates at 126°. It fires only on an angle no reference of that class
-    realises; ``donor_fold`` is the metric that reports the rest.
+    at 103° where a carboxylate donates at 126°. A floor violation identifies an unusual angle, not proof
+    of folding or inversion: a tetrahedral donor can remain inside its carrier hull below this floor.
+    ``donor_fold`` is the metric that reports the rest.
 
     Five exemptions, each acute *by construction*:
 
@@ -192,7 +193,7 @@ def donor_orientation(mol, pos, donors=None, frozen=frozenset()) -> list[Violati
     """
     out: list[Violation] = []
     for a in _donor_walk(mol, pos, donors, frozen)[0]:
-        lo, hi = _FOLD_WINDOW[a.cls]
+        lo = _FOLD_WINDOW[a.cls][0]
         if a.angle >= lo:  # floor only: gating the ceiling false-positives on a healthy phosphine at 153.9°
             continue  # (see `_FOLD_WINDOW`); the overshoot is reported by `FoldReport.outside_window`
         xsym = mol.GetAtomWithIdx(a.sub).GetSymbol()
@@ -202,9 +203,8 @@ def donor_orientation(mol, pos, donors=None, frozen=frozenset()) -> list[Violati
                 atoms=(a.metal, a.donor, a.sub),
                 value=a.angle,
                 limit=lo,
-                detail=f"{a.element}{a.donor} ({str(a.hyb).lower()}) donates at {a.angle:.1f}° to {xsym}{a.sub} "
-                f"(real {a.element} {str(a.hyb).lower()} donations: {lo:.0f}-{hi:.0f}°, median "
-                f"{_FOLD_MEDIAN[a.cls]:.0f}°): the ligand has folded back over the metal",
+                detail=f"{a.element}{a.donor} ({str(a.hyb).lower()}) M-D-X to {xsym}{a.sub}: "
+                f"{a.angle:.1f}° < census floor {lo:.0f}°; inspect donor geometry and restraints",
             )
         )
     return out
@@ -248,7 +248,7 @@ def _donor_walk(mol, pos, donors=None, frozen=frozenset()) -> tuple[list[DonorAn
     unknown: list[int] = []
     for m, sphere in spheres.items():
         for d in sorted(sphere):
-            subs = donation_axis(mol, d, all_donors, sphere=sphere)
+            subs = donation_axis(mol, d, all_donors, sphere=sphere, hyb=hyb)
             if subs is None:  # hydride, bridging or haptic: the donation question does not apply
                 continue
             cls = (mol.GetAtomWithIdx(d).GetSymbol(), hyb[d]) if d in hyb else None  # None when estimators disagree

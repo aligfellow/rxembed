@@ -12,19 +12,19 @@ import logging
 from typing import NamedTuple
 
 import numpy as np
-from rdkit import Chem
+from rdkit import Chem, rdBase
 from rdkit.Chem import rdDistGeom
 from rdkit.Geometry import Point3D
 
-from .constraints import add_pairwise_shape
 from .metal_polyhedron import (
     POLYHEDRA,
+    SLOT_BOND_PROP,
     fit_residual,
     geometries_for_cn,
     resolve_geometry,
 )
 from .metal_polyhedron import describe as _describe
-from .utils import bond_removal_mirrors, remove_bond, repair_bond_stereo
+from .utils import bond_removal_mirrors, flat_ranks, remove_bond, repair_bond_stereo, resonance_match
 
 logger = logging.getLogger("rxembed.metal")  # spelled out, not __name__ ("rxembed.metal_core"): this is
 #   the name `set_verbose` configures and every caplog filter in the suite matches.
@@ -79,7 +79,17 @@ TRANSITION_METALS = {
 COORDINATION_METALS = (
     frozenset(range(21, 31)) | frozenset(range(39, 49)) | frozenset(range(57, 81)) | frozenset(range(89, 113))
 )
+_BORON_Z = 5
+_BORON_CAGE_MIN = 5
+_PT = Chem.GetPeriodicTable()
 SURROGATE = 6  # carbon: its excluded volume stops a ligand folding into the metal, so the distance geometry keeps it
+_SURROGATE_SANITIZE = (
+    Chem.SanitizeFlags.SANITIZE_ALL
+    ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES
+    ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE
+    ^ Chem.SanitizeFlags.SANITIZE_SETAROMATICITY
+    ^ Chem.SanitizeFlags.SANITIZE_FINDRADICALS
+)
 VACANT = -1  # materialized empty vertex; immutable MetalState stores it as None
 
 
@@ -170,20 +180,22 @@ def _vertex_atom(haptic, v):
 
 def metal_index(mol):
     """Index of the first metal coordination centre (d- or f-block), or None."""
-    return next((a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS), None)
+    return next(iter(metal_indices(mol)), None)
 
 
 _MIN_STEREO_NEIGHBOURS = 3  # a tetrahedral stereocentre needs >=3 explicit neighbours (else ETKDG raises)
 
 
 def _clear_labile_donor_stereo(atom):
-    """Drop a chiral tag on a donor left below 3 neighbours by the sphere strip.
+    """Drop a chiral tag that cannot describe a tetrahedral donor after the sphere strip.
 
     A donor that is a stereocentre only while metal-bound (a planar amidate N-) keeps a stale tag that crashes
-    ETKDG. A genuine one (chiral-at-P, a carbanion C-) still has 3 substituents after the strip and is
-    untouched, so its enantiomers embed distinctly.
+    ETKDG. An aromatic donor is not tetrahedral even when metal perception left stale SP3 hybridization. A
+    genuine centre (chiral-at-P, a carbanion C-) still has 3 substituents and remains untouched.
     """
-    if atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED and atom.GetDegree() < _MIN_STEREO_NEIGHBOURS:
+    if atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED and (
+        atom.GetIsAromatic() or atom.GetDegree() < _MIN_STEREO_NEIGHBOURS
+    ):
         atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
 
 
@@ -254,6 +266,7 @@ def _basis_is_ambiguous(mol, donor, metal) -> bool:
 
 def surrogate_metal(mol):
     """Remove metal-donor bonds and swap the metal to a UFF surrogate. Returns (mol, metal, donors, real_Z, real_q)."""
+    mol = _canonical_metal_graph(mol)
     m = metal_index(mol)
     if m is None:
         raise ValueError("no metal centre found")
@@ -281,7 +294,7 @@ def surrogate_metal(mol):
     out = em.GetMol()
     # Lenient (no valence checks), the same tolerance the reader admitted this structure under and the same as
     # `surrogate_all_metals`; a strict sanitize would reject what perception waived (a quinoid ring, a BPh4-).
-    Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
+    Chem.SanitizeMol(out, _SURROGATE_SANITIZE, catchErrors=True)
     out.UpdatePropertyCache(strict=False)
     repair_bond_stereo(out)  # the strip can orphan a C=N whose reference atom was the metal; see there
     _retag(out, hands, ambiguous)  # last: the lenient sanitize and `repair_bond_stereo` both wipe atom tags
@@ -300,7 +313,7 @@ def restore_metal(mol, metal, real_z, real_q):
     a.SetFormalCharge(real_q)
 
 
-def connect_metal(mol, donor_bonds, *, order=Chem.BondType.DATIVE):
+def connect_metal(mol, donor_bonds):
     """Re-add the surrogate-stripped M-donor bonds as dative (donor->metal), returning a connected Mol.
 
     `restore_metal` is calculator-minimal, since xtb needs no graph, so it leaves the metal topologically
@@ -309,22 +322,19 @@ def connect_metal(mol, donor_bonds, *, order=Chem.BondType.DATIVE):
 
     Dative rather than covalent: it counts toward the metal's valence, never the donor's, so it restores
     connectivity without touching any ligand's valence, H-count or charge. Coordinates untouched, idempotent.
-    A bond the input drew covalent comes back dative, so the metal picks up radical electrons RDKit would
-    otherwise pair; element, formal charge and total charge, which is what a calculator reads, are unaffected.
-
-    `order` exists for the one caller that needs the opposite: `metal_smiles.cxsmiles` asks for single
-    on the sigma donors, because writing a string has to re-derive the ionic form from the donor's valence,
-    and a dative bond is already the answer to that question. Every other caller wants the default.
+    A bond the input drew covalent comes back dative; element, formal charge and total charge are unaffected.
     """
     rw = Chem.RWMol(mol)
     added = False
-    for d, m in donor_bonds:
-        if rw.GetBondBetweenAtoms(int(d), int(m)) is None:
-            rw.AddBond(int(d), int(m), order)
+    for donor, metal in donor_bonds:
+        d, m = int(donor), int(metal)
+        if rw.GetBondBetweenAtoms(d, m) is None:
+            rw.AddBond(d, m, Chem.BondType.DATIVE)
             added = True
     if not added:
         return mol
     out = rw.GetMol()
+    out.ClearComputedProps()  # AddBond preserves cached path matrices from the disconnected graph.
     out.UpdatePropertyCache(strict=False)  # recompute implicit valence (never raises, never moves a formal charge)
     Chem.FastFindRings(
         out
@@ -334,11 +344,10 @@ def connect_metal(mol, donor_bonds, *, order=Chem.BondType.DATIVE):
 
 
 def disconnect_metal(mol):
-    """Strip the DATIVE M-donor bonds `connect_metal` added, returning the bare working mol (inverse of it).
+    """Remove metal-donor dative bonds from the working graph; return the input when there are none.
 
-    A stage that MOVES atoms again (`mc`, a re-`minimize`) must see the bond-less mol the surrogate needs (UFF
-    cannot type a bonded metal), so the finalize's bonds come off before atoms move and the follow-up minimize
-    re-adds them. Any dative-to-metal bond on a pipeline mol is a `connect_metal` artefact. No-op when none.
+    Constraints own the M-L geometry during DG and UFF, independently of native bonded-metal terms.
+    Public coordination bonds are restored after relaxation by `connect_metal`.
     """
     dative = [
         (b.GetBeginAtomIdx(), b.GetEndAtomIdx())
@@ -355,6 +364,7 @@ def disconnect_metal(mol):
     for a, b in dative:
         remove_bond(rw, a, b)
     out = rw.GetMol()
+    out.ClearComputedProps()  # Removing bonds also leaves RDKit's cached path matrix behind.
     out.UpdatePropertyCache(strict=False)
     return out
 
@@ -368,17 +378,72 @@ def metal_indices(mol):
     return [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS]
 
 
+def _ligand_distance_matrix(mol):
+    """Return graph distances after removing coordination-centre edges."""
+    metals = set(metal_indices(mol))
+    if not metals:
+        return Chem.GetDistanceMatrix(mol)
+    rw = Chem.RWMol(mol)
+    for bond in list(rw.GetBonds()):
+        if bond.GetBeginAtomIdx() in metals or bond.GetEndAtomIdx() in metals:
+            rw.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+    out = rw.GetMol()
+    out.ClearComputedProps()
+    return Chem.GetDistanceMatrix(out)
+
+
 _ETA2 = 2
 
 
 def _haptic_sites(mol, donors):
-    """Group `donors` into coordination sites: a directly-bonded pi-face (Cp/arene/allyl) collapses to one.
+    """Group `donors` into sigma sites and connected pi faces.
 
     A lone sigma donor is its own 1-tuple. A chelate's donors relate only through the backbone, so they stay
-    separate and only a genuine haptic face is grouped: ferrocene's ten ring donors reduce to two sites. Run
-    on the surrogate, whose M-donor bonds are stripped, so the walk follows only ligand bonds.
+    separate even when directly bonded. A face starts at a donor-donor multiple or aromatic bond and extends
+    across adjacent charged or radical donor endpoints; bonds between face atoms then join a diene, allyl,
+    Cp, or arene into one site. A true isolated diatomic ligand is one side-on site regardless of its perceived
+    Lewis bond order; implicit hydrogens still count as substituents, so hydrazine is not mistaken for a face.
     """
     dset = set(donors)
+    pi = set()
+    pi_hybridization = {
+        Chem.HybridizationType.UNSPECIFIED,
+        Chem.HybridizationType.SP,
+        Chem.HybridizationType.SP2,
+    }
+    for ring in mol.GetRingInfo().AtomRings():
+        if set(ring) <= dset and all(mol.GetAtomWithIdx(atom).GetHybridization() in pi_hybridization for atom in ring):
+            pi.update(ring)
+    for bond in mol.GetBonds():
+        ends = {bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()}
+        conjugated = bond.GetBondTypeAsDouble() > 1 and all(
+            atom.GetHybridization() in pi_hybridization for atom in (bond.GetBeginAtom(), bond.GetEndAtom())
+        )
+        if ends <= dset and (bond.GetIsAromatic() or conjugated):
+            pi.update(ends)
+    while True:
+        extended = {
+            d
+            for d in dset - pi
+            if (atom := mol.GetAtomWithIdx(d)).GetFormalCharge() or atom.GetNumRadicalElectrons()
+            if any(neighbor.GetIdx() in pi for neighbor in atom.GetNeighbors())
+        }
+        if not extended:
+            break
+        pi.update(extended)
+
+    def joined(a, b):
+        if a in pi and b in pi:
+            return True
+        return all(
+            mol.GetAtomWithIdx(i).GetTotalNumHs() == 0
+            and all(
+                neighbor.GetIdx() in {a, b} or neighbor.GetAtomicNum() in COORDINATION_METALS
+                for neighbor in mol.GetAtomWithIdx(i).GetNeighbors()
+            )
+            for i in (a, b)
+        )
+
     seen, sites = set(), []
     for d in sorted(dset):
         if d in seen:
@@ -390,7 +455,11 @@ def _haptic_sites(mol, donors):
                 continue
             seen.add(a)
             group.append(a)
-            stack += [nb.GetIdx() for nb in mol.GetAtomWithIdx(a).GetNeighbors() if nb.GetIdx() in dset]
+            stack += [
+                nb.GetIdx()
+                for nb in mol.GetAtomWithIdx(a).GetNeighbors()
+                if nb.GetIdx() in dset and joined(a, nb.GetIdx())
+            ]
         sites.append(tuple(sorted(group)))
     return sorted(sites)
 
@@ -418,25 +487,11 @@ def _collapse_haptic(mol, donors):
     """
     sites = _haptic_sites(mol, donors)
     faces = [s for s in sites if len(s) > 1]  # a face is any mutually-bonded donor group, eta2 included
+    vertices = [d for site in sites if len(site) == 1 for d in site]
     if not faces:
-        return mol, donors, {}
-    em = Chem.RWMol(mol)
-    conf = em.GetConformer() if em.GetNumConformers() else None
-    vertices = [d for s in sites if len(s) == 1 for d in s]  # a lone sigma donor is its own vertex
-    haptic = {}
-    for site in faces:
-        idx = em.AddAtom(Chem.Atom(SURROGATE))  # a bond-less carbon: excluded volume in the DG, Xe-ghosted in the FF
-        dummy = em.GetAtomWithIdx(idx)
-        dummy.SetNoImplicit(True)  # a point, not a valence: no implicit H, as for the metal
-        dummy.SetHybridization(Chem.HybridizationType.SP3)  # keep the transient point typable by UFF
-        if conf is not None:
-            conf.SetAtomPosition(idx, Point3D(*np.mean([list(conf.GetAtomPosition(a)) for a in site], axis=0)))
-        vertices.append(idx)
-        haptic[idx] = site
-    out = em.GetMol()
-    out.UpdatePropertyCache(strict=False)  # bond-less centroids' valence (GetMoleculeBoundsMatrix needs it)
-    Chem.FastFindRings(out)  # + RingInfo (the RWMol edit cleared it), which GetMoleculeBoundsMatrix requires
-    return out, vertices, haptic
+        return mol, vertices, {}
+    haptic = {mol.GetNumAtoms() + i: site for i, site in enumerate(faces)}
+    return materialise_phantoms(mol, haptic), [*vertices, *haptic], haptic
 
 
 class Ligand(NamedTuple):
@@ -474,7 +529,9 @@ def ligands(mol):
     return out
 
 
-_PT = Chem.GetPeriodicTable()
+def ligand_degree(atom):
+    """Count ligand-side neighbours, including implicit and explicit hydrogen."""
+    return atom.GetTotalDegree() - sum(nb.GetAtomicNum() in COORDINATION_METALS for nb in atom.GetNeighbors())
 
 
 def ligand_valence(atom):
@@ -490,28 +547,282 @@ def ligand_valence(atom):
     )
 
 
-def donated_charge(donor):
-    """Give the charge a donor carries once its bond to the metal is written the ionic way, donor -> metal.
-
-    Decided from VALENCE, never from the perceived M-L bond order, because no two perceivers agree on that one:
-    xyzgraph types a terminal oxo as a neutral single-bonded `[O]` and the nitrido beside it as `[N-3]`, while
-    a SMILES writes the same oxo `O=[M]`. What survives all three is what the LIGAND side leaves unsatisfied.
-    A donor with nothing but metals on it has no other way to fill its shell, so it donates its whole valence
-    and carries the matching charge: `M=O` is `[M2+]<-[O2-]`, `M#N` is `[M3+]<-[N3-]`, `M-Cl` is `[M+]<-[Cl-]`.
-    A donor its ligand side already satisfies (a phosphine, an aqua, an ether) donates a lone pair and stays
-    neutral, which is what a dative bond means; charging a coordinated PR3 would invent an ion.
-
-    Zero for anything a metal is not the whole of: the alkoxide / amide / carbanion case, where a partly-filled
-    donor's charge is a Kekule accident and belongs to `metal_distance.delocalised_charges` instead. Reaching
-    past the empty ligand side is measured and refuted (see `ml_distance`), and it must never reach a pi face:
-    counting a Cp carbon short is what wrote ferrocene as `[Fe+10]` with ten `[c-]`.
-
-    Call it on a donor. A bare counterion has an empty ligand side too, and would come back charged.
-    """
-    valence = _PT.GetDefaultValence(donor.GetAtomicNum())
-    if valence <= 0 or ligand_valence(donor):  # a metal (no default valence), or a donor its ligand already fills
+def _ionic_donor_charge(donor, haptic):
+    """Return the formal charge needed after removing a covalent M-L valence contribution."""
+    if donor.GetFormalCharge() or donor.GetNumRadicalElectrons() or donor.GetIdx() in haptic:
         return 0
-    return -valence
+    default = _PT.GetDefaultValence(donor.GetAtomicNum())
+    deficit = default - ligand_valence(donor)
+    if default <= 0 or deficit <= 0 or not np.isclose(deficit, round(deficit)):
+        return 0
+    return -round(deficit)
+
+
+def _canonicalise_delocalised_charge(mol):
+    """Canonicalize one aromatic anion per component when RDKit proves the requested resonance form."""
+    rw = Chem.RWMol(mol)
+    metals = {atom.GetIdx() for atom in rw.GetAtoms() if atom.GetAtomicNum() in COORDINATION_METALS}
+    if not metals:
+        return rw.GetMol()
+    # RDKit's resonance proof can expose another form after a proved move changes the cached aromatic
+    # representation. Iterate to a fixed point so repeated graph normalization is itself a normal form.
+    for _ in range(max(1, rw.GetNumAtoms())):
+        bound = {bond.GetOtherAtomIdx(metal) for metal in metals for bond in rw.GetAtomWithIdx(metal).GetBonds()}
+        ranks = flat_ranks(rw, break_ties=True)
+        aromatic = Chem.RWMol(rw)
+        for bond in list(aromatic.GetBonds()):
+            if not bond.GetIsAromatic():
+                aromatic.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+        moved = False
+        for component in Chem.GetMolFrags(aromatic):
+            charged = [atom for atom in component if rw.GetAtomWithIdx(atom).GetFormalCharge()]
+            # Several charges need joint normalization. Moving them ring by ring is order-dependent and can
+            # change the string again on the next write, even when every individual move has a resonance proof.
+            if len(charged) != 1 or rw.GetAtomWithIdx(charged[0]).GetFormalCharge() != -1:
+                continue
+            current = charged[0]
+            candidates = [atom for atom in component if atom in bound and rw.GetAtomWithIdx(atom).GetIsAromatic()]
+            for candidate in sorted(candidates, key=lambda atom: (-ranks[atom], atom)):
+                if candidate != current:
+                    trial = Chem.RWMol(rw)
+                    trial.GetAtomWithIdx(current).SetFormalCharge(0)
+                    trial.GetAtomWithIdx(candidate).SetFormalCharge(-1)
+                    probe = trial.GetMol()
+                    try:
+                        with rdBase.BlockLogs():
+                            Chem.SanitizeMol(probe)
+                            Chem.Kekulize(Chem.Mol(probe), clearAromaticFlags=True)
+                            matched, capped = resonance_match(probe, rw.GetMol())
+                    except (RuntimeError, ValueError):
+                        continue
+                    if not matched:
+                        if capped:
+                            logger.warning(
+                                "metal graph: resonance search exceeded 32 forms; preserving aromatic charge placement"
+                            )
+                            break
+                        continue
+                if candidate != current:
+                    rw.GetAtomWithIdx(current).SetFormalCharge(0)
+                    rw.GetAtomWithIdx(candidate).SetFormalCharge(-1)
+                    moved = True
+                break
+        if not moved:
+            break
+        out = rw.GetMol()
+        Chem.SanitizeMol(out)
+        rw = Chem.RWMol(out)
+    return rw.GetMol()
+
+
+_BRIDGEHEAD_SIGMA_MIN = 4  # a kappa2 chelate bridgehead (P, Si, B) bonds >=4 non-metal sigma neighbours
+_BRIDGEHEAD_DONORS_MIN = 2  # fewer is a sigma-silane/borane bridgehead (one metal-bound neighbour), not this rule
+_TRIGONAL_SIGMA = 3  # Class B's bridgehead: exactly 3 non-metal sigma bonds (carboxylate/amidinate C, N-B-N B)
+_TRIGONAL_NONDONOR_Z = {1, 6}  # H and C: a TS contact or a genuine eta-n face carbon, never this rule's donor
+
+
+def _lone_pair(atom, metals):
+    """Return `atom`'s nonbonding valence: outer electrons minus formal charge minus bonded valence.
+
+    A bond to a metal is stripped from the bonded-valence term first (`Bond.GetValenceContrib`, zero
+    for a dative donor bond, the bond order for a covalent one), so this reads the same whether `atom`
+    is itself dative- or covalent-bonded to the metal. Not a per-element list, so it holds for any
+    main-group atom; shared by the bridgehead X (Class A and B) and, for Class B, its flanking donors.
+    """
+    to_metal = sum(
+        bond.GetValenceContrib(atom) for bond in atom.GetBonds() if bond.GetOtherAtomIdx(atom.GetIdx()) in metals
+    )
+    return _PT.GetNOuterElecs(atom.GetAtomicNum()) - atom.GetFormalCharge() - (atom.GetTotalValence() - to_metal)
+
+
+def _metal_free_rings(rw, metals):
+    """Return each ring of `rw` with every metal atom removed, as a list of atom-index frozensets.
+
+    Built once per graph for Class B's ring test. `RingInfo.AtomRings()` is a view into its owning
+    Mol's C++ memory, so the ring atoms are read out here, before the stripped copy is dropped, rather
+    than handing back the live RingInfo (that use-after-free crashed the measurement with a MemoryError).
+    A fresh `Chem.Atom` is used per kept atom rather than a copy of the original: copying carries over
+    cached valence/implicit-H state from the metal-bonded graph, which corrupted ring perception the
+    same way once that atom sat in a differently-bonded graph.
+    """
+    em = Chem.RWMol()
+    kept = {}
+    for atom in rw.GetAtoms():
+        if atom.GetIdx() in metals:
+            continue
+        fresh = Chem.Atom(atom.GetAtomicNum())
+        fresh.SetFormalCharge(atom.GetFormalCharge())
+        kept[atom.GetIdx()] = em.AddAtom(fresh)
+    for bond in rw.GetBonds():
+        a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if a in metals or b in metals:
+            continue
+        em.AddBond(kept[a], kept[b], Chem.BondType.SINGLE)  # bond order is irrelevant to ring membership
+    stripped = em.GetMol()
+    stripped.UpdatePropertyCache(strict=False)
+    Chem.GetSymmSSSR(stripped)
+    new_to_old = {new: old for old, new in kept.items()}
+    return [frozenset(new_to_old[i] for i in ring) for ring in stripped.GetRingInfo().AtomRings()]
+
+
+def _trigonal_donors_qualify(rw, x, donors, metals, rings):
+    """Return True when Class B's two extra conditions hold for a trigonal bridgehead's `donors`.
+
+    Every donor must be a non-carbon heteroatom that itself has a lone pair (a formal-charge carbanion
+    never qualifies -- what keeps a Cp, indenyl, or pyrrolyl ring intact, since ring aromaticity puts a
+    delocalised charge on a ring carbon too). And X must not share a metal-free ring with a donor --
+    what keeps a phosphole, thiazole, or imidazolyl face intact, where the flanking donors are joined
+    to X by a real organic ring bond, not only by both separately reaching the same metal.
+    """
+    xi = x.GetIdx()
+    for d in donors:
+        atom = rw.GetAtomWithIdx(d)
+        if atom.GetAtomicNum() in _TRIGONAL_NONDONOR_Z or _lone_pair(atom, metals) <= 0:
+            return False
+        if any(xi in ring and d in ring for ring in rings):
+            return False
+    return True
+
+
+def _prune_donorless_bridgeheads(rw, metals):
+    """Remove an M-X bond where X is a chelate bridgehead with no donor orbital of its own.
+
+    A metal-aware reader can bond the metal to a chelate bridgehead X -- the P of a kappa2 S2PR2 or
+    N-P-N/O-P-O ligand, the Si of S-Si-S, the B of kappa2-BH4 -- instead of, or besides, that bridgehead's
+    real donor neighbours. X has no donor orbital, and the bond is graph-provably wrong, exactly when: two
+    or more of X's own neighbours are themselves bonded to that same metal (the real donors) and are not
+    bonded to each other; X carries four or more sigma bonds to non-metal atoms (Class A); and X has no
+    lone pair (`_lone_pair`) -- not a per-element list, so it holds for any main-group bridgehead.
+
+    Class B extends the same X-has-no-lone-pair test to a TRIGONAL bridgehead (exactly three sigma bonds
+    to non-metal atoms: a carboxylate, amidinate, or dithiocarbamate C, or an N-B-N B). A geometric test
+    cannot see this one -- xyzgraph 1.6.14's mis-bonded M-C sits at an ordinary M-C distance -- so it
+    needs two further graph-only conditions (`_trigonal_donors_qualify`) before X loses its bond: every
+    one of its metal-bound neighbours must itself be a non-carbon heteroatom with a lone pair, and X must
+    not share a metal-free ring with one of them. A sigma-only macrocycle (each ring member independently
+    donating its own lone pair, e.g. a cyclo-As6 crown) is excluded by X's own lone-pair test, since each
+    of its members is a real donor in its own right, not a bridgehead.
+
+    A sigma-silane or sigma-borane bridgehead (eta2-Si-H, B-H: one metal-bound neighbour) fails the first
+    test and is left for the reader -- it is not graph-provable this way. Logs one warning naming every
+    removed bond; the reader should never form one. This guard mirrors xyzgraph's own `_prune_crosslinks`
+    and can be dropped once a fixed xyzgraph is installed.
+    """
+    rings = _metal_free_rings(rw, metals) if metals else []
+    bad = []
+    for metal in metals:
+        for x in rw.GetAtomWithIdx(metal).GetNeighbors():
+            xi = x.GetIdx()
+            if xi in metals:
+                continue
+            donors = [
+                n.GetIdx()
+                for n in x.GetNeighbors()
+                if n.GetIdx() != metal and rw.GetBondBetweenAtoms(n.GetIdx(), metal) is not None
+            ]
+            if len(donors) < _BRIDGEHEAD_DONORS_MIN or any(
+                rw.GetBondBetweenAtoms(a, b) is not None for a, b in itertools.combinations(donors, 2)
+            ):
+                continue
+            sigma_to_nonmetal = x.GetTotalDegree() - sum(1 for n in x.GetNeighbors() if n.GetIdx() in metals)
+            trigonal = sigma_to_nonmetal == _TRIGONAL_SIGMA
+            if sigma_to_nonmetal < _BRIDGEHEAD_SIGMA_MIN and not trigonal:
+                continue
+            if _lone_pair(x, metals) > 0:
+                continue
+            if trigonal and not _trigonal_donors_qualify(rw, x, donors, metals, rings):
+                continue
+            bad.append((xi, x.GetSymbol(), metal))
+    for xi, _sym, metal in bad:
+        remove_bond(rw, xi, metal)
+    if bad:
+        logger.warning(
+            "metal graph: dropped bridgehead bond(s) %s (no lone pair, not a donor); omit it from the input",
+            ", ".join(f"{sym}{xi}-{metal}" for xi, sym, metal in bad),
+        )
+    return bad
+
+
+def _canonical_metal_graph(mol):
+    """Return a copy with every M-L bond in the canonical ionic donor-to-metal form.
+
+    Stated total charge, charge magnitude, and non-resonant charges remain authoritative. Only the atom carrying
+    a delocalised aromatic -1 is canonicalized as a representation convention. Neutral underfilled sigma donors
+    receive the integral charge implied by their ligand-side valence, balanced on the adjacent metal. A neutral
+    bridge cannot say which metal owns that balance and therefore requires explicit charges.
+
+    Every metal graph, however it entered (an XYZ read, a parsed SMILES, or rxembed's own ligand-bond
+    restore after a swap), is canonicalized here before its donors are used, so a Class A bridgehead bond
+    (see `_prune_donorless_bridgeheads`) is caught once at this one choke point rather than per entry route.
+    """
+    rw = Chem.RWMol(mol)
+    rw.UpdatePropertyCache(strict=False)
+    metals = {atom.GetIdx() for atom in rw.GetAtoms() if atom.GetAtomicNum() in COORDINATION_METALS}
+    _prune_donorless_bridgeheads(rw, metals)  # a no-op when `metals` is empty
+    rw.UpdatePropertyCache(strict=False)
+    haptic = {
+        donor
+        for metal in metals
+        for site in _haptic_sites(
+            rw,
+            [
+                neighbor.GetIdx()
+                for neighbor in rw.GetAtomWithIdx(metal).GetNeighbors()
+                if neighbor.GetIdx() not in metals
+            ],
+        )
+        if len(site) > 1
+        for donor in site
+    }
+    charged = {}
+    for donor in rw.GetAtoms():
+        adjacent = [neighbor.GetIdx() for neighbor in donor.GetNeighbors() if neighbor.GetIdx() in metals]
+        if not adjacent:
+            continue
+        charge = _ionic_donor_charge(donor, haptic)
+        if len(adjacent) > 1 and charge:
+            raise ValueError(
+                f"neutral bridging donor {donor.GetSymbol()}{donor.GetIdx()} has ambiguous charge allocation "
+                f"between metals {adjacent}; state the donor and metal formal charges explicitly"
+            )
+        if charge:
+            charged[donor.GetIdx()] = (adjacent[0], charge)
+
+    replace = []
+    for bond in rw.GetBonds():
+        begin, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if begin in metals and end not in metals:
+            donor, metal = end, begin
+        elif end in metals and begin not in metals:
+            donor, metal = begin, end
+        else:
+            continue
+        if bond.GetBondType() == Chem.BondType.DATIVE and begin == donor:
+            continue
+        note = bond.GetProp(SLOT_BOND_PROP) if bond.HasProp(SLOT_BOND_PROP) else None
+        replace.append((donor, metal, note))
+
+    for donor, (metal, charge) in charged.items():
+        rw.GetAtomWithIdx(donor).SetFormalCharge(charge)
+        atom = rw.GetAtomWithIdx(metal)
+        atom.SetFormalCharge(atom.GetFormalCharge() - charge)
+    for donor, metal, note in replace:
+        remove_bond(rw, donor, metal)
+        rw.AddBond(donor, metal, Chem.BondType.DATIVE)
+        if note is not None:
+            rw.GetBondBetweenAtoms(donor, metal).SetProp(SLOT_BOND_PROP, note)
+    out = rw.GetMol()
+    out.UpdatePropertyCache(strict=False)
+    if replace:
+        # A covalent R2PH-M bond can make RDKit cache one P radical. The equivalent dative bond does not spend
+        # donor valence, so recompute only that property and only on donors whose notation changed. Radicals
+        # explicitly supplied on already-dative input remain authoritative.
+        probe = Chem.Mol(out)
+        result = Chem.SanitizeMol(probe, Chem.SanitizeFlags.SANITIZE_FINDRADICALS, catchErrors=True)
+        if result == Chem.SanitizeFlags.SANITIZE_NONE:
+            for donor in {donor for donor, _metal, _note in replace}:
+                out.GetAtomWithIdx(donor).SetNumRadicalElectrons(probe.GetAtomWithIdx(donor).GetNumRadicalElectrons())
+    return _canonicalise_delocalised_charge(out)
 
 
 def materialise_phantoms(mol, haptic):
@@ -534,8 +845,12 @@ def materialise_phantoms(mol, haptic):
         a.SetHybridization(Chem.HybridizationType.SP3)  # match the sanitised metal surrogate; otherwise UFF and
         #   the bounds matrix emit 'unrecognized hybridization', UpdatePropertyCache leaving it UNSPECIFIED
     out = rw.GetMol()
+    # AddAtom retains cached path matrices with the old atom count, corrupting subsequent native DG bounds.
+    out.ClearComputedProps()
     out.UpdatePropertyCache(strict=False)  # GetMoleculeBoundsMatrix / UFF need the new bond-less atoms' valence
-    Chem.FastFindRings(out)  # + RingInfo (an RWMol edit clears it), which GetMoleculeBoundsMatrix requires
+    # FastFindRings guarantees membership, not the ring sizes consumed by native DG. Retain the temporary
+    # donor-stereo dative cycles while rebuilding a symmetric small-ring basis after helper edits.
+    Chem.GetSymmSSSR(out, includeDativeBonds=True)
     for conf in out.GetConformers():
         for dummy, ring in haptic.items():
             conf.SetAtomPosition(dummy, Point3D(*np.mean([list(conf.GetAtomPosition(a)) for a in ring], axis=0)))
@@ -556,26 +871,46 @@ def strip_phantoms(mol, phantoms):
         rw.RemoveAtom(int(p))
     out = rw.GetMol()
     out.UpdatePropertyCache(strict=False)
-    Chem.FastFindRings(out)  # RemoveAtom clears RingInfo; downstream (embed's bounds matrix, perception) needs it
+    Chem.GetSymmSSSR(out, includeDativeBonds=True)  # RemoveAtom invalidates the native ring-size cache.
     return out
 
 
-def _site_radius(mol, site, cid=-1):
-    """Circumradius of a haptic ring: the mean distance of its atoms from their own centroid.
+def _bounds_matrix(mol, params=None, *, set14bounds=True):
+    """Build RDKit bounds without leaking its internal UFF-typing diagnostics for likely noisy graphs."""
+    noisy = any(atom.GetFormalCharge() or atom.GetAtomicNum() in COORDINATION_METALS for atom in mol.GetAtoms())
+    options = {} if params is None else {"embedParams": params}
+    if noisy:
+        with rdBase.BlockLogs():
+            return rdDistGeom.GetMoleculeBoundsMatrix(mol, set14bounds=set14bounds, **options)
+    return rdDistGeom.GetMoleculeBoundsMatrix(mol, set14bounds=set14bounds, **options)
 
-    From the conformer if the mol has one (a retained crystal geometry), else from RDKit's own bounds
-    midpoints as ``R = sqrt(sum d_ij^2)/n``, which is exact for a regular n-gon and so serves Cp, arene and
-    boratabenzene's longer B-C edge alike with no hand-fitted radii. A 2-atom eta2 site reduces to half the edge.
+
+def _site_radius(mol, site, *, positions=None):
+    """Return the root-mean-square distance of haptic members from their centroid.
+
+    The identity ``R^2 = sum(i<j, d_ij^2)/n^2`` holds for any point set, including irregular faces.
+    Without explicit positions, RDKit's pair-bound midpoints estimate those distances. They need not jointly
+    describe a realizable point set. The caller owns length provenance; a conformer on `mol` is not authority
+    to measure it. A two-atom eta2 site reduces to half the edge.
     """
-    if mol.GetNumConformers():
-        pos = np.array([list(mol.GetConformer(cid).GetAtomPosition(a)) for a in site])
-        return float(np.linalg.norm(pos - pos.mean(0), axis=1).mean())
+    if positions is not None:
+        pos = np.asarray(positions)[list(site)]
+        return float(np.sqrt(np.mean(np.sum((pos - pos.mean(0)) ** 2, axis=1))))
 
-    bm = rdDistGeom.GetMoleculeBoundsMatrix(mol)
+    bm = _bounds_matrix(mol)
     tot = sum(
         (0.5 * (bm[max(a, b)][min(a, b)] + bm[min(a, b)][max(a, b)])) ** 2 for a, b in itertools.combinations(site, 2)
     )
     return float(np.sqrt(tot)) / len(site)
+
+
+def _site_height(radius, member_lengths):
+    """Estimate centroid distance using ``|M-c|^2 = mean(|M-member|^2) - R^2``.
+
+    Retain the existing 0.5 A scaffold floor; it is not a feasibility proof for fitted member distances.
+    """
+    mean_squared_length = float(np.mean(np.square(member_lengths)))
+    return float(np.sqrt(max(mean_squared_length - radius * radius, 0.25)))
 
 
 def _reject_metal_bonds(mol):
@@ -592,6 +927,39 @@ def _reject_metal_bonds(mol):
         )
 
 
+def _reject_boron_cages(mol):
+    """Reject connected five-boron cages outside the two-centre donor model."""
+    metals = set(metal_indices(mol))
+    seen, cages = set(), []
+    for atom in mol.GetAtoms():
+        start = atom.GetIdx()
+        if start in metals or start in seen:
+            continue
+        stack, component = [start], []
+        while stack:
+            index = stack.pop()
+            if index in seen or index in metals:
+                continue
+            seen.add(index)
+            component.append(index)
+            stack.extend(
+                neighbor.GetIdx()
+                for neighbor in mol.GetAtomWithIdx(index).GetNeighbors()
+                if neighbor.GetIdx() not in metals
+            )
+        borons = [index for index in component if mol.GetAtomWithIdx(index).GetAtomicNum() == _BORON_Z]
+        if len(borons) >= _BORON_CAGE_MIN:
+            cages.append((tuple(sorted(borons)), tuple(sorted(component))))
+    if cages:
+        details = ", ".join(
+            f"{len(borons)} boron atoms ({component[0]}..{component[-1]})" for borons, component in cages
+        )
+        raise ValueError(
+            f"boron cage ligand(s) detected: {details}; multi-centre B-H/B-B bonding is outside rxembed's "
+            "two-centre donor model; supply an explicit donor graph or use a cage-capable backend"
+        )
+
+
 def surrogate_all_metals(mol):
     """Surrogate every metal centre (bonds removed, carbon) for a multi-metal complex.
 
@@ -599,6 +967,7 @@ def surrogate_all_metals(mol):
     Returns ``(mol, metals)`` where ``metals`` is ``[(idx, real_z, real_q), ...]``, the element and formal
     charge `restore_metal` needs. Sanitised leniently, since a stripped η⁵-Cp is a radical fragment.
     """
+    mol = _canonical_metal_graph(mol)
     idxs = metal_indices(mol)
     if not idxs:
         raise ValueError("no metal centre found")
@@ -613,6 +982,7 @@ def surrogate_all_metals(mol):
             remove_bond(em, d, m)  # as in `surrogate_metal`; a bridging donor's two strips compose here
             a = em.GetAtomWithIdx(d)
             _clear_labile_donor_stereo(a)  # stale tag on a now-<3-nbr donor crashes ETKDG
+            a.SetNumExplicitHs(a.GetTotalNumHs())
             a.SetNoImplicit(True)
             hands[d] = a.GetChiralTag()
         a = em.GetAtomWithIdx(m)
@@ -621,8 +991,9 @@ def surrogate_all_metals(mol):
         a.SetFormalCharge(0)
         a.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)  # bondless surrogate: a stray metal tag crashes ETKDG
     out = em.GetMol()
-    Chem.SanitizeMol(out, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
+    Chem.SanitizeMol(out, _SURROGATE_SANITIZE, catchErrors=True)
     out.UpdatePropertyCache(strict=False)
+    repair_bond_stereo(out)
     _retag(out, hands, ambiguous)
     return out, metals
 
@@ -672,28 +1043,28 @@ def _too_flat_for(p, rms, r):
     return rms < bound and not np.isclose(rms, bound)
 
 
-def classify_geometry(mol, metal, sites, cid=-1):
-    """Name the coordination polytope from the actual geometry: a flatness exclusion, then the angle spectrum.
+def classify_geometry(mol, metal, sites, cid=-1, *, warn=True):
+    """Name the coordination polytope by flatness exclusion and best orthogonal vertex fit.
 
     ``sites`` are coordination sites, not atoms: a haptic face is one vertex via its centroid. Returns
     ``None`` only when no record has that vertex count, and warns above `_FIT_FLOOR`, where the name is the
-    nearest record rather than a reading of the sphere.
+    nearest record rather than a reading of the sphere. Set ``warn=False`` for repeated internal validation.
 
     Flatness excludes one way only: a flat sphere cannot be a record whose metal sits off its vertex plane,
     but the converse says nothing, since an out-of-plane sphere is a distorted planar shape as readily as a
     3-D one. This is what separates `trigonal_planar` from the CN3 pyramid, where an angle boundary would
     have to be fitted and this has a natural zero.
 
-    Then the sorted vertex-metal-vertex angle spectrum, invariant to rotation and donor ordering, so no
-    Kabsch and no permutation search. It separates a trigonal bipyramid from a square pyramid, which differ
-    only in these angles. The sort discards vertex roles: lossless at CN3, but at CN4 it is 720 orderings
-    against 24 realisable, so an apex/base pair cannot be told apart here.
+    The fit preserves vertex correspondence while allowing rotation, reflection and donor reordering.
+    `metal_polyhedron.fit_residual` owns the bounded-exact seating search and its high-CN approximation.
     """
     pos = mol.GetConformer(cid).GetPositions()
     points = []
     for site in sites:
         atoms = [site] if isinstance(site, (int, np.integer)) else list(site)
         points.append(np.mean([pos[a] for a in atoms], axis=0))
+    if not points:
+        return None
     obs = np.array([p - pos[metal] for p in points], float)
     if not np.all(np.linalg.norm(obs, axis=1) > _EPS_LEN):
         return None
@@ -715,7 +1086,7 @@ def classify_geometry(mol, metal, sites, cid=-1):
     best_err, best = ranked[0]
     poor = best_err > _FIT_FLOOR  # no record fits; the argmin is still returned, but it is a name, not a reading
     runner = f"; next {_describe(ranked[1][1])} {ranked[1][0]:.3f}" if len(ranked) > 1 else ""
-    if poor:
+    if poor and warn:
         logger.warning(
             "geometry: no shape fits; nearest %s (residual %.3f > %.2f). Pass geometry= to state it",
             _describe(best),
@@ -766,17 +1137,6 @@ def coplanar(pos, metal, donors, tol=COPLANAR_TOL, haptic=None):
 def n_sites(geometry):
     """Return the number of coordination vertices the geometry has (name or 3-letter code)."""
     return len(POLYHEDRA[resolve_geometry(geometry)].vertex_dirs)  # unknown geometry -> KeyError (deliberate)
-
-
-def hold_shape(mol, atoms, cons, pad=0.1, cid=-1):
-    """Fix the shape of `atoms` at their input mutual distances (all pairwise, ``+/-pad``).
-
-    Relative and frame-independent, so a spectator sphere survives a re-embed without being pinned to an
-    absolute frame. Recorded in ``cons.shapes`` because these windows are one rigid body: pulling the M-donor
-    subset alone would tear the rest.
-    """
-    add_pairwise_shape(cons, atoms, mol.GetConformer(cid).GetPositions(), pad)
-    cons.shapes.append(set(atoms))
 
 
 _LONE_PAIR_Z = {7, 8, 15, 16, 33, 34, 51, 52}  # N O P S As Se Sb Te: p-block groups 15 and 16

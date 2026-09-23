@@ -9,7 +9,7 @@ from rdkit.Geometry import Point3D
 
 import rxembed as rx
 from rxembed import metal_constraints as constraints
-from rxembed import metal_core
+from rxembed import metal_core, stereo
 from rxembed import metal_isomer as isomer
 from rxembed import metal_polyhedron as poly
 from rxembed import metal_slots as slots
@@ -194,14 +194,13 @@ def test_isomer_source_and_metal_are_mutually_exclusive():
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_retained_input_geometry_is_logged_as_relaxed(tmp_path, caplog):
+def test_coordinate_input_reports_generated_seeds(tmp_path, caplog):
     xyz = tmp_path / "pd.xyz"
     rx.embed(rx.metal(_MA2B2, "square_planar")[0], n=1, seed=1).dump(str(xyz))
     with caplog.at_level("INFO", logger="rxembed"):
         rx.embed(str(xyz), n=1)
-    assert any("relaxed into its windows" in record.message for record in caplog.records)
-
-    caplog.clear()
+    assert any("1 seeds" in record.message for record in caplog.records)
+    assert not any("input geometry)" in record.message for record in caplog.records)
     with caplog.at_level("INFO", logger="rxembed"):
         rx.embed("OC(=O)CCCCc1ccccc1", constrain={(1, 9): (2.6, 3.0)}, n=2, seed=1)
     assert not any("relaxed into its windows" in record.message for record in caplog.records)
@@ -213,6 +212,22 @@ def test_lazy_haptic_radius_uses_the_source_geometry():
     deferred = rx.metal(source)[0]
     deferred.mol.GetConformer().SetAtomPosition(1, Point3D(20, 20, 20))
     assert deferred.cons.pulls == expected
+
+
+def test_retained_haptic_geometry_is_measured_before_count_default():
+    rw = Chem.RWMol(ferrocene())
+    for atom in range(10, 5, -1):
+        rw.RemoveAtom(atom)
+    for direction in poly.vertex_dirs("square_pyramidal")[1:]:
+        donor = rw.AddAtom(Chem.Atom("F"))
+        rw.GetAtomWithIdx(donor).SetFormalCharge(-1)
+        rw.AddBond(donor, 0, Chem.BondType.DATIVE)
+        rw.GetConformer().SetAtomPosition(donor, Point3D(*(1.95 * np.asarray(direction))))
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    Chem.FastFindRings(mol)
+
+    assert isomer.from_geometry(mol).geometry == "square_pyramidal"
 
 
 def test_haptic_centroids_follow_atoms_added_after_enumeration():
@@ -290,6 +305,67 @@ def test_retained_isomer_captures_geometry_and_keeps_the_metal_umbrella():
     assert retained.cons.umbrellas
 
 
+def test_from_geometry_uses_measured_stereo_for_site_identity():
+    candidate = rx.metal("C[N@H]1CC[N@@H](C)->[Pt+2]<-1(<-[Cl-])<-[Br-]", "SPL")[0]
+    reference = rx.embed(candidate, n=1, seed=42).mol
+    expected = rx.cxsmiles(reference)
+    source = Chem.Mol(reference)
+    Chem.RemoveStereochemistry(source)
+    tags = [atom.GetChiralTag() for atom in source.GetAtoms()]
+
+    assert rx.cxsmiles(isomer.from_geometry(source)) == expected
+    assert [atom.GetChiralTag() for atom in source.GetAtoms()] == tags
+    np.testing.assert_array_equal(source.GetConformer().GetPositions(), reference.GetConformer().GetPositions())
+
+
+def test_retained_imine_chelate_does_not_add_independent_ez():
+    candidate = rx.metal(r"C/C=C/C/N1=C(/F)C(/Cl)=N(/Br)->[Ni+2](<-[Cl-])(<-[I-])<-1", "SPL")[0]
+    source = rx.embed(candidate, n=1, seed=7, threads=1).mol
+    locked = stereo._coordination_locked_double_bonds(source, {candidate.metal})
+    assert locked
+    pendant = stereo.bond_stereo(candidate.stereo_label)
+    assert pendant
+    positions = source.GetConformer().GetPositions()
+    tags = [bond.GetStereo() for bond in source.GetBonds()]
+
+    retained = isomer.from_geometry(source)
+
+    assert locked.isdisjoint(stereo.bond_stereo(retained.stereo_label))
+    assert stereo.bond_stereo(retained.stereo_label) == pendant
+    assert all(retained.mol.GetBondBetweenAtoms(*pair).GetStereo() == Chem.BondStereo.STEREONONE for pair in locked)
+    assert rx.cxsmiles(retained) == rx.cxsmiles(candidate)
+    np.testing.assert_array_equal(retained.mol.GetConformer().GetPositions(), positions)
+    assert [bond.GetStereo() for bond in source.GetBonds()] == tags
+    np.testing.assert_array_equal(source.GetConformer().GetPositions(), positions)
+
+
+def test_from_geometry_names_an_unsupported_coordination_number():
+    rw = Chem.RWMol()
+    metal = rw.AddAtom(Chem.Atom("La"))
+    donors = [rw.AddAtom(Chem.Atom("F")) for _ in range(13)]
+    for donor in donors:
+        rw.AddBond(donor, metal, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    conf.SetAtomPosition(metal, Point3D(0, 0, 0))
+    for i, donor in enumerate(donors):
+        angle = 2 * np.pi * i / len(donors)
+        conf.SetAtomPosition(donor, Point3D(float(2 * np.cos(angle)), float(2 * np.sin(angle)), 0.3 * (i % 3 - 1)))
+    mol.AddConformer(conf)
+
+    with pytest.raises(ValueError, match=r"no polyhedron template for '13-coordinate'.*POLYHEDRA"):
+        isomer.from_geometry(mol)
+
+
+def test_from_geometry_rejects_an_unbound_metal_cleanly():
+    mol = Chem.MolFromSmiles("[Hg].[C-]#[O+]")
+    mol.AddConformer(Chem.Conformer(mol.GetNumAtoms()))
+
+    with pytest.raises(ValueError, match=r"Hg0.*no donor bonds"):
+        isomer.from_geometry(mol)
+
+
 def _ideal_sphere(geometry, symbol, scramble):
     directions = poly.vertex_dirs(geometry)
     rw = Chem.RWMol()
@@ -306,6 +382,40 @@ def _ideal_sphere(geometry, symbol, scramble):
         conf.SetAtomPosition(atom, Point3D(*(direction / np.linalg.norm(direction) * 1.95)))
     mol.AddConformer(conf)
     return mol
+
+
+@pytest.mark.parametrize("geometry", list(poly.POLYHEDRA))
+def test_retained_seating_is_atom_order_invariant_for_every_shape(geometry):
+    directions = poly.vertex_dirs(geometry)
+    scramble = np.random.RandomState(len(directions)).permutation(len(directions))
+    mol = _ideal_sphere(geometry, "F", scramble)
+    for isotope, donor in enumerate(mol.GetAtomWithIdx(0).GetNeighbors(), 1):
+        donor.SetIsotope(isotope)
+    reversed_mol = Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))
+
+    retained = [isomer.from_geometry(graph) for graph in (mol, reversed_mol)]
+
+    assert [state.geometry for state in retained] == [geometry, geometry]
+    assert rx.cxsmiles(retained[0]) == rx.cxsmiles(retained[1])
+
+
+@pytest.mark.parametrize("geometry", list(poly.POLYHEDRA))
+def test_distorted_source_and_stated_isomer_share_polyhedron_angles(geometry):
+    directions = poly.vertex_dirs(geometry)
+    mol = _ideal_sphere(geometry, "F", range(len(directions)))
+    positions = mol.GetConformer().GetPositions()
+    positions[1:] *= (1.04, 0.98, 1.0)
+    mol.GetConformer().SetPositions(positions)
+    retained = isomer.from_geometry(mol)
+    assert retained.geometry == geometry
+    stated = isomer.Isomer(mol, geometry, retained.vertices, lengths="model")
+    assert retained.cons == stated.cons
+    measured = isomer.from_geometry(mol, lengths="input")
+    assert measured.cons.angles == retained.cons.angles
+    for donor in retained.donors:
+        distance = np.linalg.norm(positions[donor] - positions[retained.metal])
+        window = measured.cons.distances[tuple(sorted((retained.metal, donor)))]
+        assert 0.5 * sum(window) == pytest.approx(distance)
 
 
 def test_derived_shape_uses_polyhedron():

@@ -1,18 +1,17 @@
-"""Distance-geometry embedding, biased by an EDITED bounds matrix.
+"""Edit native RDKit bounds and seed coordinates with KDG + AIO.
 
-RDKit's knowledge-derived bounds are edited in place, not replaced, so the experimental-torsion and
-basic-knowledge terms survive under a custom core; the matrix is then triangle-smoothed and handed to ETKDGv3.
-numpy and RDKit only.
-
-Smoothing can report that the edited bounds admit no point set at all, and it reports it as one number with
-no address. `crossings` supplies the address: it names the stated windows on the chain that contradicts.
+A supplied EmbedParameters selects another model. SetBoundsMat supplies distances, not the internal
+coordinate assumptions that produced them. Triangle smoothing detects metric contradictions, not every
+3D infeasibility.
 """
 
 from __future__ import annotations
 
+import functools
 import itertools
 import logging
-from dataclasses import dataclass
+import math
+from contextlib import nullcontext
 
 import numpy as np
 from rdkit import Chem, DistanceGeometry, rdBase
@@ -20,24 +19,24 @@ from rdkit.Chem import rdDistGeom, rdMolDescriptors
 
 from . import mechanisms as _mech
 from . import metal_core as _metal
+from .constraints import FIX_DISTANCE_TOL
 
 logger = logging.getLogger("rxembed.bounds")  # under the "rxembed" tree `set_verbose` configures
 
 DEFAULT_SEED = 0xF00D  # the one embed seed default; a probe may state its own, but never *no* seed
 _SMOOTH_LOOSE = 0.1  # smoothing beyond this means the constraints are genuinely contradictory, not merely tight
+_MAX_SEED_COUNT = 250  # bound one RDKit DG search; stereo selection reuses this ceiling in small serial batches
+_PROJECTOR_EPS = 1e-10  # Ignore the numerically null centered constant eigenspace.
+_CERTIFICATE_STEPS = 32  # Bounded proposal search, not a feasibility threshold; see benchmark/.
+_CROSS_EPS = 1e-9  # Å, floating-point slack shared by every closed-bound comparison against this matrix
 
 
 def _smooth(bm, max_tol=0.4):
-    """Triangle-smooth ``bm`` in place, escalating the crossover budget until metric; return the tolerance used.
+    """Triangle-smooth ``bm`` in place and return the crossover tolerance used.
 
-    The returned tolerance is the signal, not a detail: 0.0 means the constraints are mutually realisable,
-    and anything above it means some triple contradicts, so RDKit repaired a crossed pair by rewriting
-    ``upper := lower``. The repaired pair need not be the over-specified one: it can land on a ligand internal
-    RDKit derived correctly, which is why a non-zero tolerance is reported rather than absorbed. `crossings`
-    is the other half: the tolerance says how far, and it says on which pair and from which windows.
-
-    The tolerance is a RATIO of the crossed pair's upper bound, not an Angstrom (measured: a 0.2635 Å crossing
-    on a 1.02 Å upper settles at 0.2583). So a rung means the same thing on a bond and on a coordination span.
+    Positive tolerance permits RDKit to repair crossed bounds, including ligand internals, by raising the
+    upper bound to the lower. It is a fraction of the upper bound, not a distance. Each retry starts from
+    the original matrix; `_feasible_bounds` names the repaired pair by diffing it against that original.
     """
     back = bm.copy()
     tol = 0.0
@@ -46,63 +45,302 @@ def _smooth(bm, max_tol=0.4):
         if tol > max_tol:
             raise RuntimeError("triangle smoothing failed")
         bm[:] = back
-    if tol > _SMOOTH_LOOSE:  # `_feasible_bounds` owns the user-facing narrative and names the windows there
+    if tol > _SMOOTH_LOOSE:  # `_feasible_bounds` owns the user-facing narrative and names the pair there
         logger.debug("smoothing repaired a %.0f%% bound crossover", tol * 100.0)
     return tol
 
 
-def etkdg(seed, *, knowledge=True, threads=0, prune_rms=None):
-    """Build ETKDGv3 parameters: the one place RDKit's embed defaults are overridden.
+def embed_parameters(seed, *, knowledge=True, threads=0, prune_rms=None):
+    """Build native KDG + AIO parameters with reproducible sampling defaults.
 
-    ``seed`` is required and positional on purpose. RDKit's own ``randomSeed`` default is -1, meaning *draw
-    from the global RNG*, which silently makes every result downstream depend on how much randomness the
-    process happened to consume earlier. Requiring it here makes that defect unrepresentable rather than
-    something each call site has to remember (one of three call sites did not).
-
-    ``knowledge=False`` drops the experimental-torsion / basic-knowledge terms for plain distance geometry.
+    Require a seed rather than inheriting RDKit's process-global RNG default. ``knowledge=False`` disables
+    basic geometry for plain distance geometry, retaining AIO refinement.
     """
-    p = rdDistGeom.ETKDGv3()
+    p = rdDistGeom.KDG()
+    p.useLegacyImplementation = False
     p.randomSeed = int(seed)
     p.numThreads = threads
-    if not knowledge:
-        p.useExpTorsionAnglePrefs = False
-        p.useBasicKnowledge = False
+    p.useBasicKnowledge = knowledge
     if prune_rms is not None:
         p.pruneRmsThresh = prune_rms  # passed through with RDKit's meaning: 0.0 prunes only identical, -1 is off
     return p
 
 
-def probe_conformer(mol, seed):
-    """Embed one throwaway conformer on a copy of ``mol``; return it, or None if the embed failed.
+def embedding_options(
+    seed,
+    threads,
+    knowledge,
+    prune_rms=None,
+    embed_params=None,
+    *,
+    coplanar_14=True,
+    metal_floor_relief=True,
+    donor_orientation=True,
+    conjugation=True,
+):
+    """Resolve convenience keywords once, leaving native model choices on their parameter object."""
+    for name, value in (
+        ("coplanar_14", coplanar_14),
+        ("metal_floor_relief", metal_floor_relief),
+        ("donor_orientation", donor_orientation),
+        ("conjugation", conjugation),
+    ):
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be True or False")
+    if embed_params is not None:
+        if not isinstance(embed_params, rdDistGeom.EmbedParameters):
+            raise TypeError("embed_params must be an RDKit EmbedParameters object")
+        if knowledge is not None:
+            raise ValueError("use embed_params.useBasicKnowledge/useExpTorsionAnglePrefs, not knowledge together")
+        if seed is None:
+            seed = DEFAULT_SEED if embed_params.randomSeed == -1 else embed_params.randomSeed
+        threads = embed_params.numThreads if threads is None else threads
+        prune_rms = embed_params.pruneRmsThresh if prune_rms is None else prune_rms
+    return (
+        DEFAULT_SEED if seed is None else int(seed),
+        0 if threads is None else int(threads),
+        True if knowledge is None else knowledge,
+        0.1 if prune_rms is None else float(prune_rms),
+    )
 
-    A probe's only job is to decide a discrete question: which inter-fragment pair is closest, which
-    sigma-hole apex a contact uses. The geometry is discarded but the decision is kept, so the seed is FIXED:
-    reproducibility is wanted here, not sampling diversity.
+
+def probe_conformer(mol, seed):
+    """Embed one throwaway conformer on a copy of ``mol``, or return None on failure.
+
+    Probes choose contact atoms, not conformer diversity, so require an explicit reproducible seed.
     """
     work = Chem.Mol(mol)
-    if rdDistGeom.EmbedMolecule(work, etkdg(seed)) != 0:
+    if rdDistGeom.EmbedMolecule(work, embed_parameters(seed)) != 0:
         return None
     return work
 
 
-def _write(mol, cons):
-    """Edit RDKit's bounds matrix with every constraint, unsmoothed; return the filled context.
+def _chain_upper(bm, path):
+    """Enclose three-bond reach at every torsion using the native bond/angle intervals."""
+    a, b, c, d = path
+    intervals = [
+        (bm[max(i, j), min(i, j)], bm[min(i, j), max(i, j)]) for i, j in ((a, b), (b, c), (c, d), (a, c), (b, d))
+    ]
+    if any(not 0 < lo <= hi or not math.isfinite(hi) for lo, hi in intervals):
+        return math.inf
+    ab, bc, cd, ac, bd = intervals
+    alpha, beta = _mech._triangle_angles(ab, bc, ac), _mech._triangle_angles(bc, cd, bd)
+    if alpha is None or beta is None:
+        return math.inf
+    # Relax the terminal-bond dot product to a*c, then use each angle's maximum. The resulting expression
+    # is convex in each bond length, so interval corners enclose every torsion, including cis amides and S-S.
+    square = max(
+        (a + c - b) ** 2 + 4 * b * (a * math.sin(alpha[1] / 2) ** 2 + c * math.sin(beta[1] / 2) ** 2)
+        for a, b, c in itertools.product(ab, bc, cd)
+    )
+    return math.sqrt(square + 1e-12 * max(1.0, square))  # Outward roundoff, not a chemical tolerance.
+
+
+def ligand_reach(mol):
+    """Close native ligand bounds with torsion-independent three-bond upper limits for enumeration.
+
+    Native 1-4/1-5 bounds include conformational preferences. Removing them also loses useful free-torsion
+    reach, which triangle smoothing alone cannot recover. Project that consequence from one unmodified
+    1-2/1-3 basis before smoothing. A ring-closed path keeps RDKit's native 1-4 lower bound: unlike an
+    acyclic chain, its closure is a graph constraint rather than a free torsion (NITWIY). The native 1-4
+    upper bound only carries over when the central bond is aromatic; RDKit derives any other ring bond's
+    1-4 upper bound from an sp2-sp2 cis template regardless of ring size (`_getShareRingBond14Type`), which
+    is a hybridisation preference, not a ring constraint, and otherwise underestimates a saturated-ring
+    torsion (JOYDIK: a thiourea S...S reach twisted by a diazepane ring). This is a model upper bound,
+    not proof of whole-ligand realizability; embedding still retains RDKit's torsion knowledge.
+    Unsupported local projections abstain.
+    """
+    with rdBase.BlockLogs():
+        basis = rdDistGeom.GetMoleculeBoundsMatrix(mol, set14bounds=False, set15bounds=False, doTriangleSmoothing=False)
+        ring_bounds = rdDistGeom.GetMoleculeBoundsMatrix(
+            mol, set14bounds=True, set15bounds=False, doTriangleSmoothing=False
+        )
+    reach = basis.copy()
+    for path in Chem.FindAllPathsOfLengthN(mol, 4, useBonds=False, useHs=True, onlyShortestPaths=True):
+        a, b = sorted((path[0], path[-1]))
+        bond = mol.GetBondBetweenAtoms(path[1], path[2])
+        if bond.IsInRing():
+            reach[b, a] = ring_bounds[b, a]
+        if bond.GetIsAromatic():
+            reach[a, b] = ring_bounds[a, b]
+        else:
+            reach[a, b] = min(reach[a, b], _chain_upper(basis, path))
+    if not DistanceGeometry.DoTriangleSmoothing(reach):
+        raise ValueError("native ligand reach bounds are inconsistent")
+    return reach
+
+
+def _put(matrix, atoms, window):
+    """Narrow one matrix cell to admit ``window``, keyed the way the matrix sorts a pair."""
+    a, b = sorted(atoms)
+    matrix[b, a] = max(matrix[b, a], window[0])
+    matrix[a, b] = min(matrix[a, b], window[1])
+
+
+def _coordination_reach_base(mol, reach, metals):
+    """Build the native ligand interval matrix shared by one coordination screen."""
+    matrix = np.triu(np.full((mol.GetNumAtoms(), mol.GetNumAtoms()), math.inf), 1)
+    topology = Chem.GetDistanceMatrix(mol, force=True)
+    with rdBase.BlockLogs():
+        raw = rdDistGeom.GetMoleculeBoundsMatrix(mol, set14bounds=False, set15bounds=False, doTriangleSmoothing=False)
+    for fragment in Chem.GetMolFrags(mol):
+        for a, b in itertools.combinations(sorted(set(fragment) - set(metals)), 2):
+            _put(matrix, (a, b), (0.0, reach[a, b]))
+            if topology[a, b] in (1, 2):
+                _put(matrix, (a, b), (raw[b, a], raw[a, b]))
+    return matrix
+
+
+def coordination_reach(mol, cons, reach, *, native=None):
+    """Intersect compiled targets with native ligand reach, without repairing incompatible model priors.
+
+    An enumeration outer bound, not the embedding matrix: native ligand 1-2/1-3 intervals and free-torsion
+    upper reach are kept, nonbonded floors come only from `cons`, and the publication tolerance is added to
+    real metal-distance windows so the screen cannot reject their accepted boundary. Every angle projects
+    from the same closed side intervals, so dictionary order cannot change a leg. Virtual-centroid rows are
+    omitted: a native interval is only a seed prior, and a hard centroid equality there could turn an
+    accepted ligand distortion into a false exclusion; the caller already excludes externally constrained
+    graphs, so the omission cannot strengthen this bound.
+    """
+    matrix = _coordination_reach_base(mol, reach, cons.metals) if native is None else native.copy()
+    for atoms, (lo, hi) in cons.distances.items():
+        if cons.haptic.keys() & set(atoms):
+            continue
+        tolerance = FIX_DISTANCE_TOL if cons.metals.intersection(atoms) else 0.0
+        _put(matrix, atoms, (max(0.0, lo - tolerance), hi + tolerance))
+    for atoms, floor in cons.floors.items():
+        if cons.haptic.keys() & set(atoms):
+            continue
+        _put(matrix, atoms, (floor, math.inf))
+    basis = matrix.copy()
+    if not DistanceGeometry.DoTriangleSmoothing(basis):
+        return matrix
+    for (i, j, k), angles in cons.angles.items():
+        if cons.haptic.keys() & {i, j, k}:
+            continue
+        left = basis[max(i, j), min(i, j)], basis[min(i, j), max(i, j)]
+        right = basis[max(j, k), min(j, k)], basis[min(j, k), max(j, k)]
+        if np.isfinite((*left, *right)).all():
+            _put(matrix, (i, k), _mech._triangle_distances(left, right, angles))
+    return matrix
+
+
+@functools.lru_cache(maxsize=32)
+def _centering_matrix(n):
+    """Return the size-`n` double-centering projector shared by every squared-distance Gram build.
+
+    A pure function of the certificate's atom count, never of chemistry, so it is safe to share across
+    calls. `_euclidean_conflict` only certifies small metal-anchored subsets (route unions bounded by
+    `metal_enumeration._EUCLIDEAN_SUBSET_BUDGET`, mostly 4-6 atoms), so distinct sizes stay well under
+    this cache's bound; an evicted size is just recomputed, never a correctness risk.
+    """
+    return np.eye(n) - np.ones((n, n)) / n
+
+
+def _euclidean_conflict(matrix, *, refine=False):
+    """Say whether these distance bounds are impossible, cached since every candidate reasks the same ones."""
+    array = np.ascontiguousarray(matrix, dtype=float)
+    return _certified_conflict(array.shape[0], array.tobytes(), bool(refine))
+
+
+@functools.lru_cache(maxsize=4096)
+def _certified_conflict(n, payload, refine):
+    """Return a certified positive squared-distance margin, or None without a Euclidean contradiction.
+
+    For PSD W with W*1=0, trace(W D²)=-2*trace(X.T W X)<=0 for every Euclidean point set X.
+    Minimize that linear expression over the squared-distance intervals. A positive lower bound
+    excludes all dimensions, not just 3D. Midpoint eigenspaces only propose W; whole projectors avoid
+    arbitrary eigenvector choices at repeated eigenvalues. Optional centred-Gram refinement proposes a
+    stronger witness when the midpoint misses coupled distances. Only its certified interval margin
+    rejects a box, never convergence failure. No certificate does not prove feasibility.
+
+    Takes the matrix as `n` plus its raw bytes so the result can be memoised; see `_euclidean_conflict`.
+    """
+    matrix = np.frombuffer(payload, dtype=float).reshape(n, n)
+    lower, upper = np.tril(matrix, -1), np.triu(matrix, 1)
+    lower, upper = lower + lower.T, upper + upper.T
+    if (
+        n <= 1
+        or not np.isfinite(lower).all()
+        or not np.isfinite(upper).all()
+        or np.any(lower < 0)
+        or np.any(lower > upper)
+    ):
+        return None
+    lower, upper = lower**2, upper**2
+    centre = _centering_matrix(n)
+    gram = -0.25 * centre @ (lower + upper) @ centre
+    values, vectors = np.linalg.eigh(gram)
+    groups = np.split(np.arange(n), np.flatnonzero(np.diff(values) > 1e-9 * max(1.0, *abs(values))) + 1)
+
+    def witnesses():
+        for group in groups:
+            if min(values[group]) < 0:
+                basis = centre @ vectors[:, group]
+                yield basis @ basis.T
+        if not refine:
+            return
+        current, extrapolated, momentum = gram, gram.copy(), 1.0
+        for _ in range(_CERTIFICATE_STEPS):
+            squared = np.diag(extrapolated)[:, None] + np.diag(extrapolated) - 2 * extrapolated
+            errors = squared - np.clip(squared, lower, upper)
+            # Half the squared pair violations have gradient diag(errors.sum(1))-errors and
+            # Lipschitz bound 2*n on centred Gram matrices. Simultaneous steps preserve atom symmetry.
+            proposal = extrapolated - (np.diag(errors.sum(axis=1)) - errors) / (2 * n)
+            proposal = centre @ ((proposal + proposal.T) / 2) @ centre
+            eigenvalues, eigenvectors = np.linalg.eigh(proposal)
+            updated = (eigenvectors * np.maximum(eigenvalues, 0.0)) @ eigenvectors.T
+            next_momentum = (1 + math.sqrt(1 + 4 * momentum**2)) / 2
+            extrapolated = updated + (momentum - 1) / next_momentum * (updated - current)
+            current, momentum = updated, next_momentum
+        basis = (centre @ eigenvectors) * np.sqrt(np.maximum(-eigenvalues, 0.0))
+        yield basis @ basis.T
+
+    for candidate in witnesses():
+        if np.trace(candidate) < _PROJECTOR_EPS:
+            continue
+        weights = candidate / np.trace(candidate)
+        terms = weights * np.where(weights >= 0, lower, upper)
+        margin = float(terms.sum())
+        if margin > 1e-9 * max(1.0, float(np.abs(terms).sum())):
+            return margin
+    return None
+
+
+def _write(mol, cons, params=None):
+    """Edit native smoothed bounds without re-smoothing the edits; return the filled context.
 
     The phase order is the algorithm, and this is the only place it is stated; each mechanism
     (`mechanisms.py`) says what it writes, never when. RELIEVE must precede COMMIT so an explicit
     window always beats a floor relief; POST must follow it so the coplanar bound can read committed legs.
 
-    Separate from `_bounds` because smoothing repairs in place: `crossings` needs the matrix as written, and
-    by the time a tolerance is reported the crossed bound has already been rewritten away.
+    Separate from `_bounds` because smoothing repairs in place: `_feasible_bounds` needs the matrix as
+    written, before repair, to diff against the smoothed result.
     """
-    # A tagged C/N donor is temporarily reconnected to its real metal so ETKDG sees its fourth reference.
-    # Bounds generation then tries UFF typing even though no UFF force field is requested; the metal warning
-    # is expected and the later restrained-UFF path uses its own typeable surrogate graph.
-    if any(atom.GetAtomicNum() in _metal.COORDINATION_METALS for atom in mol.GetAtoms()):
-        with rdBase.BlockLogs():
-            bm = rdDistGeom.GetMoleculeBoundsMatrix(mol)
-    else:
-        bm = rdDistGeom.GetMoleculeBoundsMatrix(mol)
+    # Bounds generation tries UFF typing even though no force field is requested. The shared wrapper hides
+    # those diagnostics only for charged/metal graphs; exceptions still escape.
+    # Use the same native priors for the edited matrix and its refinement.
+    # Labelled ligand stereo temporarily adds dative M-L edges so RDKit has the donor's full CIP basis. Remove
+    # only edges owned by a selected metal's explicit M-L distance on a private copy; retain every other edge.
+    owned = {tuple(sorted(atoms)) for atoms in cons.distances}
+    removable = []
+    for bond in mol.GetBonds():
+        if bond.GetBondType() != Chem.BondType.DATIVE:
+            continue
+        begin, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        metals = [idx for idx in (begin, end) if mol.GetAtomWithIdx(idx).GetAtomicNum() in _metal.COORDINATION_METALS]
+        if len(metals) == 1 and metals[0] in cons.metals and tuple(sorted((begin, end))) in owned:
+            removable.append((begin, end))
+    native = mol
+    if removable:
+        rw = Chem.RWMol(mol)
+        for begin, end in removable:
+            rw.RemoveBond(begin, end)
+        native = rw.GetMol()
+        native.ClearComputedProps()
+        native.UpdatePropertyCache(strict=False)
+        Chem.GetSymmSSSR(native, includeDativeBonds=True)
+    bm = _metal._bounds_matrix(native, params)
     ctx = _mech.DGContext(mol, bm)
     for m in _mech.MECHANISM_ORDER:
         m._dg_windows(cons, ctx)  # WINDOW   distances, angles, planes -> candidate windows
@@ -116,259 +354,61 @@ def _write(mol, cons):
     return ctx
 
 
-def _bounds(mol, cons):
-    """Edit RDKit's bounds matrix with every constraint; return ``(matrix, settled tolerance)``."""
-    bm = _write(mol, cons).bm
-    return bm, _smooth(bm)  # SMOOTH; the settled tolerance travels with the matrix
-
-
-# --- Naming the windows that over-determine the matrix ----------------------------------------------------
-#
-# A crossed bound is never one window's doing. Smoothing reports that some CHAIN of bounds admits no point
-# set, and the pair it repairs need not be one any constraint stated, so naming the culprit is a shortest-path
-# question rather than a lookup. `crossings` closes the upper bounds (Floyd-Warshall, keeping the path),
-# propagates the lower bounds through that closure once, and reports each pair whose lower now exceeds its
-# upper together with the windows on the path that forced it. One propagation pass is enough: the closure
-# already satisfies the triangle inequality, so a lower bound raised through it is dominated by the one-step
-# statement it came from.
-
-_RDKIT = "rdkit"  # a cell nothing stated: RDKit's own bond / backbone / vdW knowledge
-_CROSS_EPS = 1e-9  # Å, floating-point slack: smoothing's own repair leaves exact equalities behind
-_NAMED_IN_LINE = 2  # windows quoted in the one-line symptom; the record carries the rest. Two is the line
-#   budget: a real crossing reads "0...12 by 0.16 A (11%): coplanar cap 0-59-58-55, M-L distance 0-46" and the
-#   caller's own prefix has to fit beside it.
-
-
-@dataclass(frozen=True)
-class Window:
-    """One matrix cell and the constraint that wrote it, `kind` naming the family it belongs to.
-
-    ``key`` is that constraint's own key, so a caller can go straight back to `cons.angles[key]`, and
-    ``lo``/``hi`` are the window as STATED: degrees for an angle or a dihedral cap, Å for a distance.
-    """
-
-    kind: str
-    key: tuple
-    lo: float
-    hi: float
-
-    def __str__(self):
-        """Name the window in a log line: its family and the atoms its own constraint key names."""
-        return f"{self.kind} {'-'.join(str(a) for a in self.key)}"
-
-
-@dataclass(frozen=True)
-class Crossing:
-    """A pair no point set can satisfy: its propagated lower bound exceeds its shortest-path upper bound.
-
-    ``pushing`` are the windows whose LOWER bounds drive the two atoms apart, ``capping`` those whose UPPER
-    bounds hold them together. Widening any single one of them, in its own direction, by ``gap`` clears this
-    crossing, which is what makes the pair actionable rather than merely reported.
-    """
-
-    pair: tuple
-    gap: float
-    lower: float
-    upper: float
-    pushing: tuple
-    capping: tuple
-
-    @property
-    def ratio(self):
-        """The gap as a fraction of the upper bound, which is the unit `_smooth`'s own tolerance is stated in.
-
-        The same quantity smoothing reports, from the other end, but not always the same number: RDKit repairs
-        in place as it sweeps, so it never sees the whole closure. Measured, the ratio runs from just above
-        the settled tolerance (COJKAO 0.108 against 0.107) to well above it (QELZOZ 0.368 against 0.258).
-        """
-        return self.gap / self.upper if self.upper else float("inf")
-
-    def windows(self):
-        """Return the stated windows implicated, pushing first; RDKit's own are excluded (never widen one).
-
-        Deduplicated across the two sides: a window stated with its own lower above its own upper caps and
-        pushes the same pair, and naming it twice reads as two culprits.
-        """
-        return tuple(dict.fromkeys(w for w in (*self.pushing, *self.capping) if w.kind != _RDKIT))
-
-    def __str__(self):
-        """State the symptom in one line: the pair, how far it crosses, and the windows that crossed it."""
-        named = ", ".join(str(w) for w in self.windows()[:_NAMED_IN_LINE]) or "RDKit's own bounds alone"
-        return f"{self.pair[0]}...{self.pair[1]} by {self.gap:.2f} A ({self.ratio * 100:.0f}%): {named}"
-
-
-def crossings(mol, cons):
-    """Name the windows whose combination leaves the bounds matrix with no point set; worst crossing first.
-
-    Empty when the matrix is metric, so this is the detector as well as the diagnosis. Not on the ordinary
-    path: it costs a second matrix build plus an O(n³) closure, and only a ``tol > 0`` embed needs it.
-    """
-    ctx = _write(mol, cons)
-    return _crossings(np.asarray(ctx.bm, float), _window_map(cons))
-
-
-def _crossings(bm, sources):
-    """Find the crossed pairs of an unsmoothed matrix, attributing each through `sources` (``{pair: [Window]}``)."""
-    upper = np.triu(bm, 1)
-    upper = upper + upper.T
-    lower = np.tril(bm, -1)
-    lower = lower + lower.T
-    closed, via = _upper_closure(upper)
-    reach, witness = _lower_reach(lower, closed)
-    gaps = np.triu(np.maximum(np.maximum(reach, reach.T), lower) - closed, 1)
-    out = []
-    for a, b in zip(*np.nonzero(gaps > _CROSS_EPS), strict=True):
-        i, j = int(a), int(b)
-        if lower[i][j] > closed[i][j]:  # the pair's own window is already wider than any path between them
-            push, cap = [(i, j)], []
-        else:  # ...else a third atom k is held far from one end and close to the other
-            near, far = (i, j) if reach[i][j] >= reach[j][i] else (j, i)
-            k = int(witness[near][far])
-            push, cap = [(near, k)], _path_edges(via, k, far)
-        cap += _path_edges(via, i, j)
-        out.append(
-            Crossing(
-                pair=(i, j),
-                gap=float(gaps[i][j]),
-                lower=float(max(lower[i][j], reach[i][j], reach[j][i])),
-                upper=float(closed[i][j]),
-                pushing=_attribute(push, sources),
-                capping=_attribute(cap, sources),
-            )
-        )
-    return sorted(out, key=lambda c: -c.ratio)  # by the tolerance's own unit, so the head is the pair it reports
-
-
 def _upper_closure(upper):
-    """Shortest-path closure of the upper bounds; return ``(closed, via)``.
-
-    ``via[i][j]`` is the atom the shortest i..j chain of bounds passes through, or -1 where the direct bound
-    is already the shortest. The path is what names the windows, so it is reconstructed, not just its length.
-    """
-    n = len(upper)
+    """Shortest-path closure of the upper bounds: a chain of bounds can hold a pair tighter than its own."""
     closed = upper.copy()
-    via = np.full((n, n), -1, dtype=int)
-    for k in range(n):
+    for k in range(len(upper)):
         cand = closed[:, k, None] + closed[None, k, :]
-        better = cand < closed - _CROSS_EPS
-        closed = np.where(better, cand, closed)
-        via[better] = k
-    return closed, via
+        closed = np.where(cand < closed - _CROSS_EPS, cand, closed)
+    return closed
 
 
 def _lower_reach(lower, closed):
     """How far each pair is driven apart through a third atom: ``max_k (lower[i][k] - closed[k][j])``.
 
-    Returns that maximum and the atom ``k`` achieving it. Asymmetric by construction (it is atom ``i`` that is
-    held away from ``k``), so a caller must read both orientations of a pair.
+    Asymmetric by construction (it is atom ``i`` that is held away from ``k``), so read both orientations.
     """
-    n = len(lower)
-    best = np.full((n, n), -np.inf)
-    witness = np.full((n, n), -1, dtype=int)
-    for k in range(n):
+    best = np.full(lower.shape, -np.inf)
+    for k in range(len(lower)):
         cand = lower[:, k, None] - closed[None, k, :]
-        better = cand > best
-        best = np.where(better, cand, best)
-        witness[better] = k
-    return best, witness
+        best = np.where(cand > best, cand, best)
+    return best
 
 
-def _path_edges(via, i, j):
-    """Walk out the direct-bound edges of the shortest upper-bound chain from ``i`` to ``j``."""
-    k = int(via[i][j])
-    if k < 0:
-        return [(i, j)]
-    return _path_edges(via, i, k) + _path_edges(via, k, j)
+def _bounds(mol, cons, params=None):
+    """Edit RDKit's bounds matrix with every constraint; return ``(matrix, settled tolerance)``."""
+    bm = _write(mol, cons, params).bm
+    return bm, _smooth(bm)  # SMOOTH; the settled tolerance travels with the matrix
 
 
-def _attribute(pairs, sources):
-    """Name the windows on each pair, once apiece and in order; an unstated cell is RDKit's own."""
-    out = []
-    for i, j in pairs:
-        for w in sources.get((min(i, j), max(i, j))) or [Window(_RDKIT, (min(i, j), max(i, j)), 0.0, 0.0)]:
-            if w not in out:
-                out.append(w)
-    return tuple(out)
+def _feasible_bounds(mol, cons, params=None):
+    """Build smoothed seed bounds and report the pair implicated in any repair.
 
-
-def _window_map(cons):
-    """``{pair: [Window]}`` for every matrix cell a constraint writes, in the writers' own precedence.
-
-    Mirrors `_write`'s phases rather than re-deriving them: a stated distance owns its pair outright, an angle
-    claims only a 1-3 pair no earlier window took, a plane only what is left, and the coplanar cap is a SECOND
-    window on a cell the M-D-X fold usually already owns, since it runs in POST and only tightens.
+    Smoothing may repair the seed matrix, but must not rewrite the Constraints used for relaxation and
+    acceptance. A stated window moved by the repair is named first, even where smoothing moved an unstated
+    pair further, because only a stated one is actionable; a full attribution needs the closure this no
+    longer keeps (see git history).
     """
-    out = {}
-    for (i, j), (lo, hi) in cons.distances.items():
-        out[_key(i, j)] = [Window(_distance_kind(cons, i, j), (i, j), lo, hi)]
-    for (i, j, k), (lo, hi) in cons.angles.items():
-        out.setdefault(_key(i, k), [Window(_angle_kind(cons, i, j, k), (i, j, k), lo, hi)])
-    for ring_a, ring_b, sep in cons.planes:
-        for a, b in itertools.product(ring_a, ring_b):
-            out.setdefault(_key(a, b), [Window("pi-stack", (a, b), sep, sep)])
-    # `dg_floors` is deliberately absent: a relief only ever LOWERS a lower bound, so it cannot be what
-    # over-constrains, and POST may have overwritten the cell it relieved anyway (COJKAO's Pd...C is relieved
-    # to 2.26 Å and then pushed back up by the coplanar cap). Naming it would point a repair at the one
-    # statement already giving as much ground as it can.
-    for i, j, k, w, anchor, cap in cons.coplanar:
-        if _key(i, w) not in cons.distances:  # a stated distance window is truth; the cap never reaches the cell
-            out.setdefault(_key(i, w), []).append(Window("coplanar cap", (i, j, k, w), anchor - cap, anchor + cap))
-    return out
-
-
-def _key(i, j):
-    """Sort a pair the way the matrix does, which is how every window field keys itself."""
-    return (min(i, j), max(i, j))
-
-
-def _distance_kind(cons, i, j):
-    """Which distance family a window belongs to, read off the atoms it names rather than off its source."""
-    if i in cons.metals or j in cons.metals:
-        return "M-L distance"
-    if i in cons.phantoms or j in cons.phantoms:
-        return "face radius"
-    return "distance"
-
-
-def _angle_kind(cons, i, j, k):
-    """Which angle family a window belongs to: the metal's position in the triple is what distinguishes them."""
-    if j in cons.metals:
-        return "D-M-D angle"
-    if i in cons.metals or k in cons.metals:
-        return "M-D-X fold"
-    return "angle"
-
-
-def _feasible_bounds(mol, cons):
-    """Build the bounds matrix, and name the windows that contradict when no point set satisfies them all.
-
-    ``_smooth`` returning a non-zero tolerance is the detector: RDKit repaired a crossed bound to embed at
-    all, and the pair it rewrote need not be the over-specified one, so the tolerance alone points nowhere.
-    `crossings` closes that gap by naming the windows on the chain that crossed.
-
-    Reported, not repaired. A repair was measured over the four structures in 331 that cross
-    (`benchmark/crossover.py`): widening the implicated window until the matrix is metric leaves every sphere
-    RMSD, M-L MAE and embed outcome where it was, and the one structure whose median moved (UDITUW 0.73 ->
-    0.47) scatters 0.30-0.74 across seeds inside every arm alike. PHSNFE, the only one that embeds nothing,
-    embeds nothing from a provably metric matrix too. A crossed matrix is a symptom of the windows, not a
-    cause of a bad geometry, so this says which window to go and look at and hands the matrix on.
-    """
-    bm, tol = _bounds(mol, cons)
+    bm, tol = _bounds(mol, cons, params)
     if tol <= 0.0:
-        return bm, tol  # mutually realisable, the overwhelmingly common case; say nothing
-    crossed = crossings(mol, cons)
-    if crossed:
-        worst = crossed[0]
-        named = str(worst.windows()[0]) if worst.windows() else f"atoms {worst.pair[0]}-{worst.pair[1]}"
-        logger.warning(
-            "ETKDG bounds needed smoothing for %s (gap %.2f A); continuing with the repaired seed bounds "
-            "before constrained relaxation; see DEBUG",
-            named,
-            worst.gap,
-        )
-        logger.debug("embed: constraint crossing: %s", worst)
-    else:  # the closure agrees with smoothing on 350 of 350 calls measured; if it ever does not, say so
-        logger.warning("embed: constraints not mutually realisable (%.0f%% repaired), cause unattributed", tol * 100.0)
+        return bm, tol  # no triangle contradiction detected; full embedding and validation are still required
+    ctx = _write(mol, cons, params)  # rebuild the pre-smoothing matrix to diff the repair against
+    diff = np.abs(np.asarray(bm, float) - ctx.bm)
+    changed = np.triu(np.maximum(diff, diff.T), 1)  # either bound moving counts, so fold lower onto upper
+    stated = [(min(i, j), max(i, j)) for i, j in ctx.pairs]
+    named = max(stated, key=lambda p: changed[p], default=None)
+    if named is None or changed[named] == 0.0:
+        named = tuple(int(x) for x in np.unravel_index(np.argmax(changed), changed.shape))
+    i, j = named
+    kind = "distance" if named in cons.distances else "atoms"
+    logger.warning(
+        "RDKit DG bounds needed smoothing for %s %d-%d (gap %.2f A); continuing with the repaired seed bounds "
+        "before constrained relaxation",
+        kind,
+        i,
+        j,
+        float(changed[named]),
+    )
     return bm, tol
 
 
@@ -376,8 +416,7 @@ def _bring_real_confs(mol, work, ids):
     """Copy each embedded conformer's real-atom positions from `work` (with phantom) onto the real `mol`, same ids.
 
     The haptic centroid dummy lives only in the transient `work`; the real molecule keeps exactly its own atoms.
-    `EmbedMultipleConfs` replaced `work`'s conformers (clearConfs default), so clear `mol`'s stale ones to match:
-    the caller re-adds any retained input geometry afterward, exactly as the no-phantom path relies on.
+    `EmbedMultipleConfs` replaced `work`'s conformers, so replace `mol`'s conformers too.
     """
     mol.RemoveAllConformers()
     n = mol.GetNumAtoms()
@@ -385,39 +424,114 @@ def _bring_real_confs(mol, work, ids):
         wc = work.GetConformer(int(cid))
         conf = Chem.Conformer(n)
         conf.SetId(int(cid))
-        for a in range(n):
-            conf.SetAtomPosition(a, wc.GetAtomPosition(a))
+        conf.SetPositions(wc.GetPositions()[:n])
         mol.AddConformer(conf, assignId=False)
 
 
-def seed_coordinates(mol, cons, n, seed=DEFAULT_SEED, prune_rms=0.1, knowledge=True, threads=0):
-    """Seed ``n`` conformers with ETKDGv3 using the edited bounds matrix; return their ids."""
+def seed_coordinates(
+    mol,
+    cons,
+    n,
+    seed=DEFAULT_SEED,
+    prune_rms=0.1,
+    knowledge=True,
+    threads=0,
+    enforce_chirality=True,
+    max_attempts=0,
+    embed_params=None,
+    random_coords=False,
+    coplanar_14=True,
+    metal_floor_relief=True,
+):
+    """Generate ``n`` new conformers with native RDKit parameters and edited bounds."""
     work = _metal.materialise_phantoms(mol, cons.haptic)  # transient centroid dummies for a haptic face; `mol` else
-    p = etkdg(seed, knowledge=knowledge, threads=threads, prune_rms=prune_rms)
-    if cons.distances or cons.angles or cons.planes or cons.coplanar:
-        p.embedFragmentsSeparately = False
-        bm, _tol = _feasible_bounds(work, cons)
+    constrained = bool(cons.distances or cons.angles or cons.planes or cons.coplanar)
+    search_count = int(n)
+    p = (
+        embed_params
+        if embed_params is not None
+        else embed_parameters(seed, knowledge=knowledge, threads=threads, prune_rms=prune_rms)
+    )
+    if embed_params is None:
+        p.enforceChirality = enforce_chirality
+        p.maxIterations = int(max_attempts)
+        p.trackFailures = True
+    if embed_params is not None or constrained:
+        # Always replace a supplied object's matrix: it may belong to a previous candidate or helper graph.
+        # These switches affect only our matrix edits. UFF and publication retain the complete Constraints.
+        dg = (
+            cons
+            if coplanar_14 and metal_floor_relief
+            else cons.copy(
+                coplanar=cons.coplanar if coplanar_14 else [],
+                dg_floors=cons.dg_floors if metal_floor_relief else {},
+            )
+        )
+        bm, _tol = _feasible_bounds(work, dg, p)
         p.SetBoundsMat(bm)  # a custom (edited) bounds matrix
-    # Use ETKDG's knowledge-based start (eigenvalue from the bounds matrix + experimental torsions), which
-    # survives a custom matrix. Random coords only as a fallback: a tightly constrained core can make the
-    # knowledge-seeded start metric-infeasible where random still embeds.
-    p.useRandomCoords = False
-    ids = list(rdDistGeom.EmbedMultipleConfs(work, n, p))
-    if not ids:
-        p.useRandomCoords = True
-        ids = list(rdDistGeom.EmbedMultipleConfs(work, n, p))
+    overrides = {"randomSeed": seed, "numThreads": threads, "pruneRmsThresh": prune_rms, "clearConfs": True}
+    if constrained or embed_params is not None:
+        overrides["embedFragmentsSeparately"] = False
+    previous = {}
+    if embed_params is not None:
+        previous = {name: getattr(p, name) for name in overrides}
+        # Native embedding materialises these defaults in place; do not leak them across molecules.
+        previous.update(maxIterations=p.maxIterations, basinThresh=p.basinThresh)
+    # Disconnected hydrides are intentional. Suppress their native implicit-H warning only during embedding.
+    isolated_h = any(a.GetAtomicNum() == 1 and not a.GetDegree() for a in work.GetAtoms())
+    try:
+        for name, value in overrides.items():
+            setattr(p, name, value)
+        for attempt in range(2 if embed_params is None else 1):
+            if embed_params is None:
+                p.useRandomCoords = bool(
+                    random_coords or attempt
+                )  # Retry an empty search with the same model and bounds.
+            with rdBase.BlockLogs() if isolated_h else nullcontext():
+                ids = list(rdDistGeom.EmbedMultipleConfs(work, search_count, p))
+            # Counts describe rejected native attempts, even in successful searches, not failed conformers.
+            counts = p.GetFailureCounts() if p.trackFailures else ()
+            failures = {
+                name: counts[int(cause)]
+                for name, cause in rdDistGeom.EmbedFailureCauses.names.items()
+                if int(cause) < len(counts) and counts[int(cause)]
+            }
+            logger.debug(
+                "DG random=%s knowledge=%s chirality=%s legacy=%s: %d/%d conformers; rejected attempts %s",
+                p.useRandomCoords,
+                p.useBasicKnowledge,
+                p.enforceChirality,
+                p.useLegacyImplementation,
+                len(ids),
+                search_count,
+                failures if p.trackFailures else "not tracked",
+            )
+            if any(cid < 0 for cid in ids):
+                raise TimeoutError(
+                    f"native RDKit embedding exceeded timeout={p.timeout}s; "
+                    "increase embed_params.timeout or inspect bounds/stereo with rx.set_verbose('DEBUG')"
+                )
+            if ids:
+                break
+    finally:
+        for name, value in previous.items():
+            setattr(p, name, value)
+    from .relax import bonding_ok
+
+    # Stereo selection may stop after its first match. Try intact seeds before repairable candidates.
+    ids.sort(key=lambda cid: not bonding_ok(work, cid, clash_tol=0.0, exclude=cons.frozen, constrained=cons.distances))
     if work is not mol:  # discard the phantom: bring only the real-atom coords back onto the real molecule
         _bring_real_confs(mol, work, ids)
     return ids
 
 
 def seed_count(mol, constrained=False):
-    """ETKDG seed count, scaled by rotatable-bond count rather than a flat default.
+    """Return the RDKit DG seed count, scaled by rotatable-bond count rather than a flat default.
 
     A constrained run gets ~1.6x more, because openconf's pose-frozen search is rotor-only and under-samples
     unless handed more distinct starting points. An unconstrained ``.mc()`` re-seeds and replaces these.
     """
     r = rdMolDescriptors.CalcNumRotatableBonds(mol)
     if constrained:
-        return min(250, max(40, 10 * r))
+        return min(_MAX_SEED_COUNT, max(40, 10 * r))
     return min(150, max(24, 6 * r))  # cf. openconf max(20, 3*r); a touch more for biased seeds

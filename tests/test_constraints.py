@@ -143,6 +143,60 @@ def test_compose_distance_is_last_wins():
     assert compose(a, b).distances[(0, 1)] == (2.5, 2.7)
 
 
+def test_angle_preferences_merge_once_and_release_with_their_contact():
+    key = (0, 1, 2)
+    base = Constraints(angles={key: (80.0, 140.0)}, pulls={key: 120.0, (9, 0): 2.1})
+    merged = compose(base, Constraints(pulls={key[::-1]: 120.0}))
+    assert merged.pulls == base.pulls
+    with pytest.raises(ValueError, match="conflicting pulls"):
+        compose(base, Constraints(pulls={key[::-1]: 110.0}))
+    merged.contacts = (frozenset(), frozenset({key}))
+    assert merged.relaxed().pulls == {(9, 0): 2.1}
+    assert merged.pulls == base.pulls
+
+
+def test_soft_angle_preference_cannot_replace_a_structural_window():
+    key = (0, 1, 2)
+    base = Constraints(angles={key: (80.0, 100.0)}, pulls={key: 90.0})
+    incoming = Constraints(angles={key[::-1]: (110.0, 130.0)}, pulls={key[::-1]: 120.0})
+    assert compose_soft(base, incoming) == base
+
+
+@pytest.mark.parametrize("base_key", [(0, 3), (3, 0)])
+@pytest.mark.parametrize("incoming_key", [(0, 3), (3, 0)])
+def test_soft_distance_window_and_preference_share_order_independent_ownership(base_key, incoming_key):
+    base = Constraints(distances={base_key: (1.9, 2.1)})
+    incoming = Constraints(
+        distances={incoming_key: (2.9, 3.1)},
+        pulls={incoming_key: 3.0},
+        contacts=(frozenset({incoming_key}), frozenset()),
+    )
+    assert compose_soft(base, incoming) == base
+    fixed = Constraints(fixed={base_key: (2.0, 2.0)})
+    assert compose_soft(fixed, incoming) == compose(fixed)
+    base.contacts = (frozenset({base_key[::-1]}), frozenset())
+    with pytest.raises(ValueError, match="state each degree of freedom once"):
+        compose_soft(base, incoming)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -1.0, 181.0])
+def test_angle_preferences_reject_invalid_degrees(value):
+    with pytest.raises(ValueError, match="finite angle"):
+        compose(Constraints(pulls={(0, 1, 2): value}))
+
+
+@pytest.mark.parametrize("key", [(0, 1, 2), (2, 1, 0)])
+@pytest.mark.parametrize("window", [(100.0, 100.0), (95.0, 105.0)])
+def test_fixed_angle_overrides_preference_in_either_composition_order(key, window):
+    base = Constraints(angles={(0, 1, 2): (80.0, 140.0)}, pulls={(0, 1, 2): 120.0})
+    stated = Constraints(fixed={key: window})
+    for parts in ((base, stated), (stated, base)):
+        merged = compose(*parts)
+        assert not merged.pulls
+        assert set(merged.angles) == {key}
+        assert merged.fixed == stated.fixed
+
+
 def test_compose_soft_never_replaces_a_rigid_term():
     mol = _mol("CCCC")
     rigid = resolve_core(mol, fix={(0, 2): 2.0, (0, 1, 2): 110.0}, has_geometry=True)[0]
@@ -185,6 +239,16 @@ def test_compose_soft_cannot_replace_a_structural_torsion():
     assert merged.umbrellas == base.umbrellas
 
 
+@pytest.mark.parametrize("carriers", [(0, 1, 2, 3), (1, 0, 2, 3)])
+def test_point_hand_does_not_reserve_a_torsion_angle(carriers):
+    key = (0, 1, 2, 3)
+    base = Constraints(umbrellas={carriers: 0.0})
+    incoming = Constraints(dihedrals={key: (40.0, 60.0)}, contacts=(frozenset(), frozenset({key})))
+    merged = compose_soft(base, incoming)
+    assert merged.dihedrals == incoming.dihedrals
+    assert merged.umbrellas == base.umbrellas
+
+
 def test_compose_soft_owns_each_dihedral_by_its_central_bond():
     base_key, incoming_key = (0, 1, 2, 3), (4, 1, 2, 5)
     fixed = Constraints(dihedrals={base_key: (-62.0, -58.0)}, fixed={base_key: (-60.0, -60.0)})
@@ -199,6 +263,19 @@ def test_compose_soft_owns_each_dihedral_by_its_central_bond():
     soft = fixed.copy(fixed={}, contacts=(frozenset(), frozenset({base_key})))
     with pytest.raises(ValueError, match="state each degree of freedom once"):
         compose_soft(soft, incoming)
+
+
+@pytest.mark.parametrize("ideal", [None, 30.0, 0.0])
+def test_umbrella_owns_its_points_not_an_independent_ligand_rotation(ideal):
+    base = Constraints(umbrellas={(0, 1, 2, 3): ideal})
+    for key, retained in (((4, 1, 2, 5), True), ((1, 0, 3, 2), ideal == 0.0)):
+        incoming = Constraints(dihedrals={key: (40.0, 60.0)}, contacts=(frozenset(), frozenset({key})))
+        merged = compose_soft(base, incoming)
+        assert (key in merged.dihedrals) == retained
+        assert (key in merged.contacts[1]) == retained
+        assert merged.umbrellas == base.umbrellas
+        assert merged.relaxed().umbrellas == base.umbrellas
+        assert not merged.relaxed().dihedrals
 
 
 def test_constraint_value_rejects_invalid_real_and_haptic_indices():

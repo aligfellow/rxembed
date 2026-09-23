@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 
 import numpy as np
 import pytest
@@ -20,10 +21,10 @@ from rxembed.metal_polyhedron import (
     canonical_slots,
     describe,
     geometries_for_cn,
+    hull_edges,
     isomer_permutations,
     point_group,
     resolve_geometry,
-    rotation_group,
     seat_properly,
     vertex_dirs,
 )
@@ -128,16 +129,22 @@ def test_full_point_group_is_rotations_times_reflection():
         "square_pyramidal": 4,
         "octahedral": 24,
         "trigonal_prismatic": 6,
+        "hexagonal_planar": 12,
         "pentagonal_bipyramidal": 10,
         "capped_octahedral": 3,
         "capped_trigonal_prismatic": 2,
         "square_antiprism": 8,
         "dodecahedral": 4,
+        "tricapped_trigonal_prismatic": 6,
+        "bicapped_square_antiprismatic": 8,
+        "edge_contracted_icosahedral": 2,
     }
     assert set(expected_rotations) == set(POLYHEDRA)
     for name, rec in POLYHEDRA.items():
         rot, refl = point_group(tuple(map(tuple, rec.vertex_dirs)))
-        assert rot == rotation_group(name), f"{name}: rotation_group is not point_group's proper half"
+        dirs = vertex_dirs(name)
+        proper = None if dirs is None else point_group(tuple(map(tuple, dirs)))[0]
+        assert rot == proper, f"{name}: point_group's proper rotations disagree between vertex_dirs sources"
         assert len(rot) == len(refl) == expected_rotations[name], (
             f"{name}: {len(rot)} rotations against {len(refl)} reflections, expected {expected_rotations[name]}"
         )
@@ -148,13 +155,17 @@ def test_full_point_group_is_rotations_times_reflection():
 
 def test_isomer_permutations_are_complete_proper_orbit_representatives():
     for name, rec in POLYHEDRA.items():
-        rotations = rotation_group(name)
-        covered = set()
+        if rec.cn > 9:
+            continue  # the exhaustive public path refuses these pools before iterating them
+        dirs = vertex_dirs(name)
+        rotations = None if dirs is None else point_group(tuple(map(tuple, dirs)))[0]
+        assert rotations is not None, f"{name}: no vertex-direction template"
+        count = 0
         for order in isomer_permutations(name):
             orbit = {tuple(order[q[v]] for v in range(rec.cn)) for q in rotations}
-            assert covered.isdisjoint(orbit), f"{name}: duplicate proper-rotation orbit"
-            covered.update(orbit)
-        assert covered == set(itertools.permutations(range(rec.cn))), f"{name}: incomplete pool"
+            assert order == min(orbit), f"{name}: representative is not its orbit minimum"
+            count += 1
+        assert count * len(rotations) == math.factorial(rec.cn), f"{name}: incomplete pool"
 
 
 def test_seat_properly_excludes_reflection():
@@ -194,6 +205,103 @@ def test_seating_finds_distorted_antiprism_optimum():
         order = _seat_by_alignment(observed, directions)
         score = float(np.linalg.svd(observed[list(order)].T @ directions, compute_uv=False).sum())
         assert score == pytest.approx(optimum, abs=1e-12), f"trial {trial}: {score:.6f} vs {optimum:.6f}"
+
+
+def test_seating_searches_the_exact_bounded_orbit_pool():
+    observed = np.array(
+        [
+            [-0.270833112875, -0.663552188301, 0.697386491388],
+            [-0.432464667431, -0.593676326291, 0.678618251321],
+            [0.060819489794, 0.995413034256, -0.073850395361],
+            [0.355595341221, -0.922396266561, 0.150788198263],
+            [0.593947166999, 0.297089208410, 0.747639461947],
+            [0.201852608751, 0.101956005758, -0.974094706499],
+        ]
+    )
+    ideal = np.array(vertex_dirs("octahedral"), float)
+
+    order = _seat_by_alignment(observed, ideal)
+
+    assert tuple(order) == (0, 5, 1, 4, 2, 3)
+    assert _fit_trace(observed[order].T @ ideal) == pytest.approx(4.956143442072902, abs=1e-12)
+
+
+def test_seating_reuses_template_assignments_but_refits_each_geometry(monkeypatch):
+    from rxembed import metal_polyhedron as poly
+
+    poly._seating_permutations.cache_clear()
+    generate = poly._proper_orbit_permutations
+    calls = []
+
+    def counted(dirs):
+        calls.append(dirs)
+        yield from generate(dirs)
+
+    monkeypatch.setattr(poly, "_proper_orbit_permutations", counted)
+    ideal = np.array(vertex_dirs("octahedral"), float)
+    for observed in (ideal, ideal[[0, 2, 1, 3, 5, 4]]):
+        order = _seat_by_alignment(observed, ideal)
+        assert _fit_trace(observed[order].T @ ideal) == pytest.approx(6.0)
+    assert len(calls) == 1
+
+
+# --- the convex-hull edge test, for the metal_slots chelate edge rule --------------------------------
+
+
+_HULL_EDGE_COUNTS = {  # counted by hand against a supporting-plane definition; see metal_slots._chelate_edge_links
+    "OCT": 12,
+    "TPR": 9,
+    "CTP": 13,
+    "COC": 15,
+    "SQA": 16,
+    "DOD": 18,
+    "TCT": 21,
+    "BSA": 24,
+    "ECI": 27,
+    "TET": 6,  # every pair: a tetrahedron has no diagonal or trans pair to exclude
+}
+
+
+@pytest.mark.parametrize(("code", "expected"), sorted(_HULL_EDGE_COUNTS.items()))
+def test_hull_edges_match_expected_counts(code, expected):
+    rec = POLYHEDRA[resolve_geometry(code)]
+    assert len(hull_edges(tuple(map(tuple, rec.vertex_dirs)))) == expected
+
+
+def test_hull_edges_exclude_every_trans_pair():
+    for name, rec in POLYHEDRA.items():
+        dirs = rec.vertex_dirs
+        edges = hull_edges(tuple(map(tuple, dirs)))
+        trans = {
+            frozenset((i, j))
+            for i, j in itertools.combinations(range(len(dirs)), 2)
+            if _vertex_angle(dirs[i], dirs[j]) == 180
+        }
+        assert not (trans & edges), f"{name}: a 180 deg (trans) pair counted as a hull edge"
+
+
+def test_hull_edges_exclude_a_square_face_diagonal():
+    dirs = POLYHEDRA["square_antiprism"].vertex_dirs  # 0,1,3,2 is the top face's cycle; 0-3 and 1-2 are diagonals
+    edges = hull_edges(tuple(map(tuple, dirs)))
+    assert frozenset((0, 1)) in edges
+    assert frozenset((0, 3)) not in edges
+    assert frozenset((1, 2)) not in edges
+
+
+def test_hull_edges_are_invariant_under_point_group_rotations():
+    """A genuine geometric edge set is a union of proper-rotation orbits: no rotation can turn an edge into
+    a non-edge or vice versa. This catches an edge set that swaps one record's edge/non-edge pair, or adds
+    an extra (non-orbit) chord to a planar record, even though a total-count check alone would miss it.
+    """
+    for name, rec in POLYHEDRA.items():
+        dirs = tuple(map(tuple, rec.vertex_dirs))
+        edges = hull_edges(dirs)
+        vdirs = vertex_dirs(name)
+        rotations = None if vdirs is None else point_group(tuple(map(tuple, vdirs)))[0]
+        assert rotations is not None, f"{name}: no vertex-direction template"
+        for q in rotations:
+            mapped = frozenset(frozenset((q[i], q[j])) for i, j in (tuple(pair) for pair in edges))
+            assert mapped == edges, f"{name}: hull_edges is not invariant under a proper rotation"
 
 
 def test_seating_allows_reflection_for_achiral_template():

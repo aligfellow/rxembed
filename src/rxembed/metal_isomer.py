@@ -12,8 +12,8 @@ from . import metal_core as _core
 from . import metal_slots as _slots
 from . import metal_stereo as _coord_stereo
 from . import stereo as _stereo
-from .constraints import Constraints, _is_index, add_distance, compose
-from .metal_constraints import _model_distance_window, compile_constraints, coordination_from_geometry, resolve_lengths
+from .constraints import Constraints, _is_index, add_distance
+from .metal_constraints import _donor_distance_window, compile_constraints, resolve_lengths
 from .metal_core import (
     _APICAL_MIN,
     VACANT,
@@ -119,6 +119,7 @@ class Isomer:
     donor_bonds: list  # stripped donor-metal bonds, re-added dative on output
     stereo_ref: object = None  # input-geometry chirality fingerprint (for stereo='preserve')
     stereo_label: str = ""  # ligand stereoisomer tag ('C16:R'), distinct from the metal-centre `chirality`
+    _protect_arrangement: bool = True  # a retained source permits its own sphere graft; a selected isomer does not
 
     @property
     def mol(self):
@@ -135,13 +136,14 @@ class Isomer:
     def _graph(self):
         return self._shared_mol if self._mol is None else self._mol
 
-    def __init__(self, mol, geometry, sites, lengths="auto"):
+    def __init__(self, mol, geometry, sites, lengths="model"):
         """Build a known isomer by assigning donor atom indices to polyhedron slots.
 
         `geometry` accepts a registry name or 3-letter code. `sites` is a ``{slot: atom}`` mapping or a
         slot-ordered list; omitted slots remain vacant. `lengths` selects input or model M-donor windows.
         Slot numbering is defined by `metal_polyhedron.vertex_dirs`.
         """
+        mol = _core._canonical_metal_graph(mol)
         geom = resolve_geometry(geometry)
         if geom not in POLYHEDRA:
             raise ValueError(
@@ -173,7 +175,7 @@ class Isomer:
         lengths = length_source(stored, lengths)
         roles = coordination_roles([(d, m) for d in real_donors], [(m, real_z, real_q)])
         hand = _coord_stereo.chirality_of(base, geom, vertices, haptic, roles)
-        winding = measured_haptic_windings(base, m, real_donors, haptic)
+        winding = measured_haptic_windings(stored, m, real_donors, haptic)
         self.mol = stored
         self.donor_bonds = [(d, m) for d in real_donors]
         self._centres = (_core.from_vertices(m, real_z, real_q, geom, vertices, haptic, winding.items(), hand),)
@@ -198,6 +200,7 @@ class Isomer:
         stereo_ref=None,
         stereo_label="",
         shared_mol=False,
+        protect_arrangement=True,
     ):
         """Build an isomer from real-atom states and optional pre-composed constraints."""
         iso = cls.__new__(cls)
@@ -217,6 +220,7 @@ class Isomer:
             raise ValueError(f"constraints name unknown metal(s): {sorted(unknown)}")
         iso._base_cons = Constraints() if constraints is None else constraints
         iso._constrained_metals = constrained_metals
+        iso._protect_arrangement = protect_arrangement
         iso._lengths = lengths
         iso._length_mol = iso._graph if shared_mol else Chem.Mol(iso._graph)
         iso._graft_ref = dict(graft_ref or {})
@@ -236,6 +240,10 @@ class Isomer:
     @property
     def cons(self):
         """Compile physical coordination constraints from this immutable state."""
+        return self._constraints()
+
+    def _constraints(self, *external, donor_orientation=True, conjugation=True, force_field=True, context=None):
+        """Compile model preferences, optionally omitting derived contact terms for a reach screen."""
         return compile_constraints(
             self._graph,
             self.centres,
@@ -243,6 +251,13 @@ class Isomer:
             base=self._base_cons,
             constrained_metals=self._constrained_metals,
             lengths=self._lengths,
+            stereo_label=self.stereo_label,
+            donor_bonds=self.donor_bonds,
+            external=external,
+            donor_orientation=donor_orientation,
+            conjugation=conjugation,
+            force_field=force_field,
+            context=context,
         )
 
     @property
@@ -351,6 +366,7 @@ class Isomer:
         out.donor_bonds = [*self.donor_bonds, *((atom, self.metal) for atom in atoms)]
         out._base_cons = self._base_cons.copy()
         out._constrained_metals = self._constrained_metals | {self.metal}
+        out._protect_arrangement = True
         out._length_mol = Chem.Mol(self._length_mol)
         out._graft_ref = dict(self._graft_ref)
         out._centres = (active, *self.centres[1:])
@@ -364,7 +380,7 @@ class Isomer:
                 out._base_cons.distances,
                 self.metal,
                 atom,
-                *_model_distance_window(out.mol, self.metal, atom, self.real_z, donors),
+                *_donor_distance_window(out.mol, self.metal, atom, self.real_z, donors),
             )
         return out
 
@@ -457,7 +473,7 @@ def winding_signature(iso, state, winding):
         for donor in vertices
     ]
     slots = canonical_slots(
-        vertex_dirs(state.geometry), keys, _coord_stereo.chelate_edges(iso._graph, vertices, haptic)
+        vertex_dirs(state.geometry), keys, _coord_stereo.chelate_links(iso._graph, vertices, haptic)
     )
     return tuple(key for _slot, key in sorted(zip(slots, keys, strict=True)))
 
@@ -488,7 +504,11 @@ def arrangement(iso):
 
 
 def measured_haptic_windings(mol, metal, donors, haptic):
-    """Return haptic face-orientation signs measured from a molecule's first conformer."""
+    """Return haptic signs from the real ligand graph's first conformer.
+
+    Centroid dummies are embedding scaffolding; passing them here would change RDKit's rooted symmetry
+    classes and could record a winding that the published molecule cannot reproduce.
+    """
     if not haptic or mol.GetNumConformers() == 0:
         return {}
     pos = mol.GetConformer().GetPositions()
@@ -509,14 +529,21 @@ def canonical_metals(mol, metals, *, allow_ties=False):
     return sorted(metals, key=lambda metal: (ranks[metal], metal))
 
 
+def retained_geometry(mol, metal, sites, haptic, cid=-1, *, warn=True):
+    """Return the geometry name that coordinate-derived metal identity will retain."""
+    apical = any(len(face) >= _APICAL_MIN for face in haptic.values())
+    physical_sites = [haptic.get(site, site) for site in sites]
+    measured = classify_geometry(mol, metal, physical_sites, cid, warn=warn) if mol.GetNumConformers() else None
+    return measured or geometry_for(len(sites), has_apical=apical), measured, apical
+
+
 def retained_state(mol, base, metal_info, metals, m):
     """Measure one retained metal state on a shared all-metal surrogate graph."""
     donors = [n.GetIdx() for n in mol.GetAtomWithIdx(m).GetNeighbors() if n.GetIdx() not in metals]
     _idx, real_z, real_q = next(info for info in metal_info if info[0] == m)
     base, sites, haptic = _collapse_haptic(base, donors)
-    apical = any(len(ring) >= _APICAL_MIN for ring in haptic.values())
-    measured = None if apical else classify_geometry(base, m, sites)
-    geometry = measured or geometry_for(len(sites), has_apical=apical) or f"{len(sites)}-coordinate"
+    geometry, measured, apical = retained_geometry(base, m, sites, haptic)
+    geometry = geometry or f"{len(sites)}-coordinate"
     if measured is None:
         logger.info(
             "metal: no polyhedron perceived (%s) -> CN %d default %s",
@@ -526,9 +553,6 @@ def retained_state(mol, base, metal_info, metals, m):
             len(sites),
             describe(geometry),
         )
-    order = _slots.input_ordering(base, m, sites, geometry)
-    order = list(order) if order else list(range(len(sites)))
-    vertices = [sites[k] for k in order]
     donor_bonds = [
         (neighbor.GetIdx(), metal)
         for metal in metals
@@ -536,28 +560,51 @@ def retained_state(mol, base, metal_info, metals, m):
         if neighbor.GetIdx() not in metals
     ]
     roles = coordination_roles(donor_bonds, metal_info)
+    order = _slots.input_ordering(base, m, sites, geometry, haptic, roles)
+    order = list(order) if order else list(range(len(sites)))
+    vertices = [sites[k] for k in order]
     chirality = _coord_stereo.chirality_of(base, geometry, vertices, haptic=haptic, coordination=roles)
-    winding = measured_haptic_windings(base, m, donors, haptic)
+    real = strip_phantoms(Chem.Mol(base), set(range(mol.GetNumAtoms(), base.GetNumAtoms())))
+    winding = measured_haptic_windings(real, m, donors, haptic)
     return base, _core.from_vertices(m, real_z, real_q, geometry, vertices, haptic, winding.items(), chirality)
 
 
-def from_geometry(mol, center=None):
+def from_geometry(mol, center=None, *, lengths="model"):
     """Build one selected state from a conformer-bearing Mol without enumeration.
 
-    Realised distances and angles are retained. Donors are fitted to canonical polyhedron slots, and each
-    haptic face becomes one transient centroid site. `center` selects one sphere; ``center='all'`` retains all
-    spheres on the shared surrogate graph.
+    Fit donors to canonical polyhedron slots; measure M-L distances only with ``lengths='input'``. Angles use
+    the same polyhedron and chelate model as enumerated isomers, not the source conformer's angles.
+    Each haptic face becomes one transient centroid site. `center` selects one sphere; ``center='all'``
+    retains all spheres on the shared surrogate graph.
     """
+    mol = _core._canonical_metal_graph(mol)
     if mol.GetNumConformers() == 0:
         raise ValueError("from_geometry needs an input geometry (a Mol with a conformer)")
     _reject_metal_bonds(mol)
+    _core._reject_boron_cages(mol)
     metals = metal_indices(mol)
-    ligand_stereo = _stereo.stereo_from_3d(mol, exclude=metals)
+    # Site identity and the output label must use the same measured stereo, not stale input tags.
+    ligand_stereo = _stereo.stereo_from_3d(mol, exclude=metals, apply=True)
+    # Coordination-locked E/Z is encoded by the metal state, not an independent donor-symmetry label.
+    locked = _stereo._coordination_locked_double_bonds(mol, metals)
+    _stereo._clear_ez(mol, locked)
+    ligand_stereo = _stereo._without_bond_stereo(ligand_stereo, locked)
     selected = canonical_metals(mol, metals) if center == "all" else [resolve_center(mol, metals, center)]
+    metal_set = set(metals)
+    unbound = [
+        m for m in selected if not any(n.GetIdx() not in metal_set for n in mol.GetAtomWithIdx(m).GetNeighbors())
+    ]
+    if unbound:
+        labels = [f"{mol.GetAtomWithIdx(m).GetSymbol()}{m}" for m in unbound]
+        raise ValueError(
+            f"metal centre(s) {labels} have no donor bonds, so there is no coordination geometry to retain"
+        )
     base, metal_info = surrogate_all_metals(mol)
     states = {}
     for m in selected:
         base, states[m] = retained_state(mol, base, metal_info, metals, m)
+        if states[m].geometry not in POLYHEDRA:
+            raise ValueError(f"no polyhedron template for {states[m].geometry!r}; add a POLYHEDRA row")
     donor_bonds = [
         (n.GetIdx(), m) for m in metals for n in mol.GetAtomWithIdx(m).GetNeighbors() if n.GetIdx() not in metals
     ]
@@ -565,26 +612,14 @@ def from_geometry(mol, center=None):
     identities = selected if center == "all" else [metal for metal, _z, _q in primary_first(metal_info, selected[0])]
     info = {metal: (z, q) for metal, z, q in metal_info}
     centres = tuple(states.get(m, _core.MetalState(m, *info[m])) for m in identities)
-    parts = _core.materialized_states(real_base, centres)
-    retained = [
-        coordination_from_geometry(
-            real_base,
-            state.atom,
-            parts[state.atom][0],
-            state.geometry,
-            state.atomic_num,
-            parts[state.atom][1],
-        )
-        for state in centres
-        if state.atom in selected
-    ]
     return Isomer._from_state(
         real_base,
         centres,
         donor_bonds,
-        constraints=compose(*retained),
-        lengths="input",
+        constrained_metals=selected,
+        lengths=length_source(real_base, lengths),
         stereo_label=ligand_stereo,
+        protect_arrangement=False,
     )
 
 

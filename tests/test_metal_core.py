@@ -25,8 +25,119 @@ emb = importlib.import_module("rxembed.embed")
 
 _MN_H2 = "examples/structures/mn-h2.xyz"  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
 _MN_H2_RC = [1, 5, 63, 64, 65, 66]  # its reacting core
-_EN_PDBRCL = "Br[Pd]1(Cl)NCCN1"  # neutral en-PdBrCl, which reliably embeds: the connectivity fixture
+_EN_PDBRCL = "Br[Pd]1(Cl)NCCN1"  # covalent notation for the reliably embedding chelate fixture
 _NI_N = "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1"  # net 0, Ni(II)
+
+
+@pytest.mark.parametrize(
+    ("smiles", "degree"),
+    [("[C-:1](#[O+])->[Pt+2]", 1), ("N#[C:1][Pt]", 1), ("[CH:1](->[Pt])#C", 2)],
+)
+def test_ligand_degree_ignores_metal_but_counts_all_hydrogens(smiles, degree):
+    source = Chem.MolFromSmiles(smiles)
+    for mol in (source, Chem.AddHs(source)):
+        for work in (mol, Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))):
+            atom = next(a for a in work.GetAtoms() if a.GetAtomMapNum() == 1)
+            assert _metal.ligand_degree(atom) == degree
+
+
+@pytest.mark.parametrize("face", ["centred-arene", "slipped-arene", "open-allyl"])
+def test_haptic_centroid_target_matches_measured_geometry(face):
+    if face == "open-allyl":
+        mol = Chem.MolFromSmiles("C=CC")
+        positions = np.array([[-1.2, 0.0, 0.0], [0.0, 0.7, 0.0], [1.2, 0.0, 0.0]])
+    else:
+        mol = Chem.MolFromSmiles("c1ccccc1")
+        angles = np.arange(6) * np.pi / 3
+        positions = 1.4 * np.column_stack((np.cos(angles), np.sin(angles), np.zeros(6)))
+    metal = np.array([0.0 if face == "centred-arene" else 1.2, 0.0, 1.5])
+    conf = Chem.Conformer(len(positions))
+    conf.SetPositions(positions)
+    mol.AddConformer(conf)
+    radius = _metal._site_radius(mol, tuple(range(len(positions))), positions=positions)
+    lengths = np.linalg.norm(positions - metal, axis=1)
+    actual = np.linalg.norm(metal - positions.mean(axis=0))
+    assert _metal._site_height(radius, lengths) == pytest.approx(actual)
+
+
+@pytest.mark.parametrize("operation", ["collapse", "materialise", "strip"])
+def test_haptic_centroids_rebuild_cached_topology(operation):
+    mol = Chem.AddHs(Chem.MolFromSmiles("C=C.C=C"))
+    count = mol.GetNumAtoms()
+    haptic = {count: (0, 1), count + 1: (2, 3)}
+    if operation == "strip":
+        mol = _metal.materialise_phantoms(mol, haptic)
+    fresh = Chem.Mol(mol)
+    cached = Chem.GetDistanceMatrix(mol).copy()
+
+    def apply(candidate):
+        if operation == "collapse":
+            return _metal._collapse_haptic(candidate, [0, 1, 2, 3])[0]
+        if operation == "strip":
+            return _metal.strip_phantoms(candidate, set(haptic))
+        return _metal.materialise_phantoms(candidate, haptic)
+
+    out, expected = apply(mol), apply(fresh)
+    actual = Chem.GetDistanceMatrix(out).copy()
+    np.testing.assert_array_equal(actual, Chem.GetDistanceMatrix(out, force=True))
+    np.testing.assert_array_equal(_metal._bounds_matrix(out), _metal._bounds_matrix(expected))
+    np.testing.assert_array_equal(Chem.GetDistanceMatrix(mol), cached)
+
+
+@pytest.mark.parametrize("operation", ["materialise", "strip"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_haptic_helpers_preserve_native_fused_ring_bounds(operation, reverse):
+    mol = Chem.AddHs(Chem.MolFromSmiles("[cH-]1ccc2ccccc21"))
+    if reverse:
+        mol = Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))
+    face = next(tuple(ring) for ring in Chem.GetSymmSSSR(mol) if len(ring) == 5)
+    count = mol.GetNumAtoms()
+    positions = np.arange(3 * count, dtype=float).reshape(count, 3)
+    conf = Chem.Conformer(count)
+    conf.SetPositions(positions)
+    mol.AddConformer(conf)
+    expected = rdDistGeom.GetMoleculeBoundsMatrix(mol)
+    atoms = [(a.GetAtomicNum(), a.GetFormalCharge(), a.GetChiralTag()) for a in mol.GetAtoms()]
+    bonds = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx(), b.GetBondType()) for b in mol.GetBonds()]
+    if operation == "strip":
+        # Build the removable helper independently; the addition owner must not supply the oracle.
+        builder = Chem.RWMol(mol)
+        helper = Chem.Atom(6)
+        helper.SetNoImplicit(True)
+        helper.SetHybridization(Chem.HybridizationType.SP3)
+        assert builder.AddAtom(helper) == count
+        mol = builder.GetMol()
+        mol.UpdatePropertyCache(strict=False)
+    before = mol.ToBinary()
+
+    out = (
+        _metal.materialise_phantoms(mol, {count: face})
+        if operation == "materialise"
+        else _metal.strip_phantoms(mol, {count})
+    )
+
+    np.testing.assert_allclose(rdDistGeom.GetMoleculeBoundsMatrix(out)[:count, :count], expected, atol=1e-12, rtol=0)
+    np.testing.assert_array_equal(out.GetConformer().GetPositions()[:count], positions)
+    assert [(a.GetAtomicNum(), a.GetFormalCharge(), a.GetChiralTag()) for a in list(out.GetAtoms())[:count]] == atoms
+    assert [(b.GetBeginAtomIdx(), b.GetEndAtomIdx(), b.GetBondType()) for b in out.GetBonds()] == bonds
+    assert mol.ToBinary() == before
+
+
+def test_haptic_collapse_positions_centroids_in_every_conformer():
+    mol = Chem.MolFromSmiles("C=C.C=C")
+    for cid in (7, 11):
+        conf = Chem.Conformer(mol.GetNumAtoms())
+        conf.SetId(cid)
+        conf.SetPositions(np.arange(12, dtype=float).reshape(4, 3) + cid)
+        mol.AddConformer(conf, assignId=False)
+    out, vertices, haptic = _metal._collapse_haptic(mol, [0, 1, 2, 3])
+    assert vertices == list(haptic)
+    assert {conf.GetId() for conf in out.GetConformers()} == {7, 11}
+    for conf in out.GetConformers():
+        original = mol.GetConformer(conf.GetId()).GetPositions()
+        np.testing.assert_array_equal(conf.GetPositions()[:4], original)
+        for dummy, face in haptic.items():
+            np.testing.assert_array_equal(conf.GetPositions()[dummy], original[list(face)].mean(axis=0))
 
 
 def _ideal_sphere(dirs, r):
@@ -42,6 +153,224 @@ def _ideal_sphere(dirs, r):
         conf.SetAtomPosition(i + 1, Point3D(*(u / np.linalg.norm(u) * r)))
     mol.AddConformer(conf, assignId=True)
     return mol
+
+
+def test_delocalised_charge_canonicalization_requires_rdkit_resonance_proof():
+    ligand = Chem.MolFromSmiles("[c-]1cc[nH]c1")
+    rw = Chem.RWMol(Chem.CombineMols(ligand, Chem.MolFromSmiles("[Fe+]")))
+    metal = rw.GetNumAtoms() - 1
+    for atom in list(rw.GetAtoms())[:metal]:
+        rw.AddBond(atom.GetIdx(), metal, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    before = [atom.GetFormalCharge() for atom in mol.GetAtoms()]
+
+    out = _metal._canonicalise_delocalised_charge(mol)
+
+    assert [atom.GetFormalCharge() for atom in out.GetAtoms()] == before
+
+
+# --- Class A: a chelate bridgehead with no donor orbital of its own -----------------------------------
+
+_DTP_NI = "C[P]12(C)=[S]->[Ni+2]<-1<-[S-]2"  # dimethyldithiophosphinate kappa2, plus a wrong explicit Ni-P bond
+_BH4_NI = "[H]1[BH2-]2[H]->[Ni+2]<-1<-2"  # kappa2-BH4 bridging two H, plus a wrong explicit Ni-B bond
+_SIH_NI = "C[Si]1(C)(C)[H]->[Ni+2]<-1"  # sigma-silane eta2-Si-H: only the H neighbour of Si is metal-bound
+_PHOSPHINE_NI = "C[PH](C)->[Ni+2]"  # an ordinary phosphine: the lone pair donates straight to the metal
+_CARBOXYLATE_NI = "C[C]1(=O)[O-]->[Ni+2]<-1"  # kappa1 carboxylate with an (uncorrected) M-C contact
+
+
+def _metal_neighbours(mol):
+    metal = next(a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _metal.COORDINATION_METALS)
+    return metal, sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
+
+
+def test_dithiophosphinate_bridgehead_p_loses_its_wrong_ni_bond(caplog):
+    mol = rx.parse_smiles(_DTP_NI, remove_hs=False)
+    metal, _before = _metal_neighbours(mol)
+
+    with caplog.at_level(logging.WARNING, logger="rxembed.metal"):
+        out = _metal._canonical_metal_graph(mol)
+
+    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
+    assert sorted(after) == ["S", "S"]
+    assert "bridgehead" in caplog.text
+    assert "P1-" in caplog.text
+
+
+def test_kappa2_bh4_bridgehead_b_loses_its_wrong_ni_bond(caplog):
+    mol = rx.parse_smiles(_BH4_NI, remove_hs=False)
+    metal, _before = _metal_neighbours(mol)
+
+    with caplog.at_level(logging.WARNING, logger="rxembed.metal"):
+        out = _metal._canonical_metal_graph(mol)
+
+    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
+    assert sorted(after) == ["H", "H"]
+    assert "bridgehead" in caplog.text
+
+
+def test_sigma_silane_keeps_its_one_metal_bound_neighbour():
+    mol = rx.parse_smiles(_SIH_NI, remove_hs=False)
+    metal, before = _metal_neighbours(mol)
+
+    out = _metal._canonical_metal_graph(mol)
+
+    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
+
+
+def test_phosphine_lone_pair_donor_keeps_its_m_p_bond():
+    mol = rx.parse_smiles(_PHOSPHINE_NI, remove_hs=False)
+    metal, before = _metal_neighbours(mol)
+
+    out = _metal._canonical_metal_graph(mol)
+
+    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
+
+
+def test_carboxylate_m_c_contact_is_left_for_the_reader():
+    mol = rx.parse_smiles(_CARBOXYLATE_NI, remove_hs=False)
+    metal, before = _metal_neighbours(mol)
+
+    out = _metal._canonical_metal_graph(mol)
+
+    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
+
+
+# --- Class B: a TRIGONAL bridgehead with no donor orbital of its own ----------------------------------
+
+# A kappa2 carboxylate/dithiocarbamate written with the wrong M-C bond still present, using ring-closure
+# digits the way `_DTP_NI`/`_BH4_NI` do above: one real donor bonds Ni inline, the other two (one real,
+# one the erroneous C) close back to that same Ni.
+_CARBOXYLATE_KAPPA2_NI = "C[C]1(=[O]2)[O-]->[Ni+2]<-1<-2"
+_DITHIOCARBAMATE_KAPPA2_NI = "CN(C)[C]1(=[S]2)[S-]->[Ni+2]<-1<-2"
+
+
+def _chain_bound_to_metal(symbols, bond_orders, charges, metal="Ni", metal_charge=2):
+    """Build a chain of `symbols`, each atom also sigma-bonded to one metal (a misperceived hapticity)."""
+    rw = Chem.RWMol()
+    idx = [rw.AddAtom(Chem.Atom(s)) for s in symbols]
+    for i, order in enumerate(bond_orders):
+        rw.AddBond(idx[i], idx[i + 1], Chem.BondType.DOUBLE if order == 2 else Chem.BondType.SINGLE)
+    for i, charge in zip(idx, charges, strict=True):
+        rw.GetAtomWithIdx(i).SetFormalCharge(charge)
+    m = rw.AddAtom(Chem.Atom(metal))
+    rw.GetAtomWithIdx(m).SetFormalCharge(metal_charge)
+    for i in idx:
+        rw.AddBond(i, m, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    Chem.SanitizeMol(mol)
+    return mol, idx, m
+
+
+def _ring_bound_to_metal(symbols, bond_orders, charges, metal="Ni", metal_charge=2):
+    """As `_chain_bound_to_metal`, but closed into a ring (a misperceived haptic face)."""
+    rw = Chem.RWMol()
+    idx = [rw.AddAtom(Chem.Atom(s)) for s in symbols]
+    n = len(symbols)
+    for i, order in enumerate(bond_orders):
+        rw.AddBond(idx[i], idx[(i + 1) % n], Chem.BondType.DOUBLE if order == 2 else Chem.BondType.SINGLE)
+    for i, charge in zip(idx, charges, strict=True):
+        rw.GetAtomWithIdx(i).SetFormalCharge(charge)
+    m = rw.AddAtom(Chem.Atom(metal))
+    rw.GetAtomWithIdx(m).SetFormalCharge(metal_charge)
+    for i in idx:
+        rw.AddBond(i, m, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    Chem.SanitizeMol(mol)
+    return mol, idx, m
+
+
+def test_kappa2_carboxylate_bridgehead_c_loses_its_wrong_ni_bond(caplog):
+    mol = rx.parse_smiles(_CARBOXYLATE_KAPPA2_NI, remove_hs=False)
+    metal, _before = _metal_neighbours(mol)
+
+    with caplog.at_level(logging.WARNING, logger="rxembed.metal"):
+        out = _metal._canonical_metal_graph(mol)
+
+    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
+    assert sorted(after) == ["O", "O"]
+    assert "bridgehead" in caplog.text
+
+
+def test_kappa2_dithiocarbamate_bridgehead_c_loses_its_wrong_ni_bond(caplog):
+    mol = rx.parse_smiles(_DITHIOCARBAMATE_KAPPA2_NI, remove_hs=False)
+    metal, _before = _metal_neighbours(mol)
+
+    with caplog.at_level(logging.WARNING, logger="rxembed.metal"):
+        out = _metal._canonical_metal_graph(mol)
+
+    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
+    assert sorted(after) == ["S", "S"]
+    assert "bridgehead" in caplog.text
+
+
+def test_allyl_face_keeps_all_three_metal_carbon_bonds():
+    mol, _idx, metal = _chain_bound_to_metal(["C", "C", "C"], [2, 1], [0, 0, -1])
+    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
+
+    out = _metal._canonical_metal_graph(mol)
+
+    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
+
+
+def test_cyclopentadienide_face_keeps_all_five_metal_carbon_bonds():
+    mol, _idx, metal = _ring_bound_to_metal(["C"] * 5, [2, 1, 2, 1, 1], [0, 0, 0, 0, -1])
+    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
+
+    out = _metal._canonical_metal_graph(mol)
+
+    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
+
+
+def test_imidazolyl_face_keeps_its_metal_carbon_bond():
+    # N1, C2, N3, C4, C5: C2 sits between the two ring nitrogens, exactly Class B's flanking-donor
+    # pattern, but N1/C2/N3 share a real (metal-free) ring, so condition 3 keeps the Ni-C2 bond.
+    mol, idx, metal = _ring_bound_to_metal(["N", "C", "N", "C", "C"], [1, 2, 1, 2, 1], [0, 0, 0, 0, 0])
+    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
+
+    out = _metal._canonical_metal_graph(mol)
+
+    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
+    assert idx[1] in [n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()]  # C2 specifically
+
+
+def test_eta2_formaldehyde_carbon_is_unaffected():
+    rw = Chem.RWMol()
+    c, o = rw.AddAtom(Chem.Atom("C")), rw.AddAtom(Chem.Atom("O"))
+    rw.AddBond(c, o, Chem.BondType.DOUBLE)
+    metal = rw.AddAtom(Chem.Atom("Ni"))
+    rw.GetAtomWithIdx(metal).SetFormalCharge(2)
+    rw.AddBond(c, metal, Chem.BondType.DATIVE)
+    rw.AddBond(o, metal, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    Chem.SanitizeMol(mol)
+    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
+
+    out = _metal._canonical_metal_graph(mol)
+
+    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
+
+
+def test_hydride_transfer_like_ru_h_carbon_contact_is_kept():
+    # A carbon bonded to a bridging H (the hydride-transfer contact) and a real O donor, plus the
+    # erroneous Ru-C bond this rule could otherwise prune; the H flanking donor keeps it.
+    rw = Chem.RWMol()
+    c, h, o, me = (rw.AddAtom(Chem.Atom(sym)) for sym in ("C", "H", "O", "C"))
+    rw.AddBond(c, h, Chem.BondType.SINGLE)
+    rw.AddBond(c, o, Chem.BondType.DOUBLE)
+    rw.AddBond(c, me, Chem.BondType.SINGLE)
+    metal = rw.AddAtom(Chem.Atom("Ru"))
+    rw.GetAtomWithIdx(metal).SetFormalCharge(2)
+    rw.AddBond(c, metal, Chem.BondType.DATIVE)
+    rw.AddBond(h, metal, Chem.BondType.DATIVE)
+    rw.AddBond(o, metal, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    Chem.SanitizeMol(mol, catchErrors=True)
+    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
+
+    out = _metal._canonical_metal_graph(mol)
+
+    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
 
 
 def _classify(dirs, r):
@@ -82,6 +411,13 @@ def test_all_records_round_trip(name):
     assert got == name, f"{describe(name)} re-perceives as {got}"
 
 
+def test_unbound_metal_has_no_coordination_geometry():
+    mol = Chem.MolFromSmiles("[Hg]")
+    mol.AddConformer(Chem.Conformer(1))
+
+    assert classify_geometry(mol, 0, []) is None
+
+
 def test_short_bonded_pyramid_is_not_flatness_excluded():
     dirs = POLYHEDRA["trigonal_pyramidal"].vertex_dirs
     assert _metal._ideal_plane_rms(POLYHEDRA["trigonal_pyramidal"], 1.4) < _metal.COPLANAR_TOL, "fixture premise"
@@ -110,6 +446,12 @@ def test_bailar_twist_endpoints(twist, expected, caplog):
     assert not [r for r in caplog.records if "no shape fits" in r.message], caplog.text
 
 
+def test_hexagonal_plane_is_not_forced_into_a_three_dimensional_cn6_shape():
+    directions = [(np.cos(angle), np.sin(angle), 0.0) for angle in np.arange(6) * np.pi / 3]
+
+    assert _classify(directions, 2.1) == "hexagonal_planar"
+
+
 def test_poor_shape_returns_record_and_warns(caplog):
     squashed = np.array([(np.cos(t) * 0.5, np.sin(t) * 0.5, 0.87) for t in np.radians([0, 60, 120, 180, 240, 300])])
     with caplog.at_level(logging.WARNING, logger="rxembed"):
@@ -118,9 +460,84 @@ def test_poor_shape_returns_record_and_warns(caplog):
     assert [r for r in caplog.records if "no shape fits" in r.message], caplog.text
 
 
+def test_poor_shape_can_be_checked_silently(caplog):
+    squashed = np.array([(np.cos(t) * 0.5, np.sin(t) * 0.5, 0.87) for t in np.radians([0, 60, 120, 180, 240, 300])])
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        classify_geometry(_ideal_sphere(squashed, 2.1), 0, list(range(1, 7)), warn=False)
+    assert not [r for r in caplog.records if "no shape fits" in r.message], caplog.text
+
+
 def test_cn_defaults_are_the_common_shapes():
     assert geometry_for(3) == "trigonal_planar"
+    assert geometry_for(3, has_apical=True) == "trigonal_planar"
     assert geometry_for(4) == "square_planar"
+    assert geometry_for(4, has_apical=True) == "tetrahedral"
+    assert geometry_for(5, has_apical=True) == "trigonal_bipyramidal"
+
+
+def _sigma_pair_on_pi_face():
+    rw = Chem.RWMol()
+    face = [rw.AddAtom(Chem.Atom(6)) for _ in range(2)]
+    sigma = [rw.AddAtom(Chem.Atom(8)) for _ in range(2)]
+    rw.AddBond(face[0], face[1], Chem.BondType.DOUBLE)
+    for carbon, oxygen in zip(face, sigma, strict=True):
+        rw.AddBond(carbon, oxygen, Chem.BondType.SINGLE)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    return mol, [*face, *sigma]
+
+
+def _diatomic_codonors(bond_type):
+    """Build two same-element atoms joined by `bond_type`, no implicit Hs."""
+    rw = Chem.RWMol()
+    atoms = [Chem.Atom(16) for _ in range(2)]
+    for atom in atoms:
+        atom.SetNoImplicit(True)
+    pair = [rw.AddAtom(atom) for atom in atoms]
+    rw.AddBond(pair[0], pair[1], bond_type)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    return mol, pair
+
+
+def _ring_donors(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    return mol, list(mol.GetRingInfo().AtomRings()[0])
+
+
+@pytest.mark.parametrize(
+    ("build", "check"),
+    [
+        (_sigma_pair_on_pi_face, lambda s, d: s == [tuple(d[:2]), (d[2],), (d[3],)]),
+        (lambda: _diatomic_codonors(Chem.BondType.SINGLE), lambda s, d: s == [tuple(d)]),
+        (lambda: _diatomic_codonors(Chem.BondType.DOUBLE), lambda s, d: s == [tuple(d)]),
+        (lambda: _diatomic_codonors(Chem.BondType.TRIPLE), lambda s, d: s == [tuple(d)]),
+        (lambda: (Chem.MolFromSmiles("NN"), [0, 1]), lambda s, d: s == [(0,), (1,)]),
+        (lambda: _ring_donors("[CH-]1C=CC=C1"), lambda s, d: s == [tuple(sorted(d))]),
+        (lambda: _ring_donors("C=C1C=CC=C1"), lambda s, d: s == [tuple(sorted(d))]),
+        (lambda: _ring_donors("C1=CCCC1"), lambda s, d: sorted(map(len, s)) == [1, 1, 1, 2]),
+        (lambda: (Chem.MolFromSmiles("C[S](=O)(=[CH2])[CH2-]"), [1, 3, 4]), lambda s, d: s == [(1,), (3,), (4,)]),
+        (lambda: (Chem.MolFromSmiles("[CH2-][S+]=[CH2]"), [0, 1, 2]), lambda s, d: s == [(0, 1, 2)]),
+    ],
+    ids=[
+        "sigma-donors-not-merged-into-pi-face",
+        "diatomic-codonors-single-bond",
+        "diatomic-codonors-double-bond",
+        "diatomic-codonors-triple-bond",
+        "implicit-h-sigma-pair-stays-two-sites",
+        "kekule-cyclopentadienyl-one-face",
+        "fulvene-like-sp2-ring-one-face",
+        "cyclopentene-does-not-promote-sp3-into-a-face",
+        "hypervalent-sp3-multiple-bond-not-a-pi-face",
+        "sp2-thiaallyl-one-pi-face",
+    ],
+)
+def test_haptic_sites_group_donors_into_pi_faces_and_isolated_sigma_sites(build, check):
+    mol, donors = build()
+
+    sites = _metal._haptic_sites(mol, donors)
+
+    assert check(sites, donors)
 
 
 # --- which atoms are metal centres: one predicate behind every gate ---------------------------------------
@@ -226,7 +643,8 @@ def test_public_embed_restores_oxidation_state(route):
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_isomer_restore_restores_all_metal_states():
-    iso = rx.metal(_MN_H2, "octahedral", center="Mn", fix=_MN_H2_RC)[0]
+    source = read_xyz(_MN_H2, metal_charges={0: 2, 1: 1})
+    iso = rx.metal(source, "octahedral", center="Mn", fix=_MN_H2_RC)[0]
     assert iso.mol.GetAtomWithIdx(iso.metal).GetAtomicNum() == _metal.SURROGATE  # still the neutral carbon
     assert iso.mol.GetAtomWithIdx(iso.metal).GetFormalCharge() == 0
     iso.restore()
@@ -256,6 +674,22 @@ def test_connect_disconnect_metal_are_inverses():
     assert connected.GetSubstructMatches(Chem.MolFromSmarts("[R]"))  # a ring-aware query must not raise
 
     assert len(Chem.GetMolFrags(_metal.disconnect_metal(connected))) > 1, "disconnect is not connect's inverse"
+
+
+def test_metal_bond_edits_invalidate_cached_paths():
+    mol = Chem.MolFromSmiles("[Cu+].NCCO")
+    mol.SetProp("source", "retained")
+    before = Chem.GetDistanceMatrix(mol).copy()
+    connected = _metal.connect_metal(mol, [(1, 0)])
+
+    assert connected.GetProp("source") == "retained"
+    assert np.array_equal(Chem.GetDistanceMatrix(mol), before), "connecting must not mutate the input"
+    distances = Chem.GetDistanceMatrix(connected)
+    assert distances[0, 1] == 1
+    assert distances[0, 4] == 4
+    assert np.array_equal(distances, Chem.GetDistanceMatrix(connected, force=True))
+    disconnected = _metal.disconnect_metal(connected)
+    assert np.array_equal(Chem.GetDistanceMatrix(disconnected), before)
 
 
 def test_core_embed_returns_connected_copy():
@@ -288,7 +722,7 @@ def _chirality_volume(mol, cid, centre):
 
 
 def test_metal_bound_carbanion_embeds_both_hands():
-    en = rx.metal(_CARBANION_NI, "square_planar")
+    en = rx.metal(_CARBANION_NI, "square_planar").filter(label="cis")
     assert {i.stereo_label for i in en} == {"C23:R", "C23:S"}  # metal-priority CIP labels
     hands = []
     for iso in en:
@@ -362,7 +796,7 @@ def test_chiral_phosphorus_hand_roundtrips(case, tag):
     donor = _phosphorus(mol)
     order = [b.GetOtherAtomIdx(donor) for b in mol.GetAtomWithIdx(donor).GetBonds()]  # the INPUT's own basis
     declared = mol.GetAtomWithIdx(donor).GetChiralTag()
-    confs = rx.embed(rx.enumerate_isomers(mol, stereo="free")[0], n=2, seed=0xF00D).minimize()
+    confs = rx.embed(rx.enumerate_isomers(mol)[0], n=2, seed=0xF00D).minimize()
     assert len(confs)
     for cid in confs.ids:
         assert _hand(confs.mol, donor, order, int(cid)) == declared, f"{case}/{tag}: came back as the mirror"
@@ -399,8 +833,69 @@ def test_multimetal_surrogate_preserves_hand():
     assert every.GetAtomWithIdx(donor).GetChiralTag() == one.GetAtomWithIdx(donor).GetChiralTag()
 
 
+def test_single_and_all_surrogates_preserve_the_same_donor_hydrogens():
+    mol = Chem.MolFromSmiles(_EN_PDBRCL)
+    one, _m, donors, _z, _q = _metal.surrogate_metal(mol)
+    every, _metals = _metal.surrogate_all_metals(mol)
+
+    assert [one.GetAtomWithIdx(d).GetTotalNumHs() for d in donors] == [
+        every.GetAtomWithIdx(d).GetTotalNumHs() for d in donors
+    ]
+
+
+def test_multimetal_surrogate_repairs_stereo_orphaned_by_the_strip():
+    mol = rx.parse_smiles("CC(O)=[S]->[Zn]")
+    bond = mol.GetBondBetweenAtoms(1, 3)
+    bond.SetStereoAtoms(0, 4)  # Zn is the sulfur-side E/Z reference before the coordination bond is stripped
+    bond.SetStereo(Chem.BondStereo.STEREOZ)
+
+    stripped, _metals = _metal.surrogate_all_metals(mol)
+
+    assert not _orphaned(stripped)
+
+
+def test_surrogate_preserves_a_perceived_quinoid_aromatic_form():
+    mol = rx.parse_smiles("[S]=C1C=CC=CC1=[P+]->[Ni]<-[S-]")
+    ring = set(range(1, 7))
+    for index in ring:
+        mol.GetAtomWithIdx(index).SetIsAromatic(True)
+    for bond in mol.GetBonds():
+        if {bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()} <= ring:
+            bond.SetBondType(Chem.BondType.AROMATIC)
+            bond.SetIsAromatic(True)
+
+    surrogate, *_rest = _metal.surrogate_metal(mol)
+
+    before = [(bond.GetBondType(), bond.GetIsAromatic()) for bond in mol.GetBonds() if bond.GetBeginAtomIdx() in ring]
+    after = [
+        (bond.GetBondType(), bond.GetIsAromatic()) for bond in surrogate.GetBonds() if bond.GetBeginAtomIdx() in ring
+    ]
+    assert after == before
+
+
+def test_surrogate_does_not_invent_a_radical_on_aromatic_sulfur():
+    mol = rx.parse_smiles("c1sccc1.N->[Ni]")
+    sulfur = next(atom for atom in mol.GetAtoms() if atom.GetSymbol() == "S")
+    sulfur.SetNoImplicit(True)
+
+    surrogate, *_rest = _metal.surrogate_metal(mol)
+
+    assert surrogate.GetAtomWithIdx(sulfur.GetIdx()).GetNumRadicalElectrons() == 0
+
+
+def test_surrogate_clears_a_forged_aromatic_donor_point_tag():
+    mol = Chem.MolFromSmiles("Cc1cc[cH-](c1)->[Ru+]")
+    donor = next(atom for atom in mol.GetAtoms() if atom.GetIsAromatic() and atom.GetDegree() == 3)
+    donor.SetHybridization(Chem.HybridizationType.SP3)
+    donor.SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW)
+
+    stripped, *_ = _metal.surrogate_metal(mol)
+
+    assert stripped.GetAtomWithIdx(donor.GetIdx()).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+
+
 def test_metal_referenced_donor_path_is_not_double_corrected():
-    for iso in rx.metal(_CARBANION_NI, "square_planar"):
+    for iso in rx.metal(_CARBANION_NI, "square_planar").filter(label="cis"):
         order = [b.GetOtherAtomIdx(_CARBANION_C) for b in iso.mol.GetAtomWithIdx(_CARBANION_C).GetBonds()]
         assert len(order) == _metal._MIN_STEREO_NEIGHBOURS, "the donor is not the stripped degree-3 case"
         tag = iso.mol.GetAtomWithIdx(_CARBANION_C).GetChiralTag()
@@ -412,7 +907,7 @@ def test_metal_referenced_donor_path_is_not_double_corrected():
 
 def test_donor_charge_is_unchanged_by_embedding():
     # The temporary dative bond must not change the charge sent to a downstream calculator.
-    for iso in rx.metal(_CARBANION_NI, "square_planar"):
+    for iso in rx.metal(_CARBANION_NI, "square_planar").filter(label="cis"):
         assert rx.embed(iso, n=1).mol.GetAtomWithIdx(_CARBANION_C).GetFormalCharge() == -1
 
 
@@ -454,7 +949,68 @@ def test_pipeline_tracks_a_tagged_amine_from_the_direct_constructor():
     assert set(ensemble._donor_hand) == {4}
 
 
-def test_geometry_label_restores_an_unspecified_amine_tag():
+def test_pipeline_tracks_a_tagged_phosphorus_donor():
+    iso = rx.metal("F[P@](Cl)(Br)->[Pd](Cl)(Cl)Cl", "square_planar")[0]
+    donor = next(atom.GetIdx() for atom in iso.mol.GetAtoms() if atom.GetSymbol() == "P")
+
+    ensemble = rx.embed(iso, n=1, seed=2)
+    realised = stereo.stereo_from_3d(ensemble.mol, exclude=_metal.metal_indices(ensemble.mol))
+
+    assert set(ensemble._donor_hand) == {donor}
+    assert stereo.point_stereo(realised) == stereo.point_stereo(iso.stereo_label)
+
+
+@pytest.mark.parametrize("linker", ["[N@H](C)CC[N@@H]->2C", "[P@](C)(CC)CC[P@@](C)(CC)->2"])
+def test_haptic_helpers_preserve_the_transient_donor_stereo_ring(linker, monkeypatch, tmp_path):
+    isomers = rx.metal(f"[Pt+2]12(<-[Cl-])(<-[CH2]=[CH2]->1)<-{linker}", "SPL")
+    captured = []
+    original = _metal.materialise_phantoms
+
+    def observe(mol, haptic):
+        out = original(mol, haptic)
+        bonds = [
+            (b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in mol.GetBonds() if b.GetBondType() == Chem.BondType.DATIVE
+        ]
+        if haptic and bonds:
+            assert len(bonds) == 2
+            assert any({a for pair in bonds for a in pair} <= set(ring) for ring in out.GetRingInfo().AtomRings())
+            oracle = Chem.Mol(mol)
+            oracle.ClearComputedProps()
+            oracle.UpdatePropertyCache(strict=False)
+            Chem.GetSymmSSSR(oracle, includeDativeBonds=True)
+            builder = Chem.RWMol(mol)
+            for index in sorted(haptic):
+                assert builder.AddAtom(Chem.Atom(6)) == index
+            removed = _metal.strip_phantoms(builder.GetMol(), set(haptic))
+            with rdBase.BlockLogs():
+                expected = rdDistGeom.GetMoleculeBoundsMatrix(oracle, doTriangleSmoothing=False)
+                for candidate in (out, removed):
+                    actual = rdDistGeom.GetMoleculeBoundsMatrix(candidate, doTriangleSmoothing=False)
+                    np.testing.assert_allclose(actual[: len(expected), : len(expected)], expected, atol=1e-12, rtol=0)
+            captured.append(bonds)
+        return out
+
+    monkeypatch.setattr(_metal, "materialise_phantoms", observe)
+    assert isomers
+    for iso in isomers:
+        assert len(iso.haptic) == 1
+        assert len(next(iter(iso.haptic.values()))) == 2
+        assert len(emb._stereo_donor_bonds(iso.mol, iso)) == 2
+        ensemble = rx.embed(iso, n=1, seed=2, threads=1)
+        assert not ensemble.unrelaxed
+        assert ensemble.check()[ensemble.ids[0]].ok()
+        realised = stereo.stereo_from_3d(ensemble.mol, exclude=_metal.metal_indices(ensemble.mol))
+        assert stereo.point_stereo(realised) == stereo.point_stereo(iso.stereo_label)
+        assert rx.cxsmiles(ensemble.mol) == rx.cxsmiles(iso)
+        if find_spec("xyzgraph") is not None:
+            path = tmp_path / "donor-stereo.xyz"
+            Chem.MolToXYZFile(ensemble.mol, str(path))
+            fresh = rx.read_xyz(str(path), charge=Chem.GetFormalCharge(ensemble.mol), bond_orders="xyz2mol")
+            assert rx.cxsmiles(fresh) == rx.cxsmiles(iso)
+    assert captured
+
+
+def test_geometry_does_not_make_an_unspecified_monodentate_amine_chiral():
     from rxembed.metal_isomer import from_geometry
 
     mol = Chem.AddHs(rx.parse_smiles("[Pd+2](<-[Cl-])(<-[Cl-])(<-[Cl-])<-[N@H](C)O"))
@@ -464,18 +1020,18 @@ def test_geometry_label_restores_an_unspecified_amine_tag():
     mol.GetAtomWithIdx(donor).SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
 
     iso = from_geometry(mol)
-    assert iso.stereo_label == "N4:R"
+    assert iso.stereo_label == ""
     assert iso.mol.GetAtomWithIdx(donor).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
 
     embedded = core.embed(iso, n=2, seed=2, prune_rms=-1).minimize()
     metals = set(_metal.metal_indices(embedded.mol))
 
     assert embedded.unrelaxed == []
-    assert embedded.mol.GetAtomWithIdx(donor).GetChiralTag() in _TETRAHEDRAL
-    assert stereo.defined_stereo_label(embedded.mol, metals) == iso.stereo_label
-    assert {stereo.stereo_from_3d(Chem.Mol(embedded.mol, False, int(cid)), exclude=metals) for cid in embedded.ids} == {
-        iso.stereo_label
-    }
+    assert embedded.mol.GetAtomWithIdx(donor).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+    assert all(
+        not stereo.point_stereo(stereo.stereo_from_3d(Chem.Mol(embedded.mol, False, int(cid)), exclude=metals))
+        for cid in embedded.ids
+    )
 
 
 @pytest.mark.parametrize("tag", ["@", "@@"])
@@ -548,7 +1104,8 @@ def _orphaned(mol):
 def test_prepared_mol_has_no_orphaned_stereo_flags():
     violations = []
     for path in _CORPUS:
-        mol = read_xyz(path, 0)
+        charges = {0: 2, 1: 1} if path.endswith("/mn-h2.xyz") else None
+        mol = read_xyz(path, 0, metal_charges=charges, bond_orders="xyz2mol")
         if not _metal.metal_indices(mol):
             continue
         prepared, *_ = _metal.surrogate_metal(mol)
@@ -575,7 +1132,7 @@ def test_surrogate_accepts_all_readable_metals():
 
 
 def test_ligands_reports_denticity_per_metal():
-    mol = read_xyz(_MN_H2)
+    mol = read_xyz(_MN_H2, metal_charges={0: 2, 1: 1})
     ligs = _metal.ligands(mol)
     assert ligs, "the fixture must have ligands"
 

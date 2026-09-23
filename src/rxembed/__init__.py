@@ -1,9 +1,10 @@
-"""Constrained conformer embedding and workflow tools."""
+"""rxembed: Constrained conformer embedding for reactive chemistry."""
 
 from . import core
 from .core import (
     Conformers,
     Constraints,
+    EmbeddingError,
     Isomer,
     IsomerSet,
     Ligand,
@@ -41,6 +42,7 @@ __all__ = [
     "Conformers",
     "Constraints",
     "Contact",
+    "EmbeddingError",
     "Ensemble",
     "EnsembleSet",
     "Isomer",

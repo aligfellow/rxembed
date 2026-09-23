@@ -7,6 +7,7 @@ import itertools
 from collections import Counter
 
 import numpy as np
+import pytest
 from rdkit import Chem, rdBase
 from rdkit.Chem import rdDistGeom
 
@@ -31,6 +32,166 @@ def test_donor_classes_ignore_resonance_form():
     canonical = metal.donor_classes(mol, every)
     assert canonical[oxygens[0]] == canonical[oxygens[1]]
     assert all(perceived[a] != perceived[b] or canonical[a] == canonical[b] for a in every for b in every)
+
+
+@pytest.mark.parametrize(
+    ("smiles", "donors", "equal_pairs", "unequal_pairs"),
+    [
+        (r"F/C=N/C.F/C=N\C", [2, 6], [], [(2, 6)]),
+        ("CS(C)=O.C[S+](C)[O-]", [1, 5], [], [(1, 5)]),
+        ("[NH-]C(=[NH2+])N", [0, 2, 3], [(2, 3)], [(0, 2)]),
+    ],
+    ids=["flat-symmetry-ligand-stereo", "unrelated-sulfur-forms", "charge-separated-resonance"],
+)
+def test_donor_classes_distinguish_or_merge_by_resonance_and_stereo(smiles, donors, equal_pairs, unequal_pairs):
+    mol = Chem.MolFromSmiles(smiles)
+    classes = metal.donor_classes(mol, donors)
+
+    for a, b in equal_pairs:
+        assert classes[a] == classes[b]
+    for a, b in unequal_pairs:
+        assert classes[a] != classes[b]
+
+
+def test_site_identity_restores_carriers_before_removing_donor_hydrogens():
+    from rxembed.metal_core import surrogate_all_metals
+
+    donors = [1, 6]
+    for tag, equivalent in (("@", True), ("@@", False)):
+        mol = Chem.AddHs(rx.parse_smiles(f"C[N@](CC)([H])->[Cu+]<-[N{tag}](C)([H])CC", remove_hs=False))
+        full = metal.donor_classes(mol, donors)
+        assert (full[1] == full[6]) is equivalent
+        base, identities = surrogate_all_metals(mol)
+        before = base.ToBinary()
+        roles = [(donor, *identities[0]) for donor in donors]
+
+        classes = metal.site_classes(base, donors, coordination=roles)
+
+        assert (classes[1] == classes[6]) is equivalent
+        assert base.ToBinary() == before
+
+
+def test_site_classes_preserve_inequivalent_stereo_roots_and_reuse_the_proof(monkeypatch):
+    from rxembed import utils
+
+    monkeypatch.setattr(utils, "_RESONANCE_CACHE", {})
+    mol = Chem.MolFromSmiles("N[C@H](F)[C@H](F)[C@@H](F)[C@H](F)N")
+    roots = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() == 7]
+    classes = metal.site_classes(mol, roots)
+    assert classes[roots[0]] != classes[roots[1]]
+
+    def repeated(*args, **kwargs):
+        raise AssertionError("re-enumerated an unchanged resonance proof")
+
+    monkeypatch.setattr(Chem, "ResonanceMolSupplier", repeated)
+    reordered = Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))
+    new_roots = [atom.GetIdx() for atom in reordered.GetAtoms() if atom.GetAtomicNum() == 7]
+    repeated_classes = metal.site_classes(reordered, new_roots)
+    assert repeated_classes[new_roots[0]] != repeated_classes[new_roots[1]]
+
+
+def test_site_classes_use_the_same_rooted_resonance_proof():
+    mol = Chem.MolFromSmiles(_ACAC)
+    oxygens = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() == 8]
+    classes = metal.site_classes(mol, [100, 101], {100: (oxygens[0],), 101: (oxygens[1],)})
+
+    assert classes[100] == classes[101]
+
+
+def test_large_resonance_identity_has_a_bounded_proof(monkeypatch):
+    mol = Chem.MolFromSmiles("C" * 41)
+    seen = []
+
+    def bounded(*args, **kwargs):
+        seen.append(kwargs["max_forms"])
+        return False, True
+
+    monkeypatch.setattr(metal, "resonance_match", bounded)
+    assert metal._root_resonance_match(mol, 0, 1) == (False, True)
+
+    assert seen == [8]
+
+
+def test_large_site_identity_does_not_run_full_molecule_resonance(monkeypatch):
+    mol = Chem.MolFromSmiles("C" * 40 + "C(=O)[O-]")
+    oxygens = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() == 8]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("large site identity must not enumerate whole-molecule resonance forms")
+
+    monkeypatch.setattr(metal, "_root_resonance_match", forbidden)
+    classes = metal._root_classes(mol, oxygens)
+
+    assert len(classes) == 2
+    assert classes[oxygens[0]] != classes[oxygens[1]]
+
+
+def test_site_markers_do_not_suppress_dithiocarbamate_resonance():
+    mol = Chem.MolFromSmiles("CN(C)C(=S)[S-]")
+    sulfurs = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() == 16]
+    donors = metal.donor_classes(mol, sulfurs)
+    sites = metal.site_classes(mol, sulfurs)
+
+    assert donors[sulfurs[0]] == donors[sulfurs[1]]
+    assert sites[sulfurs[0]] == sites[sulfurs[1]]
+
+
+def test_face_winding_abstains_at_the_plane_and_is_scale_invariant():
+    face_mol = Chem.MolFromSmiles("[c-]1(F)c(Br)ccc1")
+    rw = Chem.RWMol(Chem.CombineMols(face_mol, Chem.MolFromSmiles("[Fe+2]")))
+    metal_idx = rw.GetNumAtoms() - 1
+    face = [atom.GetIdx() for atom in rw.GetAtoms() if atom.GetIsAromatic()]
+    for atom in face:
+        rw.AddBond(atom, metal_idx, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    Chem.FastFindRings(mol)
+    pos = np.zeros((mol.GetNumAtoms(), 3))
+    theta = 2 * np.pi * np.arange(len(face)) / len(face)
+    pos[face, 0], pos[face, 1] = np.cos(theta), np.sin(theta)
+    pos[metal_idx] = (2.0, 0.0, 0.0)
+
+    assert metal.face_winding(mol, pos, metal_idx, face, metal.donor_classes(mol, face)) == ""
+
+    eta2 = Chem.AddHs(rx.parse_smiles(r"C/[CH]1=[CH](/F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1"))
+    metal_idx, face = 4, (1, 2)
+    donors = [
+        bond.GetBeginAtomIdx()
+        for bond in eta2.GetBonds()
+        if bond.GetBondType() == Chem.BondType.DATIVE and bond.GetEndAtomIdx() == metal_idx
+    ]
+    pos = np.zeros((eta2.GetNumAtoms(), 3))
+    for atom, point in {
+        0: (-1.2, 0.7, 0.0),
+        1: (-0.5, 0.0, 0.0),
+        2: (0.5, 0.0, 0.0),
+        3: (1.2, 0.7, 0.0),
+        4: (0.0, -1.0, 1e-6),
+        11: (-1.2, -0.7, 0.0),
+        12: (1.2, -0.7, 0.0),
+    }.items():
+        pos[atom] = point
+    ranks = metal.donor_classes(eta2, donors)
+    cip = list(Chem.ComputeAtomCIPRanks(eta2))
+
+    assert {metal.face_winding(eta2, pos * scale, metal_idx, face, ranks, cip) for scale in (1e-3, 1.0, 1e3)} == {"-"}
+
+
+def test_routine_hydrogen_is_removed_when_its_bond_defines_imine_stereo():
+    mol = Chem.MolFromSmiles("[H]/N=C(/C)F")
+
+    reduced, mapping = metal.remove_routine_hydrogens(mol)
+
+    assert Chem.MolToSmiles(reduced) == "CC(=N)F"
+    assert mapping == {1: 0, 2: 1, 3: 2, 4: 3}
+
+
+def test_equivalent_site_assignments_preserve_links_and_vacancy():
+    links = {frozenset((0, 1)): 2}
+    assignments = list(metal.equivalent_site_assignments(["N", "N", "N", None], links))
+
+    assert assignments == [{0: 0, 1: 1, 2: 2}, {0: 1, 1: 0, 2: 2}]
+    assert all(3 not in assignment and 3 not in assignment.values() for assignment in assignments)
 
 
 def _native_embed(smiles, n=_MATRIX_CONFS):

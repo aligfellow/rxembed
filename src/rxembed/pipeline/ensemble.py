@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 from rdkit import Chem
@@ -11,11 +11,17 @@ from rdkit.Chem import rdMolAlign
 
 import rxembed.metal_core as _metal
 import rxembed.metal_polyhedron as _poly
-from rxembed.constraints import _graft_owns, constraint_value, match, resolve_atom, within_window
+from rxembed.constraints import (
+    _graft_owns,
+    constraint_value,
+    match,
+    resolve_atom,
+    within_window,
+)
 from rxembed.embed import BASE_STIFFNESS as _BASE_STIFFNESS
-from rxembed.embed import Conformers
+from rxembed.embed import Conformers, Failure
 from rxembed.relax import MAX_ITERS as _MAX_ITERS
-from rxembed.relax import _error_summary, ff_energies, restrained_uff
+from rxembed.relax import ff_energies, restrained_uff
 from rxembed.stereo import matches_stereo
 
 from . import geom_check as _geometry
@@ -203,7 +209,8 @@ class Ensemble(Conformers):
     tag: dict = field(default_factory=dict)  # what distinguishes this candidate in an EnsembleSet
     _stereo: tuple | None = None  # (spec, reference signature) for the minimize() chirality filter
     _donor_hand: dict = field(default_factory=dict)  # labile donor -> signed-volume hand
-    energy_kind: str = ""  # "" | "ff" (surrogate, not cross-species) | "real" (xtb); best() ranks only "real"
+    # "" | "ff" | "uff-surrogate" (approximate) | "real" (xtb); best() ranks only "real"
+    energy_kind: str = ""
     reacted: dict = field(default_factory=dict)  # {conf id: (formed, broken)} where a stage changed the graph
     sphere: dict = field(default_factory=dict)  # metal -> donors, durable across restored connected graphs
 
@@ -222,16 +229,14 @@ class Ensemble(Conformers):
         """Openconf Monte-Carlo torsional search, in place.
 
         `preset` sets the effort ('rapid'|'ensemble'|'spectroscopic'|'docking'|'analogue'|'macrocycle'|
-        'transition_metal'), though every preset also auto-adds a metal move budget. `seed`, `max_out`,
-        `low_mode` (off under constraints) and `config` override single knobs; any other keyword is passed
-        through as a ``ConformerConfig`` field, and kwargs win over `config=`.
+        'transition_metal'); every preset also adds a metal move budget. `seed`, `max_out`, `low_mode` and
+        `config` override single knobs, and any other keyword passes through as a ``ConformerConfig`` field.
 
-        Unconstrained, openconf replaces the ETKDG seeds. Constrained or multi-fragment, it searches around the
-        pose-frozen seeds and its output is added instead; `replace=` overrides.
-
-        `explore=True` on a seeded NCI complex fires a second search with the contacts released and the
-        structural holds kept, pools both, and swaps cons to the relaxed set so a later stage cannot yank the
-        contacts back; energy then decides. On the metal path only substrate contacts release.
+        Unconstrained, openconf replaces the ETKDG seeds; constrained or multi-fragment, it searches around
+        the pose-frozen seeds and adds its output instead (`replace=` overrides). `explore=True` on a seeded
+        NCI complex adds a second pass with the contacts released and the structural holds kept, pools both,
+        and swaps `cons` to the relaxed set so a later stage cannot re-tighten the contacts; only substrate
+        contacts release on the metal path.
         """
         if not _mc.available():
             raise ImportError("mc needs openconf; pip install 'rxembed[search]'")
@@ -247,6 +252,8 @@ class Ensemble(Conformers):
         # Invalidate before either can happen so stale energies never describe a changed conformer.
         self.energies = {}
         self.unrelaxed = []
+        self.uff_surrogates = {}
+        self.uff_retyped_bonds = set()
         self.reacted = {}
         self.trajectory = None
         self.energy_kind = ""
@@ -345,39 +352,60 @@ class Ensemble(Conformers):
                 m = lo + frac * (hi - lo)
                 tgt.dihedrals[k] = (max(lo, m - 2.0), min(hi, m + 2.0))
             try:  # settling is best-effort pre-conditioning; an RDKit BFGS divergence must not sink mc()
-                restrained_uff(self._mol, tgt, stiffness=_BASE_STIFFNESS, conf_ids=[int(i) for i in group])
+                restrained_uff(
+                    self._mol,
+                    tgt,
+                    stiffness=_BASE_STIFFNESS,
+                    conf_ids=[int(i) for i in group],
+                    _surrogates=self.uff_surrogates,
+                    _retyped=self.uff_retyped_bonds,
+                )
             except RuntimeError:  # keep the raw ETKDG seeds for this group (openconf still searches around them)
                 logger.debug("mc: seed-settle relax diverged on a group; keeping the raw seeds")
 
     def _workflow_failure(self, owner, cid):
         """Return the first pipeline-only publication failure for one conformer."""
-        mol = owner.mol
+        mol = owner._restored_mol(cid)
         try:
             changed = self._scan_connectivity(mol, [cid])
         except ImportError:  # connectivity re-perception is a workflow-extra gate; core bonding still runs
             changed = {}
         if changed:
-            return "changed connectivity"
+            return Failure("connectivity", "changed connectivity")
         if self._stereo:
             spec, ref = self._stereo
-            if not _stereo.satisfies_spec(_stereo.signature(mol, cid), ref, spec):
-                return "wrong requested stereo"
+            if detail := _stereo.mismatch(_stereo.signature(mol, cid), ref, spec):
+                return Failure("requested_stereo", f"wrong requested stereo ({detail})")
         for donor, hand in self._donor_hand.items():
             references = [metal for d, metal in owner.iso.donor_bonds if d == donor] if owner.iso is not None else []
             if hand is not None and _metal.donor_chirality_sign(owner._mol, cid, donor, references) != hand:
-                return f"wrong donor-{donor} hand"
+                return Failure("donor_hand", f"wrong donor-{donor} hand")
+        # ponytail: ground-state QA cannot yet distinguish reaction/contact authority per violation.
+        # Keep explicitly constrained and retained rigid geometries diagnostic until it can.
+        cons = owner.cons
+        stated_geometry = cons.fixed or cons.frozen or cons.shapes or cons.planes or any(cons.contacts)
+        if owner.iso is not None and not stated_geometry:
+            report = _geometry.check(mol, cid, donors=self._declared_donors())
+            violations = report.violations
+            if not cons.donor_orientation:
+                violations = [v for v in violations if v.kind != "donor_orientation"]
+            if not cons.conjugation:
+                violations = [v for v in violations if v.kind != "conjugation"]
+            if violations:
+                return Failure("physical_geometry", f"physical geometry: {violations[0]}")
         return None
 
     def _required_failure(self, failures):
         """Extend the core count contract with failed pipeline-only identity requests."""
-        required = [super()._required_failure(failures)]
-        if "wrong requested stereo" in failures:
+        required = list(super()._required_failure(failures))
+        kinds = {failure.kind for failure in failures if isinstance(failure, Failure)}
+        if "requested_stereo" in kinds:
             required.append("requested stereo")
-        if any(reason.startswith("wrong donor-") for reason in failures):
+        if "donor_hand" in kinds:
             required.append("requested donor hand")
-        return " and ".join(filter(None, required))
+        return tuple(required)
 
-    def _relax_into_windows(self, trajectory=False):
+    def _relax_into_windows(self, trajectory=False, max_iters=_MAX_ITERS):
         """Relax constrained seeds into their windows without finalizing the result.
 
         The metal context remains live for later acceptance and retry gates. Embed publishes geometry, not an
@@ -391,14 +419,20 @@ class Ensemble(Conformers):
         before = list(self.ids)
         template = Chem.Mol(self._mol) if self.iso is not None else None
         frames = [] if trajectory else None
-        e = self._relax_constrained(_BASE_STIFFNESS, operation="embed", _frames=frames)
+        e = self._relax_constrained(
+            _BASE_STIFFNESS,
+            max_iters=max_iters,
+            operation="embed",
+            _frames=frames,
+        )
         self._accept_relaxed(
             _BASE_STIFFNESS,
-            _MAX_ITERS,
+            max_iters,
             operation="embed",
             validator=self._workflow_failure,
             template=template,
             seed=self.seed,
+            allow_replacement=e is not None,
         )
         self.discarded += [cid for cid in before if cid not in set(self.ids)]
         self._store_trajectory(frames)
@@ -424,26 +458,25 @@ class Ensemble(Conformers):
         before = list(self.ids)
         template = Chem.Mol(self._mol) if iso is not None else None
         if self.cons.is_constrained and self._stage == _RELAXED:
-            try:
-                e = restrained_uff(self._mol, self.cons, stiffness=stiffness, max_iters=0)
-            except RuntimeError as err:
-                e = None
-                logger.warning(
-                    "minimize: UFF could not score the embedded geometry (%s)",
-                    _error_summary(err),
-                )
-            if e is not None:
-                self.energies = {c.GetId(): float(e[k]) for k, c in enumerate(self._mol.GetConformers())}
+            e = restrained_uff(
+                self._mol,
+                self.cons,
+                stiffness=stiffness,
+                max_iters=0,
+                _surrogates=self.uff_surrogates,
+                _retyped=self.uff_retyped_bonds,
+            )
+            self.energies = {c.GetId(): float(e[k]) for k, c in enumerate(self._mol.GetConformers())}
         else:
             self.trajectory = None
-            self._relax_once(stiffness, max_iters)
-        self.energy_kind = "ff" if self.energies else ""
+            e = self._relax_once(stiffness, max_iters)
         self._accept_relaxed(
             stiffness,
             max_iters,
             validator=self._workflow_failure,
             template=template,
             seed=self.seed if self.seed is not None else (_REPLACEMENT_SEED if iso is not None else None),
+            allow_replacement=e is not None,
         )
         scored = {cid: self.energies[cid] for cid in self.ids if cid not in self.unrelaxed and cid in self.energies}
         if scored:
@@ -469,7 +502,8 @@ class Ensemble(Conformers):
             # Re-embedded batches may have needed different restraint stiffnesses. The final public energies
             # must share one objective before prune/lowest compares them.
             self._rescore_restrained(stiffness)
-            self.energy_kind = "ff" if self.energies else ""
+        approximate = self.uff_surrogates or self.uff_retyped_bonds
+        self.energy_kind = ("uff-surrogate" if approximate else "ff") if self.energies else ""
         self.discarded += [i for i in before if i not in set(self.ids)]
         self._validate()
         if iso is not None and iso.donor_bonds:  # connectivity finalize, last: geometry/element/charge settled
@@ -489,16 +523,8 @@ class Ensemble(Conformers):
         """
         if not self.ids:
             return
-        if self.iso is not None:
-            donors = sorted({int(d) for ds in self.sphere.values() for d in ds} | {int(d) for d in self.iso.donors})
-            failed = sum(
-                not _geometry.check(self._mol, cid, frozen=self.cons.frozen, donors=donors or None).ok()
-                for cid in self.ids
-            )
-            if failed:
-                logger.debug("minimize: broad geometry QA flagged %d/%d conformer(s)", failed, len(self.ids))
         frozen = self.cons.frozen
-        metals = {a.GetIdx() for a in self._mol.GetAtoms() if a.GetAtomicNum() in _metal.COORDINATION_METALS}
+        metals = set(_metal.metal_indices(self._mol))
         terms = (
             ("distance", self.cons.distances, dist_slack),
             ("angle", self.cons.angles, ang_slack),
@@ -506,12 +532,13 @@ class Ensemble(Conformers):
         )
         for name, windows, slack in terms:
             for atoms, window in windows.items():
+                transient = bool(self.cons.phantoms.intersection(atoms))
                 values = [
                     constraint_value(self._mol.GetConformer(cid).GetPositions(), atoms, self.cons.haptic, window)
                     for cid in self.ids
                 ]
                 if any(value is None or not np.isfinite(value) for value in values):
-                    logger.warning(
+                    (logger.debug if transient else logger.warning)(
                         "constraint not measurable: %s%s; check atom indices and haptic metadata", name, atoms
                     )
                 values = [value for value in values if value is not None and np.isfinite(value)]
@@ -520,7 +547,11 @@ class Ensemble(Conformers):
                     continue
                 lo, hi = window
                 value = max(missed, key=lambda v: max(lo - v, v - hi))
-                approximate = _graft_owns(atoms, frozen, self.cons.haptic) or (name == "angle" and atoms[1] in metals)
+                approximate = (
+                    transient
+                    or _graft_owns(atoms, frozen, self.cons.haptic)
+                    or (name == "angle" and atoms[1] in metals)
+                )
                 log = logger.debug if approximate else logger.warning
                 log("constraint not held: %s%s = %.2f, target %.2f-%.2f", name, atoms, value, lo, hi)
 
@@ -638,17 +669,23 @@ class Ensemble(Conformers):
         scale = 1.0 if unit == "kcal" else 1.0 / _HARTREE_KCAL
         return {i: (e - emin) * scale for i, e in have.items()}
 
+    def _declared_donors(self):
+        """Return donor atoms carried by retained and actively selected metal spheres."""
+        donors = {int(donor) for sphere in self.sphere.values() for donor in sphere}
+        if self.iso is not None:
+            donors.update(int(donor) for donor, _metal_idx in self.iso.donor_bonds)
+        donors.update(int(atom) for face in self.cons.haptic.values() for atom in face)
+        return sorted(donors)
+
     def check(self, **kwargs):
         """Run the geometry gate on every tracked conformer; return ``{conformer_id: report}``.
 
         The stated metal donors are supplied unless ``donors=`` is passed.
         """
         if "donors" not in kwargs:
-            donors = {int(d) for ds in self.sphere.values() for d in ds}
-            if self.iso is not None:
-                donors.update(int(d) for d in self.iso.donors)
+            donors = self._declared_donors()
             if donors:
-                kwargs["donors"] = sorted(donors)
+                kwargs["donors"] = donors
         mol = self.mol
         return {cid: _geometry.check(mol, cid, **kwargs) for cid in self.ids}
 
@@ -667,11 +704,18 @@ class Ensemble(Conformers):
             if iso.donors:
                 spheres.setdefault(iso.metal, list(iso.donors))
         else:  # post-minimize: the real elements are back, and `sphere` is what remembers the coordination
-            metals = _metrics._metal_indices(mol)
-        # Not _calc_charge: it warns about a metal's perceived charge and this runs on every stage. Perception
-        # here is connectivity-only (no bond orders), which the total charge barely moves.
+            metals = set(_metal.metal_indices(mol))
+        # Not _calc_charge: it warns about a metal's perceived charge and this runs on every stage, and
+        # connectivity-only perception (no bond orders) barely moves the total charge.
         q = Chem.GetFormalCharge(self._mol) if charge is None else charge
-        intended = {frozenset(pair) for pair in self.cons.distances}
+        # Coordination windows describe the metal shell, which the covalent perceiver cannot represent; an
+        # ordinary restrained ligand distance is still a graph edge and must round-trip. A numeric `fix` is
+        # different: explicit TS authority that may intentionally hold a forming or breaking pair.
+        intended = {
+            frozenset(pair)
+            for pair in self.cons.distances
+            if any(atom in metals for atom in pair) or pair in self.cons.fixed or pair[::-1] in self.cons.fixed
+        }
         out = {}
         for i in ids:
             formed, broken = _metrics.connectivity(
@@ -683,7 +727,13 @@ class Ensemble(Conformers):
                 if not donors:  # so the coordination sphere is compared as a set instead
                     continue
                 left, joined = _metrics.coordination_changed(
-                    mol, i, m, donors, elements=elements, exclude=self.cons.frozen
+                    mol,
+                    i,
+                    m,
+                    donors,
+                    elements=elements,
+                    exclude=self.cons.frozen,
+                    constrained=self.cons.distances,
                 )
                 formed = formed + [(m, a) for a in joined]
                 broken = broken + [(m, d) for d in left]
@@ -860,7 +910,7 @@ class Ensemble(Conformers):
         self.minimize()  # ensure a latent (and, for color='energy', real energies) exist; mirrors cluster()
         return viz.landscape(self, color=color, method=method, reduce=reduce, min_cluster=min_cluster, nci=nci)
 
-    # -- deriving a smaller / aligned ensemble (returns a new Ensemble) --------
+    # deriving a smaller / aligned ensemble (returns a new Ensemble) ----------
 
     def _derive(self, ids, mol=None):
         """Return an independent Ensemble over a subset while preserving its state and metal records."""
@@ -868,20 +918,17 @@ class Ensemble(Conformers):
         selected = set(ids)
         same_coordinates = mol is None
         mol = mol if mol is not None else Chem.Mol(self._mol)
-        return Ensemble(
-            mol,
-            ids,
-            self.cons,
-            self.iso,
-            {i: self.energies[i] for i in ids if i in self.energies},
+        return replace(
+            self,
+            _mol=mol,
+            ids=ids,
+            energies={i: self.energies[i] for i in ids if i in self.energies},
             unrelaxed=[i for i in self.unrelaxed if i in selected],
-            seed=self.seed,
-            _stage=self._stage,
+            uff_surrogates=dict(self.uff_surrogates),
+            uff_retyped_bonds=set(self.uff_retyped_bonds),
             discarded=list(self.discarded),
             tag=dict(self.tag),
-            _stereo=self._stereo,
             _donor_hand=dict(self._donor_hand),
-            energy_kind=self.energy_kind,
             reacted={i: v for i, v in self.reacted.items() if i in selected},
             sphere=dict(self.sphere),
             trajectory=(
@@ -992,7 +1039,7 @@ class Ensemble(Conformers):
             rdMolAlign.AlignMolConformers(m, atomIds=self._align_atoms(on), confIds=list(self.ids))
         return self._derive(self.ids, mol=m)
 
-    # -- looking (returns an artifact, never mutates) -------------------------
+    # looking (returns an artifact, never mutates) ----------------------------
     # 3D rendering is notebook-level (align()/dump() plus a few lines of py3Dmol/xyzrender). Only `landscape`
     # lives here, because the dim-reduction is real reusable work.
 

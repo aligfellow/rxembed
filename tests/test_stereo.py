@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import itertools
+
+import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom
+from rdkit.Chem import rdDepictor, rdDistGeom
+from rdkit.Geometry import Point3D
 
+import rxembed as rx
 from rxembed import stereo
 from rxembed.metal_core import metal_indices
 from rxembed.metal_smiles import parse_smiles
@@ -51,6 +56,21 @@ def test_no_stereo_returns_input_object():
     assert stereo.enumerate_unassigned(defined)[1] == 0
 
 
+def test_coordinated_phosphonate_uses_full_graph_cip_without_radical_warnings(capfd):
+    mol, metals = _with_metals("O=[P@](O)([O-]->[Zn+4])C")
+
+    assert stereo.defined_stereo_label(mol, metals) == "P1:R"
+    assert "Unusual charge" not in capfd.readouterr().err
+
+
+def test_metal_point_tag_is_not_ligand_stereo():
+    metal, metals = _with_metals("F[Cu@](Cl)(Br)I")
+    ligand, ligand_metals = _with_metals("C[P@](F)(Cl)Br.[Cu]")
+
+    assert stereo.point_centres(metal, metals) == set()
+    assert stereo.point_centres(ligand, ligand_metals) == {1}
+
+
 # ---------------------------------------------------------------------------------------------------------
 # the expansion
 # ---------------------------------------------------------------------------------------------------------
@@ -58,6 +78,25 @@ def test_no_stereo_returns_input_object():
 
 def test_undefined_point_centre_expands_with_cip_labels():
     assert _labels(_mol("CC(N)C(=O)O")) == ["C1:R", "C1:S"]
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+@pytest.mark.parametrize(
+    ("smiles", "expected"),
+    [
+        ("C[C@H](F)Cl", {1: "R"}),
+        ("OC(=O)[C@H]1CC[C@@H](CC1)O[C@@H](F)Cl", {3: "S", 6: "r", 10: "S"}),
+    ],
+)
+def test_point_labels_use_accurate_cip_independent_of_legacy_perception(legacy, smiles, expected):
+    previous = Chem.GetUseLegacyStereoPerception()
+    try:
+        Chem.SetUseLegacyStereoPerception(legacy)
+        mol = _mol(smiles)
+        assert stereo.point_stereo(stereo.defined_stereo_label(mol)) == expected
+        assert Chem.GetUseLegacyStereoPerception() is legacy
+    finally:
+        Chem.SetUseLegacyStereoPerception(previous)
 
 
 def test_stereo_selectors_are_concise_only_when_unambiguous():
@@ -87,6 +126,19 @@ def test_undefined_alkene_expands_with_point_centres():
     assert sum(":Z" in x for x in labels) == 2
 
 
+def test_skipped_stereo_is_not_expanded_behind_the_filter():
+    mol = _mol("CC=CC(N)O")
+    point = next(iter(stereo.point_centres(mol)))
+
+    points, n_points, total_points, _ = stereo.enumerate_unassigned(mol, skip_bonds=True)
+    bonds, n_bonds, total_bonds, _ = stereo.enumerate_unassigned(mol, skip_points={point})
+
+    assert (len(points), n_points, total_points) == (2, 1, 2)
+    assert (len(bonds), n_bonds, total_bonds) == (2, 1, 2)
+    assert mol.GetAtomWithIdx(point).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+    assert all(variant.GetAtomWithIdx(point).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED for variant, _ in bonds)
+
+
 def test_meso_duplicate_is_dropped():
     variants, n_unassigned, total, _unresolved = stereo.enumerate_unassigned(_mol("CC(O)C(O)C"))
     assert (n_unassigned, total) == (2, 4)
@@ -113,9 +165,18 @@ def test_stereo_cap_reports_uncapped_total():
 
 def test_allene_axis_is_unresolved_without_question_label():
     variants, n_unassigned, _total, unresolved = stereo.enumerate_unassigned(_mol("CC(F)=C=C(F)C"))
-    assert n_unassigned == 2
-    assert unresolved == 2
+    assert n_unassigned == 1
+    assert unresolved == 1
     assert [label for _v, label in variants] == [""], "an unresolved centre must be dropped from the label"
+
+
+def test_terminal_isothiocyanate_donor_is_not_a_stereo_axis():
+    mol, metals = _with_metals("S=C=[N-]->[Fe+2]<-[N-]=C=S")
+
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
+
+    assert variants == [(mol, "")]
+    assert (n_unassigned, total, unresolved) == (0, 1, 0)
 
 
 def test_stated_native_atrop_axis_is_racemized_and_measured_from_3d():
@@ -142,6 +203,36 @@ def test_atrop_axis_must_be_stated():
     assert _labels(_mol(_NATIVE_ATROP.split(" |", 1)[0])) == [""]
 
 
+def test_explicit_hydrogen_leaves_an_aryl_imine_axis_free():
+    ligand = Chem.AddHs(_mol("Cc1cccc(C)c1C=NC"))
+    axis = next(
+        tuple(sorted((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())))
+        for bond in ligand.GetBonds()
+        if bond.GetBondType() == Chem.BondType.SINGLE
+        and sum(atom.GetIsAromatic() for atom in (bond.GetBeginAtom(), bond.GetEndAtom())) == 1
+        and any(
+            other.GetBondType() == Chem.BondType.DOUBLE
+            for atom in (bond.GetBeginAtom(), bond.GetEndAtom())
+            if not atom.GetIsAromatic()
+            for other in atom.GetBonds()
+        )
+    )
+
+    assert not stereo._native_atrop_candidate(ligand, axis)
+
+
+def test_equivalent_ring_paths_do_not_define_an_atrop_axis():
+    mol = _mol("Cc1cccc(C)c1-c1c(Br)cccc1I")
+    axis = next(
+        tuple(sorted((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())))
+        for bond in mol.GetBonds()
+        if bond.GetBondType() == Chem.BondType.SINGLE
+        and all(atom.GetIsAromatic() for atom in (bond.GetBeginAtom(), bond.GetEndAtom()))
+    )
+
+    assert not stereo._native_atrop_candidate(mol, axis)
+
+
 # ---------------------------------------------------------------------------------------------------------
 # metal safety
 # ---------------------------------------------------------------------------------------------------------
@@ -154,12 +245,32 @@ def test_metal_bound_chiral_phosphorus_survives_strip():
     assert len(set(labels)) == 2, "the two P-epimers must get distinct labels"
 
 
+def test_dative_cap_participates_in_point_stereo_perception_from_3d():
+    mol, metals = _with_metals("F[P](Cl)(Br)->[Pd+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for atom, point in enumerate(
+        ((1, 0, 0), (0, 0, 0), (0, 1, 0), (0, 0, 1), (-1, -1, -1), (-2, -1, -1), (-1, -2, -1), (-1, -1, -2))
+    ):
+        conf.SetAtomPosition(atom, Point3D(*point))
+    mol.AddConformer(conf)
+
+    before = stereo.point_stereo(stereo.stereo_from_3d(mol, metals))
+    embedded = mol.GetConformer()
+    positions = embedded.GetPositions()
+    positions[:, 0] *= -1
+    embedded.SetPositions(positions)
+    after = stereo.point_stereo(stereo.stereo_from_3d(mol, metals))
+
+    assert before == {1: "S"}
+    assert after == {1: "R"}
+
+
 @pytest.mark.parametrize(
     ("smiles", "expected"),
     [
         ("C[N@H](->[Pd](Cl)(Cl)Cl)O", "N1:S"),
         ("C[P@H](->[Pt](Cl)(Cl)Cl)CC", "P1:S"),
-        ("C[S@](->[Pt](Cl)(Cl)Cl)CC", "S1:R"),
+        ("C[S@](->[Pt](Cl)(Cl)Cl)CC", "S1:S"),
         ("F[C@](Cl)(Br)[Pt](Cl)(Cl)Cl", "C1:S"),
     ],
 )
@@ -188,11 +299,119 @@ def test_ph3_donor_is_not_made_stereogenic_by_the_metal_cap():
     assert (len(variants), n_unassigned, total, unresolved) == (1, 0, 1, 0)
 
 
+def test_untagged_amine_donor_does_not_gain_point_stereo_from_its_metal_cap():
+    mol = parse_smiles("C[NH](O)->[Pd+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for atom, point in enumerate(((1, 0, 0), (0, 0, 0), (0, 1, 0), (0, 0, 1), (2, 0, 1), (0, 2, 1), (0, 0, 2))):
+        conf.SetAtomPosition(atom, Point3D(*point))
+    mol.AddConformer(conf)
+
+    assert stereo.point_stereo(stereo.stereo_from_3d(mol, metal_indices(mol))) == {}
+
+
+def test_chelated_amine_donor_enumerates_both_configurations():
+    mol, metals = _with_metals("C[NH]1CC[O-]->[Pd+2](<-[Cl-])(<-[Cl-])<-1")
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
+
+    assert {label for _variant, label in variants} == {"N1:R", "N1:S"}
+    assert (n_unassigned, total, unresolved) == (1, 2, 0)
+
+
+def test_equivalent_chelate_arms_do_not_create_donor_point_stereo():
+    mol, metals = _with_metals("CN12->[Rh+](<-[I-])(<-[C-]#[O+])<-P3(C)CN(CN(C1)C3)C2")
+    donors = {
+        atom.GetIdx() for atom in mol.GetAtoms() if any(neighbor.GetIdx() in metals for neighbor in atom.GetNeighbors())
+    }
+
+    assert donors.isdisjoint(stereo.point_centres(mol, metals))
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
+    assert variants == [(mol, "")]
+    assert (n_unassigned, total, unresolved) == (0, 1, 0)
+
+
+@pytest.mark.parametrize("symbol", ["P", "As"])
+def test_three_coordinate_pnictogen_is_reported_unresolved_instead_of_enumerated(symbol):
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(_mol(f"F[{symbol}](Cl)C"))
+
+    assert [label for _variant, label in variants] == [""]
+    assert (n_unassigned, total, unresolved) == (0, 1, 1)
+
+
+def test_three_coordinate_sulfur_remains_measurable_from_3d():
+    mol = _mol("C[S](=O)Cl")
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for atom, point in enumerate(((1, 0, 0), (0, 0, 0), (0, 1, 0), (0, 0, 1))):
+        conf.SetAtomPosition(atom, Point3D(*point))
+    mol.AddConformer(conf)
+
+    assert set(stereo.point_stereo(stereo.stereo_from_3d(mol))) == {1}
+
+
+@pytest.mark.parametrize("smiles", ["[C@](F)(Cl)(Br)I", "[P@](F)(Cl)(Br)->[Pd+2]"])
+@pytest.mark.parametrize("shape", ["inside", "outside", "on_face", "flat_carriers"])
+def test_measured_point_requires_centre_inside_carriers_independent_of_bond_order(smiles, shape):
+    source = _mol(smiles)
+    positions = np.array([(0, 0, 0), (1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)], float)
+    if shape == "outside":
+        positions[0] = (2, 2, 2)
+    elif shape == "on_face":
+        positions *= 3
+        positions[0] = (1, 1, -1)
+    elif shape == "flat_carriers":
+        positions[1:, 2] = 0
+        positions[0, 2] = 1
+    bonds = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx(), b.GetBondType()) for b in source.GetBonds()]
+    labels = []
+    for order in itertools.permutations(bonds):
+        work = Chem.RWMol(source)
+        for i, j, _kind in bonds:
+            work.RemoveBond(i, j)
+        for i, j, kind in order:
+            work.AddBond(i, j, kind)
+        mol = work.GetMol()
+        mol.UpdatePropertyCache(strict=False)
+        conf = Chem.Conformer(mol.GetNumAtoms())
+        conf.SetPositions(positions)
+        mol.AddConformer(conf)
+        before = mol.GetAtomWithIdx(0).GetChiralTag()
+        labels.append(stereo.point_stereo(stereo.stereo_from_3d(mol, metal_indices(mol))))
+        assert mol.GetAtomWithIdx(0).GetChiralTag() == before
+        assert stereo.point_stereo(stereo.stereo_from_3d(mol, metal_indices(mol), apply=True)) == labels[-1]
+        if shape == "inside":
+            assert set(labels[-1]) == {0}
+        else:
+            assert labels[-1] == {}
+            assert mol.GetAtomWithIdx(0).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+    assert all(label == labels[0] for label in labels)
+
+
+def test_aromatic_eta1_donor_is_not_made_stereogenic_by_stale_hybridization():
+    mol, metals = _with_metals("Cc1cc[cH-](c1)->[Ru+]")
+    donor = next(
+        atom
+        for atom in mol.GetAtoms()
+        if atom.GetIsAromatic() and any(n.GetIdx() in metals for n in atom.GetNeighbors())
+    )
+    donor.SetHybridization(Chem.HybridizationType.SP3)
+
+    _work, caps = stereo._build_enumeration_graph(mol, metals)
+
+    assert not caps
+
+
 def test_coordination_locked_alkene_is_not_enumerated():
     mol, metals = _with_metals(_ALPHA_DIIMINE_NI)
     assert stereo._coordination_locked_double_bonds(mol, metals), "the metal-closed imine was not detected"
     variants, _n, _total, _unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
     assert len(variants) == 2, "only the real point stereocentre should expand, not the locked imines"
+
+
+def test_coordination_locked_explicit_ez_is_not_kept_on_the_variant():
+    mol, metals = _with_metals(r"C/C1=N/[NH]->[Ni+2](<-[Cl-])(<-[Cl-])<-1")
+    (variant, _label), *_ = stereo.enumerate_unassigned(mol, exclude=metals)[0]
+    pair = next(iter(stereo._coordination_locked_double_bonds(mol, metals)))
+
+    assert variant.GetBondBetweenAtoms(*pair).GetStereo() == Chem.BondStereo.STEREONONE
 
 
 def test_eta2_alkene_is_not_coordination_locked():
@@ -216,6 +435,116 @@ def test_eta2_alkene_keeps_explicit_ez_after_metal_strip(smiles, expected):
 def test_pendant_alkene_remains_unlocked_by_metal():
     mol, metals = _with_metals("CC=CC[NH2]->[Ni+2](<-[O-]C(=O)C)<-[NH2]CC=CC")
     assert stereo._coordination_locked_double_bonds(mol, metals) == set()
+
+
+def test_flexible_metal_closed_alkene_keeps_ligand_side_ez():
+    isomer = rx.metal(r"N1CC/C=C/CC[NH2]->[Pt+2](<-[Cl-])(<-[Cl-])<-1", "square_planar")[0]
+    mol = rx.embed(isomer, n=1, seed=7).mol
+    metals = metal_indices(mol)
+    locked = stereo._coordination_locked_double_bonds(mol, metals)
+
+    assert locked == set()
+    pair = next(iter(stereo.bond_stereo(stereo.defined_stereo_label(mol, metals))))
+    bond = mol.GetBondBetweenAtoms(*pair)
+    bond.SetStereo(Chem.BondStereo.STEREOE if bond.GetStereo() == Chem.BondStereo.STEREOZ else Chem.BondStereo.STEREOZ)
+    assert stereo.defined_stereo_label(mol, metals) != stereo.stereo_from_3d(mol, metals)
+
+
+def test_inferred_ez_drops_a_resonance_dependent_cip_path():
+    stated = _mol(r"CN(C)/C(C)=C1/C=CC=C[CH-]1")
+    rdDepictor.Compute2DCoords(stated)
+    stated.GetConformer().Set3D(True)
+
+    assert stereo.bond_stereo(stereo.stereo_from_3d(stated))
+
+    forms = Chem.ResonanceMolSupplier(stated, maxStructs=3)
+    for index in (0, 2):
+        inferred = Chem.Mol(forms[index])
+        Chem.RemoveStereochemistry(inferred)
+        label = stereo.stereo_from_3d(inferred, apply=True)
+
+        assert stereo.bond_stereo(label) == {}
+        assert all(bond.GetStereo() == Chem.BondStereo.STEREONONE for bond in inferred.GetBonds())
+
+
+def test_apply_inferred_ez_uses_an_independent_measurement_graph():
+    mol = Chem.AddHs(Chem.MolFromSmiles("F/C=C/F"))
+    assert rdDistGeom.EmbedMolecule(mol, randomSeed=7) == 0
+    Chem.RemoveStereochemistry(mol)
+
+    label = stereo.stereo_from_3d(mol, apply=True)
+
+    assert stereo.bond_stereo(label)
+    assert stereo.defined_stereo_label(mol) == label
+
+
+def test_inferred_ez_drops_when_its_bond_order_moves_in_resonance():
+    mol = _mol(r"C/C=C/[CH2-]")
+    rdDepictor.Compute2DCoords(mol)
+    mol.GetConformer().Set3D(True)
+    Chem.RemoveStereochemistry(mol)
+
+    assert stereo.stereo_from_3d(mol) == ""
+
+
+def test_coordinate_free_ez_is_enumerated_only_when_resonance_stable(capfd):
+    unstable = stereo.enumerate_unassigned(_mol("CC=C[CH2-]"))
+    stable = stereo.enumerate_unassigned(_mol("CC=CC"))
+    priority = _mol("CN(C)C(C)=C1C=CC=C[CH-]1")
+    reversed_priority = Chem.RenumberAtoms(priority, list(reversed(range(priority.GetNumAtoms()))))
+
+    assert ([label for _variant, label in unstable[0]], unstable[1:]) == ([""], (0, 1, 0))
+    assert ({label for _variant, label in stable[0]}, stable[1:]) == ({"C1=C2:E", "C1=C2:Z"}, (1, 2, 0))
+    for candidate in (priority, reversed_priority):
+        variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(candidate)
+        assert ([label for _variant, label in variants], n_unassigned, total, unresolved) == ([""], 0, 1, 0)
+    assert "Pre-condition Violation" not in capfd.readouterr().err
+
+
+def test_inferred_ez_abstains_when_resonance_search_hits_its_cap(monkeypatch):
+    mol = _mol(r"F/C=C/Cl")
+    bond = next(bond.GetIdx() for bond in mol.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE)
+    monkeypatch.setattr(stereo, "_RESONANCE_EZ_CAP", 0)
+
+    assert stereo._resonance_stable_ez(mol, [bond], set()) == []
+    assert stereo._resonance_stable_ez(mol, [bond], {bond}) == [bond]
+    assert stereo._resonance_stable_ez(mol, [bond], set(), structural=True) == []
+    assert stereo._resonance_stable_ez(mol, [bond], {bond}, structural=True) == [bond]
+
+
+def test_coordinate_free_donor_imine_in_a_large_chelate_keeps_ez():
+    mol = parse_smiles(r"C/N1=C(/C)CCCCCC[NH2]->[Pt+2](<-[Cl-])(<-[Cl-])<-1")
+    labels = [iso.stereo_label for iso in rx.metal(mol, "square_planar")]
+
+    assert labels
+    assert all(label == "N1=C2:Z" for label in labels)
+
+
+def test_monodentate_donor_imine_keeps_ez():
+    mol, metals = _with_metals("CC=[NH]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
+
+    assert stereo._coordination_locked_double_bonds(mol, metals) == set()
+    assert _labels(mol, exclude=metals) == ["C1=N2:E", "C1=N2:Z"]
+
+
+def test_stereo_references_survive_metal_bond_removal_and_renumbering():
+    mol = parse_smiles(r"[H]/[N](=C(\C))->[Pt+4](<-[Cl-])(<-[Cl-])(<-[Cl-])(<-[Cl-])<-[N](/[H])=C(/C)")
+    for candidate in (mol, Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))):
+        label = stereo.defined_stereo_label(candidate, set(metal_indices(candidate)))
+        assert sorted(stereo.bond_stereo(label).values()) == ["E", "E"]
+
+
+def test_donor_cap_is_a_stereo_proxy_and_does_not_overcap_a_double_bond():
+    imine, metals = _with_metals("CC=[NH]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
+    work, caps = stereo._build_enumeration_graph(imine, metals)
+    assert len(caps) == 1
+    assert next(b for b in work.GetBonds() if b.GetEndAtomIdx() in caps).GetBondType() == Chem.BondType.SINGLE
+
+    referenced, metals = _with_metals("[H][C](=O)(P)->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
+    referenced.GetAtomWithIdx(1).SetHybridization(Chem.HybridizationType.SP3)  # stale input perception
+    work, caps = stereo._build_enumeration_graph(referenced, metals)
+    assert not caps
+    assert work.GetNumAtoms() == referenced.GetNumAtoms()
 
 
 def test_metal_strip_and_graft_are_inverse():

@@ -99,6 +99,34 @@ def test_reperception_finds_transferred_proton():
     assert metrics.bonding_ok(m, conf.GetId()), "bonding_ok is heavy-atom-only: it CANNOT see this"
 
 
+def test_zero_bond_is_not_a_connectivity_edge():
+    mol, _pos = _bare_sphere(
+        ["O", "H", "O"],
+        [(0, 1)],
+        [(0.0, 0.0, 0.0), (0.98, 0.0, 0.0), (2.18, 0.0, 0.0)],
+    )
+    rw = Chem.RWMol(mol)
+    rw.AddBond(1, 2, Chem.BondType.ZERO)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    assert metrics.connectivity(mol, 0) == ([], [])
+
+
+def test_reperception_finds_a_terminal_hydrogen_collapsed_across_an_angle():
+    # The bare H sits closer to atom 1 (0.90 A) than to its nominal bond partner atom 0 (1.09 A): real
+    # geometry-driven reperception must find the new C1-H contact on its own, with no stubbed _perceive.
+    mol, _pos = _bare_sphere(
+        ["C", "C", "H"],
+        [(0, 1), (0, 2)],
+        [(0, 0, 0), (1.68, 0, 0), (0.95, 0.53, 0)],
+    )
+
+    formed, _broken = metrics.connectivity(mol, 0)
+
+    assert formed == [(1, 2)]
+    assert metrics.connectivity(mol, 0, exclude={1, 2}) == ([], [])
+
+
 def test_connectivity_ignores_metal_pairs():
     import rxembed as rx
 
@@ -125,6 +153,13 @@ def test_metal_donor_departure_is_reported():
     assert iso.donors[0] in left
     frozen = {iso.metal, iso.donors[0]}
     assert metrics.coordination_changed(ens._mol, cid, iso.metal, iso.donors, exclude=frozen)[0] == []
+
+
+def test_stated_metal_distance_outranks_the_generic_donor_cutoff():
+    mol, _pos = _bare_sphere(["Zn", "O"], [], [(0, 0, 0), (2.52, 0, 0)])
+
+    assert metrics.coordination_changed(mol, 0, 0, [1]) == ([1], [])
+    assert metrics.coordination_changed(mol, 0, 0, [1], constrained={(0, 1): (2.42, 2.62)}) == ([], [])
 
 
 def test_hydride_uses_dative_not_covalent_diff():

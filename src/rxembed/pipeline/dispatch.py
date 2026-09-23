@@ -18,6 +18,7 @@ import rxembed.metal_core as _metal
 import rxembed.metal_enumeration as _kiso
 import rxembed.metal_isomer as _isomer
 import rxembed.metal_polyhedron as _poly
+from rxembed.bounds import embedding_options
 from rxembed.constraints import Constraints, compose_soft, resolve_atom, resolve_core
 from rxembed.constraints import template_to_fix as _core_template_to_fix
 from rxembed.embed import (  # module functions, not the package facade
@@ -50,7 +51,6 @@ class _Candidate:
     spec: object
     fix: object
     tag: dict
-    keep_input: bool = False
     coordinated: tuple = ()
 
 
@@ -113,7 +113,7 @@ def _contact_constraints(mol, contacts):
         items = [contacts]
     elif isinstance(contacts, dict):
         vals = [v for v in contacts.values() if isinstance(v, _nci.Contact)]
-        if vals and len(vals) != len(contacts):  # {label: Contact} must be ALL Contacts
+        if vals and len(vals) != len(contacts):  # {label: Contact} must be all Contacts
             raise TypeError("contacts: dict mixes Contact and non-Contact values")
         if vals:
             items = vals
@@ -170,11 +170,52 @@ def _coordination_choices(iso, coordinate, nvac):
     return [[resolve_atom(iso.mol, coordinate)]]  # an int index
 
 
-def _execute(spec, *, fix, constrain, contacts, n, seed, threads, knowledge, keep_input=False):
+def _execute(
+    spec,
+    *,
+    fix,
+    constrain,
+    contacts,
+    n,
+    seed,
+    threads,
+    knowledge,
+    embed_params=None,
+    coplanar_14=True,
+    metal_floor_relief=True,
+    donor_orientation=True,
+    conjugation=True,
+):
     """Compile and seed one candidate, returning its pipeline ensemble."""
-    mol, cons, iso, graft_ref = prepare(spec, fix=fix, constrain=constrain)
-    cons = compose_soft(cons, _contact_constraints(mol, contacts))
-    input_conf = Chem.Conformer(mol.GetConformer()) if (keep_input and mol.GetNumConformers()) else None
+    mol, cons, iso, graft_ref = prepare(
+        spec,
+        fix=fix,
+        constrain=constrain,
+        donor_orientation=donor_orientation,
+        conjugation=conjugation,
+    )
+    soft = _contact_constraints(mol, contacts)
+    cons = compose_soft(cons, soft)
+    if iso is not None and soft.is_constrained:
+        accepted = set().union(*cons.contacts)
+        active = Constraints(
+            planes=soft.planes,
+            distances={key: value for key, value in soft.distances.items() if key in accepted},
+            angles={key: value for key, value in soft.angles.items() if key in accepted},
+            dihedrals={key: value for key, value in soft.dihedrals.items() if key in accepted},
+        )
+        if active.is_constrained:
+            # Resolve ownership first: an ignored contact must not change an unrelated model preference.
+            mol, cons, iso, graft_ref = prepare(
+                spec,
+                fix=fix,
+                constrain=constrain,
+                external=active,
+                donor_orientation=donor_orientation,
+                conjugation=conjugation,
+            )
+            cons = compose_soft(cons, soft)
+    prune_rms = embed_params.pruneRmsThresh if embed_params is not None else 0.1
     mol, ids, target = seed_conformers(
         mol,
         cons,
@@ -183,17 +224,26 @@ def _execute(spec, *, fix, constrain, contacts, n, seed, threads, knowledge, kee
         seed=seed,
         threads=threads,
         knowledge=knowledge,
+        embed_params=embed_params,
+        coplanar_14=coplanar_14,
+        metal_floor_relief=metal_floor_relief,
+        prune_rms=prune_rms,
         graft_ref=graft_ref,
     )
-    if input_conf is not None:  # include the retained input within, not in addition to, the requested count
-        input_id = mol.AddConformer(input_conf, assignId=True)
-        if ids:
-            mol.RemoveConformer(ids[-1])
-            ids = [input_id, *ids[:-1]]
-        else:
-            ids = [input_id]
-    require_seed_count(ids, target)
-    ens = Ensemble(mol, list(ids), cons, iso, seed=int(seed))
+    require_seed_count(ids, target, iso)
+    ens = Ensemble(
+        mol,
+        list(ids),
+        cons,
+        iso,
+        seed=int(seed),
+        threads=int(threads),
+        knowledge=knowledge,
+        embed_params=embed_params,
+        coplanar_14=coplanar_14,
+        metal_floor_relief=metal_floor_relief,
+        prune_rms=prune_rms,
+    )
     if iso is not None:
         for donor, metal_idx in iso.donor_bonds:
             ens.sphere.setdefault(metal_idx, []).append(donor)
@@ -211,7 +261,7 @@ def _execute(spec, *, fix, constrain, contacts, n, seed, threads, knowledge, kee
     return ens
 
 
-def _expand_isomers(isomers, coordinate, fix, keep_input=False):
+def _expand_isomers(isomers, coordinate, fix):
     """Expand selected metal identities by vacant-site seating without embedding them."""
     out = []
     for iso in isomers:
@@ -228,7 +278,7 @@ def _expand_isomers(isomers, coordinate, fix, keep_input=False):
                 tag["stereo"] = candidate.stereo_label
             if atoms is not None and len(choices) > 1:
                 tag["coordinate"] = atoms[0]
-            out.append(_Candidate(candidate, fix, tag, keep_input=keep_input, coordinated=tuple(atoms or ())))
+            out.append(_Candidate(candidate, fix, tag, coordinated=tuple(atoms or ())))
     return out
 
 
@@ -262,10 +312,10 @@ def _attach_stereo(result, source, charge, stereo):
         return
     ref = source.stereo_ref if isinstance(source, _isomer.Isomer) else None
     if ref:
-        owned = {"point", "ez"}
-        if source.cons.haptic:
-            owned.add("planar")
-        ref = {kind: labels for kind, labels in ref.items() if kind not in owned}
+        # stereo_ref was computed with native=False (point/ez/axial are the embed's own job); a haptic
+        # source also owns its planar face, so it is the state metadata here too, not preserved.
+        if source.haptic:
+            ref = {kind: labels for kind, labels in ref.items() if kind != "planar"}
         stereo = "preserve"
     if ref is None and not isinstance(source, _isomer.Isomer) and source.GetNumConformers():
         try:
@@ -278,7 +328,7 @@ def _attach_stereo(result, source, charge, stereo):
     if stereo in (
         "racemic",
         "separate",
-    ):  # for a geometry input, preserve only a metallocene's PLANAR chirality, the part the embed cannot keep:
+    ):  # for a geometry input, preserve only a metallocene's planar chirality, the part the embed cannot keep:
         # axial reads differently every rotamer on a labile bond, and point R/S is the embed's own job
         spec = {"planar": "preserve", "default": "free"} if "planar" in set(ref) else None
     else:
@@ -329,9 +379,9 @@ def _stereo_variants(source, stereo, cap=_STEREO_CAP):
             len(variants),
             labels,
         )
-    if unresolved:  # an allene/cumulene axis which RDKit cannot encode from a flat SMILES
+    if unresolved:
         logger.warning(
-            "stereo=%r: %d stereo axis(es) not enumerable from a flat SMILES; one arbitrary hand each",
+            "stereo=%r: %d stereo element(s) not enumerable and 3D-measurable by RDKit; embedded without a hand",
             stereo,
             unresolved,
         )
@@ -366,15 +416,17 @@ def _template_to_fix(template, fix, own=None, target=None):
     return _core_template_to_fix(template, fix, own, target)
 
 
-def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo=None, lengths="auto"):
+def enumerate_isomers(
+    mol, geometry=None, center=None, fix=None, stereo=None, lengths="model", *, screen=True, observed_only=False
+):
     """Enumerate all distinct coordination isomers as ready-to-embed `Isomer` objects (metal surrogated).
 
     The public `rx.metal` entry point: the two things the core enumerator does not do, namely reading
     a SMILES / ``.xyz`` path into a `Mol`, and the coordinate-derived chirality fingerprint (`stereo.signature`,
     xyzgraph) the ``stereo='preserve'`` gate compares against. See `rxembed.metal_enumeration.enumerate_isomers` for
-    `geometry` / `center` / `fix` / `stereo` / `lengths`. A geometry is nameable in full (``'octahedral'``) or by
-    its 3-letter code (``'OCT'``), case-insensitively. The `Isomer` stores the registry name and `.summary()`
-    prints the compact code.
+    `geometry` / `center` / `fix` / `stereo` / `lengths` / `screen` / `observed_only`. A geometry is nameable in full
+    (``'octahedral'``) or by its 3-letter code (``'OCT'``), case-insensitively. The `Isomer` stores the registry
+    name and `.summary()` prints the compact code.
     """
     stereo = _default_stereo(mol, stereo)
     _validate_stereo(stereo)
@@ -391,10 +443,20 @@ def enumerate_isomers(mol, geometry=None, center=None, fix=None, stereo=None, le
     ref_sig = None  # chirality fingerprint of the input geometry (real metals), letting stereo='preserve'
     if mol.GetNumConformers() > 0:  # hold a spectator's planar/axial/helical handedness
         try:
-            ref_sig = _stereo.signature(mol)
+            ref_sig = _stereo.signature(mol, native=False)  # _attach_stereo only reads planar/helical
         except Exception:
             ref_sig = None
-    return _kiso.enumerate_isomers(mol, geometry, center, fix, stereo, stereo_ref=ref_sig, lengths=lengths)
+    return _kiso.enumerate_isomers(
+        mol,
+        geometry,
+        center,
+        fix,
+        stereo,
+        stereo_ref=ref_sig,
+        lengths=lengths,
+        screen=screen,
+        observed_only=observed_only,
+    )
 
 
 def _source_candidates(source, *, metal, fix, coordinate, stereo):
@@ -453,8 +515,7 @@ def _source_candidates(source, *, metal, fix, coordinate, stereo):
             _poly.describe(iso.geometry),
             _isomer.arrangement(iso),
         )
-        logger.info("metal: the retained geometry is relaxed into its windows, not returned as-is")
-        return source, _expand_isomers([iso], None, fix, keep_input=True), False
+        return source, _expand_isomers([iso], None, fix), False
     return source, [_Candidate(source, fix, {})], False
 
 
@@ -474,14 +535,10 @@ def _embed_mode(candidates, contact, nci_label, stereo_label, execute_kw):
                 candidate.spec,
                 fix=candidate.fix,
                 contacts=contact,
-                keep_input=candidate.keep_input,
                 **execute_kw,
             )
         except RuntimeError as err:
-            raise ValueError(
-                f"could not embed {identity}{coordinated}: the coordination and constraint spec are "
-                f"geometrically infeasible [{err}]"
-            ) from err
+            raise ValueError(f"could not embed {identity}{coordinated}: {err}") from err
         if not ens.ids:
             raise ValueError(
                 f"could not embed {identity}{coordinated}: no conformer satisfied the geometry and constraints"
@@ -489,13 +546,12 @@ def _embed_mode(candidates, contact, nci_label, stereo_label, execute_kw):
         ens.tag = tag
         if "arrangement" in tag:
             logger.info(
-                "embed[%s: %s%s%s]: %d seeds%s",
+                "embed[%s: %s%s%s]: %d seeds",
                 tag["geometry"],
                 tag["arrangement"],
                 f" {tag['chirality']}" if tag.get("chirality") else "",
                 f" coord@{list(candidate.coordinated)}" if candidate.coordinated else "",
                 len(ens.ids),
-                " (incl. input geometry)" if candidate.keep_input else "",
             )
         else:
             n_frag = len(Chem.GetMolFrags(ens.mol))
@@ -523,12 +579,27 @@ def _embed_dispatch(
     coordinate=None,
     charge=0,
     n=None,
-    seed=0xF00D,
-    threads=0,
-    knowledge=True,
+    seed=None,
+    threads=None,
+    knowledge=None,
+    embed_params=None,
+    coplanar_14=True,
+    metal_floor_relief=True,
+    donor_orientation=True,
+    conjugation=True,
     stereo=None,
 ):
     """Expand every candidate axis, execute each candidate once, and assemble the public result."""
+    seed, threads, knowledge, _prune_rms = embedding_options(
+        seed,
+        threads,
+        knowledge,
+        embed_params=embed_params,
+        coplanar_14=coplanar_14,
+        metal_floor_relief=metal_floor_relief,
+        donor_orientation=donor_orientation,
+        conjugation=conjugation,
+    )
     stereo = _default_stereo(source, stereo)
     _validate_stereo(stereo)
     if not isinstance(source, _isomer.Isomer):
@@ -546,6 +617,11 @@ def _embed_dispatch(
         "seed": seed,
         "threads": threads,
         "knowledge": knowledge,
+        "embed_params": embed_params,
+        "coplanar_14": coplanar_14,
+        "metal_floor_relief": metal_floor_relief,
+        "donor_orientation": donor_orientation,
+        "conjugation": conjugation,
     }
     for variant, stereo_label in variants:
         try:

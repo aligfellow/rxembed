@@ -121,7 +121,23 @@ def test_donor_orientation_reports_folded_carbonyl():
     assert len(v) == 1, f"expected exactly the 0° carbonyl, got {[str(x) for x in v]}"
     assert v[0].atoms == (0, 1, 2)
     assert v[0].value == pytest.approx(0.0, abs=0.1)
-    assert "folded back over the metal" in v[0].detail
+    assert "census floor" in v[0].detail
+    assert "inspect donor geometry and restraints" in v[0].detail
+
+
+def test_donor_angle_warning_does_not_claim_an_enclosed_carbon_has_inverted():
+    mol = Chem.MolFromSmiles("[C-]([SiH3])([SiH3])([SiH3])->[Zn+]")
+    pos = np.array([[0.0, 0.0, 0.0], [1.8, 0.0, 0.3], [-0.9, 1.55, 0.7], [-0.9, -1.55, 0.7], [0.0, 0.0, -2.0]])
+    weights = np.linalg.solve(np.vstack((pos[1:].T, np.ones(4))), [0.0, 0.0, 0.0, 1.0])
+    assert np.all(weights > 0), "the donor must be strictly inside the four-carrier tetrahedron"
+    (violation,) = coord.donor_orientation(mol, pos, donors=[0])
+    assert violation.atoms == (4, 0, 1)
+    assert violation.value == pytest.approx(99.4623222)
+    assert violation.limit == _FOLD_WINDOW[("C", Chem.HybridizationType.SP3)][0]
+    assert "census floor" in violation.detail
+    assert "inspect" in violation.detail
+    assert "folded" not in violation.detail
+    assert "inverted" not in violation.detail
 
 
 def test_element_key_splits_the_carbonyl_from_the_nitrile():
@@ -185,7 +201,7 @@ _HEALTHY = [
     # the nitrile is judged but not accept-checked: with the sp-linear seed hold deleted a bare-SMILES sp donor
     # embeds side-on and the ruler correctly flags it (the real energy re-opens it to end-on).
     ("nitrile", "CC#N[Pd](Cl)Cl", False),
-    ("en-chelate", "Br[Pd]1(Cl)NCCN1", True),  # the chelate's other arm is judged, not exempted
+    ("en-chelate", "[Br-]->[Pd+2]1(<-[Cl-])<-NCCN->1", True),  # neutral en: its other arm is judged
     ("depe-ni-amidate", "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1", True),
 ]
 
@@ -203,17 +219,20 @@ def test_healthy_donor_checks_are_nonvacuous(name, smi, accept):
         assert not v, f"{name}: FALSE POSITIVE on a healthy conformer; {[str(x) for x in v]}"
 
 
-def test_kappa2_carboxylate_apex_is_exempt():
-    from rxembed.metal_distance import APEX, overbond_tier
+def test_kappa2_carboxylate_bridgehead_is_not_a_donor_axis():
+    from rxembed.metal_distance import NEAR, overbond_tier
 
     iso = rx.metal("CC1=[O]->[Zn+2](Cl)(Cl)<-[O-]1", "tetrahedral")[0]
     ens = rx.embed(iso, n=1, seed=1).minimize()
     assert ens.ids, "the κ2 acetate did not embed"
     donors = _sphere_of(ens)
     donor_set = set(donors)
-    tiers = (overbond_tier(ens.mol, donor_set, i) for i in range(ens.mol.GetNumAtoms()))
-    apex = [i for i, tier in enumerate(tiers) if i not in donor_set and tier == APEX]
-    assert apex, "the carboxylate bridgehead must be an APEX (bonded to both donor oxygens)"
+    bridgehead = next(
+        atom.GetIdx()
+        for atom in ens.mol.GetAtoms()
+        if sum(ens.mol.GetBondBetweenAtoms(atom.GetIdx(), donor) is not None for donor in donor_set) == 2
+    )
+    assert overbond_tier(ens.mol, donor_set, bridgehead) == NEAR
     for cid in ens.ids:
         assert not coord.donor_orientation(ens.mol, ens.mol.GetConformer(cid).GetPositions(), donors)
 

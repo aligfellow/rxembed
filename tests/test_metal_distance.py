@@ -92,7 +92,7 @@ def test_vanadyl_oxo_contracts_without_splitting_acac_lengths(monkeypatch):
     assert got[oxo[0]] < min(got[d] for d in acac)
 
     contraction = _ligand_free_contraction(_OXYGEN, 5)
-    monkeypatch.setattr(D, "_LIGAND_FREE_CONTRACTION", {})
+    monkeypatch.setitem(D._LIGAND_FREE_CONTRACTION, _OXYGEN, (0.0, 0.0))
     off = targets()
     assert off[oxo[0]] - got[oxo[0]] == pytest.approx(contraction), "the oxo did not take the tmQM contraction"
     assert all(off[d] == got[d] for d in acac), "the term reached a donor whose ligand side already fills it"
@@ -176,17 +176,32 @@ def test_haptic_sp_atom_skips_sigma_contraction():
     rw.AddBond(a, b, Chem.BondType.TRIPLE)
     rw.AddBond(a, metal, Chem.BondType.DATIVE)
     rw.AddBond(b, metal, Chem.BondType.DATIVE)
+    for atom in (a, b):
+        rw.GetAtomWithIdx(atom).SetNoImplicit(True)
     mol = rw.GetMol()
     mol.UpdatePropertyCache(strict=False)
     donors = {a, b}
+    assert D.ligand_degree(mol.GetAtomWithIdx(a)) == 1, "isolate hapticity from the terminal-donor guard"
     assert D._hapticity(mol, a, donors) == 2
     sp = D.ml_distance(mol, metal, a, 26, donors, {}, hyb={a: Chem.HybridizationType.SP})
     sp2 = D.ml_distance(mol, metal, a, 26, donors, {}, hyb={a: Chem.HybridizationType.SP2})
     assert sp == sp2, "the sigma-only SP contraction reached a multi-atom haptic face"
 
-    sigma_sp = D.ml_distance(mol, metal, a, 26, {a}, {}, hyb={a: Chem.HybridizationType.SP})
-    sigma_sp2 = D.ml_distance(mol, metal, a, 26, {a}, {}, hyb={a: Chem.HybridizationType.SP2})
-    assert sigma_sp2 - sigma_sp == pytest.approx(D._SP_CONTRACTION)
+
+@pytest.mark.parametrize(
+    ("smiles", "terminal"),
+    [("[C-](#[O+])->[Pt+2]", True), ("CC(->[Pt+2])#CC", False), ("[CH](->[Pt+2])#C", False)],
+)
+def test_sigma_sp_contraction_requires_a_terminal_ligand_axis(smiles, terminal):
+    source = Chem.MolFromSmiles(smiles)
+    for mol in (source, Chem.AddHs(source)):
+        metal = metal_index(mol)
+        donor = mol.GetAtomWithIdx(metal).GetNeighbors()[0].GetIdx()
+        donors = {donor}
+        assert D._hapticity(mol, donor, donors) == 0
+        sp = D.ml_distance(mol, metal, donor, 78, donors, {}, hyb={donor: Chem.HybridizationType.SP})
+        sp2 = D.ml_distance(mol, metal, donor, 78, donors, {}, hyb={donor: Chem.HybridizationType.SP2})
+        assert sp2 - sp == pytest.approx(D._SP_CONTRACTION if terminal else 0.0)
 
 
 def test_all_m_donors_land_in_model_windows():
@@ -199,6 +214,51 @@ def test_all_m_donors_land_in_model_windows():
             lo, hi = iso.cons.distances[(min(d, iso.metal), max(d, iso.metal))]
             got = T.GetBondLength(c, iso.metal, d)
             assert lo - 0.05 <= got <= hi + 0.05, f"donor {d}: {got:.3f} Å is outside its window ({lo:.3f}, {hi:.3f})"
+
+
+def test_chelated_m_d_windows_do_not_get_independent_uff_pulls():
+    iso = rx.metal("[Pd+2]1(<-[Cl-])(<-[Cl-])(<-[NH2]CC[NH2]->1)", "square_planar")[0]
+    cons = iso.cons
+    nitrogen = {d for d in iso.donors if iso.mol.GetAtomWithIdx(d).GetAtomicNum() == _NITROGEN}
+    chloride = {d for d in iso.donors if iso.mol.GetAtomWithIdx(d).GetAtomicNum() == 17}
+
+    assert len(nitrogen) == 2
+    assert len(chloride) == 2
+    assert all(tuple(sorted((iso.metal, d))) not in cons.pulls for d in nitrogen)
+    assert all(tuple(sorted((iso.metal, d))) in cons.pulls for d in chloride)
+
+
+def test_coordinate_backed_chelate_windows_use_the_same_radial_policy():
+    rw = Chem.RWMol()
+    metal, n_left, carbon, n_right, chloride, bromide = (rw.AddAtom(Chem.Atom(z)) for z in (46, 7, 6, 7, 17, 35))
+    rw.AddBond(n_left, carbon, Chem.BondType.SINGLE)
+    rw.AddBond(carbon, n_right, Chem.BondType.SINGLE)
+    mol = rw.GetMol()
+    for atom in mol.GetAtoms():
+        atom.SetNoImplicit(True)
+    mol.UpdatePropertyCache(strict=False)
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for index, point in enumerate(((0, 0, 0), (2.1, 1, 0), (2.1, 0, 0), (2.1, -1, 0), (2.1, 0, 1), (2.1, 0, -1))):
+        conf.SetAtomPosition(index, point)
+    mol.AddConformer(conf)
+    distances = {
+        (metal, n_left): (2.1, 2.3),
+        (metal, n_right): (2.1, 2.3),
+        (metal, chloride): (2.1, 2.3),
+        (metal, bromide): (2.1, 2.3),
+    }
+    cons = rx.Constraints(distances=distances)
+
+    D.ff_terms(mol, cons, {metal: (46, [n_left, n_right, chloride, bromide])})
+
+    assert (metal, n_left) not in cons.pulls
+    assert (metal, n_right) not in cons.pulls
+    assert cons.pulls[(metal, chloride)] == pytest.approx(2.2)
+    assert cons.pulls[(metal, bromide)] == pytest.approx(2.2)
+    mol.RemoveAllConformers()
+    without_coordinates = rx.Constraints(distances=distances)
+    D.ff_terms(mol, without_coordinates, {metal: (46, [n_left, n_right, chloride, bromide])})
+    assert cons == without_coordinates
 
 
 def test_vacant_site_excludes_ligand_backbone():
@@ -223,3 +283,90 @@ def test_vacant_site_excludes_ligand_backbone():
                 )
             assert not perceive.metal_overbond(ens.mol, pos, iso.donors)
             assert metrics.coordination_changed(ens.mol, cid, iso.metal, iso.donors) == ([], [])
+
+
+def test_sigma_chelate_bridgehead_gets_the_missing_metal_repulsion():
+    iso = rx.metal("C[S+]1(=O)[CH2-]->[Pd+2](<-[CH2-]1)(<-[Cl-])<-[Cl-]", "square_planar")[0]
+    sulfur = next(atom.GetIdx() for atom in iso.mol.GetAtoms() if atom.GetAtomicNum() == 16)
+    cons = rx.Constraints()
+
+    D.nondonor_floors(iso.mol, iso.metal, iso.real_z, iso.donors, cons)
+
+    assert (min(iso.metal, sulfur), max(iso.metal, sulfur)) in cons.floors
+
+
+def test_non_donor_clearance_ignores_source_coordinates():
+    rw = Chem.RWMol()
+    metal, donor, sulfur = (rw.AddAtom(Chem.Atom(z)) for z in (46, 6, 16))
+    rw.AddBond(donor, sulfur, Chem.BondType.SINGLE)
+    mol = rw.GetMol()
+    for atom in mol.GetAtoms():
+        atom.SetNoImplicit(True)
+    mol.UpdatePropertyCache(strict=False)
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    conf.SetAtomPosition(metal, (0.0, 0.0, 0.0))
+    conf.SetAtomPosition(donor, (2.1, 0.0, 0.0))
+    conf.SetAtomPosition(sulfur, (2.76, 0.0, 0.0))
+    mol.AddConformer(conf)
+
+    cons = rx.Constraints()
+    D.nondonor_floors(mol, metal, 46, [donor], cons)
+    mol.RemoveAllConformers()
+    without_coordinates = rx.Constraints()
+    D.nondonor_floors(mol, metal, 46, [donor], without_coordinates)
+    assert cons == without_coordinates
+
+
+def test_haptic_backbone_stays_exempt_from_a_sigma_bridgehead_floor():
+    """Bonded to BOTH members of the same eta2 face (plus an unrelated sigma donor): the face geometry
+    genuinely fixes this backbone atom, so it keeps its APEX exemption (contrast the bicyclic-diene test
+    below, where a bridgehead touches only ONE atom of each of two different faces and is not exempt).
+    """
+    rw = Chem.RWMol()
+    metal, left, right, nitrogen, silicon = (rw.AddAtom(Chem.Atom(z)) for z in (22, 6, 6, 7, 14))
+    rw.AddBond(left, right, Chem.BondType.DOUBLE)
+    rw.AddBond(silicon, left, Chem.BondType.SINGLE)
+    rw.AddBond(silicon, right, Chem.BondType.SINGLE)
+    rw.AddBond(silicon, nitrogen, Chem.BondType.SINGLE)
+    for donor in (left, right, nitrogen):
+        rw.AddBond(donor, metal, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    cons = rx.Constraints()
+
+    D.nondonor_floors(mol, metal, 22, [left, right, nitrogen], cons)
+
+    assert (metal, silicon) not in cons.floors
+
+
+def test_bicyclic_diene_bridgehead_sharing_two_faces_is_not_apex():
+    """EGUZIP/EHUXEM analogue: a norbornadiene-shaped bridgehead bonded to one donor of each of TWO
+    separate eta2 faces has no single face geometry fixing its position (the docstring's own APEX
+    premise), so it must keep the anti-overbond floor, not skip it as a haptic-backed scaffold.
+    """
+    rw = Chem.RWMol()
+    metal, bh1, bh2, c1, c2, c3, c4, bridge = (rw.AddAtom(Chem.Atom(z)) for z in (42, 6, 6, 6, 6, 6, 6, 6))
+    rw.AddBond(bh1, c1, Chem.BondType.SINGLE)
+    rw.AddBond(c1, c2, Chem.BondType.DOUBLE)
+    rw.AddBond(c2, bh2, Chem.BondType.SINGLE)
+    rw.AddBond(bh2, c3, Chem.BondType.SINGLE)
+    rw.AddBond(c3, c4, Chem.BondType.DOUBLE)
+    rw.AddBond(c4, bh1, Chem.BondType.SINGLE)
+    rw.AddBond(bh1, bridge, Chem.BondType.SINGLE)
+    rw.AddBond(bridge, bh2, Chem.BondType.SINGLE)
+    donors = [c1, c2, c3, c4]
+    for donor in donors:
+        rw.AddBond(donor, metal, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+
+    sites = D._haptic_sites(mol, donors)
+    assert sorted(len(s) for s in sites) == [2, 2], "the two alkenes must stay separate faces, not merge into one"
+
+    assert D.overbond_tier(mol, donors, bh1) != D.APEX
+    assert D.overbond_tier(mol, donors, bh2) != D.APEX
+
+    cons = rx.Constraints()
+    D.nondonor_floors(mol, metal, 42, donors, cons)
+    assert (min(metal, bh1), max(metal, bh1)) in cons.floors
+    assert (min(metal, bh2), max(metal, bh2)) in cons.floors

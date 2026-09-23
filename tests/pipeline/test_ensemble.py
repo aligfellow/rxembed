@@ -10,9 +10,11 @@ from rdkit.Chem import rdMolTransforms
 
 import rxembed as rx
 from rxembed import metal_core as metal
+from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.calculators import Calculator
+from rxembed.utils import Violation
 
-_EN_PDBRCL = "Br[Pd]1(Cl)NCCN1"  # a neutral square-planar chelate: the standard metal fixture
+_EN_PDBRCL = "Br[Pd]1(Cl)NCCN1"  # covalent notation for the standard square-planar chelate fixture
 _MN_H2 = "examples/structures/mn-h2.xyz"  # bimetallic: an Mn centre and a spectator ferrocene
 _MN_H2_RC = [1, 5, 63, 64, 65, 66]
 
@@ -79,12 +81,143 @@ def test_changed_connectivity_is_not_published(monkeypatch):
     assert failed in ens.discarded
 
 
+def test_ligand_distance_constraint_does_not_exempt_a_graph_change(monkeypatch):
+    import rxembed.pipeline.ensemble as ensemble_module
+
+    ens = rx.embed("CC", n=1, seed=1)
+    ens.cons.distances[(0, 1)] = (1.4, 1.6)
+    monkeypatch.setattr(ensemble_module._metrics, "connectivity", lambda *args, **kwargs: ([(0, 1)], []))
+
+    assert ens._scan_connectivity()
+
+
+def test_puckered_aromatic_ring_remains_a_geometry_diagnostic():
+    ens = rx.embed("c1ccccc1", n=1, seed=1)
+    cid = ens.ids[0]
+    conf = ens._mol.GetConformer(cid)
+    point = conf.GetAtomPosition(0)
+    conf.SetAtomPosition(0, (point.x, point.y, point.z + 0.5))
+
+    violations = ens.check()[cid].violations
+
+    assert any(violation.detail == "aromatic ring puckered" for violation in violations)
+
+
+def _pucker_pyridine(ensemble):
+    mol = ensemble._mol
+    ring = mol.GetRingInfo().AtomRings()[0]
+    nitrogen = next(i for i in ring if mol.GetAtomWithIdx(i).GetAtomicNum() == 7)
+    distances = Chem.GetDistanceMatrix(mol)
+    para = max(ring, key=lambda i: distances[nitrogen, i])
+    conf = mol.GetConformer(ensemble.ids[0])
+    pos = conf.GetPositions()
+    normal = np.cross(pos[ring[1]] - pos[ring[0]], pos[ring[2]] - pos[ring[0]])
+    pos[para] += 0.4 * normal / np.linalg.norm(normal)
+    conf.SetPositions(pos)
+    return para
+
+
+@pytest.mark.parametrize("authority", ["none", "frozen", "fixed", "contact", "shape", "plane"])
+def test_metal_physical_gate_keeps_explicit_geometry_diagnostic(authority):
+    iso = rx.metal("[Cl-]->[Pt+2](<-[Cl-])(<-n1ccccc1)<-n1ccccc1", "SPL")[0]
+    ens = rx.embed(iso, n=1, seed=42, threads=1)
+    atom = _pucker_pyridine(ens)
+    cid = ens.ids[0]
+    assert ens._geometry_failure(cid) is None
+    assert rx.cxsmiles(ens.mol) == rx.cxsmiles(iso)
+    assert not ens.check()[cid]
+    if authority == "frozen":
+        ens.cons.frozen.add(atom)
+    elif authority in ("fixed", "contact"):
+        key = (atom, ens._mol.GetAtomWithIdx(atom).GetNeighbors()[0].GetIdx())
+        if authority == "fixed":
+            ens.cons.fixed[key] = (1.0, 2.0)
+        else:
+            ens.cons.contacts = (frozenset({key}), frozenset())
+    elif authority == "shape":
+        ens.cons.shapes.append(set(ens._mol.GetRingInfo().AtomRings()[0]))
+    elif authority == "plane":
+        ring_a, ring_b = ens._mol.GetRingInfo().AtomRings()
+        ens.cons.planes.append((ring_a, ring_b, 3.5))
+
+    failure = ens._workflow_failure(ens, cid)
+
+    if authority == "none":
+        assert failure is not None
+        assert failure.kind == "physical_geometry"
+    else:
+        assert failure is None
+
+
+def test_cleanup_ablations_filter_only_their_own_workflow_diagnostics(monkeypatch):
+    import rxembed.pipeline.ensemble as ensemble_module
+
+    iso = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", "SPL")[0]
+    ens = rx.embed(iso, n=1, seed=42, donor_orientation=False, conjugation=False)
+    report = geom.GeometryReport(
+        [
+            Violation("donor_orientation", (0, 1, 2), value=0.0, limit=90.0),
+            Violation("conjugation", (0, 1, 2, 3), value=90.0, limit=30.0),
+        ]
+    )
+    monkeypatch.setattr(ensemble_module._geometry, "check", lambda *_args, **_kwargs: report)
+
+    assert ens._workflow_failure(ens, ens.ids[0]) is None
+
+
+def test_metal_embed_replaces_a_puckered_ligand_without_changing_the_isomer(monkeypatch):
+    from rxembed.pipeline.ensemble import Ensemble
+
+    relax = Ensemble._relax_constrained
+    damaged = []
+
+    def distort(self, *args, **kwargs):
+        energy = relax(self, *args, **kwargs)
+        _pucker_pyridine(self)
+        damaged.append(self._mol.GetConformer().GetPositions())
+        return energy
+
+    monkeypatch.setattr(Ensemble, "_relax_constrained", distort)
+    iso = rx.metal("[Cl-]->[Pt+2](<-[Cl-])(<-n1ccccc1)<-n1ccccc1", "SPL")[0]
+
+    ens = rx.embed(iso, n=1, seed=42, threads=1)
+
+    assert len(damaged) == 1  # replacement batches are Conformers, not poisoned Ensembles
+    assert ens.n == 1
+    assert not np.allclose(ens._mol.GetConformer().GetPositions(), damaged[0])
+    ens.check()[ens.ids[0]].assert_ok()
+    assert rx.cxsmiles(ens.mol) == rx.cxsmiles(iso)
+
+
+def test_workflow_gate_restores_only_the_conformer_being_checked(monkeypatch):
+    _iso, ens = _pd_ensemble(n=1)
+    for _ in range(2):
+        ens.ids.append(ens._mol.AddConformer(Chem.Conformer(ens._mol.GetConformer(ens.ids[0])), assignId=True))
+    seen = []
+
+    def inspect(_self, mol, ids):
+        palladium = next(atom for atom in mol.GetAtoms() if atom.GetAtomicNum() == 46)
+        datives = [bond for bond in mol.GetBonds() if bond.GetBondType() == Chem.BondType.DATIVE]
+        seen.append(([conf.GetId() for conf in mol.GetConformers()], palladium.GetAtomicNum(), len(datives)))
+        assert ids == [cid]
+        return {}
+
+    cid = ens.ids[-1]
+    monkeypatch.setattr(type(ens), "_scan_connectivity", inspect)
+    assert ens._workflow_failure(ens, cid) is None
+    assert seen == [([cid], 46, 4)]
+
+
 def test_wrong_requested_stereo_fails_if_replacement_cannot_restore_count(monkeypatch):
     import rxembed.pipeline.ensemble as ensemble_module
 
     ens = rx.embed("CCCC", n=1, seed=1)
     ens._stereo = ("preserve", ())
-    monkeypatch.setattr(ensemble_module.Ensemble, "_workflow_failure", lambda *_args: "wrong requested stereo")
+    monkeypatch.setattr(
+        ensemble_module.Ensemble,
+        "_workflow_failure",
+        lambda *_args: ensemble_module.Failure("requested_stereo", "wrong requested stereo"),
+    )
     monkeypatch.setattr(ensemble_module.Ensemble, "_replace_failed", lambda _self, failed, *_args, **_kw: failed)
 
     with pytest.raises(ValueError, match="wrong requested stereo"):
@@ -131,18 +264,21 @@ def test_all_isomers_return_connected():
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_spectator_ferrocene_stays_rigid():
+def test_explicitly_fixed_spectator_ferrocene_stays_rigid():
 
     from rxembed.pipeline.perceive import read_xyz
 
-    ref = read_xyz(_MN_H2, 0)  # find the spectator from the MOLECULE, so a missing record fails loudly
+    ref = read_xyz(
+        _MN_H2, 0, metal_charges={0: 2, 1: 1}
+    )  # find the spectator from the MOLECULE, so a missing record fails loudly
     fe = next(
         a.GetIdx() for a in ref.GetAtoms() if a.GetAtomicNum() in metal.TRANSITION_METALS and a.GetSymbol() != "Mn"
     )
     shape = {fe, *(n.GetIdx() for n in ref.GetAtomWithIdx(fe).GetNeighbors())}
 
-    isomers = rx.metal(ref, "octahedral", center="Mn", fix=_MN_H2_RC)
-    iso = isomers.select(arrangement="C62 N6 C61 N5 P2 H63")
+    isomers = rx.metal(ref, "octahedral", center="Mn", fix=sorted(shape | set(_MN_H2_RC)))
+    reference_cx = rx.cxsmiles(ref)
+    iso = next(candidate for candidate in isomers if rx.cxsmiles(candidate) == reference_cx)
     windows = {k: v for k, v in iso.cons.distances.items() if set(k) <= shape}
     assert len(windows) > 50, "the rigid body is all pairs of {Fe, *10 Cp carbons}"
 
@@ -392,19 +528,40 @@ def test_best_refuses_ff_energies_across_species():
         s.score("ff").best()
 
 
+def test_uff_surrogate_cleanup_is_reported_as_an_approximate_objective():
+    ens = rx.embed("NC(=[Se])N", n=1, seed=1).minimize()
+    selenium = next(atom.GetIdx() for atom in ens.mol.GetAtoms() if atom.GetSymbol() == "Se")
+
+    assert ens.energies
+    assert ens.uff_surrogates == {selenium: (34, 16)}
+    assert ens.energy_kind == "uff-surrogate"
+    assert ens[0].energy_kind == "uff-surrogate"
+
+
 def test_slice_preserves_ensemble_state():
-    ens = rx.embed("CCCCO", n=4, seed=1).minimize()
+    ens = rx.embed("CCCCO", n=4, seed=1, knowledge=False).minimize()
     flagged = ens.ids[0]
     ens.seed = 1
     ens.unrelaxed = [flagged]
+    ens.uff_surrogates = {3: (34, 16)}
+    ens.uff_retyped_bonds = {(1, 2)}
     assert ens.energy_kind == "ff"
     child = ens[0]
     assert child.energy_kind == "ff"
     assert child.seed == 1
+    assert (child.knowledge, child.prune_rms) == (False, 0.1)
+    assert child._mol is not ens._mol
+    assert child.unrelaxed is not ens.unrelaxed
+    assert child.uff_surrogates is not ens.uff_surrogates
     assert child._stage == ens._stage == "minimized"
     assert child.unrelaxed == [flagged]
+    assert child.uff_surrogates == ens.uff_surrogates
+    assert child.uff_retyped_bonds == ens.uff_retyped_bonds
     assert ens.lowest(2).energy_kind == "ff"
-    assert ens.align().energy_kind == "ff"
+    assert ens.lowest(2).uff_surrogates == ens.uff_surrogates
+    aligned = ens.align()
+    assert aligned.energy_kind == "ff"
+    assert (aligned.knowledge, aligned.prune_rms) == (False, 0.1)
 
     ens.trajectory = Chem.Mol(ens._mol)
     assert ens._derive(ens.ids, Chem.Mol(ens._mol)).trajectory is None
@@ -441,7 +598,7 @@ def test_replacement_carries_unrelaxed_status_to_the_original_id(monkeypatch):
         self.unrelaxed = list(self.ids)
         return self
 
-    monkeypatch.setattr(core_embed.Conformers, "_relax_once", leave_unrelaxed)
+    monkeypatch.setattr(core_embed.Conformers, "_relax_constrained", leave_unrelaxed)
     monkeypatch.setattr(core_embed.Conformers, "_acceptance_failures", lambda *_args, **_kwargs: {})
     ens._replace_failed([source_id], 1.0, 1, template=template, seed=ens.seed)
 

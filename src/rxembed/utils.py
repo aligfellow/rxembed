@@ -11,7 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
-from rdkit import Chem
+from rdkit import Chem, rdBase
+from rdkit.Chem import rdqueries
 
 _PT = Chem.GetPeriodicTable()
 _CARBON_Z = 6
@@ -23,6 +24,162 @@ _MIRRORED = {  # the two tetrahedral tags; no other ChiralType is a parity over 
     Chem.ChiralType.CHI_TETRAHEDRAL_CW: Chem.ChiralType.CHI_TETRAHEDRAL_CCW,
     Chem.ChiralType.CHI_TETRAHEDRAL_CCW: Chem.ChiralType.CHI_TETRAHEDRAL_CW,
 }
+_RESONANCE_CACHE = {}
+_RESONANCE_CACHE_MAX = 128
+
+
+def flat_ranks(mol, *, break_ties=False):
+    """Rank a graph with bond order, charge, aromaticity, and stereo removed."""
+    rw = Chem.RWMol(mol)
+    hydrogens = [atom.GetTotalNumHs() for atom in rw.GetAtoms()]
+    for bond in rw.GetBonds():
+        bond.SetBondType(Chem.BondType.SINGLE)
+        bond.SetIsAromatic(False)
+        bond.SetStereo(Chem.BondStereo.STEREONONE)
+    for atom, count in zip(rw.GetAtoms(), hydrogens, strict=True):
+        atom.SetFormalCharge(0)
+        atom.SetIsAromatic(False)
+        atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+        atom.SetNumExplicitHs(count)
+        atom.SetNoImplicit(True)
+    flat = rw.GetMol()
+    flat.UpdatePropertyCache(strict=False)
+    Chem.FastFindRings(flat)
+    return list(Chem.CanonicalRankAtoms(flat, breakTies=break_ties))
+
+
+def hydrogen_neighbor_order(mol, hydrogen, *, metals, positions=None, ranks=None):
+    """Order a multibound hydrogen's neighbours with its nonmetal ligand leg first."""
+    if ranks is None:
+        ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
+    return sorted(
+        (neighbor.GetIdx() for neighbor in mol.GetAtomWithIdx(hydrogen).GetNeighbors()),
+        key=lambda neighbor: (
+            mol.GetAtomWithIdx(neighbor).GetAtomicNum() in metals,
+            0.0
+            if positions is None
+            else float(np.dot(positions[neighbor] - positions[hydrogen], positions[neighbor] - positions[hydrogen])),
+            ranks[neighbor],
+            neighbor,
+        ),
+    )
+
+
+def _resonance_graph(mol):
+    """Return a canonical private graph with chemically perceived conjugation."""
+    normalized = Chem.Mol(mol)
+    for atom in normalized.GetAtoms():
+        atom.SetAtomMapNum(0)  # input correspondence labels are not chemical identity
+    Chem.SanitizeMol(normalized)  # computed hybridization/conjugation must not change the proof's answer
+    zero = [b for b in normalized.GetBonds() if b.GetBondType() == Chem.BondType.ZERO]
+    if zero:
+        # Zero-order identity links are not part of a conjugated chemical graph. RDKit's resonance
+        # engine discounts their degree, but its conjugation perception does not (dithiocarbamate).
+        # Recompute only that property without the links; keep all graph edges and stereo bases intact.
+        chemical = Chem.RWMol(normalized)
+        for bond in zero:
+            chemical.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+            bond.SetIsConjugated(False)
+        Chem.SanitizeMol(chemical)
+        for bond in chemical.GetBonds():
+            normalized.GetBondBetweenAtoms(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()).SetIsConjugated(
+                bond.GetIsConjugated()
+            )
+    ranks = list(Chem.CanonicalRankAtoms(normalized, breakTies=True))
+    return Chem.RenumberAtoms(normalized, sorted(range(len(ranks)), key=ranks.__getitem__))
+
+
+def _resonance_key(mol):
+    """Serialize a private graph after rebasing supported double stereo."""
+    # Native CX fields retain bond kinds/directions and electrons; coordinates and notes are not identity.
+    fields = (
+        Chem.CXSmilesFields.CX_ENHANCEDSTEREO
+        | Chem.CXSmilesFields.CX_RADICALS
+        | Chem.CXSmilesFields.CX_COORDINATE_BONDS
+        | Chem.CXSmilesFields.CX_ZERO_BONDS
+    )
+    # Rebase double stereo with native CIP priorities without cleaning donor point tags.
+    # Protect absent stereo while shared slash bonds are interpreted in conjugated chains.
+    doubles = [
+        (b, b.GetStereo(), tuple(b.GetStereoAtoms())) for b in mol.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE
+    ]
+    Chem.SetDoubleBondNeighborDirections(mol)
+    for bond, tag, _ in doubles:
+        bond.SetStereo(Chem.BondStereo.STEREOANY if tag <= Chem.BondStereo.STEREOANY else Chem.BondStereo.STEREONONE)
+    Chem.AssignStereochemistry(mol, cleanIt=False, force=True)
+    for bond, tag, refs in doubles:
+        # Native reassignment may not support a donor bearing an extra coordination/site edge.
+        if tag <= Chem.BondStereo.STEREOANY or bond.GetStereo() <= Chem.BondStereo.STEREOANY:
+            if len(refs) == _STEREO_REFS:
+                bond.SetStereoAtoms(*refs)
+            bond.SetStereo(tag)
+    # ponytail: native CX can omit partial/site-linked E/Z; those states need an exact matching path.
+    return Chem.MolToCXSmiles(mol, Chem.SmilesWriteParams(), flags=fields)
+
+
+def resonance_match(query, source, *, flags=0, max_forms=32):
+    """Return whether ``query`` is an RDKit resonance form of ``source``, plus cap status."""
+    if query.GetNumAtoms() != source.GetNumAtoms() or query.GetNumBonds() != source.GetNumBonds():
+        return False, False
+
+    with rdBase.BlockLogs():
+        query, source = _resonance_graph(query), _resonance_graph(source)
+        # Canonical molecular identity cannot key query predicates or orphaned stereo tags; native atrop
+        # keeps its explicit matching path. Enhanced stereo groups are retained in the molecular key.
+        cacheable = not any(atom.HasQuery() for mol in (query, source) for atom in mol.GetAtoms()) and not any(
+            bond.HasQuery()
+            or bond.GetStereo() in (Chem.BondStereo.STEREOATROPCW, Chem.BondStereo.STEREOATROPCCW)
+            or (bond.GetStereo() != Chem.BondStereo.STEREONONE and len(bond.GetStereoAtoms()) != _STEREO_REFS)
+            for mol in (query, source)
+            for bond in mol.GetBonds()
+        )
+        if cacheable:
+            key = (
+                _resonance_key(query),
+                _resonance_key(source),
+                flags,
+                max_forms,
+            )
+            cached = _RESONANCE_CACHE.get(key)
+            if cached is not None:
+                return cached
+        supplier = Chem.ResonanceMolSupplier(source, flags=flags, maxStructs=max_forms + 1)
+        supplier.SetNumThreads(1)
+        if cacheable:
+            # Compare native molecular keys without a potentially exponential subgraph search.
+            matched = False
+            for form in supplier:
+                # Native resonance forms have Kekule bond orders but retain the source's aromatic flags.
+                # Re-perceive aromaticity from those orders, which may now describe a nonaromatic form.
+                for atom in form.GetAtoms():
+                    atom.SetIsAromatic(False)
+                for bond in form.GetBonds():
+                    bond.SetIsAromatic(False)
+                try:
+                    form_key = _resonance_key(_resonance_graph(form))
+                except Chem.MolSanitizeException:
+                    # Native enumeration can yield a valence-invalid form, which cannot prove a valid query.
+                    continue
+                if form_key == key[0]:
+                    matched = True
+                    break
+        else:
+            Chem.Kekulize(query, clearAromaticFlags=False)
+            # Query-only information needs native matching, with equality for zero-valued properties too.
+            # Ordinary Atom matching lets isotope-marked dummy roots match unmarked dummies.
+            for atom in query.GetAtoms():
+                exact = rdqueries.ReplaceAtomWithQueryAtom(query, atom)
+                exact.ExpandQuery(rdqueries.FormalChargeEqualsQueryAtom(exact.GetFormalCharge()))
+                exact.ExpandQuery(rdqueries.IsotopeEqualsQueryAtom(exact.GetIsotope()))
+                exact.ExpandQuery(rdqueries.HCountEqualsQueryAtom(exact.GetTotalNumHs(includeNeighbors=True)))
+                exact.ExpandQuery(rdqueries.NumRadicalElectronsEqualsQueryAtom(exact.GetNumRadicalElectrons()))
+            matched = bool(supplier.GetSubstructMatch(query, useChirality=True))
+        result = matched, not matched and len(supplier) > max_forms
+        if cacheable:
+            if len(_RESONANCE_CACHE) >= _RESONANCE_CACHE_MAX:
+                _RESONANCE_CACHE.clear()
+            _RESONANCE_CACHE[key] = result
+        return result
 
 
 @dataclass(frozen=True)
@@ -61,7 +218,12 @@ def conjugated_quartets(mol, exclude=frozenset()):
                 for n in c_atom.GetNeighbors()
                 if mol.GetBondBetweenAtoms(c_atom.GetIdx(), n.GetIdx()).GetBondType() == Chem.BondType.DOUBLE
             ]
-            subs = [n for n in x_atom.GetNeighbors() if n.GetIdx() != c_atom.GetIdx()]
+            subs = [
+                n
+                for n in x_atom.GetNeighbors()
+                if n.GetIdx() != c_atom.GetIdx()
+                and mol.GetBondBetweenAtoms(x_atom.GetIdx(), n.GetIdx()).GetBondType() != Chem.BondType.DATIVE
+            ]
             if not dbl or not subs:
                 continue
             yield dbl[0].GetIdx(), c_atom.GetIdx(), x_atom.GetIdx(), subs[0].GetIdx()
