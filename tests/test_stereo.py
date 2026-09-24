@@ -71,6 +71,31 @@ def test_metal_point_tag_is_not_ligand_stereo():
     assert stereo.point_centres(ligand, ligand_metals) == {1}
 
 
+def test_point_cip_memo_tracks_content_not_object_identity():
+    """Flipping a chiral tag in place must not get served the previous, now-stale, cached answer."""
+    mol = _mol("CCO[C@H](c1ccccc1C)[CH]1=[CH]2[CH]3=[CH2]->[Fe]<-3<-2<-1(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]")
+    idx = 3
+    assert stereo._point_cip_codes(mol, [idx]) == {idx: "R"}
+
+    atom = mol.GetAtomWithIdx(idx)
+    mirrored = {
+        Chem.ChiralType.CHI_TETRAHEDRAL_CW: Chem.ChiralType.CHI_TETRAHEDRAL_CCW,
+        Chem.ChiralType.CHI_TETRAHEDRAL_CCW: Chem.ChiralType.CHI_TETRAHEDRAL_CW,
+    }[atom.GetChiralTag()]
+    atom.SetChiralTag(mirrored)
+
+    assert stereo._point_cip_codes(mol, [idx]) == {idx: "S"}
+
+
+def test_point_cip_memo_returns_a_copy_a_caller_cannot_poison():
+    mol = _mol("C[C@H](N)C(=O)O")
+    idx = 1
+    codes = stereo._point_cip_codes(mol, [idx])
+    want = dict(codes)
+    codes[idx] = "poisoned"
+    assert stereo._point_cip_codes(mol, [idx]) == want
+
+
 # ---------------------------------------------------------------------------------------------------------
 # the expansion
 # ---------------------------------------------------------------------------------------------------------
@@ -218,7 +243,8 @@ def test_explicit_hydrogen_leaves_an_aryl_imine_axis_free():
         )
     )
 
-    assert not stereo._native_atrop_candidate(ligand, axis)
+    ranks = list(Chem.CanonicalRankAtoms(ligand, breakTies=False, includeChirality=True))
+    assert not stereo._native_atrop_candidate(ligand, axis, ranks)
 
 
 def test_equivalent_ring_paths_do_not_define_an_atrop_axis():
@@ -230,7 +256,8 @@ def test_equivalent_ring_paths_do_not_define_an_atrop_axis():
         and all(atom.GetIsAromatic() for atom in (bond.GetBeginAtom(), bond.GetEndAtom()))
     )
 
-    assert not stereo._native_atrop_candidate(mol, axis)
+    ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False, includeChirality=True))
+    assert not stereo._native_atrop_candidate(mol, axis, ranks)
 
 
 # ---------------------------------------------------------------------------------------------------------

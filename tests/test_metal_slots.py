@@ -1,10 +1,8 @@
 """Test donor-to-polyhedron seating and arrangement labels."""
 
-import math
 import random
 from collections import Counter
 
-import numpy as np
 import pytest
 from rdkit import Chem
 
@@ -262,19 +260,6 @@ def test_observed_orbit_precedes_canonical_enumeration():
     orderings = slots.distinct_vertex_orderings(mol, donors, "square_planar", retained=retained)
 
     assert orderings[0] == tuple(retained)
-
-
-def test_chelate_bite_intersects_a_partial_rdkit_reach_window():
-    mol = Chem.MolFromSmiles("NCCN")
-    bounds = np.zeros((4, 4))
-
-    def span(angle):
-        return math.sqrt(8.0 - 8.0 * math.cos(math.radians(angle)))
-
-    bounds[3, 0] = span(80.0) + slots._SPAN_TOL
-    bounds[0, 3] = span(100.0) - slots._SPAN_TOL
-
-    assert slots._chelate_bite_window(mol, 0, 3, bounds=bounds, lengths=(2.0, 2.0)) == pytest.approx((80.0, 91.0))
 
 
 def test_chelate_bite_is_independent_of_equal_shortest_path_order():

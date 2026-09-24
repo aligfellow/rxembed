@@ -10,7 +10,9 @@ from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers, rdMolTransforms
 from rdkit.Chem import rdtrajectory as _rdtrajectory
 
 from . import mechanisms as _mech
+from .constraints import _DIHEDRAL_ATOMS
 from .metal_core import COORDINATION_METALS, materialise_phantoms, strip_phantoms
+from .utils import _CARBON_Z
 
 FF_SURROGATE = 3  # Bondless Li avoids the singular CN>=3 UFF angle term while retaining a soft vdW sphere.
 UFF_GHOST = 54  # Untypeable Xe gives a haptic centroid no UFF terms inside its ring.
@@ -18,20 +20,23 @@ UFF_GHOST = 54  # Untypeable Xe gives a haptic centroid no UFF terms inside its 
 logger = logging.getLogger("rxembed.relax")
 
 MAX_ITERS = 2000  # the one restrained-UFF iteration cap: every relax entry point defaults from this name
-_DIHEDRAL_ATOMS = 4
 _PT = GetPeriodicTable()
-_BORON_Z, _CARBON_Z = 5, 6
-_MAIN_GROUPS = (
-    (3, 11, 19, 37, 55, 87),
-    (4, 12, 20, 38, 56, 88),
-    (5, 13, 31, 49, 81),
-    (6, 14, 32, 50, 82),
-    (7, 15, 33, 51, 83),
-    (8, 16, 34, 52, 84),
-    (9, 17, 35, 53, 85),
-    (10, 18, 36, 54, 86),
-)
-_LIGHTER_CONGENER = {z: group[i - 1] for group in _MAIN_GROUPS for i, z in enumerate(group) if i}
+_MAIN_GROUP_Z = frozenset(range(3, 89)) - COORDINATION_METALS  # every main-group element, d/f-block excluded
+# The main-group element directly above `z` in the same column: same valence electron count, one row up.
+# Omitted where that element is not unique (there is none, or the column skips a row, as group 13-18 do
+# between period 2 and period 4).
+_LIGHTER_CONGENER = {
+    z: above[0]
+    for z in _MAIN_GROUP_Z
+    if len(
+        above := [
+            y
+            for y in _MAIN_GROUP_Z
+            if _PT.GetRow(y) == _PT.GetRow(z) - 1 and _PT.GetNOuterElecs(y) == _PT.GetNOuterElecs(z)
+        ]
+    )
+    == 1
+}
 
 
 class UFFTypingError(RuntimeError):
@@ -40,6 +45,12 @@ class UFFTypingError(RuntimeError):
 
 class UFFOptimizationError(RuntimeError):
     """Report that RDKit failed while evaluating a constructed UFF objective."""
+
+
+def _raise_uff_typing_error(mol, atoms):
+    """Raise UFFTypingError naming the untypeable atoms and the one remedy: a different relaxation backend."""
+    names = ", ".join(f"{mol.GetAtomWithIdx(i).GetSymbol()}{i}" for i in atoms) or "unknown"
+    raise UFFTypingError(f"UFF has unsupported atom types ({names}); use a different relaxation backend")
 
 
 def _error_summary(error):
@@ -148,11 +159,7 @@ def ff_energies(mol, minimize=True, max_iters=MAX_ITERS, _statuses=None):
     """FF energies (MMFF94s where typeable, else UFF); optimise in place first when ``minimize``."""
     use_mmff = rdForceFieldHelpers.MMFFHasAllMoleculeParams(mol)
     if not use_mmff and not _uff_typeable(mol, ()):
-        missing = _uff_missing_atoms(mol, ())
-        atoms = ", ".join(f"{mol.GetAtomWithIdx(i).GetSymbol()}{i}" for i in missing) or "unknown"
-        raise UFFTypingError(
-            f"UFF has unsupported atom types ({atoms}); use restrained metal relaxation or another backend"
-        )
+        _raise_uff_typing_error(mol, _uff_missing_atoms(mol, ()))
     props = rdForceFieldHelpers.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s") if use_mmff else None
 
     def ff(c):
@@ -219,21 +226,81 @@ def _uff_missing_atoms(mol, phantoms):
         )
 
 
+def _rejected_charge_states(mol):
+    """Return atoms whose formal charge is a bookkeeping artefact UFF's typer ignores.
+
+    An ionic-dative donor SMILES (AGENTS.md) can draw a lone-pair donation as a charge-separated double or
+    triple bond, e.g. a dithiocarbene ``[C-2]=[S+]``. UFF's per-element type table does not vary with formal
+    charge for this bonding pattern, so the charge buys nothing and the type is silently wrong for what is
+    really a donor-weakened bond. The larger-magnitude partner balances the donor's dative arrow; the
+    smaller-magnitude partner carries the leftover bookkeeping charge and is the one worth re-deriving
+    (re-deriving the larger-magnitude partner instead fits worse). An equal-magnitude pair, such as an
+    amidinium, is an ordinary delocalised charge, not an artefact, and is left as UFF typed it.
+    """
+    out = set()
+    for bond in mol.GetBonds():
+        if bond.GetBondType() not in (Chem.BondType.DOUBLE, Chem.BondType.TRIPLE):
+            continue
+        i, j = bond.GetBeginAtom(), bond.GetEndAtom()
+        if i.GetAtomicNum() not in _MAIN_GROUP_Z or j.GetAtomicNum() not in _MAIN_GROUP_Z:
+            continue
+        ci, cj = i.GetFormalCharge(), j.GetFormalCharge()
+        if ci == 0 or cj == 0 or (ci > 0) == (cj > 0) or abs(ci) == abs(cj):
+            continue
+        out.add(i.GetIdx() if abs(ci) < abs(cj) else j.GetIdx())
+    return out
+
+
+def _neutralise_charge_states(rw, indices):
+    """Neutralise a rejected formal charge and re-derive hybridisation from sigma-bond degree.
+
+    A double or triple bond into an `indices` atom is read as single while RDKit derives
+    hybridisation, so the pi character the charge was drawn to balance does not skew the type UFF
+    picks from the bonding pattern alone; the original bond order is then restored. Mirrors
+    `_uff_core_graphs`'s two-phase sanitize for a dative-fixed core. Returns a new RWMol; `rw` is
+    not mutated in place past the point RDKit needs a fresh Mol to sanitize.
+    """
+    restore = []
+    for idx in indices:
+        atom = rw.GetAtomWithIdx(idx)
+        atom.SetFormalCharge(0)
+        atom.SetNoImplicit(True)
+        atom.SetHybridization(Chem.HybridizationType.UNSPECIFIED)
+        for bond in atom.GetBonds():
+            if bond.GetBondType() in (Chem.BondType.DOUBLE, Chem.BondType.TRIPLE):
+                restore.append((bond.GetIdx(), bond.GetBondType()))
+                bond.SetBondType(Chem.BondType.SINGLE)
+    mid = rw.GetMol()
+    mid.UpdatePropertyCache(strict=False)
+    with rdBase.BlockLogs():
+        Chem.SanitizeMol(mid, Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION, catchErrors=True)
+    rw = Chem.RWMol(mid)
+    for bond_idx, bond_type in restore:
+        rw.GetBondWithIdx(bond_idx).SetBondType(bond_type)
+    return rw
+
+
 def _uff_surrogate_graph(mol, cons):
     """Build a valid private UFF graph and original-radius bond holds, if possible."""
     missing = _uff_missing_atoms(mol, cons.phantoms)
-    if not missing:
+    rejected = _rejected_charge_states(mol)
+    if not missing and not rejected:
         return None
     rw = Chem.RWMol(mol)
-    replacements = {}
+    if rejected:
+        rw = _neutralise_charge_states(rw, rejected)
+    replacements = {idx: (z, z) for idx in rejected for z in (mol.GetAtomWithIdx(idx).GetAtomicNum(),)}
     for idx in missing:
         atom = rw.GetAtomWithIdx(idx)
         real_z = atom.GetAtomicNum()
         surrogate_z = _LIGHTER_CONGENER.get(real_z)
-        if surrogate_z is None and real_z == _BORON_Z:
+        if surrogate_z is None and real_z == 5:  # noqa: PLR2004  boron
             # RDKit has no type for some isolated, hypervalent boron forms.  Carbon is only
             # a private fallback here; boron-hydrogen and boron-boron networks remain unsupported.
-            if atom.GetTotalNumHs() or any(neighbor.GetAtomicNum() == _BORON_Z for neighbor in atom.GetNeighbors()):
+            if atom.GetTotalNumHs() or any(
+                neighbor.GetAtomicNum() == 5  # noqa: PLR2004  boron
+                for neighbor in atom.GetNeighbors()
+            ):
                 return None
             surrogate_z = _CARBON_Z
         if surrogate_z is None:
@@ -275,10 +342,10 @@ def _uff_surrogate_graph(mol, cons):
 
 def _select_uff_graph(work, cons, frozen):
     """Select the least invasive private graph that RDKit can type."""
-    if _uff_typeable(work, cons.phantoms):
+    if _uff_typeable(work, cons.phantoms) and not _rejected_charge_states(work):
         return work, cons, (), {}
     for candidate, retyped in _uff_core_graphs(work, frozen):
-        if _uff_typeable(candidate, cons.phantoms):
+        if _uff_typeable(candidate, cons.phantoms) and not _rejected_charge_states(candidate):
             return candidate, cons, retyped, {}
     fallback = _uff_surrogate_graph(work, cons)
     if fallback is not None:
@@ -289,9 +356,8 @@ def _select_uff_graph(work, cons, frozen):
         if fallback is not None:
             target, effective_cons, replacements = fallback
             return target, effective_cons, retyped, replacements
-    missing = _uff_missing_atoms(work, cons.phantoms)
-    atoms = ", ".join(f"{work.GetAtomWithIdx(i).GetSymbol()}{i}" for i in missing) or "unknown"
-    raise UFFTypingError(f"UFF has unsupported atom types ({atoms}); use a different relaxation backend")
+    missing = set(_uff_missing_atoms(work, cons.phantoms)) | _rejected_charge_states(work)
+    _raise_uff_typing_error(work, sorted(missing))
 
 
 def _seat_fixed_dihedrals(confs, fixed, frozen):
@@ -347,12 +413,11 @@ def restrained_uff(
 ):
     """Minimise conformers with frozen atoms and flat-bottomed constraint terms.
 
-    ``stiffness`` scales distance, floor, stack, centroid and explicit-fix penalties. Ordinary angle and
-    dihedral walls stop strengthening at 1. Native UFF, target pulls and structural repairs are unchanged;
-    this is not a multiplier for the entire objective. ``conf_ids`` selects the conformers to operate on.
-    Metal and haptic typing changes only a private graph; relaxed real-atom coordinates return to ``mol``.
-    Internal callers may collect convergence codes and private graph substitutions. Any exception restores
-    the selected conformers to their coordinates before torsion seating or minimization.
+    ``stiffness`` scales distance, floor, stack, centroid and explicit-fix penalties; angle and dihedral
+    walls stop strengthening at 1, and native UFF, target pulls and structural repairs are unchanged, so it
+    is not a multiplier over the whole objective. Metal and haptic typing changes only a private graph;
+    relaxed real-atom coordinates return to ``mol``. Any exception restores every selected conformer to its
+    coordinates before torsion seating or minimisation.
     """
     frozen = set(cons.frozen)
     confs = list(mol.GetConformers()) if conf_ids is None else [mol.GetConformer(int(i)) for i in conf_ids]

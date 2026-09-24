@@ -31,6 +31,18 @@ def test_quad_requires_rotatable_bond():
         assert not bond.IsInRing(), f"({b},{c}) is a ring bond, not a rotor"
 
 
+def test_butanol_dihedral_latent_excludes_the_methyl_and_hydroxyl_rotors():
+    """1-butanol (explicit H) has 2 backbone torsions, C0-C1-C2-C3 and C1-C2-C3-O4.
+
+    The terminal methyl (C0) and hydroxyl (O4) each have one heavy neighbour, so rotating around their bond
+    to the chain is not a distinct heavy-atom conformer; a heavy-atom-blind bond count would add both.
+    """
+    mol = Chem.AddHs(Chem.MolFromSmiles("CCCCO"))
+    quads = select.rotatable_quads(mol)
+    bonds = {tuple(sorted((b, c))) for _a, b, c, _d in quads}
+    assert bonds == {(1, 2), (2, 3)}
+
+
 @pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
 @pytest.mark.parametrize(
     ("smiles", "kw", "kinds", "mode"),

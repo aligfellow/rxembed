@@ -1,12 +1,12 @@
 """Torsional Monte-Carlo (MCMM) search via openconf.
 
-openconf is a complete generator -- ETKDG seeding plus a rich move set, a CrystalFF torsion library and
-adaptive moves -- so it is strictly more exploratory than plain ETKDG. Used two ways:
+openconf is a complete generator (ETKDG seeding, a rich move set, a CrystalFF torsion library, and
+adaptive moves), so it is strictly more exploratory than plain ETKDG. Used two ways:
 
 - unconstrained: ``generate_conformers`` drives the whole generation, its own seeding and search;
 - constrained: ``generate_conformers_from_pose`` searches around rxembed's bounds-biased seed with the
-  held atoms pose-frozen, so an NCI / TS / metal contact is provably never broken. The price is that low-
-  mode following and every ring or global move is disabled, leaving only free-rotor moves. We surface that.
+  held atoms pose-frozen, so an NCI / TS / metal contact is provably never broken. The price is that
+  low-mode following and every ring or global move are disabled, leaving only free-rotor moves.
 
 `preset` sets the effort (`transition_metal` being the metal-aware one); `seed`/`max_out`/`low_mode`
 override single knobs and `config` is an escape hatch. Needs `openconf`; `available()` guards it.

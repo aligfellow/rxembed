@@ -16,30 +16,21 @@ from functools import cache
 
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import rdMolTransforms
+from rdkit.Chem import TorsionFingerprints, rdMolTransforms
 
 from rxembed.metal_core import COORDINATION_METALS, _frag_map, metal_index
 from rxembed.metal_perceive import _coordinating
 from rxembed.utils import _angle
 
-_ROT = Chem.MolFromSmarts("[!$(*#*)&!D1]-!@[!$(*#*)&!D1]")
-
-
-def _ref(mol, a, b):
-    """Pick a reference neighbour of ``a`` (not ``b``) for the dihedral, preferring a heavy atom."""
-    nbrs = [x.GetIdx() for x in mol.GetAtomWithIdx(a).GetNeighbors() if x.GetIdx() != b]
-    heavy = [i for i in nbrs if mol.GetAtomWithIdx(i).GetAtomicNum() > 1]
-    return (heavy or nbrs or [None])[0]
-
 
 def rotatable_quads(mol):
-    """Heavy-atom dihedral 4-tuples (i, a, b, j), one per rotatable bond, stable across conformers."""
-    quads = []
-    for a, b in mol.GetSubstructMatches(_ROT):
-        i, j = _ref(mol, a, b), _ref(mol, b, a)
-        if i is not None and j is not None:
-            quads.append((i, a, b, j))
-    return quads
+    """Heavy-atom dihedral 4-tuples (i, a, b, j), one per rotatable bond, stable across conformers.
+
+    A terminal atom is excluded by its heavy-atom degree, not by SMARTS atom degree, so a methyl or hydroxyl
+    rotor stays excluded on the explicit-H molecules this pipeline always uses. Ring bonds are excluded.
+    """
+    non_ring, _ring = TorsionFingerprints.CalculateTorsionLists(mol)
+    return [quads[0] for quads, _max_dev in non_ring]
 
 
 def dihedrals(mol, conf_id, quads=None):
@@ -55,7 +46,6 @@ def dihedrals(mol, conf_id, quads=None):
 
 # The single per-conformer latent, behind both clustering and the landscape: one representation, so a plot
 # and a dedup never disagree about which conformers are alike.
-_MIN_FRAGS = 2  # a binding-mode block needs at least two fragments
 _MIN_DONORS = 2  # two donors are needed to define an L-M-L angle
 _EPS = 1e-9  # std floor for z-scoring
 
@@ -64,10 +54,9 @@ def _metal_donors(mol, ids):
     """``(metal, its coordination sphere)``, or ``(None, None)`` when there is no metal.
 
     A bonded graph states the complete non-metal sphere directly; a bond-less wrapped Mol falls back to
-    `metal_perceive`'s covalent-radius rule (a flat 2.8 Å cutoff cannot serve either: it misses long La-Se
-    bonds and admits nearby chelate backbone atoms; `benchmark/select_sphere.py` measures the corpus). Do
-    not intersect the two sources: a descriptor needs one stable column schema across every conformer, so
-    a partially bonded sphere is treated as declared, not guessed complete.
+    `metal_perceive`'s covalent-radius rule (a flat 2.8 Å cutoff misses long La-Se bonds and admits nearby
+    chelate backbone atoms). The two sources are never intersected: a descriptor needs one stable column
+    schema across every conformer, so a partially bonded sphere is treated as declared, not guessed complete.
     """
     m = metal_index(mol)
     if m is None:
@@ -125,7 +114,7 @@ def _nci_features(mol, ids):
     from . import nci as nci_mod
 
     fmap = _frag_map(mol)
-    if len(set(fmap.values())) < _MIN_FRAGS:  # single molecule -> no binding-mode block
+    if len(set(fmap.values())) < 2:  # noqa: PLR2004  single molecule -> no binding-mode block
         return None
     an = nci_mod.analyzer(mol)
     sigs = [{(t, a) for t, a, _ in _interfragment_contacts(an, mol.GetConformer(i).GetPositions(), fmap)} for i in ids]
@@ -147,7 +136,7 @@ def _relpose_features(mol, ids):
     if _metal_present(mol):
         return None
     frags = Chem.GetMolFrags(mol)
-    if len(frags) < _MIN_FRAGS:
+    if len(frags) < 2:  # noqa: PLR2004  a single fragment has no relative pose to describe
         return None
 
     def heavy(f):
@@ -237,7 +226,7 @@ def active_feature_kinds(mol, ids, nci=True):
         if donors and len(donors) >= _MIN_DONORS:
             blocks.append("metal")
         return blocks  # a metal suppresses relpose/nci (its mode = L-M-L)
-    if len(set(_frag_map(mol).values())) >= _MIN_FRAGS:
+    if len(set(_frag_map(mol).values())) >= 2:  # noqa: PLR2004  two or more fragments
         blocks.append("relpose")  # multi-fragment -> relative-pose block always present
         if nci:
             from . import nci as nci_mod
@@ -298,7 +287,7 @@ def cluster_on(feats, *, min_cluster=3, reduce=None):
     `reduce=k` PCA-compresses to k components first (denoise); by default clusters on the *full* latent
     (every column), not 2 PCA axes.
     """
-    if len(feats) < max(_MIN_FRAGS, min_cluster):  # too few conformers to cluster: treat as one mode
+    if len(feats) < max(2, min_cluster):  # too few conformers to cluster: treat as one mode
         return np.zeros(len(feats), dtype=int)
     if reduce and reduce < feats.shape[1]:
         try:

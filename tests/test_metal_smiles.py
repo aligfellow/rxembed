@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import random
 import re
 import subprocess
 import sys
@@ -27,10 +28,11 @@ from rxembed.core import embed as core_embed
 from rxembed.metal_core import VACANT, materialized_state
 from rxembed.metal_polyhedron import SLOT_BOND_PROP, point_group, vertex_dirs
 from rxembed.pipeline import geom_check as geom
-from rxembed.pipeline.perceive import read_xyz
+from rxembed.pipeline.perceive import _drop_bridgehead_bonds, read_xyz
+from tests.conftest import EXAMPLES_DIR
 
-_MN_H2 = "examples/structures/mn-h2.xyz"  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
-_MNH = "examples/structures/mnh.xyz"  # the corresponding Mn hydride minimum
+_MN_H2 = str(EXAMPLES_DIR / "mn-h2.xyz")  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
+_MNH = str(EXAMPLES_DIR / "mnh.xyz")  # the corresponding Mn hydride minimum
 _MA2B2_SEATS = {"cis": [1, 2, 3, 4], "trans": [1, 3, 2, 4]}  # square_planar: 0 and 2 are the trans pair
 _MA3B3_SEATS = {"fac": [1, 4, 2, 5, 3, 6], "mer": [1, 2, 3, 4, 5, 6]}  # octahedral: 0/1, 2/3, 4/5 are trans
 _CIS3 = [1, 3, 2, 5, 4, 6]  # cis,cis,cis-MA2B2C2: every same-element pair at 90 degrees, so the centre is chiral
@@ -47,6 +49,30 @@ _AZA_BIARYL_CR = "[O+]#[C-]->[Cr]1(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[n]2c
 _NON_CIP_CAGE_AU = "Cn1n[n+]([C@]23C[C@H]4C[C@H](C[C@H](C4)C2)C3)[c-](->[Au+]<-[Cl-])c1-c1ccccc1"
 _PSEUDO_BIS_ETA2_RU = "CC#[N]->[Ru+]123(<-[Cl-])(<-[N]#CC)(<-[N]#CC)<-[CH]4=[CH]->1[C@H]1C[C@@H]4[CH]->2=[CH]->31"
 _BAXFIQ_DONOR_SLOTS = "CC(C)(C)[N+]#[C-]->[Pt+2](<-[SiH-](c1ccccc1)c1ccccc1)(<-[SiH-](c1ccccc1)c1ccccc1)<-[P](C)(C)C"
+# One shared owner for a (smi, geometry) coverage set, reused by `test_all_enumerated_isomers_read_back`
+# and by every general order-invariance guard over "the existing metal test fixtures".
+_ENUMERATION_FIXTURES = [
+    ("[NH3]->[Pt](<-[NH3])(Cl)Cl", "square_planar"),  # cis / trans
+    ("[Pt](F)(F)(Cl)(Cl)(Br)Br", "octahedral"),  # MA2B2C2: six isomers, one delta / lambda pair
+    ("Br[Pd]1(Cl)NCCN1", "square_planar"),  # a chelate, so a bite edge is in the fold
+    ("[Co]123(OCCN1)(OCCN2)OCCN3", "octahedral"),  # three identical unsymmetrical chelates
+    ("[CH2]=[CH2].Cl[Pt](Cl)Cl", "square_planar"),  # Zeise: an eta2 face is one vertex
+    ("[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])<-N", "seesaw"),
+    ("[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])(<-N)<-O", "trigonal_bipyramidal"),
+    ("[O+]#[C-]->[Co+3](<-[F-])(<-[Cl-])(<-[Br-])(<-N)<-O", "octahedral"),
+    ("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "octahedral"),
+]
+_ENUMERATION_FIXTURE_IDS = [
+    "MA2B2",
+    "MA2B2C2",
+    "chelate",
+    "tris-chelate",
+    "eta2",
+    "SEE-all-distinct",
+    "TBP-all-distinct",
+    "OH-all-distinct",
+    "OH-all-distinct-PH3",
+]
 
 
 def _isomer(smi, geometry, seating):
@@ -669,31 +695,7 @@ def test_cxsmiles_distinguishes_metal_hands():
     assert one != other, "the two hands share a canonical string"
 
 
-@pytest.mark.parametrize(
-    ("smi", "geometry"),
-    [
-        ("[NH3]->[Pt](<-[NH3])(Cl)Cl", "square_planar"),  # cis / trans
-        ("[Pt](F)(F)(Cl)(Cl)(Br)Br", "octahedral"),  # MA2B2C2: six isomers, one delta / lambda pair
-        ("Br[Pd]1(Cl)NCCN1", "square_planar"),  # a chelate, so a bite edge is in the fold
-        ("[Co]123(OCCN1)(OCCN2)OCCN3", "octahedral"),  # three identical unsymmetrical chelates
-        ("[CH2]=[CH2].Cl[Pt](Cl)Cl", "square_planar"),  # Zeise: an eta2 face is one vertex
-        ("[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])<-N", "seesaw"),
-        ("[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])(<-N)<-O", "trigonal_bipyramidal"),
-        ("[O+]#[C-]->[Co+3](<-[F-])(<-[Cl-])(<-[Br-])(<-N)<-O", "octahedral"),
-        ("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "octahedral"),
-    ],
-    ids=[
-        "MA2B2",
-        "MA2B2C2",
-        "chelate",
-        "tris-chelate",
-        "eta2",
-        "SEE-all-distinct",
-        "TBP-all-distinct",
-        "OH-all-distinct",
-        "OH-all-distinct-PH3",
-    ],
-)
+@pytest.mark.parametrize(("smi", "geometry"), _ENUMERATION_FIXTURES, ids=_ENUMERATION_FIXTURE_IDS)
 def test_all_enumerated_isomers_read_back(smi, geometry):
     isos = rx.enumerate_isomers(Chem.AddHs(Chem.MolFromSmiles(smi)), geometry)
     assert len(isos) >= 1
@@ -721,6 +723,10 @@ def test_cxsmiles_on_a_pruned_bridgehead_graph_does_not_crash():
     off the caller's Mol before it is canonicalized, named the bridgehead as a metal neighbour, while
     `centre_notes` (built from a canonicalized `Isomer` via `from_geometry`) no longer had an entry for
     it. `complexed` must be canonicalized before either is derived; see `metal_core._canonical_metal_graph`.
+
+    The bridgehead guard now lives in `pipeline.perceive` and only `read_xyz` applies it automatically;
+    this Mol models coordinate-derived reader output (built by hand rather than actually read, so the
+    graph stays exact), so it is pruned the same way `read_xyz` would before reaching `cxsmiles`.
     """
     rw = Chem.RWMol()
 
@@ -755,6 +761,7 @@ def test_cxsmiles_on_a_pruned_bridgehead_graph_does_not_crash():
     }.items():
         conf.SetAtomPosition(idx, Point3D(*xyz))
     mol.AddConformer(conf, assignId=True)
+    mol = _drop_bridgehead_bonds(mol)
 
     text = rx.cxsmiles(mol)  # crashed with KeyError(p) before the fix; must not raise
 
@@ -848,7 +855,7 @@ def test_stated_arrangement_rejects_wrong_chirality():
 
 def test_planar_chiral_ferrocene_winding_roundtrips_and_selects_after_dg():
     iso = rx.metal(_planar_chiral_ferrocene(), stereo="free")[0]
-    raw = core_embed(iso, n=8, seed=7, prune_rms=-1)
+    raw = core_embed(iso, n=8, params=rx.EmbedParams(seed=7, prune_rms=-1))
     by_sign = {next(iter(_haptic_windings(raw.mol, iso, cid).values())): cid for cid in raw.ids}
     assert set(by_sign) == {"+", "-"}, "the ungated DG control did not sample both windings"
 
@@ -859,7 +866,7 @@ def test_planar_chiral_ferrocene_winding_roundtrips_and_selects_after_dg():
         retained = I.from_geometry(realised)
         assert set(retained.haptic_winding.values()) == {sign}
         assert set(rx.metal(realised, stereo="free")[0].haptic_winding.values()) == {sign}
-        retained_embed = core_embed(retained, n=4, seed=17, prune_rms=-1)
+        retained_embed = core_embed(retained, n=4, params=rx.EmbedParams(seed=17, prune_rms=-1))
         assert {
             next(iter(_haptic_windings(retained_embed.mol, retained, retained_cid).values()))
             for retained_cid in retained_embed.ids
@@ -872,7 +879,7 @@ def test_planar_chiral_ferrocene_winding_roundtrips_and_selects_after_dg():
         assert not default_back[0].stereo_label
         assert rx.cxsmiles(Chem.RenumberAtoms(realised, list(reversed(range(realised.GetNumAtoms()))))) == text
 
-        embedded = core_embed(back, n=6, seed=11, prune_rms=-1).minimize()
+        embedded = core_embed(back, n=6, params=rx.EmbedParams(seed=11, prune_rms=-1)).minimize()
         assert len(embedded) == 6
         assert all(
             geom.check(embedded.mol, embedded_cid, donors=back.donors, constraints=embedded.cons).ok()
@@ -896,6 +903,62 @@ def test_planar_chiral_ferrocene_winding_roundtrips_and_selects_after_dg():
     unsigned.SetProp("atomNote", unsigned.GetProp("atomNote") + "+")
     with pytest.raises(ValueError, match="mirror-symmetric face"):
         rx.enumerate_isomers(forged, stereo="free")
+
+
+def _cd_fan_near_tie_conformer():
+    """Return `(iso, mol, cid)`: the notebook-07 Cd near-tie isomer, and a conformer just past its SPY/TBP
+    fit-residual crossover (square_pyramidal 0.228, next trigonal_bipyramidal 0.224; gap < `_FIT_MARGIN`).
+
+    Spherical-linear interpolation between the two idealized templates' own `vertex_dirs`, slot by slot (the
+    same construction `test_metal_enumeration.py`'s Berry-pseudorotation test uses): fixed geometry, no embed
+    and no seed, so the near-tie does not depend on where a relax happens to land.
+    """
+    from rxembed.metal_polyhedron import record
+    from rxembed.metal_smiles import _rebuild
+
+    fans = rx.metal("[NH2]1CC[NH]2CC[NH2]->[Cd+2](<-[Cl-])(<-[Cl-])<-1<-2", "square_pyramidal")
+    iso = next(c for c in fans if c.vertices[0] == 3 and set(c.vertices[1::2]) == {0, 6})
+
+    spy = np.array(record("square_pyramidal").vertex_dirs, float)
+    tbp = np.array(record("trigonal_bipyramidal").vertex_dirs, float)
+    spy /= np.linalg.norm(spy, axis=1, keepdims=True)
+    tbp /= np.linalg.norm(tbp, axis=1, keepdims=True)
+
+    def slerp(a, b, t):
+        theta = np.arccos(np.clip(a @ b, -1.0, 1.0))
+        return a if theta < 1e-9 else (np.sin((1 - t) * theta) * a + np.sin(t * theta) * b) / np.sin(theta)
+
+    t = 0.32  # past the ~0.312 crossover: TBP argmin, SPY a near-tie runner-up inside _FIT_MARGIN
+    pts = np.array([slerp(spy[i], tbp[i], t) for i in range(5)])
+    pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+
+    bond_length = 2.4  # an ordinary Cd-N/Cd-Cl distance; the reading depends only on direction, not scale
+    mol = _rebuild(iso)  # the real dative-bonded graph cxsmiles(mol) itself needs, not the internal surrogate
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for i in range(mol.GetNumAtoms()):
+        conf.SetAtomPosition(i, Point3D(100.0 + i, 0.0, 0.0))  # park the ligand backbone away from the sphere
+    conf.SetAtomPosition(iso.metal, Point3D(0.0, 0.0, 0.0))
+    for slot, donor in enumerate(iso.vertices):
+        conf.SetAtomPosition(donor, Point3D(*(bond_length * pts[slot])))
+    cid = mol.AddConformer(conf, assignId=True)
+    return iso, mol, cid
+
+
+def test_cadmium_near_tie_conformer_round_trips_in_its_requested_frame():
+    emb = importlib.import_module("rxembed.embed")
+    iso, mol, cid = _cd_fan_near_tie_conformer()
+
+    assert emb._coordination_state_failure(mol, cid, iso) is None, "rule B must accept the near-tie request"
+    conf = mol.GetConformer(cid)
+    assert conf.HasProp(emb.SHAPE_REQUEST_PROP), "an accepted conformer must carry the machine-readable record"
+
+    assert rx.cxsmiles(mol) == rx.cxsmiles(iso), "an accepted near-tie conformer must write CX in its own frame"
+
+    raw = Chem.Mol(mol)
+    raw.GetConformer(cid).ClearProp(emb.SHAPE_REQUEST_PROP)
+    raw.GetConformer(cid).ClearProp(emb.SHAPE_PROP)
+    assert rx.cxsmiles(raw) != rx.cxsmiles(iso), "a raw geometry with no request must keep the argmin reading"
+    assert ".TBP:" in rx.cxsmiles(raw), "the argmin at this geometry is trigonal_bipyramidal, not the request"
 
 
 def test_stated_haptic_winding_survives_ligand_stereo_enumeration():
@@ -1103,6 +1166,83 @@ def test_coupled_amine_hands_are_written_after_canonical_ring_closure_rebasing()
     assert len(written) == 4
 
 
+def _shuffled_bond_order(mol, seed):
+    """Rebuild `mol` with a seeded-random atom renumbering and bond insertion order.
+
+    RDKit reads a tetrahedral CW/CCW tag against `atom.GetBonds()` order, which follows bond creation
+    order rather than atom index, so this is the vehicle for an order-invariance assertion. Each tag is
+    parity-corrected for the resulting neighbour permutation, so the represented chirality survives.
+    """
+    rng = random.Random(seed)
+    order = list(range(mol.GetNumAtoms()))
+    rng.shuffle(order)
+    renumbered = Chem.RenumberAtoms(mol, order)
+    bonds = list(renumbered.GetBonds())
+    rng.shuffle(bonds)
+    rw = Chem.RWMol()
+    for atom in renumbered.GetAtoms():
+        rw.AddAtom(Chem.Atom(atom))
+    for bond in bonds:
+        rw.AddBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), bond.GetBondType())
+        new_bond = rw.GetBondBetweenAtoms(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+        new_bond.SetIsAromatic(bond.GetIsAromatic())
+        new_bond.SetIsConjugated(bond.GetIsConjugated())
+        if bond.GetStereo() != Chem.BondStereo.STEREONONE and len(bond.GetStereoAtoms()) == 2:
+            new_bond.SetStereoAtoms(*bond.GetStereoAtoms())
+            new_bond.SetStereo(bond.GetStereo())
+    tetrahedral = (Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+    for atom in renumbered.GetAtoms():
+        tag = atom.GetChiralTag()
+        if tag not in tetrahedral:
+            continue
+        old_order = [neighbor.GetIdx() for neighbor in atom.GetNeighbors()]
+        new_order = [neighbor.GetIdx() for neighbor in rw.GetAtomWithIdx(atom.GetIdx()).GetNeighbors()]
+        position = [old_order.index(neighbor) for neighbor in new_order]
+        odd = sum(position[i] > position[j] for i in range(len(position)) for j in range(i + 1, len(position))) % 2
+        mirrored = tetrahedral[1] if tag == tetrahedral[0] else tetrahedral[0]
+        rw.GetAtomWithIdx(atom.GetIdx()).SetChiralTag(mirrored if odd else tag)
+    out = rw.GetMol()
+    out.UpdatePropertyCache(strict=False)
+    Chem.FastFindRings(out)
+    return out
+
+
+_MIRROR_AMINE_OCT_STATED = (
+    "O=C1C[S]2CC[N@@]34->[Fe+2]<-256(<-[N@@](CC[S]->5CC(=O)[O-]->6)(CCC3)CC4)<-[O-]1 "
+    "|atomProp:3.atomNote.s0:6.atomNote.s3:7.atomNote.OCT-delta:8.atomNote.s1:11.atomNote.s2:"
+    "15.atomNote.s5:21.atomNote.s4|"
+)
+
+
+def test_mirror_related_amine_arms_write_one_cx_for_any_bond_order():
+    """Two opposite-hand, non-swap-symmetric amine donors on one octahedral metal: KUQPUJ's mechanism.
+
+    `site_classes` links each donor to the metal with a temporary ZERO-order bond, and RDKit reads a
+    neighbouring tetrahedral tag differently depending on the order those links, and every other bond,
+    were added. Before the `_resonance_graph` fix this let the resonance proof merge the two amine N
+    donors' identity classes on some bond orders and not others (they are genuinely distinct: one N is
+    R, the other S, and the ligand has no arm-swap symmetry), so a stated arrangement's canonical string
+    and a free enumeration's isomer count both depended on incidental bond insertion order.
+    """
+    stated = rx.parse_smiles(_MIRROR_AMINE_OCT_STATED)
+    texts = {rx.cxsmiles(_shuffled_bond_order(stated, seed)) for seed in range(12)}
+    assert len(texts) == 1, texts
+
+    bare = rx.parse_smiles(_MIRROR_AMINE_OCT_STATED.split(" |", maxsplit=1)[0])
+    counts = {len(rx.metal(_shuffled_bond_order(bare, seed), "octahedral")) for seed in range(12)}
+    assert counts == {10}, counts
+
+
+@pytest.mark.parametrize(("smi", "geometry"), _ENUMERATION_FIXTURES, ids=_ENUMERATION_FIXTURE_IDS)
+def test_enumerated_cx_strings_are_bond_order_invariant(smi, geometry):
+    """General guard: coordination-site identity must not depend on incidental bond order on any fixture."""
+    mol = Chem.AddHs(Chem.MolFromSmiles(smi))
+    reference = {rx.cxsmiles(iso) for iso in rx.enumerate_isomers(mol, geometry)}
+    for seed in range(5):
+        texts = {rx.cxsmiles(iso) for iso in rx.enumerate_isomers(_shuffled_bond_order(mol, seed), geometry)}
+        assert texts == reference, (seed, texts, reference)
+
+
 def test_embedded_phosphorus_stays_in_the_smiles_core():
     isomer = rx.metal("[Pd](Cl)(Cl)(Cl)([P@H](C)O)", "square_planar")[0]
     text = rx.cxsmiles(rx.embed(isomer, n=1, seed=7).minimize().mol)
@@ -1141,7 +1281,7 @@ def test_coordinate_free_haptic_winding_enumerates_both_hands():
     assert "η5Sₚ" in by_sign["-"]
     assert all("Rₚ" not in rx.cxsmiles(iso) and "Sₚ" not in rx.cxsmiles(iso) for iso in isomers)
     for iso in isomers:
-        embedded = core_embed(iso, n=4, seed=7, prune_rms=-1)
+        embedded = core_embed(iso, n=4, params=rx.EmbedParams(seed=7, prune_rms=-1))
         assert {next(iter(_haptic_windings(embedded.mol, iso, cid).values())) for cid in embedded.ids} == set(
             iso.haptic_winding.values()
         )
@@ -1170,7 +1310,7 @@ def test_eta2_face_orientation_matrix(smiles, count, names):
 
 def test_eta2_face_is_selected_after_dg_and_reflection_flips_it():
     free = rx.metal(_ETA2_ASYM_E, "SPL", stereo="free")[0]
-    raw = core_embed(free, n=16, seed=7, prune_rms=-1)
+    raw = core_embed(free, n=16, params=rx.EmbedParams(seed=7, prune_rms=-1))
     by_sign = {next(iter(_haptic_windings(raw.mol, free, cid).values())): cid for cid in raw.ids}
     assert set(by_sign) == {"+", "-"}, "the ungated DG control did not sample both alkene faces"
 
@@ -1183,7 +1323,7 @@ def test_eta2_face_is_selected_after_dg_and_reflection_flips_it():
     assert set(_haptic_windings(raw.mol, free, cid).values()) == {"-"}
 
     for iso in rx.metal(_ETA2_ASYM_E, "SPL")[:2]:
-        embedded = core_embed(iso, n=4, seed=7, prune_rms=-1)
+        embedded = core_embed(iso, n=4, params=rx.EmbedParams(seed=7, prune_rms=-1))
         assert {next(iter(_haptic_windings(embedded.mol, iso, i).values())) for i in embedded.ids} == set(
             iso.haptic_winding.values()
         )
@@ -1192,7 +1332,7 @@ def test_eta2_face_is_selected_after_dg_and_reflection_flips_it():
 def test_eta2_face_and_coordinated_amine_stereo_compose_in_one_dg_seed():
     smiles = r"C/[CH]1=[CH](\F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[N@H](C)O)<-1"
     for iso in rx.metal(smiles, "SPL")[:2]:  # one seating, its two eta2 faces
-        embedded = core_embed(iso, n=2, seed=7, prune_rms=-1)
+        embedded = core_embed(iso, n=2, params=rx.EmbedParams(seed=7, prune_rms=-1))
         assert {next(iter(_haptic_windings(embedded.mol, iso, cid).values())) for cid in embedded.ids} == set(
             iso.haptic_winding.values()
         )
@@ -1317,7 +1457,7 @@ def test_identical_haptic_faces_canonicalize_opposite_windings():
     assert len(isomers.filter(haptic={0: "Rp"})) == 2
     assert len(isomers.filter(haptic={0: "Rp", 7: "Sp"})) == 1
     iso = rx.metal(source, stereo="free")[0]
-    raw = core_embed(iso, n=32, seed=7, prune_rms=-1)
+    raw = core_embed(iso, n=32, params=rx.EmbedParams(seed=7, prune_rms=-1))
     by_winding = {tuple(_haptic_windings(raw.mol, iso, cid).values()): cid for cid in raw.ids}
     assert {("+", "-"), ("-", "+")} <= set(by_winding)
     strings = {rx.cxsmiles(Chem.Mol(raw.mol, False, int(by_winding[winding]))) for winding in (("+", "-"), ("-", "+"))}
@@ -1355,7 +1495,7 @@ def test_multimetal_cxsmiles_roundtrips_and_gates_every_sphere_after_dg():
     assert len(direct.centres) == len(iso.centres) == 2
     assert rx.cxsmiles(iso) == text
     assert len(rx.metal(rx.cxsmiles(source), center="Mn", stereo="free")[0].centres) == 2
-    raw = core_embed(direct, n=4, seed=7, prune_rms=-1)
+    raw = core_embed(direct, n=4, params=rx.EmbedParams(seed=7, prune_rms=-1))
     expected_fe = I.centre_states(direct, "Fe")[0]
     expected_fe_winding = materialized_state(direct, expected_fe)[2]
     assert {
@@ -1370,7 +1510,7 @@ def test_multimetal_cxsmiles_roundtrips_and_gates_every_sphere_after_dg():
     } == {direct.chirality}
 
     fe = rx.metal(text, center="Fe", stereo="free")[0]
-    raw = core_embed(fe, n=2, seed=9, prune_rms=-1)
+    raw = core_embed(fe, n=2, params=rx.EmbedParams(seed=9, prune_rms=-1))
     expected_mn = I.centre_states(fe, "Mn")[0]
     mn_vertices, mn_haptic, _mn_winding, _mn_donors = materialized_state(fe, expected_mn)
     assert {
@@ -1414,7 +1554,7 @@ def test_multimetal_haptic_center_enumerates_each_face_before_uff():
         next(iso for iso in racemic if tuple(iso.haptic_winding.values()) == (winding,)) for winding in ("+", "-")
     ]
     for iso in representatives:
-        raw = core_embed(iso, n=2, seed=3, prune_rms=-1)
+        raw = core_embed(iso, n=2, params=rx.EmbedParams(seed=3, prune_rms=-1))
         assert {
             tuple(I.from_geometry(Chem.Mol(raw.mol, False, int(cid)), center="Fe").haptic_winding.values())
             for cid in raw.ids

@@ -60,64 +60,51 @@ its rejected-attempt counters and returned conformer count; subsequent requested
 many candidates it kept. Native DG minimization counters are not UFF cleanup failures, and a rejected attempt
 does not prove chemical infeasibility. Successful searches can also include rejected attempts.
 
-### Native embedding parameters
+### EmbedParams
 
-The default is RDKit `KDG()` with native all-in-one (AIO) refinement, followed by restrained UFF.
-Experimental torsions, small-ring torsions and macrocycle rules are off. Pass RDKit's own parameter object to
-control the seed model:
+The default is RDKit `KDG()` with native all-in-one (AIO) refinement, followed by restrained UFF, for every
+molecule including plain organics. Experimental torsions, small-ring torsions and macrocycle rules are off.
+`rx.EmbedParams(native=...)`, with any RDKit `EmbedParameters`, changes the seed model:
 
 ```python
 from rdkit.Chem import rdDistGeom
 
-p = rdDistGeom.KDG()
-p.useLegacyImplementation = False  # native all-in-one (AIO) refinement, before restrained UFF
-p.randomSeed = 42
-p.numThreads = 1
-ens = rx.embed("C1CCCCC1O", n=3, embed_params=p)
+p = rdDistGeom.srETKDGv3()  # ordinary and small-ring torsions; ETKDGv3() adds macrocycle torsions
+ens = rx.embed("C1CCCCC1O", n=3, params=rx.EmbedParams(seed=42, threads=1, native=p))
 ```
 
-Use `srETKDGv3()` for ordinary and small-ring torsions, or `ETKDGv3()` for ordinary and macrocycle torsions.
-Supplied parameters retain their native model, initialization, chirality and attempt-limit settings during
-retries. No path silently switches refinement models after a failure.
-
-The object is retained by reference for replacement searches; later edits affect those searches. Do not share
-it between concurrent operations. rxembed replaces its bounds matrix on each seed batch using `fix`, `constrain`
-and the metal constraints, embedding the constrained graph jointly. Use those arguments for geometric
-restrictions, not a preloaded `SetBoundsMat`. A native `SetCoordMap` is not merged into our edited matrix or
-carried into UFF; use `fix` or `template` for coordinate restrictions through the whole workflow. Temporary
-seed, thread, pruning and fragment-batching changes are restored, as are defaults materialized by RDKit.
-Native failure counters are available when `p.trackFailures=True`. Explicit `seed` and `threads` override
-their native fields; otherwise those fields are used, with rxembed's reproducible seed replacing an unset
-native seed. Do not combine `knowledge` with `embed_params`; choose the native knowledge flags instead.
-
-Without `embed_params`, an empty first attempt retries with random coordinates under the same KDG + AIO model.
-`knowledge=False` explicitly disables basic geometry while retaining AIO.
+`native` is kept by reference and reused for replacement searches, so do not share it between concurrent
+embeds; its own model, initialization, chirality and attempt-limit settings stay in force across retries.
+rxembed replaces its bounds matrix on each seed batch using `fix`, `constrain` and the metal constraints,
+embedding the constrained graph jointly; use those arguments for geometric restrictions, not a preloaded
+`SetBoundsMat`. A native `SetCoordMap` is not merged into our edited matrix or carried into UFF; use `fix` or
+`template` for coordinate restrictions through the whole workflow. rxembed owns sampling: leave
+`native.randomSeed`, `.numThreads` and `.pruneRmsThresh` at RDKit's defaults and set `EmbedParams(seed=...,
+threads=...)` instead, or construction raises naming the field to use. `knowledge=` combined with `native` must
+agree with `native.useBasicKnowledge`, or construction raises. `ens.params` records the `EmbedParams` a result
+was embedded with, so `rx.embed(m, n=k, params=ens.params)` reproduces it exactly. Coordinates do not depend on
+`threads` (probed on one molecule, 12 conformers, pruning on); it only changes worker count.
 
 For unmodified-metal controls, [the metal notebook](examples/07_metal.ipynb) calls KDG + AIO directly on a
 dative graph, then compares bond-only, vdW off/on, and native UFF with added distance or polyhedron-angle
 restraints from identical seeds. It exposes the native parameters and added force constants. Tagged metal
 geometries guide DG but need not survive UFF. Bond-only has no clash protection; vdW off/on affects all
-eligible pairs. Python does not expose a selective bond-plus-vdW builder or a single metal-radius knob. Both
-embedding facades expose independent controls for rxembed's matrix edits:
+eligible pairs. Python does not expose a selective bond-plus-vdW builder or a single metal-radius knob.
+
+`EmbedParams` also carries rxembed's own ablation switches, for a native-only comparison:
 
 ```python
-ens = rx.embed(iso, n=1, seed=42, coplanar_14=False, metal_floor_relief=False)
+ens = rx.embed(iso, n=1, params=rx.EmbedParams(seed=42, coplanar_14=False, metal_floor_relief=False))
 ```
 
-Both default to `True`. `coplanar_14=False` skips our additional coplanar 1-4 projections, not RDKit's native
-1-4 bounds. `metal_floor_relief=False` retains the native surrogate exclusion floors, not zero exclusion.
-Neither changes UFF settings; seed-dependent holds still follow the resulting seed. The choices persist through
-replacement searches and slices. The notebook compares all four combinations. rxembed's additional force
-constants live in `mechanisms.py`; `stiffness` scales selected restraint penalties, not native UFF or the whole
-objective (see `relax.restrained_uff`).
-
-For a native-ablation comparison, `donor_orientation=False` removes rxembed's M-D-X fold and donor-plane
-terms, while `conjugation=False` removes its organic sp2/conjugation cleanup. Explicit E/Z, point stereo,
-`fix`, and native RDKit terms remain active:
-
-```python
-ens = rx.embed(iso, n=1, seed=42, donor_orientation=False, conjugation=False)
-```
+All four switches default to `True`. `coplanar_14=False` skips our additional coplanar 1-4 projections, not
+RDKit's native 1-4 bounds. `metal_floor_relief=False` retains the native surrogate exclusion floors, not zero
+exclusion. `donor_orientation=False` removes rxembed's M-D-X fold and donor-plane terms; `conjugation=False`
+removes its organic sp2/conjugation cleanup. None changes UFF settings, and explicit E/Z, point stereo, `fix`
+and native RDKit terms stay active throughout. The choices persist through replacement searches and slices.
+The notebook compares all four combinations. rxembed's additional force constants live in `mechanisms.py`;
+`stiffness` scales selected restraint penalties, not native UFF or the whole objective (see
+`relax.restrained_uff`).
 
 `max_iters` changes only the restrained-UFF iteration cap after DG, for example `rx.embed(iso, n=1,
 max_iters=10000)`. It is a diagnostic or workload control; it does not make an unrealizable coordination
@@ -291,6 +278,10 @@ An exact pool exceeding 1,000 proper-rotation orbits raises; use `rx.metal(mol, 
 the measured arrangement is wanted, `rx.embed(mol)` to regenerate its perceived arrangement, or
 `rx.metal(rx.cxsmiles(mol))` to request a stated arrangement. The explicit `observed_only` choice does not
 assert that omitted assignments are chemically impossible.
+
+An accepted conformer's requested shape reads within `_FIT_MARGIN` (0.01) of the best reading a fresh sphere
+gives, not necessarily the argmin: `rx.embed`'s acceptance gate carries both residuals on one RDKit conformer
+property, read as `ens.mol.GetConformer(cid).GetProp("shape")`.
 
 Ordinary donor hydrogens may be implicit. Hydrides, H₂, and bridging hydrogen donors must be explicit.
 

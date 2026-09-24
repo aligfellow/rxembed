@@ -219,20 +219,17 @@ def test_healthy_donor_checks_are_nonvacuous(name, smi, accept):
         assert not v, f"{name}: FALSE POSITIVE on a healthy conformer; {[str(x) for x in v]}"
 
 
-def test_kappa2_carboxylate_bridgehead_is_not_a_donor_axis():
-    from rxembed.metal_distance import NEAR, overbond_tier
+def test_kappa2_carboxylate_apex_is_exempt():
+    from rxembed.metal_distance import APEX, overbond_tier
 
     iso = rx.metal("CC1=[O]->[Zn+2](Cl)(Cl)<-[O-]1", "tetrahedral")[0]
     ens = rx.embed(iso, n=1, seed=1).minimize()
     assert ens.ids, "the κ2 acetate did not embed"
     donors = _sphere_of(ens)
     donor_set = set(donors)
-    bridgehead = next(
-        atom.GetIdx()
-        for atom in ens.mol.GetAtoms()
-        if sum(ens.mol.GetBondBetweenAtoms(atom.GetIdx(), donor) is not None for donor in donor_set) == 2
-    )
-    assert overbond_tier(ens.mol, donor_set, bridgehead) == NEAR
+    tiers = (overbond_tier(ens.mol, donor_set, i) for i in range(ens.mol.GetNumAtoms()))
+    apex = [i for i, tier in enumerate(tiers) if i not in donor_set and tier == APEX]
+    assert apex, "the carboxylate bridgehead must be an APEX (bonded to both donor oxygens)"
     for cid in ens.ids:
         assert not coord.donor_orientation(ens.mol, ens.mol.GetConformer(cid).GetPositions(), donors)
 

@@ -90,15 +90,18 @@ UFF, rooted at the `Mechanism` class. Bounds construction has one ordering: gene
 floors, commit stated windows, project dependent terms, then triangle-smooth. Passing that smoothing does not
 establish 3D realizability.
 
-The default is native `KDG()` with AIO refinement; an empty search retries with random coordinates under the
-same model. A supplied `embed_params` object is used directly, without cloning or model-changing retries;
-temporary runtime scalar overrides are restored afterward, while the generated bounds and native failure
-counters remain on it. `coplanar_14` and `metal_floor_relief` are matrix-edit switches retained on
-`Conformers`; they filter a constraint copy only at matrix construction, and neither changes UFF or acceptance,
-which retain the complete geometric payload. `donor_orientation` and `conjugation` independently ablate
-rxembed's optional donor-fold and organic conjugation cleanup terms; explicit stereo and native RDKit terms
-stay active either way. `max_iters` changes only the restrained-UFF iteration cap after DG; it does not alter
-seed construction or candidate enumeration.
+The default is native `KDG()` with AIO refinement, for every molecule; an empty search retries with random
+coordinates under the same model. `EmbedParams` (`bounds.py`) is the one object that reproduces a seed batch:
+sampling (`seed`, `threads`, `prune_rms`, `knowledge`), an optional native `EmbedParameters` (used directly by
+reference, without cloning or model-changing retries; temporary runtime scalar overrides are restored
+afterward, while the generated bounds and native failure counters remain on it), and rxembed's four matrix-edit
+and ablation switches. `coplanar_14` and `metal_floor_relief` filter a constraint copy only at matrix
+construction, and neither changes UFF or acceptance, which retain the complete geometric payload.
+`donor_orientation` and `conjugation` independently ablate rxembed's optional donor-fold and organic
+conjugation cleanup terms; explicit stereo and native RDKit terms stay active either way. `Conformers.params`
+carries the `EmbedParams` a result was seeded with, so replaying it reproduces the batch; `resolve_params` folds
+a facade's plain `seed`/`threads` keywords into one when `params` is not given. `max_iters` changes only the
+restrained-UFF iteration cap after DG; it does not alter seed construction or candidate enumeration.
 
 `embed.py` selects metal hand and haptic winding from raw seeds and grafts fixed coordinates via
 `seed_conformers`. `relax.py` owns one restrained-UFF attempt, including private typing and optimizer status;

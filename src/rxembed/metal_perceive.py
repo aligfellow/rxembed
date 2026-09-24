@@ -1,11 +1,12 @@
-"""Metal coordination-sphere gates -- has an atom collapsed onto the metal, and does a ligand still point right.
+"""Metal coordination-sphere gates: has an atom collapsed onto the metal, and does a ligand still point right.
 
-Read-only and off the embed path: these gates judge a finished geometry, and `pipeline.geom_check` consumes
-them. They look *into* the coordination sphere, which every ``geometry`` check excludes because a dative
-distance is not covalent: ``metal_overbond`` asks whether an atom reached bonding distance,
-``donor_orientation`` whether a ligand still donates along its axis, and ``donor_fold`` reports the metric
-behind the same walk. The rest is the sphere perception both resolve on; `pipeline.select` also reads its
-`_coordinating` leaf when a wrapped metal has no bonds.
+Read-only: these gates judge a finished geometry without changing it. `pipeline.geom_check` consumes them
+directly; `embed._donor_facing_failure` also reads `donor_orientation` inside the embed acceptance path, as a
+warning only. They look into the coordination sphere, which every `geometry` check excludes because a dative
+distance is not covalent: `metal_overbond` asks whether an atom reached bonding distance, `donor_orientation`
+whether a ligand still donates along its axis, and `donor_fold` reports the metric behind the same walk. The
+rest is the sphere perception both resolve on; `pipeline.select` also reads its `_coordinating` leaf when a
+wrapped metal has no bonds.
 
 Enforcement (``_orient_donor`` / ``_coplanar_donor``) lives in ``metal_donor_orient``; both paths share its
 donation-axis rules. Shared coordinate math and ``Violation`` live in ``utils``.
@@ -37,31 +38,23 @@ from .metal_donor_orient import (
 from .utils import _CARBON_Z, Violation, _angle, _dihedral, _positions, _rcov
 
 _COORD_FACTOR = 1.3  # a heavy atom within this x covalent-sum of a metal is a coordinating donor
-_SIDEON_SYM = 0.5  # Å: max |d(M,a) - d(M,b)| for a pi pair to count as symmetric side-on (else donor + backbone)
-_SIDEON_MAX = 2.6  # Å: both eta-2 atoms must bind within this; beyond it a pi atom is backbone, not a donor.
-# Absolute, where `_COORD_FACTOR` above is a ratio of the covalent sum on the same axis, and the ratio form is
-# measured and refuted over the 57 corpus geometries. WELROW's La...Se=P at 3.10/3.45 Å is only 1.10 x the
-# covalent sum (La's radius alone is 2.07 Å), so any ratio loose enough to keep GODNOD's genuine Ni eta2-C=S
-# (1.23 x) admits it too, and that is wrong: the P is the backbone behind the Se donor, the alpha-diimine
-# false positive one shell out. COJKAO pins the inversion from the other side, its Pd...S=O rejected at
-# 1.226 x against GODNOD's accepted 1.233 x, two verdicts 0.007 apart in ratio and 0.27 Å apart here
+_SIDEON_SYM = 0.5  # A: max |d(M,a) - d(M,b)| for a pi pair to count as symmetric side-on (else donor + backbone)
+# Absolute, not a covalent-sum ratio like `_COORD_FACTOR` above: no ratio keeps GODNOD's eta2 C=S (1.233x) and
+# rejects COJKAO's Pd...S=O (1.226x); 2.6 A separates them by 0.27 A.
+_SIDEON_MAX = 2.6  # A: both eta2 atoms must bind within this; beyond it a pi atom is backbone, not a donor.
 
 
 def metal_overbond(mol, pos, donors=None, margin: float | None = None) -> list[Violation]:
-    """Atoms that have collapsed onto a metal; over-short is the silently-failing direction.
+    """Return atoms that have collapsed onto a metal; over-short is the direction other gates miss.
 
-    Every other gate excludes metals, so an atom crushed into the sphere is otherwise invisible. Every
-    non-metal atom is floored and the tier picks which floor: a non-donor is asked whether it reached bonding
-    distance, a *donor* only whether it is closer than a bond can be (``DONOR_COLLAPSE_RATIO``, reported as
-    ``metal_collapse``) -- the one ruler that can judge a monatomic hydride or halide.
+    Every other gate excludes metals, so a crushed atom is otherwise invisible. A donor is floored only
+    against `DONOR_COLLAPSE_RATIO` (reported as `metal_collapse`), the one ruler that still works for a
+    monatomic hydride or halide; a non-donor is floored by `overbond_tier`'s tiers, below the FF's own floor
+    so a floored relax never trips this. An undeclared H is skipped.
 
-    ``donors`` is the intended set and the caller must pass it: perceiving it is circular, since a collapsed
-    atom enters the radius, re-classifies as a donor, and is then asked the donor's question instead of its
-    own. ``donors=None`` falls back to perception only for a genuinely unknown sphere.
-
-    Non-donors are floored by ``overbond_tier``: a haptic-backed APEX is forced and exempt, a sigma-backed
-    second-sphere atom gets a ratio loose enough for a real β-agostic contact, and the rest the covalent sum
-    plus margin, below the FF's own floor so a floored relax never trips this. An *undeclared* H is skipped.
+    `donors` is the intended set, and the caller must pass it: perceiving it here is circular, since a
+    collapsed atom would enter the radius, re-classify as a donor, and get asked the donor's looser question
+    instead of its own. `donors=None` falls back to perception only for a genuinely unknown sphere.
     """
     margin = OUTER_REPORT_MARGIN if margin is None else margin
     out: list[Violation] = []
@@ -137,7 +130,7 @@ class FoldReport:
 
     @property
     def planarity(self) -> float:
-        """Max deg the metal lies out of a conjugated donor's ligand plane (0.0 if none). REPORT only."""
+        """Max deg the metal lies out of a conjugated donor's ligand plane (0.0 if none); report only."""
         return max((a.planarity for a in self.angles if a.planarity is not None), default=0.0)
 
     @property
@@ -171,25 +164,21 @@ def donor_fold(mol, conf_id: int = -1, *, donors=None, frozen=frozenset()) -> Fo
 def donor_orientation(mol, pos, donors=None, frozen=frozenset()) -> list[Violation]:
     """Report donor angles below their class-specific empirical floors.
 
-    ``metal_overbond`` is blind to the commonest fold, a short D-X bond being unable to reach the over-bond
-    floor even swung fully side-on (a carbonyl bent to a right angle holds its O at 2.13 Å over a 2.04 Å
-    floor). So this reads the M-D-X angle, which folding collapses. The floor per class is the 0.5th
-    percentile of 721 crystal donations minus 5°, keyed on (element, hybridisation) because a thiolate donates
-    at 103° where a carboxylate donates at 126°. A floor violation identifies an unusual angle, not proof
-    of folding or inversion: a tetrahedral donor can remain inside its carrier hull below this floor.
-    ``donor_fold`` is the metric that reports the rest.
+    `metal_overbond` is blind to the commonest fold: a short D-X bond can swing fully side-on without ever
+    reaching the over-bond floor (a carbonyl bent to a right angle holds its O at 2.13 A over a 2.04 A floor).
+    This reads the M-D-X angle instead, which folding collapses. The floor per class is the census 0.5th
+    percentile minus 5 deg, keyed on (element, hybridisation) since a thiolate donates at 103 deg where a
+    carboxylate donates at 126 deg. A floor violation flags an unusual angle, not proven folding or inversion:
+    a tetrahedral donor can sit inside its carrier hull below this floor, and real crystals do (WOKWUO's
+    Zn-bound C(SiMe3)3 donor reads 101 deg against its 104 deg floor, measured on the benchmark fixtures and
+    the tmQMg sample). `embed._donor_facing_failure` warns on this, never rejects. `donor_fold` reports the rest.
 
-    Five exemptions, each acute *by construction*:
+    Exemptions follow `donation_axis` (no axis to judge), plus one more here: an M-D-X unit wholly inside the
+    frozen core takes its orientation from the reference TS, not this gate. A donor the two estimators
+    disagree on, or an uncalibrated class (n < 6), is never gated.
 
-    * a haptic donor bonded to a co-donor has no donation axis, sitting ~70° off it;
-    * a hydride, sigma-complex or agostic H has no lone-pair axis;
-    * a bridging donor takes its geometry from the bridge;
-    * an APEX substituent bonded to >=2 donors sits at ~90° geometrically; a chelate's other arm is not exempt;
-    * an M-D-X unit wholly inside the frozen core takes its orientation from the reference TS.
-
-    A donor the two estimators disagree on, or an uncalibrated class (n < 6), is never gated. ``donors`` is
-    the intended sphere and the caller must pass it: perceiving it is circular, since a folded atom enters the
-    radius, reads as a co-donor, and writes its own donor off as haptic.
+    `donors` is the intended sphere and the caller must pass it: perceiving it is circular, since a folded
+    atom would enter the radius, read as a co-donor, and write its own donor off as haptic.
     """
     out: list[Violation] = []
     for a in _donor_walk(mol, pos, donors, frozen)[0]:
@@ -277,10 +266,10 @@ def _donor_walk(mol, pos, donors=None, frozen=frozenset()) -> tuple[list[DonorAn
 
 
 def _planarity_dev(mol, pos, *, hyb, m, d, x) -> float | None:
-    """Deg the metal lies out of a CONJUGATED donor's ligand plane (None when the D-X bond is not conjugated).
+    """Deg the metal lies out of a conjugated donor's ligand plane, or None when the D-X bond is not conjugated.
 
-    A carboxylate/pyridine plane rotated into the coordination sphere with an acceptable M-D-X angle. Report-only
-    It can never gate: the census p95 is 54.8° and real crystals reach 87.6° out of plane.
+    A carboxylate or pyridine plane rotated into the coordination sphere with an acceptable M-D-X angle.
+    Report only: it can never gate. The census p95 is 54.8 deg and real crystals reach 87.6 deg out of plane.
     """
     bond = mol.GetBondBetweenAtoms(d, x)
     sp2 = Chem.HybridizationType.SP2

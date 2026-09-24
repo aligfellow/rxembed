@@ -15,6 +15,8 @@ from functools import lru_cache
 
 import numpy as np
 
+from .constraints import FIX_ANGLE_TOL
+
 
 def _vertex_angle(u, v):
     u, v = np.array(u), np.array(v)
@@ -27,6 +29,9 @@ CHELATE_SPAN_ANGLE = 135  # a same-ligand donor pair this wide needs a trans-spa
 # Measured on the first 100 tmQMg sample and the named issue corpus: every tractable pool was <=504 raw
 # proper-rotation orbits, while the first factorial cliff began at 1,680. This is a resource limit, not chemistry.
 _MAX_EXHAUSTIVE_ORBITS = 1_000
+_AXIS_EPS = 1e-12  # a bite pair this close to antipodal has no well-defined rotation axis
+_SHELL_DAMPING = 0.5  # relaxed_shell's per-round step; undamped, a closed bite cycle oscillates, never converging
+_SPACE_DIMS = 3  # a lower vertex-direction rank means the metal and every vertex share one plane
 
 
 def _improper(p1, p2, p3, p4):
@@ -557,6 +562,32 @@ def hull_edges(dirs):
     return frozenset(edges)
 
 
+@lru_cache(maxsize=None)
+def _polygon_faces(dirs):
+    """Return the template's convex-hull faces of four or more vertices, as vertex-index arrays.
+
+    A plane through three vertices that leaves every vertex and the metal on one side supports a hull face;
+    the face is every vertex on that plane. A triangle is planar whatever its vertices do, so only larger faces
+    are returned. A planar template has no 3-D hull and returns none.
+    """
+    t = np.asarray(dirs, float)
+    t = t / np.linalg.norm(t, axis=1, keepdims=True)
+    if np.linalg.matrix_rank(t, tol=_SYM_TOL) < _SPACE_DIMS:
+        return ()
+    pts = np.vstack([t, np.zeros(3)])
+    faces = set()
+    for i, j, k in itertools.combinations(range(len(t)), 3):
+        normal = np.cross(t[j] - t[i], t[k] - t[i])
+        if np.linalg.norm(normal) < _SYM_TOL:
+            continue
+        side = (pts - t[i]) @ (normal / np.linalg.norm(normal))
+        if np.all(side <= _SYM_TOL) or np.all(side >= -_SYM_TOL):
+            face = tuple(int(v) for v in np.flatnonzero(np.abs(side[: len(t)]) <= _SYM_TOL))
+            if len(face) > 3:  # noqa: PLR2004 - a triangle is always planar
+                faces.add(face)
+    return tuple(np.array(face) for face in sorted(faces))
+
+
 def _proper_orbit_permutations(dirs):
     """Yield one vertex assignment per proper-rotation orbit."""
     rotations = point_group(dirs)[0]
@@ -602,6 +633,129 @@ def orientation_parity(dirs_obs, dirs):
     """Return +1 for a proper best fit of observed directions to an ideal shape, otherwise -1."""
     u, _s, vt = np.linalg.svd(np.asarray(dirs_obs).T @ np.asarray(dirs))
     return 1 if np.linalg.det(u @ vt) >= 0 else -1
+
+
+def relaxed_shell(dirs, bites, iters=500):
+    """Return unit rays for `dirs`, each bite pair rotated symmetrically to its target angle, or ``None``.
+
+    Every bite pair ``frozenset({i, j})`` in `bites` (a target angle in degrees) is closed or opened about
+    its own great-circle bisector until every bite is within `constraints.FIX_ANGLE_TOL` of its target; a
+    vertex outside every bite moves only to keep a non-triangular hull face of the template planar, so every
+    other row is the free, minimum-displacement consequence of the bite rays' new positions (the H-invariant
+    shell: see ARCHITECTURE.md). Folding a polygon face along a diagonal is a named distortion path: a square
+    pyramid's base gives the Berry pseudorotation toward trigonal bipyramidal, a trigonal prism's rectangles
+    give the Bailar twist toward octahedral. The per-round step is damped by
+    `_SHELL_DAMPING`: undamped, a vertex shared by two bite pairs on a closed cycle (a porphyrin's four
+    donors) overshoots each round and settles into a limit cycle instead of converging. Returns ``None``
+    when a bite pair cannot be rotated (already antipodal), when the relaxation has not converged after
+    `iters` rounds, or when the relaxed shell's oriented type -- the sign of every nonzero vertex triple
+    product not spanned by a template trans pair (`CHELATE_SPAN_ANGLE` or wider), or every nonzero in-plane
+    pair orientation for a planar template -- no longer matches the ideal template. That is a different
+    geometry, not a chelate distortion; returns None, so the caller refuses the arrangement. A trans pair is
+    excluded because it bends either way about its own axis without changing the arrangement, so its sign is
+    not a shape identity.
+
+    Pure in `(dirs, bites, iters)`, so results are memoised: a repeated enumeration-time input costs one cache
+    lookup, and the returned array is read-only so a cached result cannot be mutated by a caller.
+    """
+    key = tuple(sorted((tuple(sorted(pair)), float(target)) for pair, target in bites.items()))
+    return _relaxed_shell_cached(tuple(map(tuple, dirs)), key, iters)
+
+
+def _cross3(a, b):
+    """Cross product of two (N, 3) arrays, bit-identical to `np.cross(a, b)` (verified by fuzz test).
+
+    `np.cross` dispatches through generic per-call axis handling meant for arbitrary axis positions; at the
+    fixed (N, 3) shape every call in `_relaxed_shell_cached`'s hot loop uses, that dispatch alone was half
+    the loop's cost. The formula below is exactly what `np.cross` reduces to for this shape, so it changes
+    nothing about which shell a target relaxes to, only how many numpy calls that costs.
+    """
+    out = np.empty_like(a)
+    out[..., 0] = a[..., 1] * b[..., 2] - a[..., 2] * b[..., 1]
+    out[..., 1] = a[..., 2] * b[..., 0] - a[..., 0] * b[..., 2]
+    out[..., 2] = a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+    return out
+
+
+@lru_cache(maxsize=None)
+def _relaxed_shell_cached(dirs, bites_key, iters):
+    template = np.asarray(dirs, float)
+    template = template / np.linalg.norm(template, axis=1, keepdims=True)
+    r = template.copy()
+    if not bites_key:  # no bite pair to relax: the ideal template is already the (trivially converged) shell
+        r.setflags(write=False)
+        return r
+    i_idx = np.array([pair[0] for pair, _target in bites_key])
+    j_idx = np.array([pair[1] for pair, _target in bites_key])
+    targets = np.array([target for _pair, target in bites_key], float)
+    faces = _polygon_faces(dirs)
+    for _ in range(iters):
+        for face in faces:  # a polygon face folding along a diagonal is the Berry or Bailar path
+            pts = r[face]
+            centre = pts.mean(axis=0)
+            normal = np.linalg.svd(pts - centre)[2][2]
+            pts = pts - np.outer((pts - centre) @ normal, normal)
+            r[face] = pts / np.linalg.norm(pts, axis=1, keepdims=True)
+        ri, rj = r[i_idx], r[j_idx]
+        theta = np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", ri, rj), -1.0, 1.0)))
+        axis = _cross3(ri, rj)
+        norm = np.linalg.norm(axis, axis=1)
+        if np.any(norm < _AXIS_EPS):
+            return None
+        if float(np.max(np.abs(theta - targets))) < FIX_ANGLE_TOL:
+            r.setflags(write=False)
+            return r if _keeps_oriented_type(template, r) else None
+        half = (_SHELL_DAMPING * np.radians(theta - targets) / 2.0)[:, None] * (axis / norm[:, None])
+        move = np.zeros_like(r)
+        np.add.at(move, i_idx, half)
+        np.add.at(move, j_idx, -half)
+        phi = np.linalg.norm(move, axis=1)
+        moving = phi > 0.0
+        n, v, p = move[moving] / phi[moving, None], r[moving], phi[moving, None]
+        dot = np.einsum("ij,ij->i", n, v)[:, None]
+        r[moving] = v * np.cos(p) + _cross3(n, v) * np.sin(p) + n * dot * (1.0 - np.cos(p))
+    return None  # did not converge within `iters` rounds
+
+
+def _trans_pairs(template):
+    """Return the vertex-index pairs at or wider than `CHELATE_SPAN_ANGLE` in the ideal `template`."""
+    limit = math.cos(math.radians(CHELATE_SPAN_ANGLE))
+    return frozenset(
+        pair
+        for pair in itertools.combinations(range(len(template)), 2)
+        if float(template[pair[0]] @ template[pair[1]]) <= limit
+    )
+
+
+def _oriented_signs(r, planar, template):
+    """Return each triple's signed orientation, or each pair's signed in-plane sense for a planar template.
+
+    A triple that contains a `template` trans pair is dropped from the non-planar case: see `relaxed_shell`.
+    """
+    if planar:
+        normal = np.cross(r[0], r[1])
+        if np.linalg.norm(normal) < _SYM_TOL:
+            normal = np.cross(r[0], r[2])
+        normal = normal / np.linalg.norm(normal)
+        return {
+            pair: float(np.cross(r[pair[0]], r[pair[1]]) @ normal) for pair in itertools.combinations(range(len(r)), 2)
+        }
+    trans = _trans_pairs(template)
+    return {
+        triple: float(np.linalg.det(r[list(triple)]))
+        for triple in itertools.combinations(range(len(r)), 3)
+        if not any(pair in trans for pair in itertools.combinations(triple, 2))
+    }
+
+
+def _keeps_oriented_type(template, r):
+    """Return whether `r` keeps every nonzero orientation `template` states, with the same sign."""
+    planar = np.linalg.matrix_rank(template, tol=_SYM_TOL) < _SPACE_DIMS  # vertices and the metal share one plane
+    before, after = _oriented_signs(template, planar, template), _oriented_signs(r, planar, template)
+    return all(
+        abs(value) < _SYM_TOL or (after[key] * value > 0 and abs(after[key]) > _SYM_TOL)
+        for key, value in before.items()
+    )
 
 
 def _link_items(links):

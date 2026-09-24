@@ -54,8 +54,14 @@ def _check_assignment_cap(geometry, counts, rotations, limit=None):
         raise _assignment_cap_error(geometry, limit)
 
 
-def _chelate_bite_window(mol, a, b, donors=(), *, bounds=None, lengths=None):
-    """Return a soft chelate bite window compatible with the ligand graph and RDKit bounds."""
+def _chelate_bite_window(mol, a, b, donors=()):
+    """Return the ring-size census bite window, or ``None`` outside a 4-6 membered donor-free backbone.
+
+    Existence and census test only: `metal_constraints._seated_bites` is the sole caller that also needs the
+    native ligand reach triangle, and it builds that itself (`mechanisms._triangle_angles`) around this census.
+    `_chelate_edge_links` and the long-arc skip in `metal_enumeration._chelate_span_failure` read this
+    existence test alone, same as before.
+    """
     if not 0 <= a < mol.GetNumAtoms() or not 0 <= b < mol.GetNumAtoms():
         return None  # a haptic centroid is a coordination site, not an atom with a ligand-backbone path
     path = Chem.GetShortestPath(mol, a, b)
@@ -74,21 +80,7 @@ def _chelate_bite_window(mol, a, b, donors=(), *, bounds=None, lengths=None):
     # donor-free route is not the pair's chelate backbone and must not supply its bite prior.
     if distances.get(b) != len(path) - 1:
         return None
-    prior = _CHELATE_BITE.get(distances[b] + 2)
-    if prior is None or bounds is None or lengths is None:
-        return prior
-    left, right = map(float, lengths)
-
-    def angle(span):
-        cosine = (left * left + right * right - span * span) / (2.0 * left * right)
-        return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
-
-    lower = max(0.0, float(bounds[max(a, b)][min(a, b)]) - _SPAN_TOL)
-    upper = float(bounds[min(a, b)][max(a, b)]) + _SPAN_TOL
-    reachable = (angle(lower), angle(upper))
-    if reachable[1] < prior[0] or reachable[0] > prior[1]:
-        return reachable
-    return max(prior[0], reachable[0]), min(prior[1], reachable[1])
+    return _CHELATE_BITE.get(distances[b] + 2)
 
 
 def _chelate_edge_links(mol, padded, haptic=None, distances=None):

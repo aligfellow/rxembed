@@ -34,12 +34,22 @@ def test_editable_install_loads_this_checkout():
 
 
 def test_public_and_engine_surfaces():
-    for name in ("embed", "minimize", "metal", "read_xyz", "Ensemble", "EnsembleSet"):
+    for name in ("embed", "minimize", "metal", "read_xyz", "Ensemble", "EnsembleSet", "EmbedParams"):
         assert hasattr(rxembed, name), name
-    for name in ("embed", "minimize", "enumerate_isomers", "Conformers", "Constraints", "Isomer", "IsomerSet"):
+    for name in (
+        "embed",
+        "minimize",
+        "enumerate_isomers",
+        "Conformers",
+        "Constraints",
+        "Isomer",
+        "IsomerSet",
+        "EmbedParams",
+    ):
         assert hasattr(core, name), name
     assert rxembed.embed.__module__ == "rxembed.pipeline.api"
     assert core.embed.__module__ == "rxembed.embed"
+    assert rxembed.EmbedParams is core.EmbedParams
 
 
 def test_warning_reaches_stderr_with_no_logging_setup():

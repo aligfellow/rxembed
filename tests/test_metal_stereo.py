@@ -38,10 +38,10 @@ def test_donor_classes_ignore_resonance_form():
     ("smiles", "donors", "equal_pairs", "unequal_pairs"),
     [
         (r"F/C=N/C.F/C=N\C", [2, 6], [], [(2, 6)]),
-        ("CS(C)=O.C[S+](C)[O-]", [1, 5], [], [(1, 5)]),
+        ("CS(C)=O.C[S+](C)[O-]", [1, 5], [(1, 5)], []),
         ("[NH-]C(=[NH2+])N", [0, 2, 3], [(2, 3)], [(0, 2)]),
     ],
-    ids=["flat-symmetry-ligand-stereo", "unrelated-sulfur-forms", "charge-separated-resonance"],
+    ids=["flat-symmetry-ligand-stereo", "same-sulfoxide-drawn-in-its-two-lewis-forms", "charge-separated-resonance"],
 )
 def test_donor_classes_distinguish_or_merge_by_resonance_and_stereo(smiles, donors, equal_pairs, unequal_pairs):
     mol = Chem.MolFromSmiles(smiles)
@@ -71,19 +71,12 @@ def test_site_identity_restores_carriers_before_removing_donor_hydrogens():
         assert base.ToBinary() == before
 
 
-def test_site_classes_preserve_inequivalent_stereo_roots_and_reuse_the_proof(monkeypatch):
-    from rxembed import utils
-
-    monkeypatch.setattr(utils, "_RESONANCE_CACHE", {})
+def test_site_classes_preserve_inequivalent_stereo_roots():
     mol = Chem.MolFromSmiles("N[C@H](F)[C@H](F)[C@@H](F)[C@H](F)N")
     roots = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() == 7]
     classes = metal.site_classes(mol, roots)
     assert classes[roots[0]] != classes[roots[1]]
 
-    def repeated(*args, **kwargs):
-        raise AssertionError("re-enumerated an unchanged resonance proof")
-
-    monkeypatch.setattr(Chem, "ResonanceMolSupplier", repeated)
     reordered = Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))
     new_roots = [atom.GetIdx() for atom in reordered.GetAtoms() if atom.GetAtomicNum() == 7]
     repeated_classes = metal.site_classes(reordered, new_roots)
@@ -98,32 +91,49 @@ def test_site_classes_use_the_same_rooted_resonance_proof():
     assert classes[100] == classes[101]
 
 
-def test_large_resonance_identity_has_a_bounded_proof(monkeypatch):
-    mol = Chem.MolFromSmiles("C" * 41)
-    seen = []
-
-    def bounded(*args, **kwargs):
-        seen.append(kwargs["max_forms"])
-        return False, True
-
-    monkeypatch.setattr(metal, "resonance_match", bounded)
-    assert metal._root_resonance_match(mol, 0, 1) == (False, True)
-
-    assert seen == [8]
+_TRIP = "c2c(C(C)C)cc(C(C)C)cc2C(C)C"  # 2,4,6-triisopropylphenyl
 
 
-def test_large_site_identity_does_not_run_full_molecule_resonance(monkeypatch):
-    mol = Chem.MolFromSmiles("C" * 40 + "C(=O)[O-]")
-    oxygens = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() == 8]
+@pytest.mark.parametrize("phosphine", ["[P](C)(C)C", f"[P]({_TRIP})({_TRIP}){_TRIP}"], ids=["PMe3", "PTrip3"])
+def test_kappa2_acetate_oxygens_stay_equivalent_beside_a_bulky_phosphine(phosphine):
+    isomers = rx.metal(f"CC1=[O]->[Pd+2](<-[Cl-])(<-{phosphine})<-[O-]1", "SPL")
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("large site identity must not enumerate whole-molecule resonance forms")
+    assert len(isomers) == 1
 
-    monkeypatch.setattr(metal, "_root_resonance_match", forbidden)
-    classes = metal._root_classes(mol, oxygens)
 
-    assert len(classes) == 2
-    assert classes[oxygens[0]] != classes[oxygens[1]]
+@pytest.mark.parametrize(
+    ("smiles", "want"),
+    [
+        (f"CC(=O)[O-]->[Pd+2](<-[P]({_TRIP})({_TRIP}){_TRIP})(<-[Cl-])<-O=C(C)[O-]", 2),
+        (r"C/C=C/C#N->[Pd+2](<-[Cl-])(<-[Br-])<-N#C/C=C\C", 3),
+        ("CP1(C)=[O]->[Pd+2](<-[Cl-])(<-[P](C)(C)C)<-[O-]1", 1),
+        ("[O-]S1(=O)=[O]->[Pd+2](<-[Cl-])(<-[P](C)(C)C)<-[O-]1", 1),
+    ],
+    ids=[
+        "mixed-lewis-form-kappa1-acetates",
+        "crotononitrile-ez-stays-diastereomeric",
+        "kappa2-phosphinate-expanded-octet",
+        "kappa2-sulfate-expanded-octet",
+    ],
+)
+def test_resonance_identity_case_table_isomer_counts(smiles, want):
+    # The kappa1 acetates sit in two separate conjugated systems drawn in opposite Lewis forms and must
+    # still merge into one ligand class. The crotononitriles carry E/Z stereo on a bond inside the merged
+    # conjugated system and must stay diastereomeric, so the rule must not erase stated bond stereo. The
+    # phosphinate and sulfate oxygens sit on a p-block centre RDKit does not perceive as conjugated and must
+    # still merge, the same drawing choice as a carboxylate's.
+    assert len(rx.metal(smiles, "SPL")) == want
+
+
+def test_tetraphenylporphyrinato_nitrogens_merge_above_the_former_size_cap():
+    # meso-tetraphenylporphyrinato dianion, one Lewis form (two pyrrolide N-, two pyridine-type N): 48 heavy
+    # atoms, above the deleted 40-atom cap. All four donors sit in one macrocyclic conjugated system.
+    smiles = "c1ccc(cc1)-c1c2ccc([n-]2)c(-c2ccccc2)c2ccc(n2)c(-c2ccccc2)c2ccc([n-]2)c(-c2ccccc2)c2ccc1n2"
+    mol = Chem.MolFromSmiles(smiles)
+    nitrogens = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() == 7]
+    classes = metal.donor_classes(mol, nitrogens)
+
+    assert len(set(classes.values())) == 1
 
 
 def test_site_markers_do_not_suppress_dithiocarbamate_resonance():
@@ -325,7 +335,7 @@ def test_rxembed_post_dg_gate_covers_every_chiral_candidate_before_cleanup():
     for geometry, smiles in fixtures:
         for iso in rx.metal(smiles, geometry):
             assert iso.chirality in {"delta", "lambda"}
-            conformers = emb.embed(iso, n=_RX_CONFS, seed=7, prune_rms=-1)
+            conformers = emb.embed(iso, n=_RX_CONFS, params=rx.EmbedParams(seed=7, prune_rms=-1))
             assert len(conformers) == _RX_CONFS
             assert {_orientation_parity(conformers._mol, cid, iso) for cid in conformers.ids} == {1}
             tested[geometry] += len(conformers)
@@ -355,7 +365,7 @@ def test_chiral_ligand_filters_wrong_metal_hands_before_uff(monkeypatch):
         return ids
 
     monkeypatch.setattr(emb, "seed_coordinates", counted)
-    conformers = emb.embed(iso, n=8, seed=7, prune_rms=-1)
+    conformers = emb.embed(iso, n=8, params=rx.EmbedParams(seed=7, prune_rms=-1))
     assert len(conformers) == 8
     assert calls[0] > 8, "a mirror-unsafe ligand must sample both DG hands before selecting one"
     assert len(calls) > 1, "an all-wrong first batch must retry before cleanup"
@@ -369,7 +379,7 @@ def test_chiral_ligand_filters_wrong_metal_hands_before_uff(monkeypatch):
 
 def test_free_hand_reflection_preserves_distances_and_flips_chirality():
     iso = rx.metal("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "octahedral")[0]
-    conformers = emb.embed(iso, n=1, seed=7, prune_rms=-1)
+    conformers = emb.embed(iso, n=1, params=rx.EmbedParams(seed=7, prune_rms=-1))
     mol, cid = conformers._mol, conformers.ids[0]
     before = np.asarray(Chem.Get3DDistanceMatrix(mol, confId=cid))
     parity = _orientation_parity(mol, cid, iso)
@@ -404,6 +414,6 @@ def test_post_dg_gate_is_geometry_derived_for_every_nonplanar_polyhedron():
             continue
         iso = _distinct_donor_isomer(geometry)
         assert iso.chirality in {"delta", "lambda"}, geometry
-        conformers = emb.embed(iso, n=2, seed=7, prune_rms=-1)
+        conformers = emb.embed(iso, n=2, params=rx.EmbedParams(seed=7, prune_rms=-1))
         assert len(conformers) == 2, geometry
         assert {_orientation_parity(conformers._mol, cid, iso) for cid in conformers.ids} == {1}, geometry

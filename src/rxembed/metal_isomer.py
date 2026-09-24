@@ -40,8 +40,6 @@ from .metal_polyhedron import (
 )
 
 _PT = GetPeriodicTable()
-_PAIR = 2
-_HAPTIC_FACE_MIN = 3
 
 
 def length_source(mol, lengths):
@@ -482,9 +480,9 @@ def _state_haptic_configuration(iso, state):
     """Return rac/meso for one interchangeable pair of named haptic faces."""
     _vertices, haptic, winding, donors = _core.materialized_state(iso, state)
     descriptors = _coord_stereo.face_descriptors(iso._graph, donors, haptic, winding)
-    windings = {d: w for d, w in winding.items() if len(haptic.get(d, ())) >= _HAPTIC_FACE_MIN}
+    windings = {d: w for d, w in winding.items() if len(haptic.get(d, ())) >= 3}  # noqa: PLR2004 - orientable faces
     faces = [d for d in descriptors if d in windings]
-    if len(faces) != _PAIR or set(faces) != set(windings):
+    if len(faces) != 2 or set(faces) != set(windings):  # noqa: PLR2004 - a pair of faces
         return ""
     left, right = faces
     if winding_signature(iso, state, {left: "+", right: "-"}) != winding_signature(iso, state, {left: "-", right: "+"}):
@@ -513,7 +511,8 @@ def measured_haptic_windings(mol, metal, donors, haptic):
         return {}
     pos = mol.GetConformer().GetPositions()
     ranks = _coord_stereo.donor_classes(mol, donors)
-    eta2_ranks = list(Chem.ComputeAtomCIPRanks(mol)) if any(len(face) == _PAIR for face in haptic.values()) else None
+    # An eta2 face has two atoms.
+    eta2_ranks = list(Chem.ComputeAtomCIPRanks(mol)) if any(len(face) == 2 for face in haptic.values()) else None  # noqa: PLR2004
     return {
         dummy: sign
         for dummy, face in haptic.items()

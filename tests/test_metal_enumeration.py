@@ -6,7 +6,6 @@ import csv
 import itertools
 from collections import Counter
 from importlib.util import find_spec
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -22,9 +21,10 @@ from rxembed import metal_stereo as MS  # noqa: N812
 from rxembed import stereo as ligand_stereo
 from rxembed.constraints import Constraints
 from rxembed.embed import embed as core_embed
-from rxembed.metal_core import HapticSite, metal_indices
-from rxembed.metal_polyhedron import hull_edges, vertex_dirs
+from rxembed.metal_core import _FIT_MARGIN, VACANT, HapticSite, metal_indices, shape_gap
+from rxembed.metal_polyhedron import hull_edges, record, vertex_dirs
 from rxembed.pipeline import geom_check as geom
+from tests.conftest import TMQMG_DIR
 from tests.metal_fixtures import ferrocene
 
 _MA2B2 = "CCCN[Pd](Cl)(Cl)NCCC"  # square-planar MA2B2 -> the cis / trans pair
@@ -103,10 +103,32 @@ def test_unbound_metal_has_no_coordination_isomer():
         rx.metal(source)
 
 
-def test_boron_cage_fails_at_enumeration_boundary():
-    source = rx.parse_smiles("[BH-]1[BH-][BH-][BH-][BH-]1->[Fe+2]")
+def _closo_b6h6_bound_to_iron():
+    """Build a closo-B6H6 octahedron, each boron bonding four borons and one hydrogen, dative-bound to Fe2+.
 
-    with pytest.raises(ValueError, match=r"boron cage ligand.*two-centre donor model"):
+    RDKit will not sanitise a five-bonded boron from SMILES, so this is built as a raw graph.
+    """
+    rw = Chem.RWMol()
+    borons = [rw.AddAtom(Chem.Atom(5)) for _ in range(6)]
+    hydrogens = [rw.AddAtom(Chem.Atom(1)) for _ in range(6)]
+    antipode = {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4}
+    for i, j in itertools.combinations(range(6), 2):
+        if antipode[i] != j:
+            rw.AddBond(borons[i], borons[j], Chem.BondType.SINGLE)
+    for boron, hydrogen in zip(borons, hydrogens, strict=True):
+        rw.AddBond(boron, hydrogen, Chem.BondType.SINGLE)
+    iron = rw.AddAtom(Chem.Atom(26))
+    rw.GetAtomWithIdx(iron).SetFormalCharge(2)
+    rw.AddBond(borons[0], iron, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    return mol
+
+
+def test_boron_cage_fails_at_enumeration_boundary():
+    source = _closo_b6h6_bound_to_iron()
+
+    with pytest.raises(ValueError, match="two-centre donor model"):
         rx.metal(source)
     assert rx.metal("[BH3-][H]->[Fe+]")
 
@@ -116,7 +138,7 @@ def test_boron_cage_fails_at_enumeration_boundary():
         coordinates.SetAtomPosition(index, (float(index), 0.0, 0.0))
     coordinates.Set3D(True)
     conformer.AddConformer(coordinates)
-    with pytest.raises(ValueError, match=r"boron cage ligand.*two-centre donor model"):
+    with pytest.raises(ValueError, match="two-centre donor model"):
         rx.embed(conformer)
 
 
@@ -608,6 +630,27 @@ def test_compiled_network_screen_preserves_cis_and_long_trans_chelates(carbons, 
         _assert_embeds_as(iso)
 
 
+@pytest.mark.parametrize(
+    ("smiles", "geometry", "count"),
+    [
+        ("[Cl-]->[Cu+2]1<-n2cccc3ccc4ccc[n]->1c4c32", "trigonal_planar", 1),
+        ("[O+]#[C-]->[Fe]1(<-[C-]#[O+])(<-[C-]#[O+])<-n2cccc3ccc4ccc[n]->1c4c32", "trigonal_bipyramidal", 2),
+    ],
+    ids=["cu_trigonal_planar", "fe_trigonal_bipyramidal"],
+)
+def test_fused_chelate_is_screened_at_its_bite_on_a_trigonal_site(smiles, geometry, count):
+    """A fused (phenanthroline-like) 5-ring chelate holds its native backbone bite, not the ideal 120 vertex angle.
+
+    Before the fix the screen judged this independent pair at the ideal vertex angle and rejected every
+    arrangement; compile already holds it at the narrower `metal_slots._chelate_bite_window` bite. Measured:
+    0 and 1 isomer before the fix, 1 and 2 after (`screen=False` gives 1 and 3).
+    """
+    isomers = rx.metal(smiles, geometry)
+    assert len(isomers) == count
+    for iso in isomers:
+        _assert_embeds_as(iso)
+
+
 def test_short_trans_requires_euclidean_consistency_not_only_triangle_smoothing(monkeypatch):
     """Disabling either check alone still excludes the trans chelate; the edge rule now also proves it.
 
@@ -644,7 +687,7 @@ def test_trans_reach_screen_uses_the_shared_150_degree_slot_boundary(monkeypatch
     reach = np.full((5, 5), 10.0)
     reach[1, 3] = reach[3, 1] = 3.0
     monkeypatch.setattr(K._constraints, "_donor_distance_window", lambda *_args, **_kwargs: (2.0, 2.1))
-    monkeypatch.setattr(K, "_donor_facing_failure", lambda *_args: None)
+    monkeypatch.setattr(K, "_opposed_donor_span_failure", lambda *_args: None)
 
     failure = K._unreachable_span(iso, reach, {}, ())
 
@@ -673,7 +716,7 @@ def test_bonded_donors_keep_native_triangle_for_reach(monkeypatch):
     reach = np.full((5, 5), 10.0)
     reach[0, 1] = reach[1, 0] = 3.0
     monkeypatch.setattr(K._constraints, "_donor_distance_window", lambda *_args, **_kwargs: (2.0, 2.1))
-    monkeypatch.setattr(K, "_donor_facing_failure", lambda *_args: None)
+    monkeypatch.setattr(K, "_opposed_donor_span_failure", lambda *_args: None)
 
     assert K._unreachable_span(iso, reach, {}, ()) is None
     iso.vertices = (0, 2, 3, 1)
@@ -688,32 +731,6 @@ def test_embedded_chelate_survives_input_length_screening():
     assert len(rx.metal(embedded, lengths="model")) == 1
     assert len(rx.metal(embedded, lengths="input")) == 1
     assert len(rx.metal(embedded, lengths="input", screen=False)) == 1
-
-
-def test_direct_donor_bond_keeps_its_native_triangle_for_input_screening():
-    mol = rx.parse_smiles("N1N->[Zn+2](<-[Cl-])(<-[Cl-])<-1")
-    span = 1.398
-    radius = 2.0
-    theta = np.arcsin(span / (2 * radius))
-    chloride_radius = 2.2
-    chloride_z = -chloride_radius / np.sqrt(3)
-    chloride_y = chloride_radius * np.sqrt(2 / 3)
-    conformer = Chem.Conformer(mol.GetNumAtoms())
-    conformer.Set3D(True)
-    conformer.SetAtomPosition(0, Point3D(radius * np.sin(theta), 0.0, radius * np.cos(theta)))
-    conformer.SetAtomPosition(1, Point3D(-radius * np.sin(theta), 0.0, radius * np.cos(theta)))
-    conformer.SetAtomPosition(2, Point3D(0.0, 0.0, 0.0))
-    conformer.SetAtomPosition(3, Point3D(0.0, chloride_y, chloride_z))
-    conformer.SetAtomPosition(4, Point3D(0.0, -chloride_y, chloride_z))
-    mol.AddConformer(conformer)
-
-    reference = rx.metal(mol, lengths="input", screen=False)
-    screened = rx.metal(mol, lengths="input")
-
-    assert np.linalg.norm(conformer.GetPositions()[0] - conformer.GetPositions()[1]) == pytest.approx(span)
-    assert len(reference) == 1
-    assert reference[0].geometry == "tetrahedral"
-    assert {rx.cxsmiles(iso) for iso in screened} == {rx.cxsmiles(iso) for iso in reference}
 
 
 @pytest.mark.parametrize(("carbons", "count"), [(3, 1), (7, 2)])
@@ -836,7 +853,7 @@ def test_separate_pi_ligand_does_not_disable_chelate_network_screen(carbons, cou
 def test_inconclusive_haptic_subset_keeps_the_prior_donor_facing_screen(monkeypatch):
     smiles = "[Cl-]->[Pt+2]12(<-[NH2]CCC[NH2]->1)<-[CH2]=[CH2]->2"
     monkeypatch.setattr(K, "_compiled_span_failure", lambda *_args: None)
-    monkeypatch.setattr(K, "_donor_facing_failure", lambda *_args: "prior donor-facing conflict")
+    monkeypatch.setattr(K, "_opposed_donor_span_failure", lambda *_args: "prior donor-facing conflict")
 
     assert len(rx.metal(smiles, "SPL")) == 0
     assert len(rx.metal(smiles, "SPL", screen=False)) == 2
@@ -938,7 +955,11 @@ def test_narrow_span_pruning_clears_the_tethered_orbit_cap():
 @pytest.mark.parametrize(
     ("smiles", "count"),
     [
-        ("[Cl-]->[La+3]12(<-[Cl-])<-[NH2]CC[NH]->1CC[NH2]->2", 5),
+        # 4, not 5: the all-equatorial seating (both dien bites on adjacent equatorial slots) forces the
+        # third equatorial pair to 180 deg -- a square-pyramidal reading, not trigonal_bipyramidal, at every
+        # point in its bite windows including the anchor -- so `metal_constraints._bounded_bites` refuses it
+        # ("chelate bites leave trigonal_bipyramidal") independently of this test's own pruning screen.
+        ("[Cl-]->[La+3]12(<-[Cl-])<-[NH2]CC[NH]->1CC[NH2]->2", 4),
         ("[Cl-]->[La+3]123(<-[Cl-])(<-[NH2]CC[NH2]->1)<-[NH2]CC[NH]->2CC[NH2]->3", 24),
     ],
     ids=["tbp", "pbp"],
@@ -1008,27 +1029,53 @@ def test_chelate_edge_rule_bonded_pair_forces_the_zudwuq_perimeter():
     assert len(unrestricted) > 1
 
 
-_TMQMG_DIR = Path("/home/ali/Documents/Codes/tmQMg/data")
-
-
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-@pytest.mark.skipif(not _TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
+@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
 @pytest.mark.parametrize("tmqmg_id", ["ROGWIW", "IKOYOX", "KUVQOK"])
 def test_observed_only_survives_a_forbidden_measured_arrangement(tmqmg_id):
     """Regression: 3 real tmQMg structures went from 1 (their measured isomer) to 0 isomers once the
     forbidden-pair filter (narrow/linked) incorrectly ran on `observed_only`'s explicit retained order too.
     """
     charges = {
-        row["id"]: int(row["charge"])
-        for row in csv.DictReader((_TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
+        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
     }
     mol = rx.read_xyz(
-        str(_TMQMG_DIR / "xyz" / f"{tmqmg_id}.xyz"),
+        str(TMQMG_DIR / "xyz" / f"{tmqmg_id}.xyz"),
         charge=charges[tmqmg_id],
         connectivity="xyzgraph",
         bond_orders="xyz2mol",
     )
     assert len(rx.metal(mol, observed_only=True)) == 1
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
+def test_vudtul_chelate_bite_and_pair_rule_survive_the_span_screen():
+    """VUDTUL reads to one trigonal_planar isomer, only once both stages of this plan are in.
+
+    A d8 sigma,sigma C6-C7 metallacycle plus a 5-ring Se,P chelate: not the 0 isomers the span screen gave
+    before the chelate bite was let through (stage 1), nor the 2 square_planar isomers the pair rule alone
+    gives without it (the C6-C7 pair must first read as one haptic site, then that site's Se-Ni-P chelate
+    must be judged at its own bite, not the ideal 120 degrees).
+    """
+    charges = {
+        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
+    }
+    mol = rx.read_xyz(
+        str(TMQMG_DIR / "xyz" / "VUDTUL.xyz"),
+        charge=charges["VUDTUL"],
+        connectivity="xyzgraph",
+        bond_orders="xyz2mol",
+    )
+    isomers = rx.metal(mol)
+
+    assert len(isomers) == 1
+    iso = isomers[0]
+    assert iso.geometry == "trigonal_planar"
+    assert set(iso.haptic.values()) == {(6, 7)}
+
+    embedded = rx.embed(iso, n=1, seed=42, threads=1).mol
+    assert rx.metal(embedded, observed_only=True)[0].geometry == "trigonal_planar"
 
 
 def test_tethered_haptic_faces_reject_an_unreachable_trans_state():
@@ -1325,9 +1372,19 @@ def test_sandwich_uses_two_centroids(door, tmp_path):
         assert int(f.readline()) == 11, "a centroid dummy reached the dumped xyz"
 
 
-def test_haptic_complex_survives_the_mc_search():
-    assert rx.embed(rx.metal(ferrocene())[0], n=3).mc().ids
-    assert rx.embed(rx.metal(ferrocene())[0], n=3).mc(explore=True).ids
+@pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
+def test_haptic_complex_mc_search_warns_and_keeps_the_seeded_conformers(caplog):
+    """openconf's pose generator refuses a haptic centroid mol ("changed the atom set"); mc() must warn
+    instead of raising and must leave the seeded conformers exactly as they were.
+    """
+    ens = rx.embed(rx.metal(ferrocene())[0], n=3, seed=1)
+    seeded = list(ens.ids)
+
+    with caplog.at_level("WARNING", logger="rxembed"):
+        ens.mc()
+
+    assert list(ens.ids) == seeded
+    assert any("openconf could not search this system" in r.getMessage() for r in caplog.records)
 
 
 def test_haptic_spectator_uses_the_same_centroid_constraints():
@@ -1392,7 +1449,7 @@ def test_haptic_centroid_participates_in_post_dg_metal_hand_selection():
     iso = rx.metal(mol, "tetrahedral")[0]
     assert iso.chirality
     assert len(iso.haptic) == 1
-    conformers = core_embed(iso, n=8, seed=7, prune_rms=-1)
+    conformers = core_embed(iso, n=8, params=rx.EmbedParams(seed=7, prune_rms=-1))
     assert len(conformers) == 8
     assert {
         MS.realised_chirality(conformers._mol, cid, iso.geometry, iso.vertices, iso.metal, iso.chirality, iso.haptic)
@@ -1452,3 +1509,202 @@ def test_empty_isomer_enumeration_from_a_pruned_pool_names_the_screen_remedy(cap
     # screen=False is the wrong remedy for a model-length contradiction (it returns non-embeddable states);
     # lengths='input' must be named too.
     assert any("lengths='input'" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_chelate_bites_that_cannot_jointly_reach_the_polyhedron_are_refused(caplog):
+    """A triamine fan (NH2-CH2-NH-CH2-NH2, two fused 4-ring bites) on a trigonal-planar centre cannot hold
+    its 58-81 deg model bite windows at 120 deg ideal without folding out of plane: even the ideal-clamped
+    anchor no longer reads as trigonal_planar, so the sole candidate is refused rather than silently compiled
+    against a shape its own bites cannot support.
+    """
+    import logging
+
+    smiles = "[NH2]1C[NH]2C[NH2]->[Pd+2]<-1<-2"
+    with caplog.at_level(logging.DEBUG, logger="rxembed.metal"):
+        isomers = rx.metal(smiles, "trigonal_planar")
+    assert isomers == []
+    assert any("chelate bites leave trigonal_planar" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_six_ring_pincer_opens_to_a_trigonal_bipyramid_equator():
+    """PIVPOB's SNS pincer (a rigid 6-ring bite each side) reads 105-108 deg at its equator, above the 74-104
+    deg ring-size census. The census-only window's ideal-clamped anchor misreads square_pyramidal, so a
+    census-only wall refused this isomer outright. The gap rule (`metal_constraints._bounded_bites`) instead
+    opens a box from the census edge out to the backbone-triangle reach, which this arrangement's relaxed
+    shell does read as trigonal_bipyramidal, so it is enumerated and embeds.
+    """
+    smiles = "[O-2]->[V+5]12(<-[O-2])<-[S-]CCc3cccc(CC[S-]->1)[n]->23"
+    isomers = rx.metal(smiles, "trigonal_bipyramidal")
+    mol = isomers[0]._graph  # one shared graph; atom symbols identify the pincer regardless of vertex order
+    equatorial = set(dict(record("trigonal_bipyramidal").site_groups)["equatorial"])
+
+    def is_pincer_equatorial(iso):
+        pincer = {v for v, d in enumerate(iso.vertices) if d != VACANT and mol.GetAtomWithIdx(d).GetSymbol() != "O"}
+        return pincer == equatorial
+
+    matches = [iso for iso in isomers if is_pincer_equatorial(iso)]
+    assert len(matches) == 1
+
+    ensemble = rx.embed(matches[0], n=1, seed=42, threads=1)
+    assert ensemble.n == 1
+
+
+def test_seesaw_bis_bipyridine_silver_enumerates():
+    """`_bounded_bites`'s synthetic witness must read at the model M-L radius, not a bare unit ray (YEGNAA).
+
+    Two independent cis bipyridine bites on a seesaw silver each have a compiled window of (70.0, 91.0) deg
+    around a 90 deg ideal. At a unit witness radius, an ideal seesaw's own plane RMS (0.2449) undercuts the
+    absolute flatness tolerance `classify_geometry` compares it against, so every corner of the box reads
+    square_planar instead of seesaw and `_bounded_bites` collapses the whole box to its anchor, refusing the
+    only candidate. Scaling the witness to the real model M-L distance restores the reading.
+    """
+    smiles = "c1ccc2-c3cccc[n]3->[Ag+]4(<-[n]2c1)<-[n]1ccccc1-c1cccc[n]->41"
+    isomers = rx.metal(Chem.MolFromSmiles(smiles), geometry="seesaw")
+    assert len(isomers) >= 1
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
+@pytest.mark.parametrize(
+    ("tmqmg_id", "geometry"), [("MADQAM", "tetrahedral"), ("VALRAE", "square_pyramidal")], ids=["madqam", "valrae"]
+)
+def test_bounded_bite_box_still_embeds_the_reference_isomer(tmqmg_id, geometry):
+    """The bounded bite box (`metal_constraints._bounded_bites`) narrows MADQAM's and VALRAE's compiled bite
+    rows, but their reference isomer -- the one matching the crystal's own donor arrangement -- must still
+    embed and read its own requested polyhedron within `_FIT_MARGIN` of the best, not slip into a clearly
+    different shape the fold accepts instead (rule B, the acceptance gate's own predicate).
+    """
+    charges = {
+        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
+    }
+    mol = rx.read_xyz(
+        str(TMQMG_DIR / "xyz" / f"{tmqmg_id}.xyz"),
+        charge=charges[tmqmg_id],
+        connectivity="xyzgraph",
+        bond_orders="xyz2mol",
+    )
+    isomers = rx.metal(mol, lengths="model")
+    ref_cx = rx.cxsmiles(mol)
+    ref = next(iso for iso in isomers if rx.cxsmiles(iso) == ref_cx)
+    assert ref.geometry == geometry
+    ensemble = rx.embed(ref, n=1, seed=42, threads=1)
+    assert ensemble.n == 1
+
+    accepted = shape_gap(ensemble.mol, ref.metal, ref.vertices, ref.haptic, geometry, ensemble.ids[0])[3]
+    assert accepted
+
+
+def _valrae_reference():
+    """Load VALRAE's crystal-matching reference isomer: square_pyramidal, a near-tie input vs TBP."""
+    charges = {
+        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
+    }
+    mol = rx.read_xyz(
+        str(TMQMG_DIR / "xyz" / "VALRAE.xyz"),
+        charge=charges["VALRAE"],
+        connectivity="xyzgraph",
+        bond_orders="xyz2mol",
+    )
+    isomers = rx.metal(mol, lengths="model")
+    ref_cx = rx.cxsmiles(mol)
+    return next(iso for iso in isomers if rx.cxsmiles(iso) == ref_cx)
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
+@pytest.mark.parametrize("seed", range(1, 21))
+def test_valrae_near_tie_reference_embeds_at_every_seed(seed):
+    """VALRAE's reference sits at a near-tie input (square_pyramidal vs trigonal_bipyramidal, gap < `_FIT_MARGIN`).
+
+    Rule B accepts the output whenever the requested shape reads within `_FIT_MARGIN` of the best, instead
+    of the pre-rule-B gate retrying until a clear square_pyramidal survives, which failed outright at 4 of
+    the first 5 seeds. Which of the two reads as the outright best is not this test's contract; a face-rule
+    embed reads square_pyramidal outright at every one of these seeds, where an unfolded one only tied it.
+    """
+    ref = _valrae_reference()
+    assert ref.geometry == "square_pyramidal"
+    ensemble = rx.embed(ref, n=1, seed=seed, threads=1)
+    assert ensemble.n == 1
+
+    accepted = shape_gap(ensemble.mol, ref.metal, ref.vertices, ref.haptic, ref.geometry, ensemble.ids[0])[3]
+    assert accepted
+
+
+def _berry_intermediate_positions(t):
+    """Return 5 unit vectors on the SPY->TBP Berry pseudorotation path at parameter `t` (0 = SPY, 1 = TBP).
+
+    Spherical-linear interpolation, slot by slot, between the two idealized templates' own `vertex_dirs`.
+    Not the literature pivot/turnstile pairing (this codebase's own fit is seating-invariant, so any
+    continuous path between the two templates crosses their residual tie the same way); only the residual
+    gap it lands at matters here.
+    """
+    spy = np.array(record("square_pyramidal").vertex_dirs, float)
+    tbp = np.array(record("trigonal_bipyramidal").vertex_dirs, float)
+    spy /= np.linalg.norm(spy, axis=1, keepdims=True)
+    tbp /= np.linalg.norm(tbp, axis=1, keepdims=True)
+
+    def slerp(a, b):
+        theta = np.arccos(np.clip(a @ b, -1.0, 1.0))
+        if theta < 1e-9:  # SPY and TBP already share this slot's direction (both templates' axial/apex)
+            return a
+        return (np.sin((1 - t) * theta) * a + np.sin(t * theta) * b) / np.sin(theta)
+
+    pts = np.array([slerp(spy[i], tbp[i]) for i in range(5)])
+    return pts / np.linalg.norm(pts, axis=1, keepdims=True)
+
+
+def test_berry_pseudorotation_intermediate_reads_back_in_its_requested_frame():
+    """A five-coordinate [FeCl5]2- Berry pseudorotation intermediate, close enough past the SPY/TBP fit-residual
+    crossover that trigonal_bipyramidal reads as the argmin (0.224) with square_pyramidal a near-tie runner-up
+    (0.228), inside `_FIT_MARGIN`: rule B accepts the requested square_pyramidal, where the pre-rule-B gate
+    could only ever publish a strict argmin match or raise. `rx.metal(..., geometry='square_pyramidal',
+    observed_only=True)` must still round-trip it, since `observed_only` shares the acceptance gate's rule B
+    predicate, not a strict argmin equality. Fixed geometry, no embed and no seed: the premise does not depend
+    on where a relax happens to land.
+    """
+    mol = Chem.MolFromSmiles("[Cl-]->[Fe+3](<-[Cl-])(<-[Cl-])(<-[Cl-])<-[Cl-]")
+    metal = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "Fe")
+    donors = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "Cl"]
+    bond_length = 2.3  # Å, an ordinary Fe(III)-Cl distance; the reading depends only on direction, not scale
+    positions = _berry_intermediate_positions(0.32)  # past the ~0.312 crossover, TBP wins by ~0.003 < _FIT_MARGIN
+
+    conformer = Chem.Conformer(mol.GetNumAtoms())
+    conformer.SetAtomPosition(metal, Point3D(0.0, 0.0, 0.0))
+    for donor, direction in zip(donors, positions, strict=True):
+        conformer.SetAtomPosition(donor, Point3D(*(bond_length * direction)))
+    mol.AddConformer(conformer, assignId=True)
+
+    requested, next_name, next_residual, accepted = shape_gap(mol, metal, donors, {}, "square_pyramidal")
+    assert next_name == "trigonal_bipyramidal"
+    assert next_residual < requested, "premise: this shell's argmin is the OTHER shape, not the requested one"
+    assert requested - next_residual < _FIT_MARGIN
+    assert accepted
+
+    reread = rx.metal(mol, geometry="square_pyramidal", observed_only=True)
+    assert len(reread) >= 1
+    assert reread[0].geometry == "square_pyramidal"
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
+def test_kuqpuj_reference_embed_keeps_its_own_donor_pair_slots():
+    """The plan's per-ID evidence reports KUQPUJ's fresh embed swapping donor-pair slots (atoms 6/11 and
+    15/21) under an all-rows-pulled construction. That swap does not reproduce from a single `rx.embed`
+    call at seed 42 in this environment (confirmed on the unmodified 6f85aaf baseline too, by mutation
+    testing); this stays a plain correctness confirmation, and the benchmark run owns the discriminating
+    check (fair A2-vs-stage-2 comparison, run.py's own pipeline).
+    """
+    charges = {
+        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
+    }
+    mol = rx.read_xyz(
+        str(TMQMG_DIR / "xyz" / "KUQPUJ.xyz"),
+        charge=charges["KUQPUJ"],
+        connectivity="xyzgraph",
+        bond_orders="xyz2mol",
+    )
+    isomers = rx.metal(mol, lengths="model")
+    ref_cx = rx.cxsmiles(mol)
+    ref = next(iso for iso in isomers if rx.cxsmiles(iso) == ref_cx)
+    ensemble = rx.embed(ref, n=1, seed=42, threads=1)
+    assert rx.cxsmiles(ensemble.mol) == rx.cxsmiles(ref)

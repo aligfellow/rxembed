@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from itertools import permutations
 from pathlib import Path
@@ -74,6 +75,111 @@ def test_fragment_valence_is_checked_after_native_bond_orders(element, monkeypat
         }
         assert Chem.MolToSmiles(perceived) == f"[Ag+].[O-][{element}+3]([O-])([O-])[O-]"
         assert Chem.GetFormalCharge(perceived) == 0
+
+
+def test_titanium_is_never_read_above_its_four_valence_electrons():
+    """Ti(IV) is titanium's highest oxidation state; four chlorides asking for more must be refused."""
+    rw = Chem.RWMol()
+    titanium = rw.AddAtom(Chem.Atom(22))
+    chlorines = [rw.AddAtom(Chem.Atom(17)) for _ in range(4)]
+    for chlorine in chlorines:
+        rw.AddBond(titanium, chlorine, Chem.BondType.SINGLE)
+    rw.UpdatePropertyCache(strict=False)
+    mol = rw.GetMol()
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    conf.SetAtomPosition(titanium, Point3D(0, 0, 0))
+    for chlorine, point in zip(chlorines, [(2.3, 0, 0), (-2.3, 0, 0), (0, 2.3, 0), (0, -2.3, 0)], strict=True):
+        conf.SetAtomPosition(chlorine, Point3D(*point))
+    mol.AddConformer(conf)
+    coords = mol.GetConformer().GetPositions()
+
+    get_tmc_mol(None, 0, graph=(mol, coords))  # Ti+4 at four Cl-: at the cap, not over it
+
+    with pytest.raises(ValueError, match=r"Ti\+8 is an impossible oxidation state"):
+        get_tmc_mol(None, 4, graph=(mol, coords))  # same ligands, asked to give up two more electrons
+
+
+def _boratacyclopentadienyl_titanium_trichloride():
+    """Ti bound to an eta5-borole ring (B + 4 CH) and three chlorides, borole ring not yet charged.
+
+    Borole is non-aromatic neutral and aromatic (6 pi electrons, isoelectronic with cyclopentadienide)
+    as its dianion: `_fast_bond_orders` ranks the aromatic q=-2 ring above the neutral q=0 one regardless
+    of hint. At three chlorides the q=-2 ring reads Ti+5 (over the four-electron cap); only the
+    lower-ranked neutral ring keeps Ti in range, so this is a real case for the rescue search, not a
+    synthetic one.
+    """
+    rw = Chem.RWMol()
+    titanium = rw.AddAtom(Chem.Atom(22))
+    boron = rw.AddAtom(Chem.Atom(5))
+    ring = [boron] + [rw.AddAtom(Chem.Atom(6)) for _ in range(4)]
+    for a, b in zip(ring, ring[1:] + ring[:1], strict=True):
+        rw.AddBond(a, b, Chem.BondType.SINGLE)
+    hydrogens = []
+    for atom in ring:
+        hydrogen = rw.AddAtom(Chem.Atom(1))
+        rw.AddBond(atom, hydrogen, Chem.BondType.SINGLE)
+        hydrogens.append(hydrogen)
+        rw.AddBond(titanium, atom, Chem.BondType.SINGLE)
+    chlorines = [rw.AddAtom(Chem.Atom(17)) for _ in range(3)]
+    for chlorine in chlorines:
+        rw.AddBond(titanium, chlorine, Chem.BondType.SINGLE)
+    rw.UpdatePropertyCache(strict=False)
+    mol = rw.GetMol()
+
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    conf.SetAtomPosition(titanium, Point3D(0, 0, 0))
+    for i, atom in enumerate(ring):
+        angle = 2 * math.pi * i / len(ring)
+        conf.SetAtomPosition(atom, Point3D(2.2 * math.cos(angle), 2.2 * math.sin(angle), 1.9))
+    for i, hydrogen in enumerate(hydrogens):
+        angle = 2 * math.pi * i / len(hydrogens)
+        conf.SetAtomPosition(hydrogen, Point3D(3.3 * math.cos(angle), 3.3 * math.sin(angle), 2.6))
+    for i, chlorine in enumerate(chlorines):
+        angle = 2 * math.pi * i / len(chlorines)
+        conf.SetAtomPosition(chlorine, Point3D(2.3 * math.cos(angle), 2.3 * math.sin(angle), -1.9))
+    mol.AddConformer(conf)
+    return mol, mol.GetConformer().GetPositions()
+
+
+def test_over_cap_borole_ring_charge_is_rescued_by_its_neutral_form():
+    """The aromatic dianion ring reads Ti+5 and must be refused outright; the rescue search instead
+    tries the ring's own lower-ranked neutral form, which keeps Ti+3, and takes it."""
+    mol, coords = _boratacyclopentadienyl_titanium_trichloride()
+
+    out, _xyz = get_tmc_mol(None, 0, graph=(mol, coords))
+
+    titanium = next(a for a in out.GetAtoms() if a.GetAtomicNum() == 22)
+    boron = next(a for a in out.GetAtoms() if a.GetAtomicNum() == 5)
+    assert titanium.GetFormalCharge() == 3  # Ti+3: neutral ring (0) + three Cl- (-3)
+    assert boron.GetFormalCharge() == 0
+
+
+def test_over_cap_ligand_charge_takes_a_ranked_alternative_before_refusing(monkeypatch):
+    """One ligand's best-ranked charge can push the metal over its cap; the search tries that ligand's
+    next-ranked charge (not just its winner) before refusing, and takes the first one that fits."""
+    placeholder, best, fallback = Chem.MolFromSmiles("C"), Chem.Mol(), Chem.Mol()
+    monkeypatch.setattr(tmc, "_ligand_charge_pool", lambda m, charge, coord: [(best, -6), (fallback, -2)])
+
+    rescue = tmc._rescue_over_cap_ligand_charge([(placeholder, [], -6)], total_lig_charge=-8, overall_charge=0, limit=4)
+
+    assert rescue == (0, fallback, -2, -4)
+
+
+def test_over_cap_ligand_charge_still_refuses_when_no_alternative_fits(monkeypatch):
+    """No pool entry brings the metal under its cap: the rescue search reports failure, not a bad pick."""
+    placeholder = Chem.MolFromSmiles("C")
+    monkeypatch.setattr(tmc, "_ligand_charge_pool", lambda m, charge, coord: [(Chem.Mol(), -7), (Chem.Mol(), -6)])
+
+    rescue = tmc._rescue_over_cap_ligand_charge([(placeholder, [], -6)], total_lig_charge=-8, overall_charge=0, limit=4)
+
+    assert rescue is None
+
+
+def test_ligand_charge_pool_is_empty_for_a_monatomic_ligand():
+    """A single-atom ligand (a halide, a hydride) has no alternate resonance form to search."""
+    chloride = Chem.MolFromSmiles("[Cl-]")
+
+    assert tmc._ligand_charge_pool(chloride, -1, [0]) == []
 
 
 def test_invented_hydrogen_gate_counts_bracket_h_but_not_xyz_h_atoms():

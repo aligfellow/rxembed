@@ -103,6 +103,40 @@ def test_max_iters_zero_scores_without_moving_an_atom():
     assert np.allclose(mol.GetConformer(0).GetPositions(), before), "max_iters=0 moved atoms"
 
 
+def _worst_sp2_improper(mol):
+    """The largest |improper dihedral| over every degree-3 aromatic-carbon sp2 centre."""
+    conf = mol.GetConformer()
+    sp2 = [
+        (a.GetIdx(), [n.GetIdx() for n in a.GetNeighbors()])
+        for a in mol.GetAtoms()
+        if a.GetAtomicNum() == 6 and a.GetHybridization() == Chem.HybridizationType.SP2 and a.GetDegree() == 3
+    ]
+    return max(abs(GetDihedralDeg(conf, nb[0], nb[1], nb[2], c)) for c, nb in sp2)
+
+
+def test_sp2_hold_preserves_a_seeded_pucker_instead_of_flattening_it():
+    """The sp2-carbon hold must PRESERVE a seed's existing pucker, never flatten it back to planar.
+
+    Bare UFF has no reason to keep an aromatic ring bent, so it relaxes a manually puckered benzene ring
+    straight back to ~0 deg; `restrained_uff` (which adds the sp2-hold window) must not do that.
+    """
+    mol = Chem.AddHs(Chem.MolFromSmiles("c1ccccc1"))
+    assert rdDistGeom.EmbedMolecule(mol, randomSeed=1) == 0
+    assert _worst_sp2_improper(mol) < 1.0, "ETKDG did not seed benzene flat: the premise this bends away from is void"
+
+    conf = mol.GetConformer()
+    pos = conf.GetPositions()
+    pos[0, 2] += 0.5  # bend one ring carbon out of plane: a synthetic, deterministic pucker
+    for i, p in enumerate(pos):
+        conf.SetAtomPosition(i, p.tolist())
+    seeded = _worst_sp2_improper(mol)
+    assert seeded > 30.0, "the manual bend did not survive onto the measured improper"
+
+    restrained_uff(mol, Constraints())
+    held = _worst_sp2_improper(mol)
+    assert held > 0.5 * seeded, f"worst sp2 improper fell to {held:.1f} deg from a {seeded:.1f} deg seed: flattened"
+
+
 @pytest.mark.parametrize("trajectory", [False, True])
 def test_restrained_energy_scores_endpoint_on_the_same_field(monkeypatch, trajectory):
     mol = _mol()
@@ -251,6 +285,32 @@ def test_isolated_untyped_boron_uses_a_private_carbon_type():
     assert surrogates == {1: (5, 6)}
 
 
+def test_dithiocarbene_donor_gets_a_recognised_sulfur_charge_state():
+    """A ZTDXCO-shaped `[C-2]=[S+]` donor: UFF ignores S's charge for a divalent double-bonded S and
+
+    keeps the native (too-short) double-bond radius, crushing the C-S bond to ~1.43 A (measured on
+    ZTDXCO's real crystal geometry, no metal, no constraints). Re-deriving S's hybridisation from its
+    sigma degree gives the recognised ~1.59 A type instead.
+    """
+    mol = Chem.MolFromSmiles("C[S+]=[CH0-2]")
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for i, xyz in enumerate(((-1.8, 0.0, 0.0), (0.0, 0.0, 0.0), (1.6, 0.0, 0.0))):
+        conf.SetAtomPosition(i, xyz)
+    mol.AddConformer(conf)
+    before_charges = [a.GetFormalCharge() for a in mol.GetAtoms()]
+    before_smiles = Chem.MolToSmiles(mol)
+    surrogates = {}
+
+    energies = restrained_uff(mol, Constraints(), max_iters=200, _surrogates=surrogates)
+
+    length = GetBondLength(mol.GetConformer(0), 1, 2)
+    assert np.isfinite(energies).all()
+    assert length >= 1.55, f"the C-S bond crushed to {length:.3f} A"
+    assert [a.GetFormalCharge() for a in mol.GetAtoms()] == before_charges, "public formal charges moved"
+    assert Chem.MolToSmiles(mol) == before_smiles, "the public molecule was retyped, not just its private FF graph"
+    assert surrogates == {1: (16, 16)}
+
+
 def test_boron_network_is_not_retyped_as_carbon():
     mol = Chem.MolFromSmiles("C=[B]B")
     mol.AddConformer(Chem.Conformer(mol.GetNumAtoms()))
@@ -291,6 +351,13 @@ def test_plain_ff_energy_rejects_an_incomplete_uff_objective():
 
     with pytest.raises(relax_module.UFFTypingError, match="Se2"):
         ff_energies(mol, minimize=False)
+
+
+def test_uff_typing_error_is_one_message_from_one_place():
+    """`ff_energies` and the internal surrogate-graph search must not diverge on the remedy they name."""
+    mol = Chem.MolFromSmiles("[He].[He]")
+    with pytest.raises(relax_module.UFFTypingError, match=r"He0, He1.*use a different relaxation backend"):
+        relax_module._raise_uff_typing_error(mol, [0, 1])
 
 
 def test_surrogate_single_point_reports_its_private_objective_once(caplog):

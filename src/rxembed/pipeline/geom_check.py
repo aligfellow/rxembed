@@ -25,6 +25,7 @@ from rdkit.Numerics import rdAlignment
 
 # metals excluded from every ground-state check (dative, not vdW):
 from rxembed.constraints import constraint_value, within_window
+from rxembed.embed import SHAPE_PROP
 from rxembed.metal_core import COORDINATION_METALS, metal_indices
 from rxembed.metal_perceive import (
     _coordinating_carbons,
@@ -48,10 +49,9 @@ from rxembed.utils import (
 
 _FLEX_CONJ = 60.0  # deg: the wider conjugation-dihedral window a metal-coordinated / side-on π atom gets (vs 30)
 _XH_TOL = 0.2  # Å slack over an X-H covalent-radius sum (P-H/Si-H/S-H run longer than the flat C-H ceiling)
-_FUSE_RATIO = (
-    1.0  # a NON-bonded 1-3 pair has fused when its separation drops to the covalent sum: a ring closed by the relax
-)
-# rather than by the graph. Bonded 1-3 pairs are excluded, being legitimately this close.
+# A non-bonded 1-3 pair has fused when its separation drops to the covalent sum: a ring closed by the relax,
+# not the graph. Bonded 1-3 pairs are excluded, being legitimately this close.
+_FUSE_RATIO = 1.0
 
 
 # --- the result -------------------------------------------------------------
@@ -62,6 +62,7 @@ class GeometryReport:
     """Result of ``check()``. Falsy/``ok()`` when there are no violations."""
 
     violations: list[Violation] = field(default_factory=list)
+    shape: str | None = None  # the conformer's SHAPE_PROP record; None for a non-metal conformer
 
     def ok(self) -> bool:
         """Return True when the conformer passed every check."""
@@ -72,11 +73,13 @@ class GeometryReport:
         return self.ok()
 
     def summary(self) -> str:
-        """Format the violations one per line (or an all-clear message)."""
+        """Format the shape record, then the violations one per line (or an all-clear message)."""
+        lines = [self.shape] if self.shape is not None else []
         if self.ok():
-            return "geometry OK (no violations)"
-        lines = [f"{len(self.violations)} geometry violation(s):"]
-        lines += [f"  - {v}" for v in self.violations]
+            lines.append("geometry OK (no violations)")
+        else:
+            lines.append(f"{len(self.violations)} geometry violation(s):")
+            lines += [f"  - {v}" for v in self.violations]
         return "\n".join(lines)
 
     def assert_ok(self) -> None:
@@ -422,15 +425,10 @@ def stereo_violations(mol, pos, reference, conf_id: int = -1) -> list[Violation]
 def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=None, donors=None) -> GeometryReport:
     """Run the full physical gate on one conformer and collect all violations.
 
-    Parameters
-    ----------
-    frozen : sequence of int, optional
-        The frozen or reacting TS core: excluded from the ground-state checks (a forming/breaking bond
-        or distorted reacting sp2 is correct by design) and held to ``reference`` by an RMSD check.
-    reference : rdkit.Chem.Mol or .xyz path, optional
-        Reference geometry for the frozen-core RMSD and stereo checks.
-    constraints : mapping or Constraints-like, optional
-        ``distances`` / ``angles`` to confirm the seed was realised.
+    ``frozen`` is the frozen or reacting TS core: skipped by the ground-state checks (a forming/breaking
+    bond or distorted reacting sp2 is correct by design) and held to ``reference`` by an RMSD check.
+    ``reference`` also sets the stereo check. ``constraints`` gives the distance/angle windows to confirm
+    the seed was realised.
     """
     if isinstance(reference, str):
         reference = Chem.MolFromXYZFile(reference)  # coords only; atom order must match `mol`
@@ -447,8 +445,9 @@ def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=No
                 )
             ]
         )
+    metals = metal_indices(mol)
     exclude = set(frozen) if frozen is not None else set()
-    exclude |= set(metal_indices(mol))  # dative, not vdW
+    exclude |= set(metals)  # dative, not vdW
     exclude = frozenset(exclude)
     coord_c = _coordinating_carbons(mol, pos)  # dative, not covalent: an organic valence rule would false-flag it
     v: list[Violation] = []
@@ -466,7 +465,11 @@ def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=No
         v += check_constraints(mol, pos, constraints)
     if reference is not None:
         v += stereo_violations(mol, pos, reference, conf_id)
-    return GeometryReport(v)
+    shape = None
+    if metals:
+        conf = mol.GetConformer(conf_id)
+        shape = conf.GetProp(SHAPE_PROP) if conf.HasProp(SHAPE_PROP) else "no shape record (ungated)"
+    return GeometryReport(v, shape=shape)
 
 
 # --- small private utilities -------------------------------------------------

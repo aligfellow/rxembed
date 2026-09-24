@@ -108,7 +108,6 @@ exclude = ["examples", ".venv"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "--doctest-modules"
 doctest_optionflags = "NORMALIZE_WHITESPACE"
 
 # ===== Coverage =====

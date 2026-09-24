@@ -1,5 +1,6 @@
 """Test Ensemble and EnsembleSet behavior."""
 
+import logging
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -13,9 +14,10 @@ from rxembed import metal_core as metal
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.calculators import Calculator
 from rxembed.utils import Violation
+from tests.conftest import EXAMPLES_DIR
 
 _EN_PDBRCL = "Br[Pd]1(Cl)NCCN1"  # covalent notation for the standard square-planar chelate fixture
-_MN_H2 = "examples/structures/mn-h2.xyz"  # bimetallic: an Mn centre and a spectator ferrocene
+_MN_H2 = str(EXAMPLES_DIR / "mn-h2.xyz")  # bimetallic: an Mn centre and a spectator ferrocene
 _MN_H2_RC = [1, 5, 63, 64, 65, 66]
 
 
@@ -153,7 +155,7 @@ def test_cleanup_ablations_filter_only_their_own_workflow_diagnostics(monkeypatc
     import rxembed.pipeline.ensemble as ensemble_module
 
     iso = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", "SPL")[0]
-    ens = rx.embed(iso, n=1, seed=42, donor_orientation=False, conjugation=False)
+    ens = rx.embed(iso, n=1, params=rx.EmbedParams(seed=42, donor_orientation=False, conjugation=False))
     report = geom.GeometryReport(
         [
             Violation("donor_orientation", (0, 1, 2), value=0.0, limit=90.0),
@@ -163,6 +165,21 @@ def test_cleanup_ablations_filter_only_their_own_workflow_diagnostics(monkeypatc
     monkeypatch.setattr(ensemble_module._geometry, "check", lambda *_args, **_kwargs: report)
 
     assert ens._workflow_failure(ens, ens.ids[0]) is None
+
+
+def test_donor_orientation_violation_warns_without_failing_the_workflow_gate(monkeypatch, caplog):
+    import rxembed.pipeline.ensemble as ensemble_module
+
+    iso = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", "SPL")[0]
+    ens = rx.embed(iso, n=1, seed=42)
+    detail = "N0 (sp3) M-D-X to C1: 99.5 deg < census floor 104 deg; inspect donor geometry and restraints"
+    report = geom.GeometryReport([Violation("donor_orientation", (0, 1, 2), value=99.5, limit=104.0, detail=detail)])
+    monkeypatch.setattr(ensemble_module._geometry, "check", lambda *_args, **_kwargs: report)
+
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        failure = ens._workflow_failure(ens, ens.ids[0])
+    assert failure is None, "a donor-orientation floor violation must not fail the workflow gate"
+    assert f"donor orientation: {detail}" in caplog.text
 
 
 def test_metal_embed_replaces_a_puckered_ligand_without_changing_the_isomer(monkeypatch):
@@ -539,17 +556,15 @@ def test_uff_surrogate_cleanup_is_reported_as_an_approximate_objective():
 
 
 def test_slice_preserves_ensemble_state():
-    ens = rx.embed("CCCCO", n=4, seed=1, knowledge=False).minimize()
+    ens = rx.embed("CCCCO", n=4, params=rx.EmbedParams(seed=1, knowledge=False)).minimize()
     flagged = ens.ids[0]
-    ens.seed = 1
     ens.unrelaxed = [flagged]
     ens.uff_surrogates = {3: (34, 16)}
     ens.uff_retyped_bonds = {(1, 2)}
     assert ens.energy_kind == "ff"
     child = ens[0]
     assert child.energy_kind == "ff"
-    assert child.seed == 1
-    assert (child.knowledge, child.prune_rms) == (False, 0.1)
+    assert child.params == rx.EmbedParams(seed=1, knowledge=False)
     assert child._mol is not ens._mol
     assert child.unrelaxed is not ens.unrelaxed
     assert child.uff_surrogates is not ens.uff_surrogates
@@ -561,7 +576,7 @@ def test_slice_preserves_ensemble_state():
     assert ens.lowest(2).uff_surrogates == ens.uff_surrogates
     aligned = ens.align()
     assert aligned.energy_kind == "ff"
-    assert (aligned.knowledge, aligned.prune_rms) == (False, 0.1)
+    assert (aligned.params.knowledge, aligned.params.prune_rms) == (False, None)
 
     ens.trajectory = Chem.Mol(ens._mol)
     assert ens._derive(ens.ids, Chem.Mol(ens._mol)).trajectory is None
@@ -600,7 +615,7 @@ def test_replacement_carries_unrelaxed_status_to_the_original_id(monkeypatch):
 
     monkeypatch.setattr(core_embed.Conformers, "_relax_constrained", leave_unrelaxed)
     monkeypatch.setattr(core_embed.Conformers, "_acceptance_failures", lambda *_args, **_kwargs: {})
-    ens._replace_failed([source_id], 1.0, 1, template=template, seed=ens.seed)
+    ens._replace_failed([source_id], 1.0, 1, template=template, params=ens.params)
 
     assert len(ens.ids) == 1
     assert ens.unrelaxed == ens.ids

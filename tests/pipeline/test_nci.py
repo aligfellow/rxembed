@@ -46,10 +46,22 @@ def test_registry_rows_are_enumerable(kind):
         assert 90.0 < lo < hi <= 180.0, "a contact orientation is an obtuse-to-linear window"
 
 
-def test_sigma_hole_sets_hold_only_polarisable_heavies():
-    assert 9 not in nci._SIGMA_HOLE_Z["XB"], "organic C-F has no sigma hole"
-    assert 8 not in nci._SIGMA_HOLE_Z["ChB"], "an ether O is not a donor"
-    assert 7 not in nci._SIGMA_HOLE_Z["PnB"], "an amine N is a lone-pair DONOR"
+@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
+@pytest.mark.parametrize(
+    ("kind", "silent", "audible"),
+    [
+        # Mutation: put F (9) back into _SIGMA_HOLE_Z["XB"] and the fluorobenzene case fires.
+        pytest.param("XB", "Fc1ccccc1.n1ccccc1", "Ic1ccccc1.n1ccccc1", id="XB-F-vs-I"),
+        # Mutation: put O (8) back into _SIGMA_HOLE_Z["ChB"] and the ether case fires.
+        pytest.param("ChB", "COC.n1ccccc1", "CSC.n1ccccc1", id="ChB-O-vs-S"),
+        # Mutation: put N (7) back into _SIGMA_HOLE_Z["PnB"] and the amine case fires.
+        pytest.param("PnB", "CNC.n1ccccc1", "C[AsH]C.n1ccccc1", id="PnB-N-vs-As"),
+    ],
+)
+def test_sigma_hole_kinds_require_a_polarisable_heavy_donor(kind, silent, audible):
+    """Organic C-F/O/N have no usable sigma hole; a heavier congener of the same family does."""
+    assert not nci.candidate_contacts(_mol(silent), kinds=(kind,)), f"{kind} must not fire on {silent!r}"
+    assert nci.candidate_contacts(_mol(audible), kinds=(kind,)), f"{kind} must fire on {audible!r}"
 
 
 def test_acceptor_quality_prefers_localised_lone_pair():

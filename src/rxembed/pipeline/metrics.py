@@ -1,16 +1,15 @@
-"""Geometry sanity check: is a generated conformer a real molecule rather than nonsense.
+"""Geometry sanity check: is a generated conformer a real molecule, not nonsense.
 
 Two checks, kept apart because they answer differently for a metal:
 
-* ``bonding_ok``: are the bond lengths sane? Covalent-radius cutoffs, heavy atoms, metals skipped (a
-  dative distance is not a covalent one), and pairs the user gave a length skipped (that length is the
-  request, not a broken bond). The cheap gate the FF stages use to drop garbage. It is the CORE's
-  (``rxembed.relax``), which accepts its own relax on it; re-exported here so the two sanity checks
-  are still read side by side.
-* ``connectivity``: is it still the same molecule? Re-perceives the graph and diffs it against the
-  intended one. Catches what a length check cannot: a proton transfer, a new bond at a normal 1.54 Å, a
-  ligand leaving the metal. An optimiser can return a clean, low-energy geometry of a different species.
-  Pipeline-only: it needs xyzgraph perception, which the core's numpy + rdkit floor excludes.
+* ``bonding_ok``: are the bond lengths sane? Covalent-radius cutoffs; metals are skipped (a dative
+  distance is not a covalent one) and so is any pair the user gave a length for (that length is the
+  request, not a broken bond). Owned by ``rxembed.relax``, which also uses it to gate its own relax;
+  re-exported here so both sanity checks read side by side.
+* ``connectivity``: is it still the same molecule? Re-perceives the graph from the geometry and diffs it
+  against the intended one, catching what a length check cannot: a proton transfer, a new bond at a
+  normal 1.54 Å, a ligand leaving the metal. Pipeline-only: it needs xyzgraph perception, which the
+  core's numpy + rdkit floor excludes.
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ _BREAK_RATIO = 1.5  # a bond is broken only past this multiple of its covalent-r
 _FORM_RATIO = 1.2  # a new bond must be at a covalent distance, not merely close.
 _MIN_TOPO = 3  # a new heavy-atom bond needs its atoms >= this many bonds apart. A terminal H is checked at
 # topological distance 2 as well: collapse across an angle is a proton transfer, not a harmless short 1-3.
-_ANGLE_PATH = 2  # graph distance between a 1-3 angle's endpoints
 
 
 def _perceive(mol, conf_id, charge=0, elements=None):
@@ -93,7 +91,7 @@ def connectivity(mol, conf_id, *, exclude=frozenset(), metals=frozenset(), charg
         i, j = sorted(p)
         hydrogens = [k for k in p if mol.GetAtomWithIdx(k).GetAtomicNum() == 1]
         one_terminal_h = len(hydrogens) == 1 and mol.GetAtomWithIdx(hydrogens[0]).GetDegree() == 1
-        separated = topo[i][j] >= _MIN_TOPO or (topo[i][j] == _ANGLE_PATH and one_terminal_h)
+        separated = topo[i][j] >= _MIN_TOPO or (topo[i][j] == 2 and one_terminal_h)  # noqa: PLR2004  1-3 angle
         return judged(p) and separated and ratio(i, j) < _FORM_RATIO
 
     def real_lost(p):  # a lost bond: genuinely dissociated, not merely strained or oddly perceived

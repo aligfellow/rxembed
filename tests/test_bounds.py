@@ -67,10 +67,11 @@ def test_default_parameters_select_native_kdg_and_aio():
 )
 def test_constrained_seed_uses_its_native_bounds_parameters(monkeypatch, smiles, force_trans):
     mol = _graph(smiles)
-    params = bnd.embed_parameters(42, threads=1)
-    params.forceTransAmides = force_trans
+    native = rdDistGeom.KDG()
+    native.forceTransAmides = force_trans
+    params = bnd.EmbedParams(seed=42, threads=1, native=native)
     native_bounds, native_embed = rdDistGeom.GetMoleculeBoundsMatrix, rdDistGeom.EmbedMultipleConfs
-    expected = native_bounds(mol, embedParams=params)
+    expected = native_bounds(mol, embedParams=native)
     built = []
 
     def build(candidate, *args, **kwargs):
@@ -79,37 +80,40 @@ def test_constrained_seed_uses_its_native_bounds_parameters(monkeypatch, smiles,
         return matrix
 
     def embed(candidate, count, used_params):
-        assert used_params is params
+        assert used_params is native
         np.testing.assert_array_equal(built[-1], expected)
         return native_embed(candidate, count, used_params)
 
     monkeypatch.setattr(rdDistGeom, "GetMoleculeBoundsMatrix", build)
     monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", embed)
     cons = Constraints(distances={(0, 1): (expected[1, 0], expected[0, 1])})
-    assert bnd.seed_coordinates(mol, cons, n=1, seed=42, threads=1, embed_params=params)
+    assert bnd.seed_coordinates(mol, cons, 1, params)
 
 
 @pytest.mark.parametrize("reject", [False, True])
 @pytest.mark.parametrize("legacy", [False, True])
 def test_native_parameters_reach_rdkit_without_model_fallback_or_stale_bounds(monkeypatch, reject, legacy):
-    params = rdDistGeom.srETKDGv3()
-    params.useLegacyImplementation = legacy
-    params.useRandomCoords = True
-    params.enforceChirality = False
-    params.maxIterations = 17
-    params.randomSeed, params.numThreads, params.pruneRmsThresh = 7, 2, 0.4
-    params.SetCPCI({(0, 1): 0.01})
-    before = json.loads(rdDistGeom.EmbedParametersToJSON(params))
-    native, set_bounds = rdDistGeom.EmbedMultipleConfs, rdDistGeom.EmbedParameters.SetBoundsMat
+    native = rdDistGeom.srETKDGv3()
+    native.useLegacyImplementation = legacy
+    native.useRandomCoords = True
+    native.enforceChirality = False
+    native.maxIterations = 17
+    params = bnd.EmbedParams(seed=42, threads=1, prune_rms=-1, native=native)
+    # Set the caller's own pre-existing native fields only after wrapping: EmbedParams requires them at
+    # RDKit's defaults, but seed_coordinates must still save and restore whatever the caller had before it.
+    native.randomSeed, native.numThreads, native.pruneRmsThresh = 7, 2, 0.4
+    native.SetCPCI({(0, 1): 0.01})
+    before = json.loads(rdDistGeom.EmbedParametersToJSON(native))
+    real_embed, set_bounds = rdDistGeom.EmbedMultipleConfs, rdDistGeom.EmbedParameters.SetBoundsMat
     matrices, calls = [], []
 
     def handoff(used, matrix):
-        assert used is params
+        assert used is native
         matrices.append(matrix.copy())
         return set_bounds(used, matrix)
 
     def embed(mol, n, used):
-        assert used is params
+        assert used is native
         assert used.useLegacyImplementation == legacy
         assert used.useRandomCoords
         assert not used.enforceChirality
@@ -123,38 +127,39 @@ def test_native_parameters_reach_rdkit_without_model_fallback_or_stale_bounds(mo
         assert not used.embedFragmentsSeparately
         assert matrices[-1].shape == (mol.GetNumAtoms(),) * 2
         calls.append(mol.GetNumAtoms())
-        return [] if reject else native(mol, n, used)
+        return [] if reject else real_embed(mol, n, used)
 
     monkeypatch.setattr(rdDistGeom.EmbedParameters, "SetBoundsMat", handoff)
     monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", embed)
     for smiles in ("CCCC", "CC.CC", "CC"):
         mol = _graph(smiles)
-        matrix = rdDistGeom.GetMoleculeBoundsMatrix(mol, embedParams=params)
+        matrix = rdDistGeom.GetMoleculeBoundsMatrix(mol, embedParams=native)
         cons = Constraints(distances={(0, 1): (matrix[1, 0], matrix[0, 1])}) if smiles == "CCCC" else Constraints()
-        ids = bnd.seed_coordinates(mol, cons, 1, seed=42, threads=1, prune_rms=-1, embed_params=params)
+        ids = bnd.seed_coordinates(mol, cons, 1, params)
         assert bool(ids) != reject
-        after = json.loads(rdDistGeom.EmbedParametersToJSON(params))
+        after = json.loads(rdDistGeom.EmbedParametersToJSON(native))
         assert after.pop("boundsMatrix")
         assert after == before
     assert len(calls) == len(matrices) == 3
 
 
 def test_untracked_native_parameters_do_not_report_stale_failure_counts(monkeypatch, caplog):
-    params = rdDistGeom.KDG()
+    params = bnd.EmbedParams(native=rdDistGeom.KDG())
 
     def stale(_params):
         raise AssertionError("untracked failure counts belong to an earlier native call")
 
     monkeypatch.setattr(rdDistGeom.EmbedParameters, "GetFailureCounts", stale)
     with caplog.at_level("DEBUG", logger="rxembed.bounds"):
-        assert bnd.seed_coordinates(_graph("CC"), Constraints(), 1, embed_params=params)
+        assert bnd.seed_coordinates(_graph("CC"), Constraints(), 1, params)
     assert "rejected attempts not tracked" in caplog.text
 
 
 def test_native_timeout_is_not_a_conformer_id_or_an_implicit_retry(monkeypatch):
-    params = rdDistGeom.KDG()
-    params.timeout = 1
-    before = params.randomSeed, params.numThreads, params.clearConfs
+    native = rdDistGeom.KDG()
+    native.timeout = 1
+    params = bnd.EmbedParams(seed=42, threads=2, native=native)
+    before = native.randomSeed, native.numThreads, native.clearConfs
     calls = []
 
     def timeout(_mol, _n, used):
@@ -162,32 +167,88 @@ def test_native_timeout_is_not_a_conformer_id_or_an_implicit_retry(monkeypatch):
         return [-1]  # RDKit's timeout sentinel, not an attached conformer.
 
     monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", timeout)
-    with pytest.raises(TimeoutError, match=r"native RDKit.*timeout=1s.*embed_params\.timeout"):
-        bnd.seed_coordinates(_graph("CC"), Constraints(), 1, seed=42, threads=2, embed_params=params)
-    assert calls == [params]
-    assert (params.randomSeed, params.numThreads, params.clearConfs) == before
+    with pytest.raises(TimeoutError, match=r"native RDKit.*timeout=1s.*native\.timeout"):
+        bnd.seed_coordinates(_graph("CC"), Constraints(), 1, params)
+    assert calls == [native]
+    assert (native.randomSeed, native.numThreads, native.clearConfs) == before
 
 
-def test_native_parameter_keywords_have_one_precedence_rule():
-    params = rdDistGeom.KDG()
-    assert bnd.embedding_options(None, None, None, embed_params=params) == (bnd.DEFAULT_SEED, 1, True, -1)
-    params.randomSeed, params.numThreads, params.pruneRmsThresh = 7, 3, 0.25
-    assert bnd.embedding_options(None, None, None, embed_params=params) == (7, 3, True, 0.25)
-    assert bnd.embedding_options(42, 1, None, -1, params) == (42, 1, True, -1)
-    for knowledge in (False, True):
-        with pytest.raises(ValueError, match="useBasicKnowledge"):
-            bnd.embedding_options(None, None, knowledge, embed_params=params)
+# ---------------------------------------------------------------------------------------------------------
+# EmbedParams: one owner per setting
+# ---------------------------------------------------------------------------------------------------------
+
+
+def test_seed_or_threads_together_with_params_is_a_loud_conflict():
+    with pytest.raises(ValueError, match=r"dataclasses\.replace"):
+        bnd.resolve_params(bnd.EmbedParams(), 5, None)
+    with pytest.raises(ValueError, match=r"dataclasses\.replace"):
+        bnd.resolve_params(bnd.EmbedParams(), None, 2)
+    assert bnd.resolve_params(None, 5, 2) == bnd.EmbedParams(seed=5, threads=2)
+    assert bnd.resolve_params(None, None, None) == bnd.EmbedParams()
+
+
+def test_a_plain_native_object_must_be_wrapped():
+    with pytest.raises(TypeError, match=r"EmbedParams\(native=\.\.\.\)"):
+        bnd.resolve_params(rdDistGeom.KDG(), None, None)
+
+
+@pytest.mark.parametrize(
+    ("rdkit_name", "field_name"), [("randomSeed", "seed"), ("numThreads", "threads"), ("pruneRmsThresh", "prune_rms")]
+)
+def test_native_sampling_fields_must_stay_at_rdkits_own_defaults(rdkit_name, field_name):
+    native = rdDistGeom.KDG()
+    setattr(native, rdkit_name, 42 if rdkit_name != "pruneRmsThresh" else 0.4)
+    with pytest.raises(ValueError, match=f"native.{rdkit_name}.*EmbedParams\\({field_name}="):
+        bnd.EmbedParams(native=native)
+
+
+def test_knowledge_together_with_native_must_agree_or_stay_unset():
+    with pytest.raises(ValueError, match="useBasicKnowledge"):
+        bnd.EmbedParams(native=rdDistGeom.KDG(), knowledge=False)
+    with pytest.raises(ValueError, match="useBasicKnowledge"):
+        bnd.EmbedParams(native=rdDistGeom.ETDG(), knowledge=True)
+    assert bnd.EmbedParams(native=rdDistGeom.KDG(), knowledge=True).knowledge
+    assert bnd.EmbedParams(native=rdDistGeom.KDG()).native.useBasicKnowledge  # ty: ignore[unresolved-attribute]
+
+
+@pytest.mark.parametrize("name", ["coplanar_14", "metal_floor_relief", "donor_orientation", "conjugation"])
+def test_a_non_bool_switch_is_a_type_error(name):
+    with pytest.raises(TypeError, match=f"{name} must be True or False"):
+        bnd.EmbedParams(**{name: "yes"})  # ty: ignore[invalid-argument-type]
+
+
+def test_a_negative_seed_is_not_reproducible():
+    with pytest.raises(ValueError, match="not reproducible"):
+        bnd.EmbedParams(seed=-1)
+
+
+def test_native_must_be_an_embed_parameters_object():
     with pytest.raises(TypeError, match="EmbedParameters"):
-        bnd.embedding_options(None, None, None, embed_params={})
+        bnd.EmbedParams(native={})  # ty: ignore[invalid-argument-type]
+
+
+def test_an_unset_native_object_keeps_rdkits_own_prune_default(monkeypatch):
+    seen = []
+    native_embed = rdDistGeom.EmbedMultipleConfs
+
+    def spy(mol, n, used):
+        seen.append(used.pruneRmsThresh)
+        return native_embed(mol, n, used)
+
+    monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", spy)
+    params = bnd.EmbedParams(seed=42, native=rdDistGeom.KDG())
+    assert bnd.seed_coordinates(_graph("CC"), Constraints(), 1, params)
+    assert seen == [-1.0]
 
 
 def test_aio_refines_the_edited_interfragment_distance():
-    params = rdDistGeom.srETKDGv3()
-    params.useLegacyImplementation = False
+    native = rdDistGeom.srETKDGv3()
+    native.useLegacyImplementation = False
+    params = bnd.EmbedParams(seed=42, threads=1, native=native)
     for distance in (3.0, 6.0):
         mol = _graph("CC.CC")
         cons = Constraints(distances={(0, 2): (distance, distance + 0.05)})
-        ids = bnd.seed_coordinates(mol, cons, 1, seed=42, threads=1, embed_params=params)
+        ids = bnd.seed_coordinates(mol, cons, 1, params)
         assert ids
         positions = mol.GetConformer(ids[0]).GetPositions()
         assert distance - 0.1 < np.linalg.norm(positions[0] - positions[2]) < distance + 0.15
@@ -208,7 +269,7 @@ def test_existing_coordinates_do_not_replace_native_embedding(monkeypatch):
 
     monkeypatch.setattr(bnd.rdDistGeom, "EmbedMultipleConfs", generate)
 
-    ids = bnd.seed_coordinates(mol, Constraints(), 1, seed=42)
+    ids = bnd.seed_coordinates(mol, Constraints(), 1, bnd.EmbedParams(seed=42))
 
     assert len(ids) == 1
     assert calls == [1]
@@ -603,7 +664,9 @@ def test_matrix_is_edited_not_replaced():
         (
             # the hydride's own construction warns too; build it at collection time (default-arg trick) so
             # only the seeding call itself is under test, matching the UFFTYPER row's fresh-matrix timing
-            lambda mol=_graph("[H-].CC"): bnd.seed_coordinates(mol, Constraints(), n=1, seed=42),  # noqa: B008
+            lambda mol=_graph("[H-].CC"): bnd.seed_coordinates(  # noqa: B008
+                mol, Constraints(), 1, bnd.EmbedParams(seed=42)
+            ),
             "not removing hydrogen atom without neighbors",
         ),
     ],
@@ -641,24 +704,24 @@ def test_unconstrained_embed_does_not_build_a_custom_matrix(monkeypatch):
     calls = []
     monkeypatch.setattr(bnd, "_feasible_bounds", lambda *a, **k: calls.append(a) or (_matrix(a[0]), 0.0))
 
-    bnd.seed_coordinates(_mol(), Constraints(), n=2, seed=3)
+    bnd.seed_coordinates(_mol(), Constraints(), 2, bnd.EmbedParams(seed=3))
     assert calls == []
 
-    bnd.seed_coordinates(_mol(), Constraints(distances={(0, 2): (2.5, 2.6)}), n=2, seed=3)
+    bnd.seed_coordinates(_mol(), Constraints(distances={(0, 2): (2.5, 2.6)}), 2, bnd.EmbedParams(seed=3))
     assert len(calls) == 1
 
 
 def test_embed_ids_are_reproducible_and_attached():
     mol = _graph("CCO")
-    ids = bnd.seed_coordinates(mol, Constraints(), n=4, seed=3, prune_rms=-1)
+    ids = bnd.seed_coordinates(mol, Constraints(), 4, bnd.EmbedParams(seed=3, prune_rms=-1))
     assert len(ids) == 4
     assert {int(c.GetId()) for c in mol.GetConformers()} == {int(i) for i in ids}
 
-    assert len(bnd.seed_coordinates(_graph("CCO"), Constraints(), n=8, seed=3)) < 8
+    assert len(bnd.seed_coordinates(_graph("CCO"), Constraints(), 8, bnd.EmbedParams(seed=3))) < 8
 
     a, b = _graph("CCO"), _graph("CCO")
-    bnd.seed_coordinates(a, Constraints(), n=2, seed=1234)
-    bnd.seed_coordinates(b, Constraints(), n=2, seed=1234)
+    bnd.seed_coordinates(a, Constraints(), 2, bnd.EmbedParams(seed=1234))
+    bnd.seed_coordinates(b, Constraints(), 2, bnd.EmbedParams(seed=1234))
     assert np.allclose(a.GetConformer(0).GetPositions(), b.GetConformer(0).GetPositions())
 
 
@@ -673,8 +736,8 @@ def test_seed_coordinates_can_delegate_chirality_to_a_later_accept_gate(monkeypa
     bnd.seed_coordinates(
         _graph("F[C@H](Cl)Br"),
         Constraints(),
-        n=1,
-        seed=42,
+        1,
+        bnd.EmbedParams(seed=42),
         enforce_chirality=False,
         max_attempts=30,
     )
@@ -719,7 +782,7 @@ def test_native_recovery_preserves_bounds_and_stereo(monkeypatch, knowledge, rej
     monkeypatch.setattr(bnd, "_feasible_bounds", matrix)
     monkeypatch.setattr(rdDistGeom.EmbedParameters, "SetBoundsMat", handoff)
     monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", embed)
-    ids = bnd.seed_coordinates(mol, cons, n=1, seed=42, threads=1, knowledge=knowledge, max_attempts=30)
+    ids = bnd.seed_coordinates(mol, cons, 1, bnd.EmbedParams(seed=42, threads=1, knowledge=knowledge), max_attempts=30)
 
     expected = [(False, False, knowledge, False), (False, True, knowledge, False)]
     assert stages == expected[: rejections + 1]
@@ -752,7 +815,7 @@ def test_native_failure_counts_are_reported_before_each_fallback(monkeypatch, ca
     monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", reject)
     monkeypatch.setattr(rdDistGeom.EmbedParameters, "GetFailureCounts", lambda _self: tuple(counts))
     with caplog.at_level("DEBUG", logger="rxembed.bounds"):
-        assert not bnd.seed_coordinates(_graph("CC"), Constraints(), n=1, seed=42)
+        assert not bnd.seed_coordinates(_graph("CC"), Constraints(), 1, bnd.EmbedParams(seed=42))
 
     messages = [record.message for record in caplog.records if record.name == "rxembed.bounds"]
     assert len(messages) == 2
@@ -765,14 +828,15 @@ def test_native_failure_counts_are_reported_before_each_fallback(monkeypatch, ca
 def test_native_failure_tracking_does_not_change_seed_coordinates(monkeypatch):
     native = rdDistGeom.EmbedMultipleConfs
     tracked, untracked = _graph("CCCO"), _graph("CCCO")
-    ids = bnd.seed_coordinates(tracked, Constraints(), n=3, seed=42, threads=1, prune_rms=-1)
+    params = bnd.EmbedParams(seed=42, threads=1, prune_rms=-1)
+    ids = bnd.seed_coordinates(tracked, Constraints(), 3, params)
 
     def without_tracking(mol, n, params):
         params.trackFailures = False
         return native(mol, n, params)
 
     monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", without_tracking)
-    assert bnd.seed_coordinates(untracked, Constraints(), n=3, seed=42, threads=1, prune_rms=-1) == ids
+    assert bnd.seed_coordinates(untracked, Constraints(), 3, params) == ids
     for cid in ids:
         np.testing.assert_array_equal(
             tracked.GetConformer(cid).GetPositions(), untracked.GetConformer(cid).GetPositions()
@@ -798,7 +862,7 @@ def test_seed_selection_prefers_intact_bonds_without_losing_candidates(monkeypat
         return original_ids.copy()
 
     monkeypatch.setattr(bnd.rdDistGeom, "EmbedMultipleConfs", embed)
-    ids = bnd.seed_coordinates(mol, Constraints(), n=4, knowledge=mode != "plain")
+    ids = bnd.seed_coordinates(mol, Constraints(), 4, bnd.EmbedParams(knowledge=mode != "plain"))
 
     assert ids == (original_ids if mode == "broken" else [3, 5, 7, 11])
     assert {conf.GetId() for conf in mol.GetConformers()} == set(original_ids)
@@ -919,6 +983,30 @@ def test_r2_disjoint_intersection_keeps_backbone():
     cons.angles[(0, 1, 2)] = (1.0, 2.0)  # a physically impossible bite -> derived window far below the backbone
     lo, hi = _window(_edited(mol, cons), 0, 2)
     assert (lo, hi) == pytest.approx((blo, bhi)), "a disjoint intersection must leave the backbone standing"
+
+
+def test_angle_prior_keeps_the_nonbonded_floor_between_cis_donors():
+    """A 1-6 pair (past RDKit's own 1-5 topology bounds) has only a generic nonbonded floor, not real backbone
+    geometry. Two metal legs bent to a tight angle put the far donors closer than that floor (FOPSOT): the
+    angle-derived window is disjoint from and entirely below RDKit's own, so a disjoint intersection must leave
+    RDKit's bounds standing, exactly as if the angle constraint had never been stated. Relieving the floor
+    there instead (letting the angle prior narrow it) was tried and reverted (mechanisms.Angle._dg_windows).
+    """
+    mol = _rule_mol("CCCCCC.[Ni]")
+    assert Chem.GetDistanceMatrix(mech.disconnect_metal(mol), force=True)[0][5] == 5  # past RDKit's 1-5 bound
+
+    cons_no_angle = Constraints()
+    add_distance(cons_no_angle.distances, 0, 6, 1.95, 2.05)
+    add_distance(cons_no_angle.distances, 6, 5, 1.95, 2.05)
+    without_angle = _window(_edited(mol, cons_no_angle), 0, 5)
+
+    cons = Constraints()
+    add_distance(cons.distances, 0, 6, 1.95, 2.05)
+    add_distance(cons.distances, 6, 5, 1.95, 2.05)
+    cons.angles[(0, 6, 5)] = (62.0, 74.0)  # a physically tight bite: its derived window sits below RDKit's floor
+    with_angle = _window(_edited(mol, cons), 0, 5)
+
+    assert with_angle == pytest.approx(without_angle), "a disjoint intersection must leave the backbone standing"
 
 
 def test_r3_no_bond_path_writes_the_angle_outright():

@@ -18,7 +18,7 @@ import rxembed.metal_core as _metal
 import rxembed.metal_enumeration as _kiso
 import rxembed.metal_isomer as _isomer
 import rxembed.metal_polyhedron as _poly
-from rxembed.bounds import embedding_options
+from rxembed.bounds import resolve_params
 from rxembed.constraints import Constraints, compose_soft, resolve_atom, resolve_core
 from rxembed.constraints import template_to_fix as _core_template_to_fix
 from rxembed.embed import (  # module functions, not the package facade
@@ -38,7 +38,6 @@ from .perceive import read_xyz
 
 logger = logging.getLogger("rxembed")
 
-_TEMPLATE_LEN = 2  # template= is (reference, mapping)
 _STEREO_MODES = {"unassigned", "racemic", "separate", "free", "preserve", "all", "invert"}
 _STEREO_KINDS = {"point", "ez", "axial", "planar", "helical", "default"}
 _STEREO_FILTERS = {"free", "preserve", "invert", "racemic"}
@@ -136,21 +135,16 @@ def _coordination_choices(iso, coordinate, nvac):
     """Resolve ``coordinate=`` to the donor set(s) to seat: one choice, or several for an ambiguous SMARTS."""
     if coordinate is None:
         return [None]
-    if coordinate == "auto":
-        atoms = _metal.lone_pair_donors(iso.mol, iso.metal, exclude=iso.donors)
-        if len(atoms) > nvac:
-            logger.info(
-                "coordinate=auto: %d candidate donor(s) for %d vacant site(s); using %d "
-                "(name them explicitly to choose)",
-                len(atoms),
-                nvac,
-                nvac,
-            )
-        return [atoms[:nvac]]
     if isinstance(coordinate, (list, tuple)):  # explicit: one spec per vacancy
         return [[resolve_atom(iso.mol, s) for s in coordinate]]
     if isinstance(coordinate, str):  # a SMARTS, which may match several atoms
-        ms = [m[0] for m in iso.mol.GetSubstructMatches(Chem.MolFromSmarts(coordinate))]
+        pattern = Chem.MolFromSmarts(coordinate)
+        if pattern is None:
+            raise ValueError(
+                f"coordinate={coordinate!r} is not a valid SMARTS; pass a SMARTS pattern, an atom "
+                "index, or a list with one spec per vacancy"
+            )
+        ms = [m[0] for m in iso.mol.GetSubstructMatches(pattern)]
         if not ms:
             raise ValueError(f"coordinate={coordinate!r} matched no atoms")
         if len(ms) == 1:
@@ -170,30 +164,9 @@ def _coordination_choices(iso, coordinate, nvac):
     return [[resolve_atom(iso.mol, coordinate)]]  # an int index
 
 
-def _execute(
-    spec,
-    *,
-    fix,
-    constrain,
-    contacts,
-    n,
-    seed,
-    threads,
-    knowledge,
-    embed_params=None,
-    coplanar_14=True,
-    metal_floor_relief=True,
-    donor_orientation=True,
-    conjugation=True,
-):
+def _execute(spec, *, fix, constrain, contacts, n, params):
     """Compile and seed one candidate, returning its pipeline ensemble."""
-    mol, cons, iso, graft_ref = prepare(
-        spec,
-        fix=fix,
-        constrain=constrain,
-        donor_orientation=donor_orientation,
-        conjugation=conjugation,
-    )
+    mol, cons, iso, graft_ref = prepare(spec, fix=fix, constrain=constrain, params=params)
     soft = _contact_constraints(mol, contacts)
     cons = compose_soft(cons, soft)
     if iso is not None and soft.is_constrained:
@@ -206,44 +179,11 @@ def _execute(
         )
         if active.is_constrained:
             # Resolve ownership first: an ignored contact must not change an unrelated model preference.
-            mol, cons, iso, graft_ref = prepare(
-                spec,
-                fix=fix,
-                constrain=constrain,
-                external=active,
-                donor_orientation=donor_orientation,
-                conjugation=conjugation,
-            )
+            mol, cons, iso, graft_ref = prepare(spec, fix=fix, constrain=constrain, external=active, params=params)
             cons = compose_soft(cons, soft)
-    prune_rms = embed_params.pruneRmsThresh if embed_params is not None else 0.1
-    mol, ids, target = seed_conformers(
-        mol,
-        cons,
-        iso,
-        n,
-        seed=seed,
-        threads=threads,
-        knowledge=knowledge,
-        embed_params=embed_params,
-        coplanar_14=coplanar_14,
-        metal_floor_relief=metal_floor_relief,
-        prune_rms=prune_rms,
-        graft_ref=graft_ref,
-    )
+    mol, ids, target = seed_conformers(mol, cons, iso, n, params, graft_ref=graft_ref)
     require_seed_count(ids, target, iso)
-    ens = Ensemble(
-        mol,
-        list(ids),
-        cons,
-        iso,
-        seed=int(seed),
-        threads=int(threads),
-        knowledge=knowledge,
-        embed_params=embed_params,
-        coplanar_14=coplanar_14,
-        metal_floor_relief=metal_floor_relief,
-        prune_rms=prune_rms,
-    )
+    ens = Ensemble(mol, list(ids), cons, iso, params=params)
     if iso is not None:
         for donor, metal_idx in iso.donor_bonds:
             ens.sphere.setdefault(metal_idx, []).append(donor)
@@ -282,13 +222,13 @@ def _expand_isomers(isomers, coordinate, fix):
     return out
 
 
-def _contact_modes(source, contacts, seed):
+def _contact_modes(source, contacts, params):
     """Return explicit contacts or discover independent automatic contact modes."""
     if contacts != "auto":
         return [(None, contacts)]
     disc = source.mol if isinstance(source, _isomer.Isomer) else source
     try:
-        modes = _nci.auto_binding_modes(disc, seed=seed)
+        modes = _nci.auto_binding_modes(disc, seed=params.seed)
     except Exception as err:
         raise ValueError(
             f"contacts='auto' could not discover binding modes ({type(err).__name__}: {err}); "
@@ -325,11 +265,9 @@ def _attach_stereo(result, source, charge, stereo):
             ref = None
     if not ref:
         return
-    if stereo in (
-        "racemic",
-        "separate",
-    ):  # for a geometry input, preserve only a metallocene's planar chirality, the part the embed cannot keep:
-        # axial reads differently every rotamer on a labile bond, and point R/S is the embed's own job
+    # For a geometry input, preserve only a metallocene's planar chirality, the part the embed cannot keep:
+    # axial reads differently every rotamer on a labile bond, and point R/S is the embed's own job.
+    if stereo in ("racemic", "separate"):
         spec = {"planar": "preserve", "default": "free"} if "planar" in set(ref) else None
     else:
         spec = stereo
@@ -399,7 +337,7 @@ def _template_to_fix(template, fix, own=None, target=None):
     ``own`` is the source's own coordinates, which a ``fix=[atoms]`` list beside the template is resolved
     against; the caller must read them from the *normalised* source.
     """
-    if isinstance(template, (tuple, list)) and len(template) == _TEMPLATE_LEN:
+    if isinstance(template, (tuple, list)) and len(template) == 2:  # noqa: PLR2004  template=(reference, mapping)
         reference, mapping = template
         if isinstance(reference, Ensemble):
             if not reference.ids:
@@ -581,25 +519,11 @@ def _embed_dispatch(
     n=None,
     seed=None,
     threads=None,
-    knowledge=None,
-    embed_params=None,
-    coplanar_14=True,
-    metal_floor_relief=True,
-    donor_orientation=True,
-    conjugation=True,
+    params=None,
     stereo=None,
 ):
     """Expand every candidate axis, execute each candidate once, and assemble the public result."""
-    seed, threads, knowledge, _prune_rms = embedding_options(
-        seed,
-        threads,
-        knowledge,
-        embed_params=embed_params,
-        coplanar_14=coplanar_14,
-        metal_floor_relief=metal_floor_relief,
-        donor_orientation=donor_orientation,
-        conjugation=conjugation,
-    )
+    params = resolve_params(params, seed, threads)
     stereo = _default_stereo(source, stereo)
     _validate_stereo(stereo)
     if not isinstance(source, _isomer.Isomer):
@@ -611,18 +535,7 @@ def _embed_dispatch(
     variants, expanded = _stereo_variants(source, stereo)
     groups, force_set = [], False
     last_failure = None
-    execute_kw = {
-        "constrain": constrain,
-        "n": n,
-        "seed": seed,
-        "threads": threads,
-        "knowledge": knowledge,
-        "embed_params": embed_params,
-        "coplanar_14": coplanar_14,
-        "metal_floor_relief": metal_floor_relief,
-        "donor_orientation": donor_orientation,
-        "conjugation": conjugation,
-    }
+    execute_kw = {"constrain": constrain, "n": n, "params": params}
     for variant, stereo_label in variants:
         try:
             discovery, candidates, source_set = _source_candidates(
@@ -632,7 +545,7 @@ def _embed_dispatch(
                 coordinate=coordinate,
                 stereo=stereo,
             )
-            modes = _contact_modes(discovery, contacts, seed)
+            modes = _contact_modes(discovery, contacts, params)
             force_set = force_set or source_set
             live = EnsembleSet()
             for nci_label, contact in modes:

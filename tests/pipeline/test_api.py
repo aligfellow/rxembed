@@ -25,31 +25,52 @@ _SLACK_A = 0.15  # the pipeline's own _validate distance slack: a window realise
 @pytest.mark.parametrize("engine", [rx.embed, rx.core.embed])
 @pytest.mark.parametrize("metal", [False, True])
 def test_embed_accepts_native_parameters_through_both_facades(monkeypatch, engine, metal):
-    params = rdDistGeom.srETKDGv3()
-    params.useLegacyImplementation = False
-    params.randomSeed, params.numThreads = 42, 1
-    before = json.loads(rdDistGeom.EmbedParametersToJSON(params))
-    native, seen = rdDistGeom.EmbedMultipleConfs, []
+    native = rdDistGeom.srETKDGv3()
+    native.useLegacyImplementation = False
+    before = json.loads(rdDistGeom.EmbedParametersToJSON(native))
+    params = rx.EmbedParams(seed=42, threads=1, native=native)
+    real_embed, seen = rdDistGeom.EmbedMultipleConfs, []
 
     def embed(mol, n, used):
         seen.append(used)
-        assert used is params
+        assert used is native
         assert not used.useLegacyImplementation
-        return native(mol, n, used)
+        return real_embed(mol, n, used)
 
     monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", embed)
     source = rx.metal("N->[Pt+2](<-[Cl-])(<-[Cl-])<-N", "SPL")[0] if metal else Chem.AddHs(Chem.MolFromSmiles("CCO"))
-    result = engine(source, n=1, embed_params=params)
+    result = engine(source, n=1, params=params)
     assert len(result.ids) == 1
     assert seen
-    assert result.embed_params is params
-    assert result[0].embed_params is params
-    assert (result.seed, result.threads, result.prune_rms) == (42, 1, -1)
-    after = json.loads(rdDistGeom.EmbedParametersToJSON(params))
+    assert result.params is params
+    assert result[0].params is params
+    after = json.loads(rdDistGeom.EmbedParametersToJSON(native))
     assert after.pop("boundsMatrix")
     assert after == before
     if metal:
         assert rx.cxsmiles(result.minimize().mol) == rx.cxsmiles(source)
+
+
+@pytest.mark.parametrize("engine", [rx.embed, rx.core.embed])
+def test_params_round_trips_through_both_facades(engine):
+    ethanol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
+    result = engine(ethanol, n=2, seed=5)
+    assert result.params == rx.EmbedParams(seed=5)
+
+    again = engine(ethanol, n=2, params=result.params)
+    for cid in result.ids:
+        np.testing.assert_array_equal(
+            result.mol.GetConformer(cid).GetPositions(), again.mol.GetConformer(cid).GetPositions()
+        )
+
+    by_seed = engine(ethanol, n=2, seed=7)
+    by_params = engine(ethanol, n=2, params=rx.EmbedParams(seed=7))
+    for cid in by_seed.ids:
+        np.testing.assert_array_equal(
+            by_seed.mol.GetConformer(cid).GetPositions(), by_params.mol.GetConformer(cid).GetPositions()
+        )
+
+    assert result[:1].params == result.params
 
 
 @pytest.mark.parametrize("engine", [rx.embed, rx.core.embed])
@@ -61,13 +82,16 @@ def test_matrix_edit_controls_leave_uff_constraints_intact(monkeypatch, engine, 
     isomer = next(
         iso for iso in rx.metal("[Pt+2](<-[Cl-])(<-[Cl-])(<-n1ccccc1)<-n1ccccc1", "SPL") if iso.label == "cis"
     )
-    params = bounds.embed_parameters(42, threads=1)
+    native = rdDistGeom.KDG()
+    params = rx.EmbedParams(
+        seed=42, threads=1, native=native, coplanar_14=coplanar_14, metal_floor_relief=metal_floor_relief
+    )
     core = importlib.import_module("rxembed.embed")
     native_bounds, native_uff = bounds._feasible_bounds, core.restrained_uff
     seen_dg, seen_uff = [], []
 
     def matrix(mol, cons, used):
-        assert used is params
+        assert used is native
         seen_dg.append((bool(cons.coplanar), bool(cons.dg_floors)))
         return native_bounds(mol, cons, used)
 
@@ -77,7 +101,7 @@ def test_matrix_edit_controls_leave_uff_constraints_intact(monkeypatch, engine, 
 
     monkeypatch.setattr(bounds, "_feasible_bounds", matrix)
     monkeypatch.setattr(core, "restrained_uff", cleanup)
-    result = engine(isomer, n=1, embed_params=params, coplanar_14=coplanar_14, metal_floor_relief=metal_floor_relief)
+    result = engine(isomer, n=1, params=params)
     result.minimize()
     assert seen_dg
     assert all(flags == (coplanar_14, metal_floor_relief) for flags in seen_dg)
@@ -85,28 +109,20 @@ def test_matrix_edit_controls_leave_uff_constraints_intact(monkeypatch, engine, 
     assert all(flags == (True, True, True) for flags in seen_uff)
     assert result.cons.coplanar
     assert result.cons.dg_floors
-    assert (result.coplanar_14, result.metal_floor_relief) == (coplanar_14, metal_floor_relief)
-    assert (result[0].coplanar_14, result[0].metal_floor_relief) == (coplanar_14, metal_floor_relief)
+    assert (result.params.coplanar_14, result.params.metal_floor_relief) == (coplanar_14, metal_floor_relief)
+    assert (result[0].params.coplanar_14, result[0].params.metal_floor_relief) == (coplanar_14, metal_floor_relief)
     geom.check(result.mol, donors=isomer.donors).assert_ok()
 
 
 @pytest.mark.parametrize("engine", [rx.embed, rx.core.embed])
 def test_custom_cleanup_controls_are_public_ablations(engine):
     isomer = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", "SPL")[0]
-    native = engine(isomer, n=1, seed=42, donor_orientation=False, conjugation=False)
+    native = engine(isomer, n=1, params=rx.EmbedParams(seed=42, donor_orientation=False, conjugation=False))
 
     assert not native.cons.donor_orientation
     assert not native.cons.conjugation
     # D-M-D shell angles remain: only rxembed's donor-axis additions are disabled.
     assert len(native.cons.angles) < len(isomer.cons.angles)
-
-
-@pytest.mark.parametrize("engine", [rx.embed, rx.core.embed])
-@pytest.mark.parametrize("name", ["coplanar_14", "metal_floor_relief", "donor_orientation", "conjugation"])
-@pytest.mark.parametrize("value", [None, 0, "false"])
-def test_matrix_edit_controls_require_booleans(engine, name, value):
-    with pytest.raises(TypeError, match=f"{name} must be True or False"):
-        engine(Chem.AddHs(Chem.MolFromSmiles("CCO")), n=1, **{name: value})
 
 
 def test_embed_passes_public_relaxation_cap(monkeypatch):
@@ -198,6 +214,11 @@ def test_chiral_diene_keeps_its_face_through_native_refinement(monkeypatch, lega
 
 @pytest.mark.parametrize("inspect_first", [False, True])
 def test_macrocyclic_donor_stereo_embeds_without_read_order_dependencies(inspect_first):
+    # This tetradentate macrocycle bites all four consecutive donor pairs at once, so both diagonal rows widen
+    # to the free consequence of the relaxed shell (metal_polyhedron.relaxed_shell); the bounded bite box
+    # (metal_constraints._bounded_bites) keeps that widening inside the requested tetrahedron rather than
+    # opening a seesaw-like basin next to it, so the embed itself -- not only the compiled contract -- must
+    # survive an early read.
     smiles = "C1C[N@@H]2->[Cu+]34<-[S](CC2)CC/[C-]->3=[NH+]/CC[S]->4C1"
     isomer = rx.metal(smiles, "tetrahedral")[0]
     if inspect_first:
@@ -519,7 +540,8 @@ def test_pipeline_embeds_stated_cxsmiles(monkeypatch):
     checked_spheres = []
 
     def tracked_seed(*args, **kwargs):
-        seed_calls.append(kwargs["seed"])
+        params = kwargs.get("params", args[4] if len(args) > 4 else None)
+        seed_calls.append(params.seed)
         return seed_conformers(*args, **kwargs)
 
     connectivity_scan = ensemble_module.Ensemble._scan_connectivity
@@ -547,7 +569,7 @@ def test_pipeline_embeds_stated_cxsmiles(monkeypatch):
 
     assert forced, "the retry path was not exercised"
     assert seed_calls, "the retry did not call the shared fresh-seed embed seam"
-    assert seed_calls[0] == ens.seed + 1
+    assert seed_calls[0] == ens.params.seed + 1
     assert checked_spheres
     assert all(ens.sphere == sphere for sphere in checked_spheres)
     assert ens.n == target, "the retry path did not restore the starting count"
@@ -610,7 +632,7 @@ def test_max_iteration_embed_keeps_valid_seed_marked_unrelaxed(monkeypatch):
 
     assert ens.n == 2
     assert ens.unrelaxed == [ens.ids[0]]
-    assert ens._relax_ok(ens.unrelaxed[0])
+    assert ens._geometry_failure(ens.unrelaxed[0]) is None
     ens.minimize()
     assert ens.n == 2
     assert ens.unrelaxed == [ens.ids[0]]

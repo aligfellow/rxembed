@@ -11,7 +11,8 @@ from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 from rdkit.Geometry import Point3D
 
-from rxembed.metal_core import n_sites
+from rxembed.constraints import FIX_ANGLE_TOL
+from rxembed.metal_core import _plane_rms, n_sites, rank_shapes
 from rxembed.metal_polyhedron import (
     _ALIASES,
     POLYHEDRA,
@@ -24,6 +25,7 @@ from rxembed.metal_polyhedron import (
     hull_edges,
     isomer_permutations,
     point_group,
+    relaxed_shell,
     resolve_geometry,
     seat_properly,
     vertex_dirs,
@@ -319,3 +321,66 @@ def test_seating_allows_reflection_for_achiral_template():
         for i, j in ((0, 1), (2, 3), (4, 5))
     ]
     assert min(trans) > 140.0
+
+
+# --- relaxed_shell ------------------------------------------------------------------------------------
+
+
+def test_relaxed_shell_returns_none_when_it_does_not_converge():
+    """A square-pyramidal basal 4-cycle pulled from its 86 deg ideal to 104 deg oscillates: the residual
+    stalls at 14 deg regardless of iteration count, rather than shrinking toward `constraints.FIX_ANGLE_TOL`.
+    """
+    dirs = POLYHEDRA["square_pyramidal"].vertex_dirs
+    bites = {frozenset((1, 2)): 104.0, frozenset((2, 3)): 104.0, frozenset((3, 4)): 104.0, frozenset((4, 1)): 104.0}
+    assert relaxed_shell(dirs, bites) is None
+
+
+def test_relaxed_shell_ignores_a_bent_trans_pair_for_the_oriented_type():
+    """A square-pyramidal apex fan bitten to both members of a trans basal pair (150 deg ideal) keeps its
+    type down to a crystal-realistic 83 deg: the trans pair itself bends without the shape changing, so its
+    triple must not decide the oriented-type test. A tetrahedral 4-cycle, which has no trans pair to exclude,
+    is unaffected and still reads as a different shape.
+    """
+    sp = POLYHEDRA["square_pyramidal"].vertex_dirs
+    assert relaxed_shell(sp, {frozenset((0, 1)): 83.0, frozenset((0, 3)): 83.0}) is not None
+
+    tet = POLYHEDRA["tetrahedral"].vertex_dirs
+    cycle = {frozenset((0, 1)): 80.5, frozenset((1, 2)): 89.0, frozenset((2, 3)): 80.5, frozenset((3, 0)): 89.0}
+    assert relaxed_shell(tet, cycle) is None
+
+
+def test_relaxed_shell_converges_on_a_closed_bite_cycle():
+    """A porphyrin-like closed ring of four bites, each donor shared by its two ring neighbours, used to
+    oscillate in a +-1.5 deg limit cycle instead of converging: the undamped simultaneous update overshoots
+    every round on a closed cycle (see `metal_polyhedron._SHELL_DAMPING`). Every bite must land within
+    `constraints.FIX_ANGLE_TOL` of its own target, not just settle at some smaller but nonzero residual.
+    """
+    dirs = POLYHEDRA["octahedral"].vertex_dirs  # equatorial 4-cycle: 0-2-1-3-0 (each adjacent pair cis, 90 deg ideal)
+    bites = {frozenset((0, 2)): 86.5, frozenset((2, 1)): 90.5, frozenset((1, 3)): 96.5, frozenset((3, 0)): 86.5}
+
+    rays = relaxed_shell(dirs, bites)
+
+    assert rays is not None
+    for pair, target in bites.items():
+        i, j = tuple(pair)
+        angle = math.degrees(math.acos(np.clip(rays[i] @ rays[j], -1.0, 1.0)))
+        assert angle == pytest.approx(target, abs=FIX_ANGLE_TOL)
+
+
+def test_square_pyramid_apex_fan_keeps_its_base_planar():
+    """An apex bitten to both ends of a basal diagonal (83 deg) is the Berry mode toward trigonal bipyramidal:
+    the basal face must fold about that diagonal, not tip as a rigid rectangle, so the four basal rays stay
+    coplanar and the shell still reads as the requested square_pyramidal, not the argmin trigonal_bipyramidal.
+    """
+    dirs = POLYHEDRA["square_pyramidal"].vertex_dirs
+    rays = relaxed_shell(dirs, {frozenset((0, 1)): 83.0, frozenset((0, 3)): 83.0})
+
+    assert rays is not None
+    base = rays[1:]
+    plane_rms = _plane_rms(base.mean(axis=0), base)
+    assert plane_rms < 1e-6, "the basal face folded instead of staying planar"
+
+    radius = 2.1  # an ordinary M-L distance (Angstrom); the reading depends only on direction, not scale
+    rms = _plane_rms(np.zeros(3), rays * radius)
+    ranked = rank_shapes(rays, rms, radius)
+    assert ranked[0][1] == "square_pyramidal", ranked[:2]

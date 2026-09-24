@@ -1,7 +1,7 @@
-"""The pipeline's public verbs: what a user calls, and what comes back.
+"""The pipeline's public verbs.
 
-`Ensemble` and `EnsembleSet` live in `ensemble.py`; the routing behind these verbs lives in `dispatch.py`.
-Keeping the verbs here is what lets both of those import in one direction only.
+`Ensemble`/`EnsembleSet` live in `ensemble.py`; routing lives in `dispatch.py`. Keeping the verbs here lets
+both import this module in one direction only.
 """
 
 from __future__ import annotations
@@ -46,12 +46,7 @@ def embed(
     n=None,
     seed=None,
     threads=None,
-    knowledge=None,
-    embed_params=None,
-    coplanar_14=True,
-    metal_floor_relief=True,
-    donor_orientation=True,
-    conjugation=True,
+    params=None,
     stereo=None,
     trajectory=False,
     max_iters=MAX_ITERS,
@@ -81,14 +76,12 @@ def embed(
     For a geometry input, stereo is already 3D-defined, so ``stereo=`` instead tunes the preservation filter
     for chirality the embed cannot keep.
 
-    ``embed_params`` accepts RDKit's `EmbedParameters` directly, retaining its model on retries; rxembed
-    replaces its bounds matrix on that same object, so do not share it concurrently. Explicit ``seed`` /
-    ``threads`` override native fields, and an unset seed uses rxembed's reproducible default; use native
-    knowledge flags instead of combining them with ``knowledge``. ``coplanar_14``, ``metal_floor_relief``,
-    ``donor_orientation`` and ``conjugation`` toggle rxembed's optional coplanar-bound, floor-relief,
-    donor-fold and conjugation cleanup terms; explicit stereo and ``fix`` stay authoritative over them.
-    ``max_iters`` caps the restrained-UFF relax that publishes the geometry; it does not change the DG seed
-    or retry ladder.
+    ``seed`` / ``threads`` are convenience for `EmbedParams.seed` / `.threads` when every other field can stay
+    at its default; give at most one of ``seed``/``threads`` or ``params``, not both. ``params`` carries the
+    full sampling and model choice (including a native RDKit ``EmbedParameters``, see `rx.EmbedParams`) and
+    rxembed's ``coplanar_14``/``metal_floor_relief``/``donor_orientation``/``conjugation`` ablation switches;
+    explicit stereo and ``fix`` stay authoritative over the switches. ``max_iters`` caps the restrained-UFF
+    relax that publishes the geometry; it does not change the DG seed or retry ladder.
     """
     if not isinstance(trajectory, bool):
         raise TypeError("trajectory must be True or False")
@@ -108,12 +101,7 @@ def embed(
         n=n,
         seed=seed,
         threads=threads,
-        knowledge=knowledge,
-        embed_params=embed_params,
-        coplanar_14=coplanar_14,
-        metal_floor_relief=metal_floor_relief,
-        donor_orientation=donor_orientation,
-        conjugation=conjugation,
+        params=params,
         stereo=stereo,
     )
     # `EnsembleSet` subclasses `list`, so the plain-list branch must come last: an earlier

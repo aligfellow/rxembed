@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-import pathlib
 from importlib.util import find_spec
 
 import numpy as np
@@ -20,10 +19,11 @@ from rxembed.metal_core import classify_geometry, geometry_for
 from rxembed.metal_polyhedron import POLYHEDRA, describe
 from rxembed.pipeline.perceive import read_xyz
 from rxembed.relax import bonding_ok
+from tests.conftest import EXAMPLES_DIR
 
 emb = importlib.import_module("rxembed.embed")
 
-_MN_H2 = "examples/structures/mn-h2.xyz"  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
+_MN_H2 = str(EXAMPLES_DIR / "mn-h2.xyz")  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
 _MN_H2_RC = [1, 5, 63, 64, 65, 66]  # its reacting core
 _EN_PDBRCL = "Br[Pd]1(Cl)NCCN1"  # covalent notation for the reliably embedding chelate fixture
 _NI_N = "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1"  # net 0, Ni(II)
@@ -170,207 +170,39 @@ def test_delocalised_charge_canonicalization_requires_rdkit_resonance_proof():
     assert [atom.GetFormalCharge() for atom in out.GetAtoms()] == before
 
 
-# --- Class A: a chelate bridgehead with no donor orbital of its own -----------------------------------
-
-_DTP_NI = "C[P]12(C)=[S]->[Ni+2]<-1<-[S-]2"  # dimethyldithiophosphinate kappa2, plus a wrong explicit Ni-P bond
-_BH4_NI = "[H]1[BH2-]2[H]->[Ni+2]<-1<-2"  # kappa2-BH4 bridging two H, plus a wrong explicit Ni-B bond
-_SIH_NI = "C[Si]1(C)(C)[H]->[Ni+2]<-1"  # sigma-silane eta2-Si-H: only the H neighbour of Si is metal-bound
-_PHOSPHINE_NI = "C[PH](C)->[Ni+2]"  # an ordinary phosphine: the lone pair donates straight to the metal
-_CARBOXYLATE_NI = "C[C]1(=O)[O-]->[Ni+2]<-1"  # kappa1 carboxylate with an (uncorrected) M-C contact
-
-
 def _metal_neighbours(mol):
     metal = next(a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in _metal.COORDINATION_METALS)
     return metal, sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
 
 
-def test_dithiophosphinate_bridgehead_p_loses_its_wrong_ni_bond(caplog):
-    mol = rx.parse_smiles(_DTP_NI, remove_hs=False)
-    metal, _before = _metal_neighbours(mol)
-
-    with caplog.at_level(logging.WARNING, logger="rxembed.metal"):
-        out = _metal._canonical_metal_graph(mol)
-
-    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
-    assert sorted(after) == ["S", "S"]
-    assert "bridgehead" in caplog.text
-    assert "P1-" in caplog.text
+_METALLAOXIRANE_HF = [
+    ("[Cl-]->[Hf+4]1(<-[Cl-])(<-[Cl-])(<-[Cl-])<-[O-][C-]->1(C)C", -1),  # X2 dianion: already ionic
+    ("[Cl-]->[Hf+2]1(<-[Cl-])(<-[Cl-])(<-[Cl-])<-O=C->1(C)C", 0),  # L ketone: a genuine neutral donor
+    ("Cl[Hf]1(Cl)(Cl)(Cl)OC1(C)C", -1),  # covalent: the reader's own ionic correction, unaffected by the merge
+]
 
 
-def test_kappa2_bh4_bridgehead_b_loses_its_wrong_ni_bond(caplog):
-    mol = rx.parse_smiles(_BH4_NI, remove_hs=False)
-    metal, _before = _metal_neighbours(mol)
+@pytest.mark.parametrize(("smiles", "charge"), _METALLAOXIRANE_HF, ids=["dianion", "neutral_ketone", "covalent"])
+def test_bonded_donor_pair_is_one_site_whatever_its_lewis_form(smiles, charge):
+    """RITCIG's C-O metallaoxirane is one haptic site whatever its drawn Lewis form.
 
-    with caplog.at_level(logging.WARNING, logger="rxembed.metal"):
-        out = _metal._canonical_metal_graph(mol)
+    Five vertices (four Cl plus the O-C pair) whether the pair is an X2 dianion, an L ketone or plain
+    covalent SMILES; `_canonical_metal_graph` keeps `pairs=False`, so each form's own O/C charge is
+    unaffected by the site merge (the covalent form's own ionic correction still leaves O and C at -1).
+    """
+    mol = rx.parse_smiles(smiles, remove_hs=False)
+    _metal_idx, donors = _metal_neighbours(mol)
 
-    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
-    assert sorted(after) == ["H", "H"]
-    assert "bridgehead" in caplog.text
+    sites = _metal._haptic_sites(mol, donors)
 
+    faces = [site for site in sites if len(site) > 1]
+    assert len(sites) == len(donors) - 1
+    assert len(faces) == 1
+    pair = faces[0]
+    assert {mol.GetAtomWithIdx(a).GetSymbol() for a in pair} == {"O", "C"}
 
-def test_sigma_silane_keeps_its_one_metal_bound_neighbour():
-    mol = rx.parse_smiles(_SIH_NI, remove_hs=False)
-    metal, before = _metal_neighbours(mol)
-
-    out = _metal._canonical_metal_graph(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-
-
-def test_phosphine_lone_pair_donor_keeps_its_m_p_bond():
-    mol = rx.parse_smiles(_PHOSPHINE_NI, remove_hs=False)
-    metal, before = _metal_neighbours(mol)
-
-    out = _metal._canonical_metal_graph(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-
-
-def test_carboxylate_m_c_contact_is_left_for_the_reader():
-    mol = rx.parse_smiles(_CARBOXYLATE_NI, remove_hs=False)
-    metal, before = _metal_neighbours(mol)
-
-    out = _metal._canonical_metal_graph(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-
-
-# --- Class B: a TRIGONAL bridgehead with no donor orbital of its own ----------------------------------
-
-# A kappa2 carboxylate/dithiocarbamate written with the wrong M-C bond still present, using ring-closure
-# digits the way `_DTP_NI`/`_BH4_NI` do above: one real donor bonds Ni inline, the other two (one real,
-# one the erroneous C) close back to that same Ni.
-_CARBOXYLATE_KAPPA2_NI = "C[C]1(=[O]2)[O-]->[Ni+2]<-1<-2"
-_DITHIOCARBAMATE_KAPPA2_NI = "CN(C)[C]1(=[S]2)[S-]->[Ni+2]<-1<-2"
-
-
-def _chain_bound_to_metal(symbols, bond_orders, charges, metal="Ni", metal_charge=2):
-    """Build a chain of `symbols`, each atom also sigma-bonded to one metal (a misperceived hapticity)."""
-    rw = Chem.RWMol()
-    idx = [rw.AddAtom(Chem.Atom(s)) for s in symbols]
-    for i, order in enumerate(bond_orders):
-        rw.AddBond(idx[i], idx[i + 1], Chem.BondType.DOUBLE if order == 2 else Chem.BondType.SINGLE)
-    for i, charge in zip(idx, charges, strict=True):
-        rw.GetAtomWithIdx(i).SetFormalCharge(charge)
-    m = rw.AddAtom(Chem.Atom(metal))
-    rw.GetAtomWithIdx(m).SetFormalCharge(metal_charge)
-    for i in idx:
-        rw.AddBond(i, m, Chem.BondType.DATIVE)
-    mol = rw.GetMol()
-    Chem.SanitizeMol(mol)
-    return mol, idx, m
-
-
-def _ring_bound_to_metal(symbols, bond_orders, charges, metal="Ni", metal_charge=2):
-    """As `_chain_bound_to_metal`, but closed into a ring (a misperceived haptic face)."""
-    rw = Chem.RWMol()
-    idx = [rw.AddAtom(Chem.Atom(s)) for s in symbols]
-    n = len(symbols)
-    for i, order in enumerate(bond_orders):
-        rw.AddBond(idx[i], idx[(i + 1) % n], Chem.BondType.DOUBLE if order == 2 else Chem.BondType.SINGLE)
-    for i, charge in zip(idx, charges, strict=True):
-        rw.GetAtomWithIdx(i).SetFormalCharge(charge)
-    m = rw.AddAtom(Chem.Atom(metal))
-    rw.GetAtomWithIdx(m).SetFormalCharge(metal_charge)
-    for i in idx:
-        rw.AddBond(i, m, Chem.BondType.DATIVE)
-    mol = rw.GetMol()
-    Chem.SanitizeMol(mol)
-    return mol, idx, m
-
-
-def test_kappa2_carboxylate_bridgehead_c_loses_its_wrong_ni_bond(caplog):
-    mol = rx.parse_smiles(_CARBOXYLATE_KAPPA2_NI, remove_hs=False)
-    metal, _before = _metal_neighbours(mol)
-
-    with caplog.at_level(logging.WARNING, logger="rxembed.metal"):
-        out = _metal._canonical_metal_graph(mol)
-
-    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
-    assert sorted(after) == ["O", "O"]
-    assert "bridgehead" in caplog.text
-
-
-def test_kappa2_dithiocarbamate_bridgehead_c_loses_its_wrong_ni_bond(caplog):
-    mol = rx.parse_smiles(_DITHIOCARBAMATE_KAPPA2_NI, remove_hs=False)
-    metal, _before = _metal_neighbours(mol)
-
-    with caplog.at_level(logging.WARNING, logger="rxembed.metal"):
-        out = _metal._canonical_metal_graph(mol)
-
-    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
-    assert sorted(after) == ["S", "S"]
-    assert "bridgehead" in caplog.text
-
-
-def test_allyl_face_keeps_all_three_metal_carbon_bonds():
-    mol, _idx, metal = _chain_bound_to_metal(["C", "C", "C"], [2, 1], [0, 0, -1])
-    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
-
-    out = _metal._canonical_metal_graph(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-
-
-def test_cyclopentadienide_face_keeps_all_five_metal_carbon_bonds():
-    mol, _idx, metal = _ring_bound_to_metal(["C"] * 5, [2, 1, 2, 1, 1], [0, 0, 0, 0, -1])
-    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
-
-    out = _metal._canonical_metal_graph(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-
-
-def test_imidazolyl_face_keeps_its_metal_carbon_bond():
-    # N1, C2, N3, C4, C5: C2 sits between the two ring nitrogens, exactly Class B's flanking-donor
-    # pattern, but N1/C2/N3 share a real (metal-free) ring, so condition 3 keeps the Ni-C2 bond.
-    mol, idx, metal = _ring_bound_to_metal(["N", "C", "N", "C", "C"], [1, 2, 1, 2, 1], [0, 0, 0, 0, 0])
-    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
-
-    out = _metal._canonical_metal_graph(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-    assert idx[1] in [n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()]  # C2 specifically
-
-
-def test_eta2_formaldehyde_carbon_is_unaffected():
-    rw = Chem.RWMol()
-    c, o = rw.AddAtom(Chem.Atom("C")), rw.AddAtom(Chem.Atom("O"))
-    rw.AddBond(c, o, Chem.BondType.DOUBLE)
-    metal = rw.AddAtom(Chem.Atom("Ni"))
-    rw.GetAtomWithIdx(metal).SetFormalCharge(2)
-    rw.AddBond(c, metal, Chem.BondType.DATIVE)
-    rw.AddBond(o, metal, Chem.BondType.DATIVE)
-    mol = rw.GetMol()
-    Chem.SanitizeMol(mol)
-    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
-
-    out = _metal._canonical_metal_graph(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-
-
-def test_hydride_transfer_like_ru_h_carbon_contact_is_kept():
-    # A carbon bonded to a bridging H (the hydride-transfer contact) and a real O donor, plus the
-    # erroneous Ru-C bond this rule could otherwise prune; the H flanking donor keeps it.
-    rw = Chem.RWMol()
-    c, h, o, me = (rw.AddAtom(Chem.Atom(sym)) for sym in ("C", "H", "O", "C"))
-    rw.AddBond(c, h, Chem.BondType.SINGLE)
-    rw.AddBond(c, o, Chem.BondType.DOUBLE)
-    rw.AddBond(c, me, Chem.BondType.SINGLE)
-    metal = rw.AddAtom(Chem.Atom("Ru"))
-    rw.GetAtomWithIdx(metal).SetFormalCharge(2)
-    rw.AddBond(c, metal, Chem.BondType.DATIVE)
-    rw.AddBond(h, metal, Chem.BondType.DATIVE)
-    rw.AddBond(o, metal, Chem.BondType.DATIVE)
-    mol = rw.GetMol()
-    Chem.SanitizeMol(mol, catchErrors=True)
-    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
-
-    out = _metal._canonical_metal_graph(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
+    canon = _metal._canonical_metal_graph(mol)
+    assert all(canon.GetAtomWithIdx(a).GetFormalCharge() == charge for a in pair)
 
 
 def _classify(dirs, r):
@@ -424,11 +256,11 @@ def test_short_bonded_pyramid_is_not_flatness_excluded():
     assert _classify(dirs, 1.4) == "trigonal_pyramidal"
 
 
-def test_bowed_square_plane_is_not_reclassified():
+def test_bowed_square_plane_reads_square_planar():
     assert _classify(_tilted_square(8), 2.3) == "square_planar"
 
 
-def test_bis_chelate_tetrahedron_is_not_reclassified():
+def test_bis_chelate_zinc_tetrahedron_reads_tetrahedral():
     iso = rx.metal("CC1=[O]->[Zn+2](Cl)(Cl)<-[O-]1", "tetrahedral").select(index=0)
     mol = iso.restore(rx.embed(iso, n=2, seed=7).minimize().mol)
     assert [i.geometry for i in rx.metal(mol)] == ["tetrahedral"]
@@ -465,6 +297,21 @@ def test_poor_shape_can_be_checked_silently(caplog):
     with caplog.at_level(logging.WARNING, logger="rxembed"):
         classify_geometry(_ideal_sphere(squashed, 2.1), 0, list(range(1, 7)), warn=False)
     assert not [r for r in caplog.records if "no shape fits" in r.message], caplog.text
+
+
+def test_near_tie_keeps_the_argmin_and_names_the_runner_up(caplog):
+    """A CN5 witness almost equidistant between trigonal_bipyramidal and square_pyramidal (residual gap
+    ~3e-5, far inside `_FIT_MARGIN`) still returns one name, the argmin, and logs the runner-up rather than
+    silently picking either. The acceptance gate is what accepts a requested shape this close to the argmin
+    (`shape_reading`, rule B); `classify_geometry` itself always names the one nearest reading.
+    """
+    sp = np.array(POLYHEDRA["square_pyramidal"].vertex_dirs, float)
+    tbp = np.array(POLYHEDRA["trigonal_bipyramidal"].vertex_dirs, float)
+    dirs = 0.662 * sp + 0.338 * tbp
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        got = classify_geometry(_ideal_sphere(dirs, 2.1), 0, list(range(1, 6)))
+    assert got == "trigonal_bipyramidal"
+    assert [r for r in caplog.records if "near-tie" in r.message and "square_pyramidal" in r.message], caplog.text
 
 
 def test_cn_defaults_are_the_common_shapes():
@@ -512,7 +359,8 @@ def _ring_donors(smiles):
         (lambda: _diatomic_codonors(Chem.BondType.SINGLE), lambda s, d: s == [tuple(d)]),
         (lambda: _diatomic_codonors(Chem.BondType.DOUBLE), lambda s, d: s == [tuple(d)]),
         (lambda: _diatomic_codonors(Chem.BondType.TRIPLE), lambda s, d: s == [tuple(d)]),
-        (lambda: (Chem.MolFromSmiles("NN"), [0, 1]), lambda s, d: s == [(0,), (1,)]),
+        (lambda: (Chem.MolFromSmiles("NN"), [0, 1]), lambda s, d: s == [(0, 1)]),
+        (lambda: _ring_donors("C1CCCC1"), lambda s, d: s == [(i,) for i in sorted(d)]),
         (lambda: _ring_donors("[CH-]1C=CC=C1"), lambda s, d: s == [tuple(sorted(d))]),
         (lambda: _ring_donors("C=C1C=CC=C1"), lambda s, d: s == [tuple(sorted(d))]),
         (lambda: _ring_donors("C1=CCCC1"), lambda s, d: sorted(map(len, s)) == [1, 1, 1, 2]),
@@ -524,7 +372,8 @@ def _ring_donors(smiles):
         "diatomic-codonors-single-bond",
         "diatomic-codonors-double-bond",
         "diatomic-codonors-triple-bond",
-        "implicit-h-sigma-pair-stays-two-sites",
+        "bonded-donor-pair-is-one-site-whatever-its-hydrogens-or-bond-order",
+        "saturated-sigma-ring-of-three-or-more-stays-separate-sites",
         "kekule-cyclopentadienyl-one-face",
         "fulvene-like-sp2-ring-one-face",
         "cyclopentene-does-not-promote-sp3-into-a-face",
@@ -1023,7 +872,7 @@ def test_geometry_does_not_make_an_unspecified_monodentate_amine_chiral():
     assert iso.stereo_label == ""
     assert iso.mol.GetAtomWithIdx(donor).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
 
-    embedded = core.embed(iso, n=2, seed=2, prune_rms=-1).minimize()
+    embedded = core.embed(iso, n=2, params=rx.EmbedParams(seed=2, prune_rms=-1)).minimize()
     metals = set(_metal.metal_indices(embedded.mol))
 
     assert embedded.unrelaxed == []
@@ -1043,7 +892,7 @@ def test_two_metal_bridge_uses_its_absolute_label_after_the_surrogate_strip(tag,
     iso = rx.metal(mol, center="all")[0]
     assert iso.mol.GetAtomWithIdx(1).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
 
-    embedded = core.embed(iso, n=2, seed=2, prune_rms=-1).minimize()
+    embedded = core.embed(iso, n=2, params=rx.EmbedParams(seed=2, prune_rms=-1)).minimize()
     metals = set(_metal.metal_indices(embedded.mol))
     donor = embedded.mol.GetAtomWithIdx(1)
 
@@ -1066,7 +915,7 @@ def test_bridge_stereo_forbids_global_metal_hand_reflection(monkeypatch):
 
     monkeypatch.setattr(emb, "_reflect", lambda *_args: pytest.fail("reflection inverted hidden bridge stereo"))
 
-    assert core.embed(iso, n=1, seed=0, prune_rms=-1).ids
+    assert core.embed(iso, n=1, params=rx.EmbedParams(seed=0, prune_rms=-1)).ids
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -1091,7 +940,7 @@ def test_bridge_stereo_forbids_global_metal_hand_reflection(monkeypatch):
 # this repo ships rather than reaching into a sibling checkout: a unit suite that depends on an absolute path
 # outside the project is not portable and is not a gate. The 144-structure corpus SWEEP that originally found
 # these defects is a measurement, not a gate, and lives in `benchmark/` where the corpus is in scope.
-_CORPUS = sorted(str(p) for p in pathlib.Path("examples/structures").glob("*.xyz"))
+_CORPUS = sorted(str(p) for p in EXAMPLES_DIR.glob("*.xyz"))
 corpus_only = pytest.mark.skipif(not _CORPUS, reason="no structure fixtures found")
 
 

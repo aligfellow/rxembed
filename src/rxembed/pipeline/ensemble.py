@@ -11,6 +11,7 @@ from rdkit.Chem import rdMolAlign
 
 import rxembed.metal_core as _metal
 import rxembed.metal_polyhedron as _poly
+from rxembed.bounds import EmbedParams
 from rxembed.constraints import (
     _graft_owns,
     constraint_value,
@@ -19,7 +20,7 @@ from rxembed.constraints import (
     within_window,
 )
 from rxembed.embed import BASE_STIFFNESS as _BASE_STIFFNESS
-from rxembed.embed import Conformers, Failure
+from rxembed.embed import SHAPE_PROP, Conformers, Failure, _shape_clause
 from rxembed.relax import MAX_ITERS as _MAX_ITERS
 from rxembed.relax import ff_energies, restrained_uff
 from rxembed.stereo import matches_stereo
@@ -37,7 +38,6 @@ _MIN_OVERLAY_ATOMS = 3  # need >=3 atoms to define an alignment frame
 _HARTREE_KCAL = 627.5094740631  # Eh -> kcal/mol
 # Relax failures lie 1e3-1e11 kcal/mol above the minimum; 250 stays beyond any physical rotamer.
 _RELAX_ENERGY_WINDOW = 250.0
-_REPLACEMENT_SEED = 0xF00D  # fallback for a search-free metal minimize with no originating embed seed
 _SEEDED, _RELAXED, _MINIMIZED = "seeded", "relaxed", "minimized"
 
 
@@ -228,15 +228,16 @@ class Ensemble(Conformers):
     ):
         """Openconf Monte-Carlo torsional search, in place.
 
-        `preset` sets the effort ('rapid'|'ensemble'|'spectroscopic'|'docking'|'analogue'|'macrocycle'|
-        'transition_metal'); every preset also adds a metal move budget. `seed`, `max_out`, `low_mode` and
-        `config` override single knobs, and any other keyword passes through as a ``ConformerConfig`` field.
+        `preset` sets the effort: ``'rapid'``, ``'ensemble'``, ``'spectroscopic'``, ``'docking'``,
+        ``'analogue'``, ``'macrocycle'`` or ``'transition_metal'``. Every preset also adds a metal move
+        budget. `seed`, `max_out`, `low_mode` and `config` override single knobs; any other keyword passes
+        through as a ``ConformerConfig`` field.
 
-        Unconstrained, openconf replaces the ETKDG seeds; constrained or multi-fragment, it searches around
-        the pose-frozen seeds and adds its output instead (`replace=` overrides). `explore=True` on a seeded
-        NCI complex adds a second pass with the contacts released and the structural holds kept, pools both,
-        and swaps `cons` to the relaxed set so a later stage cannot re-tighten the contacts; only substrate
-        contacts release on the metal path.
+        Unconstrained, it replaces the ETKDG seeds; constrained or multi-fragment, it instead searches from
+        the pose-frozen seeds and adds the results (`replace=` overrides the default). ``explore=True`` on a
+        seeded NCI complex runs a second pass with contacts released but structural holds kept, pools both
+        passes, and swaps `cons` to the relaxed set so a later stage cannot re-tighten the contacts; only
+        substrate contacts release on the metal path.
         """
         if not _mc.available():
             raise ImportError("mc needs openconf; pip install 'rxembed[search]'")
@@ -258,6 +259,7 @@ class Ensemble(Conformers):
         self.trajectory = None
         self.energy_kind = ""
         self._stage = _SEEDED
+        self._clear_shape()  # mc moves coordinates; a shape record is only true of the geometry it was read on
         if self.iso is not None:  # restore the selected surrogate graph before any stage moves atoms again
             current = self._mol
             self._mol = Chem.Mol(self.iso.mol)
@@ -387,8 +389,13 @@ class Ensemble(Conformers):
         if owner.iso is not None and not stated_geometry:
             report = _geometry.check(mol, cid, donors=self._declared_donors())
             violations = report.violations
-            if not cons.donor_orientation:
-                violations = [v for v in violations if v.kind != "donor_orientation"]
+            # A donor-orientation floor violation is not proof of folding (metal_perceive.donor_orientation,
+            # embed._donor_facing_failure): warn, never reject, the same policy the embed gate now applies.
+            if cons.donor_orientation:
+                for v in violations:
+                    if v.kind == "donor_orientation":
+                        logger.warning("donor orientation: %s", v.detail)
+            violations = [v for v in violations if v.kind != "donor_orientation"]
             if not cons.conjugation:
                 violations = [v for v in violations if v.kind != "conjugation"]
             if violations:
@@ -431,7 +438,7 @@ class Ensemble(Conformers):
             operation="embed",
             validator=self._workflow_failure,
             template=template,
-            seed=self.seed,
+            params=self.params,
             allow_replacement=e is not None,
         )
         self.discarded += [cid for cid in before if cid not in set(self.ids)]
@@ -475,7 +482,7 @@ class Ensemble(Conformers):
             max_iters,
             validator=self._workflow_failure,
             template=template,
-            seed=self.seed if self.seed is not None else (_REPLACEMENT_SEED if iso is not None else None),
+            params=self.params if self.params is not None else (EmbedParams() if iso is not None else None),
             allow_replacement=e is not None,
         )
         scored = {cid: self.energies[cid] for cid in self.ids if cid not in self.unrelaxed and cid in self.energies}
@@ -606,6 +613,48 @@ class Ensemble(Conformers):
             )
         return q
 
+    def _clear_shape(self):
+        """Clear `SHAPE_PROP` from every tracked conformer: it describes a geometry a later stage moved off."""
+        for cid in self.ids:
+            conf = self._mol.GetConformer(int(cid))
+            if conf.HasProp(SHAPE_PROP):
+                conf.ClearProp(SHAPE_PROP)
+
+    def _rewrite_shape_after_optimize(self, new_mol, kept, refine):
+        """Append each kept conformer's post-optimize shape reading to its `SHAPE_PROP`, in place.
+
+        `minimize()`'s reading describes the pre-optimize geometry; xtb may have moved off it, and
+        `SetPositions` does not update or clear a stale property on its own. Warns, rather than dropping the
+        conformer, when a centre no longer reads its requested shape within `_FIT_MARGIN` (see `shape_gap`).
+        """
+        states = self._coordination_states(self.iso)
+        for i in kept:
+            conf = new_mol.GetConformer(int(i))
+            if not conf.HasProp(SHAPE_PROP):
+                continue
+            segments = conf.GetProp(SHAPE_PROP).split(" | ")
+            updated = []
+            for segment, prep in zip(segments, states, strict=False):
+                residual, next_name, next_err, accepted = _metal.shape_gap(
+                    new_mol, prep.state.atom, prep.vertices, prep.haptic, prep.state.geometry, int(i)
+                )
+                if residual is None:
+                    updated.append(segment)
+                    continue
+                clause = _shape_clause(prep.state.geometry, residual, next_name, next_err)
+                updated.append(f"{segment}; after optimize {clause}")
+                if not accepted:
+                    logger.warning(
+                        "optimize: %s no longer reads %s after %s optimize (%.3f vs %s %.3f)",
+                        prep.centre,
+                        prep.state.geometry,
+                        refine,
+                        residual,
+                        next_name,
+                        next_err,
+                    )
+            conf.SetProp(SHAPE_PROP, " | ".join(updated))
+
     def optimize(self, refine="gxtb", level="normal", solvent=None, charge=None):
         """Geometry-optimise each conformer with xtb at `level`, returning a new ensemble.
 
@@ -642,6 +691,8 @@ class Ensemble(Conformers):
             raise RuntimeError(
                 f"optimize: {refine} --opt produced nothing. Is the xtb binary on PATH ($XTB_EXE, or ~/bin/xtb)?"
             )
+        if self.iso is not None:
+            self._rewrite_shape_after_optimize(new_mol, kept, refine)
         out = self._derive(kept, new_mol)
         out.energies = energies
         out._remove(out._report_missed_fixes(out.ids, f"optimize[{refine}]"))

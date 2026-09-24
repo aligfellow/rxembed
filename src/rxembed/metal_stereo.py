@@ -2,36 +2,31 @@
 
 from __future__ import annotations
 
-import itertools
-import logging
-
 import numpy as np
 from rdkit import Chem
 
 from . import metal_polyhedron as _poly
-from .metal_core import _EPS_LEN, VACANT, _frag_map, _ligand_distance_matrix, _vertex_atom, metal_indices
+from .metal_core import (
+    _EPS_LEN,
+    _ETA2,
+    COORDINATION_METALS,
+    VACANT,
+    _frag_map,
+    _ligand_distance_matrix,
+    _vertex_atom,
+    metal_indices,
+)
 from .metal_polyhedron import vertex_dirs
 from .stereo import _apply_encoded_bond_stereo, _coordination_locked_double_bonds
-from .utils import bond_removal_mirrors, flat_ranks, mirror_tag, resonance_match
+from .utils import bond_removal_mirrors, mirror_tag
 
-_MIN_STEREO_NEIGHBOURS = 3
-_ETA2 = 2
-_FACE_MIN = 3
-_PATH_ENDS = 2
 _FACE_EPS = 1e-8
 _HALF_TURN = 180
 _CIS_STEREO = {Chem.BondStereo.STEREOCIS, Chem.BondStereo.STEREOZ}
 _TRANS_STEREO = {Chem.BondStereo.STEREOTRANS, Chem.BondStereo.STEREOE}
-_RESONANCE_CLASS_CAP = 32
-_RESONANCE_LARGE_GRAPH = 40
-_RESONANCE_LARGE_CAP = 8
-# Large graphs keep exact graph classes; resonance proof is bounded to small graphs.
-logger = logging.getLogger("rxembed.metal")
-
-
-def _resonance_cap(mol):
-    """Bound direct resonance proofs on graphs whose form count is expensive."""
-    return _RESONANCE_LARGE_CAP if mol.GetNumAtoms() > _RESONANCE_LARGE_GRAPH else _RESONANCE_CLASS_CAP
+_PT = Chem.GetPeriodicTable()
+_P_BLOCK_OUTER = frozenset(range(3, 8))  # RDKit's group index for main-group 13-17; d/f-block excluded below
+_CHALCOGEN_OUTER = 6  # group 16: the terminal donor atom of a p-block hypervalent centre
 
 
 def remove_routine_hydrogens(mol, keep=()):
@@ -84,88 +79,75 @@ def remove_routine_hydrogens(mol, keep=()):
     return out, at
 
 
-def _root_resonance_match(mol, left, right):
-    """Return whether RDKit proves that two roots map across a resonance form, plus cap status."""
-    used = {atom.GetIsotope() for atom in mol.GetAtoms()}
-    marker = next(value for value in range(1, 65536) if value not in used)
+def _hypervalent_bond(bond):
+    """Return whether a bond joins a p-block centre to one of its terminal chalcogen donors.
 
-    def rooted(root):
-        marked = Chem.Mol(mol)
-        marked.GetAtomWithIdx(root).SetIsotope(marker)
-        fragments = Chem.GetMolFrags(marked, asMols=True, sanitizeFrags=False)
-        return next(
-            fragment for fragment in fragments if any(atom.GetIsotope() == marker for atom in fragment.GetAtoms())
-        )
+    RDKit's conjugation perception never marks an expanded-octet X=O bond conjugated, so a terminal chalcogen
+    (group 16, one heavy neighbour) bonded to a p-block centre (groups 13-17, not a coordination metal) is
+    added by this same graph fact: X=O and X(+)-O(-) are one drawing choice, exactly as a carboxylate's are.
+    """
 
-    query, source = rooted(left), rooted(right)
-    return resonance_match(
-        query,
-        source,
-        flags=Chem.ALLOW_CHARGE_SEPARATION,
-        max_forms=_resonance_cap(mol),
-    )
+    def centre(atom):
+        z = atom.GetAtomicNum()
+        return z not in COORDINATION_METALS and _PT.GetNOuterElecs(z) in _P_BLOCK_OUTER
+
+    def terminal(atom):
+        heavy_degree = sum(neighbor.GetAtomicNum() != 1 for neighbor in atom.GetNeighbors())
+        return _PT.GetNOuterElecs(atom.GetAtomicNum()) == _CHALCOGEN_OUTER and heavy_degree == 1
+
+    begin, end = bond.GetBeginAtom(), bond.GetEndAtom()
+    return (centre(begin) and terminal(end)) or (centre(end) and terminal(begin))
 
 
+# Resonance moves bond orders and charges only inside one conjugated system, so ranking a graph that gives
+# every conjugated bond one type and every atom of a system that system's total charge, leaving everything
+# else exact, proves the same identity as form enumeration: two roots share a rank exactly when a resonance
+# form maps one onto the other, at any molecule size and with no cap. `_hypervalent_bond` extends the same
+# rule to a p-block centre's expanded-octet donors, which RDKit's own conjugation perception cannot reach,
+# and the two kinds of bond share one systems graph, so a hypervalent group merges with an adjoining
+# conjugated system wherever they touch with no extra code.
 def _root_classes(mol, roots):
-    """Classify roots by exact symmetry, with bounded resonance coarsening on small graphs."""
+    """Classify roots by graph symmetry after erasing each conjugated system's drawn Lewis form."""
     roots = list(dict.fromkeys(roots))
+    chemical = Chem.RWMol(mol)
+    for bond in mol.GetBonds():
+        if bond.GetBondType() in (Chem.BondType.ZERO, Chem.BondType.DATIVE):
+            chemical.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
     try:
+        chemical.UpdatePropertyCache(strict=False)
+        Chem.SetConjugation(chemical)
+        systems = Chem.RWMol(chemical)
+        flat = Chem.RWMol(mol)
+        for bond in chemical.GetBonds():
+            begin, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            if not (bond.GetIsConjugated() or _hypervalent_bond(bond)):
+                systems.RemoveBond(begin, end)
+                continue
+            flat.GetBondBetweenAtoms(begin, end).SetBondType(Chem.BondType.AROMATIC)
+            flat.GetBondBetweenAtoms(begin, end).SetIsAromatic(False)
+        for atoms in Chem.GetMolFrags(systems, sanitizeFrags=False):
+            charge = sum(mol.GetAtomWithIdx(index).GetFormalCharge() for index in atoms)
+            for index in atoms:
+                atom = flat.GetAtomWithIdx(index)
+                atom.SetNumExplicitHs(mol.GetAtomWithIdx(index).GetTotalNumHs())
+                atom.SetNoImplicit(True)
+                atom.SetFormalCharge(charge)
+                atom.SetIsAromatic(False)
+        flat.UpdatePropertyCache(strict=False)
+        ranks = list(Chem.CanonicalRankAtoms(flat, breakTies=False))
         exact = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
     except (RuntimeError, ValueError) as exc:
         raise ValueError("RDKit could not canonicalize coordination-site identity") from exc
-    if mol.GetNumAtoms() > _RESONANCE_LARGE_GRAPH:
-        return {root: exact[root] for root in roots}
-    try:
-        flat = flat_ranks(mol)
-    except (RuntimeError, ValueError):
-        flat = None
-    parent = {root: root for root in roots}
-
-    def find(root):
-        while parent[root] != root:
-            parent[root] = parent[parent[root]]
-            root = parent[root]
-        return root
-
-    def merge(left, right):
-        left, right = find(left), find(right)
-        parent[max(left, right)] = min(left, right)
-
-    for left, right in itertools.combinations(roots, 2):
-        if exact[left] == exact[right]:
-            merge(left, right)
-            continue
-        if flat is None or flat[left] != flat[right]:
-            continue
-        capped = False
-        try:
-            for source, target in ((left, right), (right, left)):
-                matched, hit_cap = _root_resonance_match(mol, source, target)
-                capped |= hit_cap
-                if matched:
-                    merge(left, right)
-                    break
-        except (RuntimeError, ValueError):
-            continue
-        if capped:
-            logger.warning(
-                "coordination identity: resonance search exceeded %d forms; keeping roots %d and %d distinct",
-                _RESONANCE_CLASS_CAP,
-                left,
-                right,
-            )
-    groups = {}
+    labels = {}
     for root in roots:
-        groups.setdefault(find(root), []).append(root)
-    labels = {group: min(exact[root] for root in members) for group, members in groups.items()}
-    return {root: labels[find(root)] for root in roots}
+        labels[ranks[root]] = min(labels.get(ranks[root], exact[root]), exact[root])
+    return {root: labels[ranks[root]] for root in roots}
 
 
 def donor_classes(mol, donors):
     """Map donor atoms to graph or RDKit-proven resonance symmetry classes.
 
     Coordination identity follows graph automorphism, not one localized charge or bond-order assignment.
-    Failed resonance coarsening leaves exact classes distinct; it never falls back to element identity.
     """
     ranked, at = remove_routine_hydrogens(mol, donors)
     classes = _root_classes(ranked, [at[donor] for donor in donors])
@@ -259,7 +241,8 @@ def _face_walk(mol, face):
         for atom in face
     }
     ends = [atom for atom in face if len(neighbours[atom]) == 1]
-    if any(len(neighbours[atom]) > _PATH_ENDS for atom in face) or len(ends) not in (0, _PATH_ENDS):
+    # A path or cycle has at most two neighbours per atom, and 0 open ends if a cycle, else 2.
+    if any(len(neighbours[atom]) > 2 for atom in face) or len(ends) not in (0, 2):  # noqa: PLR2004
         return None
     walk = [min(ends) if ends else min(face)]
     while len(walk) < len(face):
@@ -273,7 +256,7 @@ def _face_walk(mol, face):
 
 def _canonical_face_walk(mol, face, ranks):
     """Return the canonical direction around a planar-chiral haptic face."""
-    if len(face) < _FACE_MIN or (walked := _face_walk(mol, face)) is None:
+    if len(face) < 3 or (walked := _face_walk(mol, face)) is None:  # noqa: PLR2004 - eta2 has its own signature path
         return None
     order, closed = walked
     n = len(order)
@@ -296,7 +279,7 @@ def _eta2_centres(mol, face, ranks, metal=None):
     for atom in face:
         neighbours = [n.GetIdx() for n in mol.GetAtomWithIdx(atom).GetNeighbors() if n.GetIdx() != metal]
         ordered = sorted(neighbours, key=ranks.__getitem__, reverse=True)
-        if len(ordered) == _MIN_STEREO_NEIGHBOURS and len({ranks[n] for n in ordered}) == len(ordered):
+        if len(ordered) == 3 and len({ranks[n] for n in ordered}) == len(ordered):  # noqa: PLR2004 - CIP needs 3
             key = (ranks[atom], tuple(sorted((ranks[n] for n in ordered), reverse=True)))
             out.append((atom, key, ordered))
     return out
@@ -323,9 +306,9 @@ def eta2_signatures(mol, face, ranks=None):
         a, b = face
         bond = mol.GetBondBetweenAtoms(a, b)
         refs = list(bond.GetStereoAtoms())
-        if len(centres) != _ETA2:
+        if len(centres) != 2:  # noqa: PLR2004 - a two-atom face has at most two CIP centres
             return (), ()
-        if bond.GetStereo() in _CIS_STEREO | _TRANS_STEREO and len(refs) == _ETA2:
+        if bond.GetStereo() in _CIS_STEREO | _TRANS_STEREO and len(refs) == 2:  # noqa: PLR2004 - two stereo refs
             cis = bond.GetStereo() in _CIS_STEREO
             if bond.GetBeginAtomIdx() != a:
                 refs.reverse()  # RDKit stores stereo references in bond begin/end order, not `face` order

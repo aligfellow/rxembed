@@ -43,7 +43,6 @@ logger = logging.getLogger("rxembed.metal")  # spelled out, not __name__: the na
 
 _E_BOND = {Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOTRANS}
 _Z_BOND = {Chem.BondStereo.STEREOZ, Chem.BondStereo.STEREOCIS}
-_STEREO_REFS = 2
 _CX_BOND_FIELD = re.compile(r"(?:^|,)([ct]):((?:\d+(?:,\d+)*)?)(?=,|$)")
 _CX_BOND_PREFIX = re.compile(r"(?:^|,)[ct]:")
 
@@ -52,7 +51,7 @@ def _repair_haptic_bond_stereo(mol):
     """Replace shared-metal E/Z references with ligand-side references without changing CIP."""
     for bond in mol.GetBonds():
         refs = list(bond.GetStereoAtoms())
-        if bond.GetStereo() not in _E_BOND | _Z_BOND or len(refs) != _STEREO_REFS:
+        if bond.GetStereo() not in _E_BOND | _Z_BOND or len(refs) != 2:  # noqa: PLR2004 - two stereo refs
             continue
         begin, end = bond.GetBeginAtom(), bond.GetEndAtom()
         shared = {n.GetIdx() for n in begin.GetNeighbors() if n.GetAtomicNum() in COORDINATION_METALS} & {
@@ -62,7 +61,7 @@ def _repair_haptic_bond_stereo(mol):
         right = [n.GetIdx() for n in end.GetNeighbors() if n.GetIdx() != begin.GetIdx() and n.GetIdx() not in shared]
         if not shared or not left or not right:
             continue
-        expected = _bond_stereo_code(mol, bond.GetIdx()) if len(set(refs)) == _STEREO_REFS else None
+        expected = _bond_stereo_code(mol, bond.GetIdx()) if len(set(refs)) == 2 else None  # noqa: PLR2004
         bond.SetStereoAtoms(min(left), min(right))
         if expected is None:
             continue
@@ -99,7 +98,7 @@ def _validate_cx_bond_stereo(smi, mol):
             raise ValueError(f"CX {marker}: field names missing bond {idx}")
         bond = mol.GetBondWithIdx(order[idx])
         refs = list(bond.GetStereoAtoms())
-        if bond.GetStereo() not in _E_BOND | _Z_BOND or len(refs) != _STEREO_REFS or len(set(refs)) != _STEREO_REFS:
+        if bond.GetStereo() not in _E_BOND | _Z_BOND or len(refs) != 2 or len(set(refs)) != 2:  # noqa: PLR2004
             raise ValueError(f"CX {marker}:{idx} did not define valid double-bond stereo")
 
 
@@ -170,13 +169,9 @@ _METAL_STEREO_TAGS = frozenset(  # the non-tetrahedral classes perception leaves
 
 
 def dative_smiles(mol, *, cx=False):
-    """Write canonical SMILES with dative M-donor bonds and ordinary hydrogens implicit.
+    """Return canonical dative SMILES without the metal arrangement, so cis and trans give one string.
 
-    The constitution layer: connectivity, charges and ligand stereocentres. The metal's arrangement is not
-    written, so cis and trans give one string, as do fac and mer; `cxsmiles` is the layer that adds
-    it. Set ``cx=True`` to retain ligand E/Z and atropisomer fields without writing metal slot notes. Zero-order
-    contacts require a native CX ``Z:`` appendix; plain ``~`` loses their bond type and CIP assignability. Not
-    a species key on its own.
+    Use `cxsmiles` when the arrangement matters; this string alone is not a species key.
     """
     return write_dative(mol, cx=cx)[0]
 
@@ -490,15 +485,12 @@ def _round_trip_graph_error(expected, actual, written):
 def _write_dative(mol, stereo_label):  # noqa: C901 - one graph-normalisation transaction
     """Return canonical dative SMILES plus atom-position and bond-position maps.
 
-    The positions are what an `atomProp` block indexes, so the CXSMILES writer needs them and cannot get
-    them from the string. Only atoms that remain explicit have a position.
+    The atom-position map is what an `atomProp` block indexes; only atoms that remain explicit have one.
+    Every accepted M-donor bond is normalized to dative first. A hydrogen with more than one connection keeps
+    its nonmetal leg covalent and donates through its metal legs; for H2 or a nonmetal relay, distance and
+    canonical graph rank break the tie.
 
-    Every accepted M-donor bond is normalized to dative before writing. A hydrogen with more than one
-    connection keeps its nonmetal ligand leg covalent and donates through metal legs. For H2 or a nonmetal
-    relay, distance and canonical graph rank break the tie.
-
-    Raises rather than hand back a string that does not round-trip, since a SMILES you cannot read back is
-    worse than none.
+    Raises instead of returning a SMILES that will not round-trip: an unreadable string is worse than none.
     """
     expected_mol = Chem.Mol(mol)
     expected_mol.UpdatePropertyCache(strict=False)
@@ -705,14 +697,14 @@ def write_dative(mol, stereo_label=None, *, cx=False):
 
 
 def _site_keys(iso, vertices, haptic, winding):
-    """Return one order-invariant key per vertex (``None`` at a vacancy): what decides which sites tie.
+    """Return one order-invariant key per vertex (``None`` at a vacancy), for deciding which sites tie.
 
-    A sigma donor is its symmetry class. A haptic face is the symmetry class of the complete atom set,
-    so two identical Cp rings tie and constitutionally different faces do not, plus its winding where present.
-    Never an atom index and never a position in a string, so any writer folding on these agrees.
+    A sigma donor's key is its symmetry class; a haptic face's key adds the symmetry class of its whole atom
+    set and its winding, so identical Cp rings tie and constitutionally different faces do not. Never an atom
+    index or a string position, so every writer folding on these agrees.
 
-    The `Isomer` owns the winding. A geometry measured by `from_geometry` has already stored it; a vertex-only
-    isomer honestly leaves it empty.
+    `Isomer` owns the winding: `from_geometry` has already measured and stored it, while a vertex-only isomer
+    leaves it empty.
     """
     classes = _coord_stereo.site_classes(iso._graph, vertices, haptic, _isomer.isomer_roles(iso))
     keys = []
@@ -833,13 +825,12 @@ def _arrangement_notes(iso, state, at):
 def cxsmiles(source):
     """Write canonical dative CXSMILES carrying the selected metal state.
 
-    The plain core is a constitution key. Metal notes store geometry and hand; donor notes store canonical
-    slots and haptic winding. Native bond directions and standard CX ``c:``/``t:`` fields retain E/Z where
-    RDKit supports them; paired ``_rxEZ`` atom properties are the lossless fallback. Multiple centres use
-    dative adjacency, and a bridge stores one slot per adjacent metal.
+    Metal notes store geometry and hand; donor notes store canonical slots and haptic winding. E/Z uses
+    native bond directions and CX ``c:``/``t:`` fields where RDKit supports them, and paired ``_rxEZ`` atom
+    properties otherwise. A bridging donor stores one slot per adjacent metal.
 
-    `source` is an `Isomer` or a conformer-bearing `Mol`. Missing polyhedron templates, contradictory stereo,
-    and symmetry-equivalent metals carrying different states fail rather than lose identity.
+    `source` is an `Isomer` or a conformer-bearing `Mol`. Fails rather than lose identity: a missing
+    polyhedron template, contradictory stereo, or symmetry-equivalent metals carrying different states.
     """
     iso = None if isinstance(source, Chem.Mol) else source
     complexed = source if iso is None else _rebuild(iso)  # a Mol is already its own constitution
@@ -870,7 +861,27 @@ def cxsmiles(source):
     if iso is not None:
         records = [(iso, state) for state in _isomer.centre_states(iso)]
     elif complexed.GetNumConformers():
-        records = [(record, record.centres[0]) for record in (_isomer.from_geometry(source, center=m) for m in centres)]
+        # An accepted conformer's requested frame (embed.SHAPE_REQUEST_PROP, written beside SHAPE_PROP by the
+        # acceptance gate) wins over the argmin: the gate already verified it within _FIT_MARGIN (rule B), and
+        # for a near-tie the argmin can read the OTHER shape. A conformer without the record (a raw geometry,
+        # never through the gate) keeps today's argmin reading.
+        from .embed import SHAPE_REQUEST_PROP, _decode_shape_request
+        from .metal_enumeration import enumerate_isomers
+
+        conf = source.GetConformer() if source.GetNumConformers() else None
+        requested = (
+            _decode_shape_request(conf.GetProp(SHAPE_REQUEST_PROP))
+            if conf is not None and conf.HasProp(SHAPE_REQUEST_PROP)
+            else {}
+        )
+        records = []
+        for m in centres:
+            built = (
+                enumerate_isomers(source, geometry=requested[m], center=m, observed_only=True)
+                if m in requested
+                else (_isomer.from_geometry(source, center=m),)
+            )
+            records.append((built[0], built[0].centres[0]))
     else:
         from .metal_enumeration import _from_stated_arrangements, stated_arrangement
 

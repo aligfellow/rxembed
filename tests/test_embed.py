@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import itertools
 import logging
+import re
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,6 +14,7 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 from rdkit.Chem.rdMolTransforms import GetAngleDeg, GetBondLength, SetBondLength
 
+import rxembed as rx
 from rxembed import bounds as bnd
 from rxembed import metal_core as _metal
 from rxembed import stereo as _stereo
@@ -95,7 +97,7 @@ def test_embed_fix_chains_minimize_and_dump(tmp_path):
 def test_numeric_fix_delivers_a_linear_three_centre_core():
     mol = _mol("[F-].CCl")  # F(0), C(1), Cl(2)
     fix = {(0, 1): 2.0, (1, 2): 2.2, (0, 1, 2): 178.0}
-    confs = embed(mol, fix=fix, n=1, seed=0xF00D, prune_rms=-1).minimize()
+    confs = embed(mol, fix=fix, n=1, params=bnd.EmbedParams(seed=0xF00D, prune_rms=-1)).minimize()
     assert confs
     for cid in confs.ids:
         conf = confs.mol.GetConformer(int(cid))
@@ -134,8 +136,8 @@ def test_metal_publication_keeps_the_ligand_bond_integrity_contract():
 
 def test_numeric_fix_rejects_when_cleanup_cannot_hold_it(monkeypatch, caplog):
     fix = {(1, 2): 2.026, (2, 0): 1.557}
-    confs = embed(_mol("[O-].ClCCCCBr"), fix=fix, n=1, seed=1, prune_rms=-1)
-    assert not confs._fixed_geometry_ok(confs.ids[0]), "the raw seed must miss for this test to exercise rejection"
+    confs = embed(_mol("[O-].ClCCCCBr"), fix=fix, n=1, params=bnd.EmbedParams(seed=1, prune_rms=-1))
+    assert confs._fixed_geometry_misses(confs.ids[0]), "the raw seed must miss for this test to exercise rejection"
 
     monkeypatch.setattr(
         emb,
@@ -146,7 +148,8 @@ def test_numeric_fix_rejects_when_cleanup_cannot_hold_it(monkeypatch, caplog):
     real_seed = emb.seed_conformers
 
     def tracked_seed(*args, **kwargs):
-        seed_calls.append(kwargs["seed"])
+        params = kwargs.get("params", args[4] if len(args) > 4 else None)
+        seed_calls.append(params.seed)
         return real_seed(*args, **kwargs)
 
     monkeypatch.setattr(emb, "seed_conformers", tracked_seed)
@@ -235,6 +238,54 @@ def test_coordination_gate_rejects_a_better_exact_search_slot_assignment():
     assert not emb._coordination_state_ok(confs._mol, confs.ids[0], iso)
 
 
+def test_cobalt_tetraammine_vacancy_rejects_a_trigonal_bipyramidal_shell():
+    """A CN6 octahedral request with one vacancy (Co(NH3)4Cl, 5 donors) is read against its 5 occupied sites.
+
+    An ideal trigonal_bipyramidal shell -- not the octahedral-minus-one square pyramid its own vacant subset
+    would read as -- is a clear miss, named with both residuals; the old gate never read a vacant centre's
+    shape at all (`_retained_polyhedron` returned None for any vacancy, so this shell passed unchecked).
+    """
+    iso = _isomer("[Co](N)(N)(N)(N)Cl", "octahedral")
+    confs = embed(iso, n=1, seed=1)
+    conf = confs._mol.GetConformer(confs.ids[0])
+    conf.SetAtomPosition(iso.metal, (0.0, 0.0, 0.0))
+    donors = [v for v in iso.vertices if v != _metal.VACANT]
+    for donor, direction in zip(donors, POLYHEDRA["trigonal_bipyramidal"].vertex_dirs, strict=True):
+        conf.SetAtomPosition(donor, tuple(map(float, 2 * np.asarray(direction))))
+
+    failure = emb._coordination_state_failure(confs._mol, confs.ids[0], iso)
+    assert failure is not None
+    assert "expected octahedral" in str(failure)
+    assert "reads trigonal_bipyramidal" in str(failure)
+    assert len(re.findall(r"\d\.\d{3}", str(failure))) >= 2
+
+
+def test_fe_pentacarbonyl_square_pyramid_shell_is_rejected_with_numbers():
+    """Fe(CO)5 requesting trigonal_bipyramidal, given an ideal square_pyramidal shell: residual 0.233, well
+    under `_FIT_FLOOR` (0.45) but not a near-tie, so an identity-only gate would accept it. The rejection
+    must carry both residual numbers, not just a name.
+    """
+    iso = _isomer("[Fe](N)(O)(F)(Cl)Br", "trigonal_bipyramidal")
+    confs = embed(iso, n=1, seed=1)
+    conf = confs._mol.GetConformer(confs.ids[0])
+    conf.SetAtomPosition(iso.metal, (0.0, 0.0, 0.0))
+    for donor, direction in zip(iso.vertices, POLYHEDRA["square_pyramidal"].vertex_dirs, strict=True):
+        conf.SetAtomPosition(donor, tuple(map(float, 2 * np.asarray(direction))))
+
+    failure = emb._coordination_state_failure(confs._mol, confs.ids[0], iso)
+    assert failure is not None
+    assert len(re.findall(r"\d\.\d{3}", str(failure))) >= 2
+
+
+def test_fe_pentacarbonyl_conformer_carries_its_shape_record():
+    """An accepted `rx.embed` conformer carries one `shape` property naming its centre and polyhedron."""
+    iso = _isomer("[Fe](N)(O)(F)(Cl)Br", "trigonal_bipyramidal")
+    confs = embed(iso, n=1, seed=1).minimize()
+
+    prop = confs._mol.GetConformer(confs.ids[0]).GetProp(emb.SHAPE_PROP)
+    assert prop.startswith("Fe0 TBP")
+
+
 def test_publication_rejects_a_different_coordination_arrangement():
     isomers = enumerate_isomers(_mol("[Pt](F)(Cl)(Br)I"), "square_planar", screen=False)
     selected = embed(isomers[0], n=1, seed=1, threads=1)
@@ -283,31 +334,34 @@ def test_structural_gate_rejects_undefined_coplanarity():
 
 
 @pytest.mark.parametrize(
-    ("cons", "detail"),
+    ("cons", "kind", "detail"),
     [
         (
             Constraints(metals={0}, distances={(0, 2): (2.0, 2.1)}),
+            "ml_distance",
             "M-L distance (0, 2): 1.414 (excess 0.576) A; "
             f"expected [{2.0 - emb._ML_WINDOW_TOL:g}, {2.1 + emb._ML_WINDOW_TOL:g}] A",
         ),
         (
             Constraints(coplanar=[(0, 1, 2, 3, None, 10.0)]),
+            "structural_constraint",
             "coplanarity deviation (0, 1, 2, 3): 45.000 (excess 33) deg; expected [0, 12] deg",
         ),
         (
             Constraints(umbrellas={(0, 1, 2, 3): 60.0}),
+            "structural_constraint",
             "absolute umbrella dihedral (0, 1, 2, 3): 45.000 (excess 13) deg; expected [58, 92] deg",
         ),
     ],
 )
-def test_geometry_failure_names_the_structural_measurement(cons, detail):
+def test_geometry_failure_names_the_structural_measurement(cons, kind, detail):
     mol = Chem.MolFromSmiles("[He].[He].[He].[He]")
     conf = Chem.Conformer(4)
     conf.SetPositions(np.array(((0, 1, 0), (0, 0, 0), (1, 0, 0), (1, 1, 1)), dtype=float))
     mol.AddConformer(conf)
     conformers = Conformers(mol, [0], cons)
 
-    assert conformers._geometry_failure(0) == Failure("structural_constraint", detail)
+    assert conformers._geometry_failure(0) == Failure(kind, detail)
 
 
 def test_structural_failure_reports_excess_below_display_precision():
@@ -318,7 +372,7 @@ def test_structural_failure_reports_excess_below_display_precision():
     cons = Constraints(metals={0}, distances={(0, 1): (2.0, 2.1)})
 
     failure = emb._structural_failure(mol, 0, cons)
-    assert failure.kind == "structural_constraint"
+    assert failure.kind == "ml_distance"
     assert "excess 0.0004" in failure.detail
 
 
@@ -340,7 +394,7 @@ def test_model_ml_window_accepts_physical_slack_a_fixed_distance_does_not():
     fixed = Constraints(metals={0}, distances={(0, 1): (2.0, 2.1)}, fixed={(0, 1): (2.0, 2.1)})
     failure = emb._structural_failure(mol, 0, fixed)
     assert failure == Failure(
-        "structural_constraint",
+        "ml_distance",
         f"M-L distance (0, 1): 2.106 (excess {0.006 - FIX_DISTANCE_TOL:.3g}) A; "
         f"expected [{2.0 - FIX_DISTANCE_TOL:g}, {2.1 + FIX_DISTANCE_TOL:g}] A",
     )
@@ -357,15 +411,17 @@ def test_donor_orientation_seed_wall_is_not_a_structural_postcondition():
     assert emb._structural_failure(mol, 0, cons) is None
 
 
-def test_donor_angle_failure_preserves_the_measurement_without_inferring_folding(monkeypatch):
+def test_donor_angle_failure_warns_without_rejecting_the_conformer(monkeypatch, caplog):
     confs = embed(_isomer(), n=1, seed=1, threads=1).minimize()
     cid = confs.ids[0]
     assert confs._geometry_failure(cid) is None
     detail = "C1 (sp3) M-D-X to Si2: 99.5° < census floor 104°; inspect donor geometry and restraints"
     monkeypatch.setattr(emb, "donor_orientation", lambda *args: [SimpleNamespace(detail=detail)])
 
-    failure = confs._geometry_failure(cid)
-    assert failure == Failure("metal_state", f"donor orientation: {detail}")
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        failure = confs._geometry_failure(cid)
+    assert failure is None, "a donor-orientation floor violation must not reject the conformer"
+    assert f"donor orientation: {detail}" in caplog.text
 
 
 @pytest.mark.parametrize(("real_window", "expected"), [((0.9, 2.2), True), ((1.9, 2.2), False)])
@@ -391,7 +447,7 @@ def test_structural_gate_ignores_transient_phantom_but_checks_real_face_distance
 
 
 def test_indexing_reuses_mol_in_new_conformers():
-    confs = embed(_mol("CCOCC"), n=6, seed=7, prune_rms=-1)
+    confs = embed(_mol("CCOCC"), n=6, params=bnd.EmbedParams(seed=7, prune_rms=-1))
     sub = confs[:2]
     assert sub.ids == confs.ids[:2]
     assert sub._mol is confs._mol
@@ -715,8 +771,20 @@ def test_minimize_uses_model_distances_unless_input_requested(lengths):
 # ---------------------------------------------------------------------------------------------------------
 
 
+def test_high_force_candidate_and_stable_coordination_use_kind_not_message_wording():
+    reworded_ml = Failure("ml_distance", "a completely reworded M-L overshoot message")
+    assert emb._high_force_candidate(reworded_ml)
+    assert not emb._high_force_candidate(Failure("structural_constraint", "M-L distance (0, 1): 2.2 A"))
+    assert not emb._high_force_candidate("M-L distance (0, 1): not a Failure")
+
+    reworded_shape = Failure("coordination_shape", "a completely reworded shape mismatch message")
+    assert emb._stable_coordination_failure(reworded_shape)
+    assert not emb._stable_coordination_failure(Failure("metal_state", "coordination state at M0 is nonplanar"))
+    assert not emb._stable_coordination_failure("coordination state at M0: not a Failure")
+
+
 def test_stiffness_ladder_retries_only_the_unresolved_conformer(monkeypatch):
-    confs = embed(_isomer(_NI_N), n=2, seed=1, threads=1, prune_rms=-1)
+    confs = embed(_isomer(_NI_N), n=2, params=bnd.EmbedParams(seed=1, threads=1, prune_rms=-1))
     victim = int(confs.ids[0])
     calls = []
     constraints = []
@@ -749,7 +817,7 @@ def test_stiffness_ladder_retries_only_the_unresolved_conformer(monkeypatch):
 
 def test_relax_ladder_does_not_escalate_a_converged_wrong_coordination_shape(monkeypatch):
     mol = _with_geometry("CCO")
-    confs = Conformers(mol, [0], Constraints(), seed=1)
+    confs = Conformers(mol, [0], Constraints(), params=bnd.EmbedParams(seed=1))
     calls = []
 
     def marked_uff(_mol, _cons, *, max_iters, conf_ids, _statuses=None, **_kw):
@@ -762,14 +830,14 @@ def test_relax_ladder_does_not_escalate_a_converged_wrong_coordination_shape(mon
     monkeypatch.setattr(
         Conformers,
         "_geometry_failure",
-        lambda *_args: Failure("metal_state", "coordination state at M0: expected SPY, found TBP"),
+        lambda *_args: Failure("coordination_shape", "coordination state at M0: expected SPY, found TBP"),
     )
 
     confs._relax_constrained(BASE_STIFFNESS, max_iters=10)
 
     assert calls == [10, 0]
     assert confs.unrelaxed == [0]
-    assert confs.relax_failures[0].kind == "metal_state"
+    assert confs.relax_failures[0].kind == "coordination_shape"
 
 
 @pytest.mark.parametrize(
@@ -984,7 +1052,7 @@ def test_uff_optimizer_failure_is_not_relabelled_as_unavailable(monkeypatch, con
 
 
 def test_higher_uff_ceiling_preserves_ni_seed_diversity():
-    confs = embed(_isomer(_NI_N), n=20, seed=42, threads=1, prune_rms=-1)
+    confs = embed(_isomer(_NI_N), n=20, params=bnd.EmbedParams(seed=42, threads=1, prune_rms=-1))
     raw = {cid: confs._mol.GetConformer(cid).GetPositions().copy() for cid in confs.ids}
     statuses = {}
     restrained_uff(confs._mol, confs.cons, conf_ids=confs.ids, _statuses=statuses)
@@ -1332,7 +1400,7 @@ def test_coordination_gate_accepts_a_graph_equivalent_site_swap():
     positions[[left, right]] = positions[[right, left]]
     conformers._mol.GetConformer().SetPositions(positions)
 
-    assert conformers._coordination_ok(conformers.ids[0])
+    assert emb._coordination_state_ok(conformers._mol, conformers.ids[0], conformers.iso)
 
 
 def test_handed_coordination_gate_rejects_an_improper_equivalent_reseating():
@@ -1383,12 +1451,12 @@ def test_partial_coordination_gate_preserves_vacancy_and_equivalent_sites():
     positions = conf.GetPositions().copy()
     positions[fluorines] = positions[fluorines[::-1]]
     conf.SetPositions(positions)
-    assert conformers._coordination_ok(conformers.ids[0])
+    assert emb._coordination_state_ok(conformers._mol, conformers.ids[0], conformers.iso)
 
     positions = conf.GetPositions().copy()
     positions[[fluorines[0], chlorine]] = positions[[chlorine, fluorines[0]]]
     conf.SetPositions(positions)
-    assert not conformers._coordination_ok(conformers.ids[0])
+    assert not emb._coordination_state_ok(conformers._mol, conformers.ids[0], conformers.iso)
 
 
 def test_independent_ligand_ez_is_restored_when_relaxation_changes_it():
@@ -1418,8 +1486,8 @@ def test_stereo_selection_streams_one_bounded_seed_budget(monkeypatch, caplog):
     isomer = enumerate_isomers(_mol("CC=[NH]->[Pt](Cl)(Br)I"), "tetrahedral")[0]
     seen = []
 
-    def reject_all(_mol, _cons, count, *, seed, **_kwargs):
-        seen.append((count, seed))
+    def reject_all(_mol, _cons, count, params, **_kwargs):
+        seen.append((count, params.seed))
         return []
 
     monkeypatch.setattr(emb, "seed_count", lambda *_args, **_kwargs: 10)
@@ -1536,7 +1604,7 @@ def test_replacements_rank_valid_settled_scores_without_touching_survivors(monke
     for conf in target.GetConformers():
         conf.SetId(conf.GetId() + 20)
     failed = list(range(20, 20 + count))
-    owner = Conformers(Chem.Mol(target), [*failed, 27], seed=42, energies={27: -77.0})
+    owner = Conformers(Chem.Mol(target), [*failed, 27], params=bnd.EmbedParams(seed=42), energies={27: -77.0})
     calls = []
     marker = object()
 
@@ -1570,7 +1638,7 @@ def test_replacements_rank_valid_settled_scores_without_touching_survivors(monke
 
 
 def test_restrained_rescore_does_not_rank_unrelaxed_seeds(monkeypatch):
-    confs = embed(_mol("CCC"), n=2, seed=1, prune_rms=-1)
+    confs = embed(_mol("CCC"), n=2, params=bnd.EmbedParams(seed=1, prune_rms=-1))
     confs.unrelaxed = [confs.ids[1]]
     seen = []
 
@@ -1589,20 +1657,26 @@ def test_restrained_rescore_does_not_rank_unrelaxed_seeds(monkeypatch):
     "success_on", [2, 3, 4], ids=("second-batch-rescue", "third-batch-rescue", "third-batch-rejected")
 )
 def test_replacement_searches_three_bounded_serial_batches(monkeypatch, success_on):
-    confs = embed(_isomer(), n=1, seed=1, threads=3, knowledge=False, prune_rms=-1)
+    confs = embed(_isomer(), n=1, seed=1, threads=3)
     from rdkit.Chem import rdDistGeom
 
-    confs.embed_params = rdDistGeom.KDG()
-    confs.coplanar_14 = False
-    confs.metal_floor_relief = False
+    confs.params = bnd.EmbedParams(
+        seed=1,
+        threads=3,
+        knowledge=False,
+        prune_rms=-1,
+        native=rdDistGeom.ETDG(),  # useBasicKnowledge=False by default, matching knowledge=False
+        coplanar_14=False,
+        metal_floor_relief=False,
+    )
     victim = confs.ids[0]
     calls = []
 
-    def seeds(source, _cons, _iso, n, *, seed, threads, knowledge=True, prune_rms=0.1, **_kwargs):
-        assert _kwargs["embed_params"] is confs.embed_params
-        assert not _kwargs["coplanar_14"]
-        assert not _kwargs["metal_floor_relief"]
-        calls.append((n, seed, threads, knowledge, prune_rms))
+    def seeds(source, _cons, _iso, n, trial_params, **_kwargs):
+        assert trial_params.native is confs.params.native
+        assert not trial_params.coplanar_14
+        assert not trial_params.metal_floor_relief
+        calls.append((n, trial_params.seed, trial_params.threads, trial_params.knowledge, trial_params.prune_rms))
         mol = Chem.Mol(source)
         ids = [conf.GetId() for conf in mol.GetConformers()]
         return mol, ids, None
@@ -1629,10 +1703,7 @@ def test_replacement_searches_three_bounded_serial_batches(monkeypatch, success_
     assert calls == [(4, seed, 3, False, -1) for seed in range(2, 2 + min(success_on, 3))]
     assert len(constrained_relaxations) == min(success_on, 3)
     child = confs[0]
-    assert child.embed_params is confs.embed_params
-    assert not child.coplanar_14
-    assert not child.metal_floor_relief
-    assert (child.seed, child.threads, child.knowledge, child.prune_rms) == (1, 3, False, -1)
+    assert child.params is confs.params
     assert child._mol is confs._mol
     assert child.unrelaxed is not confs.unrelaxed
     assert child.uff_surrogates is not confs.uff_surrogates
@@ -1655,7 +1726,7 @@ def test_ligand_hard_chirality_falls_back_when_it_blocks_the_metal_hand(monkeypa
     mol, cons, prepared, graft = emb.prepare(iso)
     calls = []
 
-    def seeds(candidate, _cons, n, *, enforce_chirality=True, **_kwargs):
+    def seeds(candidate, _cons, n, _params, *, enforce_chirality=True, **_kwargs):
         calls.append((n, enforce_chirality, _kwargs["max_attempts"]))
         candidate.RemoveAllConformers()
         for _ in range(n):
@@ -1666,7 +1737,7 @@ def test_ligand_hard_chirality_falls_back_when_it_blocks_the_metal_hand(monkeypa
     monkeypatch.setattr(emb, "seed_count", lambda *_args, **_kwargs: 8)
     monkeypatch.setattr(emb, "_seed_stereo_matches", lambda *_args, **_kwargs: not calls[-1][1])
 
-    _mol_out, ids, target = emb.seed_conformers(mol, cons, prepared, 1, seed=1, graft_ref=graft)
+    _mol_out, ids, target = emb.seed_conformers(mol, cons, prepared, 1, bnd.EmbedParams(seed=1), graft_ref=graft)
 
     assert calls == [(4, True, 30), (4, False, 30)]
     assert len(ids) == target == 1
@@ -1677,7 +1748,7 @@ def test_stereo_seed_selection_prefers_a_seed_with_the_requested_geometry(monkey
     iso = next(i for i in enumerate_isomers(_mol(_CO_EN), "octahedral") if i.chirality)
     mol, cons, prepared, graft = emb.prepare(iso)
 
-    def seeds(candidate, _cons, n, **_kwargs):
+    def seeds(candidate, _cons, n, _params, **_kwargs):
         candidate.RemoveAllConformers()
         for marker in range(n):
             conf = Chem.Conformer(candidate.GetNumAtoms())
@@ -1689,11 +1760,23 @@ def test_stereo_seed_selection_prefers_a_seed_with_the_requested_geometry(monkey
     monkeypatch.setattr(emb, "_seed_stereo_matches", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(emb, "_seed_geometry_matches", lambda _mol, cid, _iso: cid == 2)
 
-    seeded, ids, target = emb.seed_conformers(mol, cons, prepared, n, seed=1, graft_ref=graft)
+    seeded, ids, target = emb.seed_conformers(mol, cons, prepared, n, bnd.EmbedParams(seed=1), graft_ref=graft)
 
     assert len(ids) == target == n
     assert len({seeded.GetConformer(cid).GetAtomPosition(0).x for cid in ids}) == n
     assert seeded.GetConformer(ids[0]).GetAtomPosition(0).x == 2.0
+
+
+_PHEN_W_CO3 = "[O+]#[C-]->[W]1(<-[C-]#[O+])(<-[C-]#[O+])<-n2cccc3ccc4ccc[n]->1c4c32"
+
+
+def test_a_raw_dg_seed_is_gated_after_relaxation_not_redrawn_for_its_pre_relax_shape():
+    """A DG seed only approximates its metal angle windows; its relaxed endpoint, not its raw shape, is gated."""
+    for iso in rx.metal(_PHEN_W_CO3, "trigonal_bipyramidal"):
+        ensemble = rx.embed(iso, n=1, seed=42, threads=1)
+        assert rx.cxsmiles(ensemble.mol) == rx.cxsmiles(iso)
+        assert not ensemble.unrelaxed
+        assert all(report.ok() for report in ensemble.check().values())
 
 
 @pytest.mark.parametrize("kind", ["ez", "axial"])
@@ -1707,7 +1790,7 @@ def test_nonpoint_ligand_stereo_does_not_enable_the_point_fallback(monkeypatch, 
     else:
         monkeypatch.setattr(_stereo, "axis_stereo", lambda _label: {})
 
-    def seeds(candidate, _cons, n, *, enforce_chirality=True, **kwargs):
+    def seeds(candidate, _cons, n, _params, *, enforce_chirality=True, **kwargs):
         calls.append((enforce_chirality, kwargs["max_attempts"]))
         candidate.RemoveAllConformers()
         for _ in range(n):
@@ -1717,7 +1800,7 @@ def test_nonpoint_ligand_stereo_does_not_enable_the_point_fallback(monkeypatch, 
     monkeypatch.setattr(emb, "seed_coordinates", seeds)
     monkeypatch.setattr(emb, "_seed_stereo_matches", lambda *_args, **_kwargs: True)
 
-    _mol_out, ids, target = emb.seed_conformers(mol, cons, prepared, 1, seed=1, graft_ref=graft)
+    _mol_out, ids, target = emb.seed_conformers(mol, cons, prepared, 1, bnd.EmbedParams(seed=1), graft_ref=graft)
 
     assert calls == [(True, 0)]
     assert len(ids) == target == 1
@@ -1730,7 +1813,7 @@ def test_stereo_seed_budget_scales_with_independent_metal_states(monkeypatch):
     targets = [(state, (), {}, {}), (state, (), {}, {})]
     calls, inspected = [], 0
 
-    def seeds(candidate, _cons, n, **_kwargs):
+    def seeds(candidate, _cons, n, _params, **_kwargs):
         calls.append(n)
         candidate.RemoveAllConformers()
         for _ in range(n):
@@ -1748,7 +1831,7 @@ def test_stereo_seed_budget_scales_with_independent_metal_states(monkeypatch):
     monkeypatch.setattr(emb, "seed_coordinates", seeds)
     monkeypatch.setattr(emb, "_seed_stereo_matches", twelfth_seed_matches)
 
-    _mol_out, ids, target = emb.seed_conformers(mol, cons, prepared, 1, seed=1, graft_ref=graft)
+    _mol_out, ids, target = emb.seed_conformers(mol, cons, prepared, 1, bnd.EmbedParams(seed=1), graft_ref=graft)
 
     assert calls == [4, 4, 4]
     assert inspected == 12
@@ -1783,7 +1866,7 @@ def test_unconstrained_max_iteration_replaces_invalid_geometry_and_keeps_status(
 
     assert confs.ids
     assert confs.unrelaxed == confs.ids
-    assert all(confs._relax_ok(cid) for cid in confs.ids)
+    assert all(confs._geometry_failure(cid) is None for cid in confs.ids)
 
 
 def test_measure_reports_distance_and_angle():

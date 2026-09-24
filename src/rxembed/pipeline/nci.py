@@ -15,6 +15,7 @@ import numpy as np
 from rdkit import Chem
 
 from rxembed.metal_core import _frag_map, metal_indices
+from rxembed.utils import _CARBON_Z
 
 if TYPE_CHECKING:
     from xyzgraph.nci import NCIAnalyzer
@@ -63,8 +64,6 @@ _ACCEPTOR_Z = {7, 8, 9}  # N O F: lone-pair H-bond acceptors (for M-H; the
 # A sigma-hole needs a polarisable heavy donor, so the element list is the physics, not a convenience:
 # F has no usable hole and O/N are the acceptors, not the donors.
 _SIGMA_HOLE_Z = {"XB": {17, 35, 53, 85}, "ChB": {16, 34, 52}, "PnB": {33, 51, 83}}
-_N_Z, _C_Z = 7, 6  # nitrogen, carbon atomic numbers
-_DOUBLE_BOND = 2  # bond order of a double bond
 
 
 @dataclass(frozen=True)
@@ -96,7 +95,7 @@ class ContactKind:
 # The registry: one row per contact type. H-bonds tolerate bending (~140°); sigma-holes are sharply linear.
 # XB 2.5-3.1 is the GFN-FF-surviving window on the I...pyridine probe. CATPI stays at the generic 3.5 A:
 # its cation-dependent GFN-FF optima span 1.55-4.41 A, which one registry row cannot encode without overfitting.
-# Measured by `benchmark/nci_wall.py`; ring values are centroid heights, expanded to atom windows downstream.
+# Ring values are centroid heights, expanded to atom windows downstream.
 KINDS = {
     k.name: k
     for k in [
@@ -281,12 +280,12 @@ def _acceptor_quality(mol, ak):
     if ak[0] != "atom":
         return 1
     a = mol.GetAtomWithIdx(ak[1])
-    if a.GetAtomicNum() == _N_Z:
+    if a.GetAtomicNum() == 7:  # noqa: PLR2004  nitrogen
         if a.GetIsAromatic():
             return 0  # pyrrole/amide-like aromatic N: lone pair in ring
         for nb in a.GetNeighbors():  # amide / amidine / (thio)urea: N-C(=O/=S/=N)
-            if nb.GetAtomicNum() == _C_Z and any(
-                b.GetBondTypeAsDouble() >= _DOUBLE_BOND and b.GetOtherAtom(nb).GetAtomicNum() in (7, 8, 16)
+            if nb.GetAtomicNum() == _CARBON_Z and any(
+                b.GetBondTypeAsDouble() >= 2 and b.GetOtherAtom(nb).GetAtomicNum() in (7, 8, 16)  # noqa: PLR2004
                 for b in nb.GetBonds()
             ):
                 return 0
@@ -363,15 +362,13 @@ def _augment_with_aux(combo, aux, cap):
 
 
 def auto_binding_modes(mol, kinds=_AUTO_KINDS, inter_fragment=True, acceptor_cap=2, max_modes=8, seed=0xC0FFEE):
-    """Enumerate cooperative, geometrically-compatible binding modes (each a combination of contacts).
+    """Enumerate cooperative binding modes, each a maximal combination of compatible contacts.
 
-    Multipoint binding, not any single weak contact, is what stabilises these complexes. Returns
-    ``{mode_label: Contact}`` (merged); drive with ``embed(contacts='auto')`` or pass one to ``embed(contacts=)``.
-    Anchors (H-bond, ionic, cation-lone-pair, metal-hydride) define a mode and are assigned to acceptors
-    maximally (`acceptor_cap`, default 2, for bifurcated clamps); compatible auxiliary sigma-holes then ride
-    a strong grip without standing alone. Modes are ranked (most contacts, strongest, acceptor quality,
-    bifurcation) and the top `max_modes` returned; ring/π is off by default, and with no anchor each
-    auxiliary is its own weak mode.
+    Multipoint binding, not any single weak contact, stabilises these complexes. Anchors (H-bond, ionic,
+    cation-lone-pair, metal-hydride) are matched to acceptors first, up to `acceptor_cap` each; compatible
+    auxiliary sigma-holes then ride a strong grip without standing alone, so with no anchor present each
+    auxiliary is its own weak mode. Returns the top `max_modes`, ranked by contact count then strength, as
+    ``{mode_label: Contact}``; drive with ``embed(contacts='auto')`` or pass one to ``embed(contacts=)``.
     """
     from collections import OrderedDict, defaultdict
 

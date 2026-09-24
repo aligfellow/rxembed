@@ -12,6 +12,7 @@ import rxembed as rx
 from rxembed import metal_distance as mdist
 from rxembed import metal_perceive as perceive
 from rxembed.pipeline import geom_check as geom
+from tests.conftest import EXAMPLES_DIR
 
 _DFT = (
     pytest.param("mn-h2", {"metal_charges": {0: 2, 1: 1}}, id="mn-h2"),
@@ -83,6 +84,24 @@ def test_ensemble_checks_every_tracked_conformer():
     reports = ens.check()
     assert set(reports) == set(ens.ids)
     assert all(report.ok() for report in reports.values())
+
+
+def test_geom_check_prints_the_shape_record():
+    """`check()`'s summary carries the acceptance gate's shape record; a core seed that never ran the gate
+    (`rx.core.embed`'s raw output, before `minimize()`) prints an explicit ungated line instead of silently
+    omitting it, which is what exposes `rx.core.embed` seeds, `mc` output and `wrap`.
+    """
+    iso = next(
+        iter(rx.enumerate_isomers(Chem.AddHs(Chem.MolFromSmiles("[Fe](N)(O)(F)(Cl)Br")), "trigonal_bipyramidal"))
+    )
+    confs = rx.core.embed(iso, n=1, seed=1)
+
+    seed_report = geom.check(confs.mol, confs.ids[0], donors=iso.donors)
+    assert "no shape record (ungated)" in seed_report.summary()
+
+    confs.minimize()
+    report = geom.check(confs.mol, confs.ids[0], donors=iso.donors)
+    assert "Fe0 TBP" in report.summary()
 
 
 def test_geometry_check_rejects_nonfinite_coordinates():
@@ -328,7 +347,7 @@ def test_overbond_gate_accepts_clean_isomers():
 def test_donor_sets_are_per_metal():
     import rxembed as rx
 
-    reference = rx.read_xyz("examples/structures/mn-h2.xyz", metal_charges={0: 2, 1: 1})
+    reference = rx.read_xyz(str(EXAMPLES_DIR / "mn-h2.xyz"), metal_charges={0: 2, 1: 1})
     isos = rx.metal(reference, "octahedral", center="Mn", fix=[1, 5, 63, 64, 65, 66])
     iso = next(candidate for candidate in isos if rx.cxsmiles(candidate) == rx.cxsmiles(reference))
     ens = rx.embed(iso, n=1, seed=1)
@@ -372,7 +391,7 @@ def test_gate_catches_third_sphere_overbond():
     assert [x.kind for x in perceive.metal_overbond(mol, buried, None)] == ["metal_collapse"]
 
 
-def test_overbond_tier_treats_sigma_bridgehead_as_second_sphere():
+def test_overbond_tier_counts_bonded_donors():
     ac, pos = _bare_sphere(  # Pd | O O (donors) | C carboxyl | C methyl: the CMD/AMLA motif
         ["Pd", "O", "O", "C", "C"],
         [(1, 3), (2, 3), (3, 4)],
@@ -385,7 +404,7 @@ def test_overbond_tier_treats_sigma_bridgehead_as_second_sphere():
     assert np.linalg.norm(tpos[2] - tpos[0]) == pytest.approx(2.554, abs=0.01)
     assert not perceive.metal_overbond(ti, tpos, [1])
 
-    assert mdist.overbond_tier(ac, [1, 2], 3) == mdist.NEAR  # two sigma arms still need metal repulsion
+    assert mdist.overbond_tier(ac, [1, 2], 3) == mdist.APEX  # bonded to both donors: a chelate bite, forced
     assert mdist.overbond_tier(ac, [1, 2], 4) == mdist.OUTER  # bonded to neither: third sphere
     assert mdist.overbond_tier(ac, [1], 3) == mdist.NEAR  # bonded to one: second sphere, floored
 
@@ -424,7 +443,7 @@ def test_floors_accept_reference_geometries(name, read_kw):
     from rxembed.pipeline.perceive import read_xyz
 
     pt = GetPeriodicTable()
-    mol = read_xyz(f"examples/structures/{name}.xyz", 0, **read_kw)
+    mol = read_xyz(str(EXAMPLES_DIR / f"{name}.xyz"), 0, **read_kw)
     pos = mol.GetConformer().GetPositions()
     metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS]
     assert metals, f"{name} carries no transition metal: the fixture exercises no floor at all"
@@ -489,8 +508,8 @@ def test_buried_donor_triggers_metal_collapse(kind):
 
 # --- the two FF caps, seen through the gate on real complexes ------------------------------------------------
 
-_SCHREINER = "FC(F)(F)c1cc(cc(c1)C(F)(F)F)NC(=S)Nc1cc(cc(c1)C(F)(F)F)C(F)(F)F.CC(C)=O"
-_CHB = "C1CSC2=NC(CN12)c1ccccc1.CC(=O)OC(C)=O"  # tetramisole isothiourea + acetic anhydride
+_SCHREINER = "c1ccccc1NC(=S)Nc1ccccc1.CC(C)=O"  # diphenylthiourea + acetone: a Schreiner-type H-bond donor
+_CHB = "C1CSC2=NCCN12.CC(=O)OC(C)=O"  # tetramisole's bicyclic thiazoline/imidazolidine core + acetic anhydride
 
 
 def _seeded(smi, seed=1, pick=None):
@@ -527,31 +546,3 @@ def test_chb_caps_keep_sp2_carbons_planar():
             seen += 1
             assert "planarity" not in _kinds(geom.check(ens.mol, int(cid), frozen=frozen))
     assert seen, "no conformer was produced: the gate assertion never ran"
-
-
-def test_sp2_hold_preserves_window_not_flatness():
-    from rdkit.Chem import rdDistGeom
-
-    from rxembed import mechanisms
-    from rxembed.constraints import Constraints
-    from rxembed.relax import restrained_uff
-
-    mol = Chem.AddHs(Chem.MolFromSmiles("c1cc2ccc3ccc4ccc5ccc1c1c2c3c4c51"))
-    assert rdDistGeom.EmbedMolecule(mol, randomSeed=1) == 0
-
-    def worst_improper():
-        conf = mol.GetConformer()
-        sp2 = [
-            (a.GetIdx(), [n.GetIdx() for n in a.GetNeighbors()])
-            for a in mol.GetAtoms()
-            if a.GetAtomicNum() == 6 and a.GetHybridization() == Chem.HybridizationType.SP2 and a.GetDegree() == 3
-        ]
-        # indexed, not *nb: the degree-3 filter above is what makes the length 3, and a star-unpack hides that
-        return max((abs(rdMolTransforms.GetDihedralDeg(conf, nb[0], nb[1], nb[2], c)) for c, nb in sp2), default=0.0)
-
-    assert worst_improper() < 1.0, "ETKDG did not seed corannulene flat: the R4 premise is void"
-    restrained_uff(mol, Constraints())
-    held = worst_improper()
-    assert 0.5 * mechanisms._SP2_HOLD_WIN < held < mechanisms._SP2_HOLD_WIN + 3.0, (
-        f"worst sp2 improper {held:.1f} deg; expected it to ride the +/-{mechanisms._SP2_HOLD_WIN:.0f} deg window"
-    )

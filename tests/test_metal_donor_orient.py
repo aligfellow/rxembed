@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 from importlib.util import find_spec
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -14,8 +13,9 @@ from rdkit.Chem import rdMolTransforms as T
 import rxembed as rx
 from rxembed import metal_donor_orient as DO  # noqa: N812
 from rxembed.constraints import Constraints
+from tests.conftest import EXAMPLES_DIR, TMQMG_DIR
 
-_MN_H2 = "examples/structures/mn-h2.xyz"  # a frozen-TS bimetallic
+_MN_H2 = str(EXAMPLES_DIR / "mn-h2.xyz")  # a frozen-TS bimetallic
 _MN_H2_RC = [1, 5, 63, 64, 65, 66]  # its reacting core
 
 # the N-bound Ni(II) linkage isomer: a carboxylate O donor (one heavy neighbour) and an amidate N donor (two
@@ -343,12 +343,8 @@ def test_only_terminal_sp_donors_get_end_on_restraints(smiles, terminal):
             assert all(lo > 150 for lo, _ in cons.angles.values())
 
 
-@pytest.mark.parametrize(
-    ("bond_type", "expected"),
-    [(Chem.BondType.SINGLE, [3]), (Chem.BondType.DOUBLE, None)],
-    ids=["sigma-codonors", "eta2-face"],
-)
-def test_only_pi_bonded_codonors_remove_the_donation_axis(bond_type, expected):
+def _codonor_pair(bond_type):
+    """Two N donors bonded to each other, no third donor neighbour: one site under the pair rule."""
     rw = Chem.RWMol()
     metal, left, right, left_sub, right_sub = (rw.AddAtom(Chem.Atom(z)) for z in (78, 7, 7, 6, 6))
     rw.AddBond(left, right, bond_type)
@@ -358,8 +354,48 @@ def test_only_pi_bonded_codonors_remove_the_donation_axis(bond_type, expected):
     rw.AddBond(right, metal, Chem.BondType.DATIVE)
     mol = rw.GetMol()
     mol.UpdatePropertyCache(strict=False)
+    return mol, left, {left, right}
 
-    assert DO.donation_axis(mol, left, {left, right}) == expected
+
+def _codonor_triangle():
+    """Three N donors in a sigma-only ring: each has a third donor neighbour, so none merge (ZUDWUQ's shape)."""
+    rw = Chem.RWMol()
+    metal = rw.AddAtom(Chem.Atom(78))
+    ns = [rw.AddAtom(Chem.Atom(7)) for _ in range(3)]
+    subs = [rw.AddAtom(Chem.Atom(6)) for _ in range(3)]
+    for i in range(3):
+        rw.AddBond(ns[i], ns[(i + 1) % 3], Chem.BondType.SINGLE)
+        rw.AddBond(ns[i], subs[i], Chem.BondType.SINGLE)
+        rw.AddBond(ns[i], metal, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    return mol, ns[0], set(ns)
+
+
+@pytest.mark.parametrize(
+    ("build", "kept"),
+    [
+        (lambda: _codonor_pair(Chem.BondType.SINGLE), False),
+        (lambda: _codonor_pair(Chem.BondType.DOUBLE), False),
+        (_codonor_triangle, True),
+    ],
+    ids=["sigma-pair-removes-axis", "eta2-face-removes-axis", "sigma-ring-of-three-keeps-its-axis"],
+)
+def test_a_bonded_codonor_pair_removes_the_donation_axis(build, kept):
+    """A bonded codonor pair with no third donor neighbour is one site and off-axis, whatever its bond order.
+
+    Only a component of 3+ donors (a sigma-only ring, ZUDWUQ's boundary) keeps each donor's own axis.
+    """
+    mol, donor, sphere = build()
+
+    axis = DO.donation_axis(mol, donor, sphere)
+
+    substituent = next(
+        nb.GetIdx()
+        for nb in mol.GetAtomWithIdx(donor).GetNeighbors()
+        if nb.GetIdx() not in sphere and nb.GetAtomicNum() > 1
+    )
+    assert axis == ([substituent] if kept else None)
 
 
 def test_uncalibrated_codonor_keeps_the_shared_backbone_arm_walled():
@@ -530,20 +566,16 @@ def test_nonconjugated_and_oversized_rings_get_no_hinge_row(name, smi, geometry)
     assert not hinge, f"{name}: no ring here is both small enough and fully conjugated"
 
 
-_TMQMG_DIR = Path("/home/ali/Documents/Codes/tmQMg/data")
-
-
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-@pytest.mark.skipif(not _TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
+@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
 def test_fiscit_dithiolate_hinge_holds_the_measured_fold():
     # FISCIT (bis-benzenedithiolate-oxo-Tc): unconstrained the ring hinge fold measures ~38 deg; the hinge
     # holds it to ~34. Mutation: delete the hinge row and this fold exceeds 36 again.
     charges = {
-        row["id"]: int(row["charge"])
-        for row in csv.DictReader((_TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
+        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
     }
     ref = rx.read_xyz(
-        str(_TMQMG_DIR / "xyz" / "FISCIT.xyz"),
+        str(TMQMG_DIR / "xyz" / "FISCIT.xyz"),
         charge=charges["FISCIT"],
         connectivity="xyzgraph",
         bond_orders="xyz2mol",
@@ -644,7 +676,6 @@ def test_graph_recovers_missed_donors(name, smi, symbol, conjugated):
 
 
 def test_uncalibrated_donor_class_still_gets_the_cap():
-    assert ("S", DO._SP2) not in DO._FOLD_WINDOW, "('S',SP2) must stay uncalibrated (corpus has no conjugated one)"
     iso = rx.metal(_THIONE_SMI, "square_planar")[0]
     s = _donor(iso, "S")
     assert not any(k[0] == iso.metal and k[1] == s for k in iso.cons.angles), "the fold wall must abstain on S sp2"

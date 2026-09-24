@@ -345,14 +345,23 @@ def _frozen_permutations(base, m, padded, geom, frozen_donors, sites, haptic=Non
     return generate()
 
 
-def _radial_distance_windows(mol, metal, real_z, donors, atoms, positions, base_distances=None):
+def _radial_distance_windows(mol, metal, real_z, donors, atoms, positions, base_distances=None, context=None):
     """Return each donor atom's model M-donor distance window and hybridisation, shared by both screens.
 
     `positions` is resolved by the caller: `_unreachable_span` measures from `iso._length_mol`, which need
-    not be `mol` itself.
+    not be `mol` itself. `context` reuses a caller's already-compiled hybridisation/charges (`compile_context`)
+    instead of recomputing them for every candidate.
     """
-    hyb = _constraints._stripped_hybridisation(mol)
-    charges = _constraints.delocalised_charges(mol) if positions is None else None
+    if context is None:
+        hyb = _constraints._stripped_hybridisation(mol)
+        charges = _constraints.delocalised_charges(mol) if positions is None else None
+    else:
+        hyb = _constraints._fact(context, "hybridisation", lambda: _constraints._stripped_hybridisation(mol))
+        charges = (
+            _constraints._fact(context, "charges", lambda: _constraints.delocalised_charges(mol))
+            if positions is None
+            else None
+        )
     radial = Constraints()
     base_distances = base_distances or {}
     for donor in atoms:
@@ -363,20 +372,22 @@ def _radial_distance_windows(mol, metal, real_z, donors, atoms, positions, base_
     return radial, hyb
 
 
-def _narrow_span_pairs(base, source, padded, haptic, base_iso, lengths, native_reach):
+def _narrow_span_pairs(base, source, padded, haptic, base_iso, lengths, native_reach, context=None):
     """Return same-ligand donor-position pairs that cannot span `CHELATE_SPAN_ANGLE` (135 deg) or more.
 
     No-loss: a compiled angle row this wide keeps a floor >= CHELATE_SPAN_ANGLE - _ANGLE_PAD (127 deg). Any
-    path that could instead recentre that row (`_joint_shell_targets`, `_planar_bite_targets`'s fan branch)
-    only commits a witness whose span also fits the same native reach within 1e-7, which this test has
-    already shown a pair this wide cannot do.
+    path that could instead widen that row (`metal_polyhedron.relaxed_shell`'s bite-corner image) only
+    commits a witness whose span also fits the same native reach within 1e-7, which this test has already
+    shown a pair this wide cannot do.
     """
     metal = base_iso.metal
     frag = _core._frag_map(base)
     real_slots = [i for i, donor in enumerate(padded) if donor != VACANT and donor not in haptic]
     atoms = {padded[i] for i in real_slots}
     positions, _ = _constraints.resolve_lengths(source, lengths)
-    radial, _hyb = _radial_distance_windows(source, metal, base_iso.real_z, set(base_iso.donors), atoms, positions)
+    radial, _hyb = _radial_distance_windows(
+        source, metal, base_iso.real_z, set(base_iso.donors), atoms, positions, context=context
+    )
     span = (CHELATE_SPAN_ANGLE - _constraints._ANGLE_PAD, 180.0)
     narrow = set()
     for i, j in itertools.combinations(real_slots, 2):
@@ -428,7 +439,7 @@ def _isomers_for_geometry(
     distances = _core._ligand_distance_matrix(base) if tethered else None
     retained = (
         _slots.input_ordering(base, m, padded, geom, haptic, roles, classes=classes)
-        if observed_only and base.GetNumConformers() and _isomer.retained_geometry(base, m, donors, haptic)[0] == geom
+        if observed_only and base.GetNumConformers() and _core.shape_gap(base, m, donors, haptic, geom)[3]
         else None
     )
     if observed_only:
@@ -452,10 +463,12 @@ def _isomers_for_geometry(
         else None
     )
     screen_context = _constraints.compile_context(source) if native_reach is not None else None
+    if screen_context is not None:
+        screen_context["native_reach"] = native_reach  # metal_constraints._seated_bites' own fact, seeded once
     # Prune same-ligand pairs the compiled screen would reject wholesale before the streamed tethered pool
     # (metal_slots.distinct_vertex_orderings' uncapped else-branch) can raise its resource cap on them.
     narrow = (
-        _narrow_span_pairs(base, source, padded, haptic, base_iso, lengths, native_reach)
+        _narrow_span_pairs(base, source, padded, haptic, base_iso, lengths, native_reach, screen_context)
         if native_reach is not None
         else frozenset()
     )
@@ -520,11 +533,43 @@ def _isomers_for_geometry(
     return out
 
 
-def _chelate_span_failure(iso, reach, radial, links, compiled=None):
-    """Reject a linked target whose slot separation exceeds its native upper reach."""
+def _chelate_span_failure(iso, reach, radial, links, compiled=None, context=None):
+    """Reject an independent long-arc chelate whose slot separation exceeds its native upper reach.
+
+    "Long-arc" excludes a pair compile holds at its own backbone bite (`metal_slots._chelate_bite_window`);
+    that pair is skipped here and left to `_compiled_span_failure`, which checks the bite row instead.
+
+    Also rejects when this candidate's own seated bites (`metal_constraints._seated_bites`, the same windows
+    `coordination` compiles) cannot jointly support the requested polyhedron at all: not a distortion `compile`
+    could widen into, but a fold `metal_constraints._bounded_bites` finds even at the ideal-clamped anchor.
+    A haptic bite's outright triangle is compile-only here: `_compiled_span_failure` and
+    `bounds.coordination_reach` already skip every centroid row, so this screen's own seated bites only need
+    to settle the fold check above, not the exact haptic window `coordination` will compile.
+    """
     mol, metal, vertices, haptic = iso._graph, iso.metal, iso.vertices, iso.haptic
     directions = POLYHEDRA[iso.geometry].vertex_dirs
     measured = iso._lengths == "input"
+    donors = set(iso.donors)  # the same blocker set compile passes (real_od: sigma donors + haptic face atoms)
+    ideal_angles = {
+        frozenset((i, j)): _vertex_angle(directions[i], directions[j])
+        for i, j in itertools.combinations(range(len(vertices)), 2)
+    }
+    frag = _core._frag_map(mol)
+    seated = _constraints._seated_bites(
+        mol,
+        metal,
+        vertices,
+        haptic,
+        lambda v: frag[_core._vertex_atom(haptic, v)],
+        ideal_angles,
+        radial.distances,
+        donors,
+        context if context is not None else {},
+    )
+    if seated:
+        radius = _constraints._bite_radius(vertices, seated, radial.distances, metal)
+        if _constraints._bounded_bites(directions, iso.geometry, ideal_angles, seated, radius) is None:
+            return f"chelate bites leave {iso.geometry}"
     # Acute or coupled bites are soft DG priors; only independent long arcs are an outer bound.
     independent = len({vertex for pair in links for vertex in pair}) == 2 * len(links)
     for pair in links or ():
@@ -543,6 +588,8 @@ def _chelate_span_failure(iso, reach, radial, links, compiled=None):
             continue
         if mol.GetBondBetweenAtoms(left, right) is not None:
             continue
+        if angle < CHELATE_SPAN_ANGLE and _slots._chelate_bite_window(mol, left, right, donors) is not None:
+            continue  # compile holds this pair at its backbone bite, not `angle`; _compiled_span_failure checks it
         if not independent or links[pair] < _CHELATE_PATH_MIN or angle < _CHELATE_SPAN_MIN:
             continue
         radii = tuple(radial.distances[tuple(sorted((metal, donor)))][0] for donor in (left, right))
@@ -637,8 +684,10 @@ def _unreachable_span(iso, reach, classes, links, native=None, context=None):
     donors = set(iso.donors)
     atoms = set(vertices) - haptic.keys() - {VACANT}
     positions, _ = _constraints.resolve_lengths(iso._length_mol, iso._lengths)
-    radial, hyb = _radial_distance_windows(mol, metal, iso.real_z, donors, atoms, positions, iso._base_cons.distances)
-    if failure := _chelate_span_failure(iso, reach, radial, links, compiled):
+    radial, hyb = _radial_distance_windows(
+        mol, metal, iso.real_z, donors, atoms, positions, iso._base_cons.distances, context=context
+    )
+    if failure := _chelate_span_failure(iso, reach, radial, links, compiled, context):
         return failure
     for left, right in pairs:
         a, b = (radial.distances[tuple(sorted((metal, donor)))][0] for donor in (left, right))
@@ -646,7 +695,7 @@ def _unreachable_span(iso, reach, classes, links, native=None, context=None):
         available = float(reach[min(left, right), max(left, right)])
         if needed > available + _slots._SPAN_TOL:
             return f"donors {left}/{right} need >= {needed:.3f} A; ligand reach <= {available:.3f} A"
-    return _donor_facing_failure(iso, reach, radial, hyb, classes, links)
+    return _opposed_donor_span_failure(iso, reach, radial, hyb, classes, links)
 
 
 def _route_certificate_subsets(path):
@@ -792,13 +841,17 @@ def _donor_pair_fit_cost(reach, radii, axes, floors, donors):
     return 4 - 4 * math.sin(hi / 2)  # Use the upper bracket: a conservative lower fit cost.
 
 
-def _donor_facing_failure(iso, reach, radial, hyb, classes, links):
+def _opposed_donor_span_failure(iso, reach, radial, hyb, classes, links):
     """Reject only when donor-facing reach exhausts the shared fit budget in every equivalent seating.
 
-    An ideal opposed pair capped at angle theta costs at least 4-4*sin(theta/2) squared unit-ray error.
-    Sum disjoint pairs against the one n*FIT_FLOOR^2 budget, not a fresh budget for each chelate. Caps
-    follow from the existing single-endpoint cones without assuming a donor-substituent bond length.
-    Native ligand reach intervals remain model priors, not proof of chemical impossibility.
+    An ideal opposed pair capped at angle theta costs at least 4-4*sin(theta/2), a squared unit-ray error on
+    the same raw (unaveraged, pre-sqrt) scale `metal_core.fit_residual` averages and roots: occupied *
+    _FIT_FLOOR**2 converts the per-vertex RMS floor back into that raw-sum budget for `occupied` vertices, so
+    disjoint pairs sum against one shared budget, not a fresh one per chelate. Caps follow from the existing
+    single-endpoint cones without assuming a donor-substituent bond length. Native ligand reach intervals
+    remain model priors, not proof of chemical impossibility. Measured on the 100 benchmark fixtures and 157
+    issue-cohort ids: refuses no arrangement in the cohort (see embed._donor_facing_failure, an unrelated
+    function on the accepted conformer, not this pre-embed candidate screen).
     """
     vertices, mol, metal = iso.vertices, iso._graph, iso.metal
     occupied = sum(vertex != VACANT for vertex in vertices)

@@ -7,6 +7,7 @@ connectivity, but only the latter two rank bond orders.
 
 from __future__ import annotations
 
+import itertools
 import logging
 
 import numpy as np
@@ -18,26 +19,32 @@ from rxembed.metal_core import (
     metal_indices,
 )
 from rxembed.stereo import stereo_from_3d
-from rxembed.utils import _rcov, flat_ranks, hydrogen_neighbor_order
+from rxembed.utils import _lone_pair, _rcov, flat_ranks, hydrogen_neighbor_order, remove_bond
 
 _AROMATIC_BO_TOL = 0.25  # |bond_order - 1.5| within this reads as aromatic
-_SHARED_H_MAX_RATIO = 1.15  # comparable X-H legs denote a shared proton; the benchmark owns the calibration
-_SHARED_H_NEIGHBOURS = 2
+# Measured threshold: a real bridge's two legs (DEDPUX, SIJQIL, MOCQIE) split 1.007-1.034; an ordinary H-bond's
+# legs (HIRGIA, JAKNUE) split 1.231-1.290. 1.15 sits in the gap between them.
+_SHARED_H_MAX_RATIO = 1.15  # comparable X-H legs denote a shared proton
 _BRIDGE_H_FACTOR = 1.2  # x (r_cov(H) + r_cov(X)); same margin as a new-bond distance elsewhere in the pipeline
 _CONNECTIVITY = {"rdkit", "xyzgraph", "xyz2mol"}
 _BOND_ORDERS = {"xyzgraph", "xyz2mol"}
+_BRIDGEHEAD_SIGMA_MIN = 4  # a kappa2 chelate bridgehead (P, Si, B) bonds >=4 non-metal sigma neighbours
+_BRIDGEHEAD_DONORS_MIN = 2  # fewer is a sigma-silane/borane bridgehead (one metal-bound neighbour), not this rule
+_TRIGONAL_SIGMA = 3  # Class B's bridgehead: exactly 3 non-metal sigma bonds (carboxylate/amidinate C, N-B-N B)
+_TRIGONAL_NONDONOR_Z = {1, 6}  # H and C: a TS contact or a genuine eta-n face carbon, never this rule's donor
 logger = logging.getLogger("rxembed")
 
 
 def read_xyz(path, charge=0, connectivity="xyzgraph", bond_orders="xyzgraph", metal_charges=None, fallback=True):
-    """Read an ``.xyz`` into a Mol with perceived bonds and a conformer; robust for metals and TSs.
+    """Read an ``.xyz`` into a Mol with perceived bonds and a conformer; handles metals and TSs.
 
     `connectivity` picks RDKit's connect-the-dots, ``"xyzgraph"``, or ``"xyz2mol"``. `bond_orders` is xyzgraph's
     optimiser (needs ``connectivity="xyzgraph"``) or xyz2mol's ranked charge search (metal complexes only; a
     metal-free TS keeps xyzgraph's orders instead of failing); RDKit connectivity never adds or removes a metal-donor
     contact. ``metal_charges`` names a formal charge per metal index for a multi-metal XYZ whose total does not
     determine the split; every metal must be named. Sanitisation is lenient (rings yes, valence checks no); perceiver
-    choices land on the returned Mol's ``_rxembed*`` properties.
+    choices land on the returned Mol's ``_rxembed*`` properties. A bridgehead M-X bond a reader mis-perceived
+    (`_drop_bridgehead_bonds`) is dropped here, once, since only a coordinate-derived graph can carry that fault.
     """
     if connectivity not in _CONNECTIVITY:
         raise ValueError(f"connectivity must be 'rdkit', 'xyzgraph', or 'xyz2mol', got {connectivity!r}")
@@ -74,6 +81,7 @@ def read_xyz(path, charge=0, connectivity="xyzgraph", bond_orders="xyzgraph", me
     # fallback graph (not xyzgraph's) is what orphans a 3c-2e bridge into a free hydride for a structure
     # like B3H8-, and only the post-order mol shows it.
     _reject_unbonded_bridging_hydrogens(mol)
+    mol = _drop_bridgehead_bonds(mol)
     used_fallback |= order_fallback
     if perceived_by != selected_connectivity:
         added = ()
@@ -103,7 +111,7 @@ def _reject_unbonded_bridging_hydrogens(mol):
     M-H-M) with zero neighbours instead of choosing one leg; it then survives as a free hydride and
     xyz2mol forces a nonsense two-centre graph around it, surfacing as a confusing failure five stages
     later. Geometry- and graph-derived only (no element list, no atom count), so this also catches a
-    bridge `_reject_boron_cages`'s boron count cannot: a single B-H-B pair, or a non-boron bridge. A
+    bridge `_reject_boron_cages`'s cage-vertex rule cannot: a single B-H-B pair, or a non-boron bridge. A
     dropped terminal hydrogen sits near one heavy atom, not two; a free hydride counterion sits outside
     the covalent-radius reach of anything.
     """
@@ -123,7 +131,7 @@ def _reject_unbonded_bridging_hydrogens(mol):
             distance = float(np.linalg.norm(pos[h] - pos[other.GetIdx()]))
             if distance <= _BRIDGE_H_FACTOR * (r_h + _rcov(other.GetAtomicNum())):
                 near.append((other.GetIdx(), distance))
-        if len(near) >= _SHARED_H_NEIGHBOURS:
+        if len(near) >= 2:  # noqa: PLR2004  two or more heavy neighbours makes this a bridging H
             bridges.append((h, near))
     if bridges:
         details = ", ".join(
@@ -133,6 +141,132 @@ def _reject_unbonded_bridging_hydrogens(mol):
             f"3-centre-2-electron bridge(s) detected: {details}; multi-centre X-H-X bonding is outside "
             "rxembed's two-centre donor model; supply an explicit donor graph or use a cage-capable backend"
         )
+
+
+def _metal_free_rings(rw, metals):
+    """Return each ring of `rw` with every metal atom removed, as a list of atom-index frozensets.
+
+    Built once per graph for Class B's ring test. `RingInfo.AtomRings()` is a view into its owning
+    Mol's C++ memory, so the ring atoms are read out here, before the stripped copy is dropped, rather
+    than handing back the live RingInfo (that use-after-free crashed the measurement with a MemoryError).
+    A fresh `Chem.Atom` is used per kept atom rather than a copy of the original: copying carries over
+    cached valence/implicit-H state from the metal-bonded graph, which corrupted ring perception the
+    same way once that atom sat in a differently-bonded graph.
+    """
+    em = Chem.RWMol()
+    kept = {}
+    for atom in rw.GetAtoms():
+        if atom.GetIdx() in metals:
+            continue
+        fresh = Chem.Atom(atom.GetAtomicNum())
+        fresh.SetFormalCharge(atom.GetFormalCharge())
+        kept[atom.GetIdx()] = em.AddAtom(fresh)
+    for bond in rw.GetBonds():
+        a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if a in metals or b in metals:
+            continue
+        em.AddBond(kept[a], kept[b], Chem.BondType.SINGLE)  # bond order is irrelevant to ring membership
+    stripped = em.GetMol()
+    stripped.UpdatePropertyCache(strict=False)
+    Chem.GetSymmSSSR(stripped)
+    new_to_old = {new: old for old, new in kept.items()}
+    return [frozenset(new_to_old[i] for i in ring) for ring in stripped.GetRingInfo().AtomRings()]
+
+
+def _trigonal_donors_qualify(rw, x, donors, metals, rings):
+    """Return True when Class B's two extra conditions hold for a trigonal bridgehead's `donors`.
+
+    Every donor must be a non-carbon heteroatom that itself has a lone pair (a formal-charge carbanion
+    never qualifies -- what keeps a Cp, indenyl, or pyrrolyl ring intact, since ring aromaticity puts a
+    delocalised charge on a ring carbon too). And X must not share a metal-free ring with a donor --
+    what keeps a phosphole, thiazole, or imidazolyl face intact, where the flanking donors are joined
+    to X by a real organic ring bond, not only by both separately reaching the same metal.
+    """
+    xi = x.GetIdx()
+    for d in donors:
+        atom = rw.GetAtomWithIdx(d)
+        if atom.GetAtomicNum() in _TRIGONAL_NONDONOR_Z or _lone_pair(atom, metals) <= 0:
+            return False
+        if any(xi in ring and d in ring for ring in rings):
+            return False
+    return True
+
+
+def _prune_donorless_bridgeheads(rw, metals):
+    """Remove an M-X bond where X is a chelate bridgehead with no donor orbital of its own.
+
+    xyzgraph can bond the metal to a chelate bridgehead X -- the P of a kappa2 S2PR2 or N-P-N/O-P-O
+    ligand, the Si of S-Si-S, the B of kappa2-BH4 -- instead of, or besides, that bridgehead's real donor
+    neighbours. X has no donor orbital, and the bond is graph-provably wrong, exactly when: two or more of
+    X's own neighbours are themselves bonded to that same metal (the real donors) and are not bonded to
+    each other; X carries four or more sigma bonds to non-metal atoms (Class A); and X has no lone pair
+    (`_lone_pair`) -- not a per-element list, so it holds for any main-group bridgehead.
+
+    Class B extends the same X-has-no-lone-pair test to a TRIGONAL bridgehead (exactly three sigma bonds
+    to non-metal atoms: a carboxylate, amidinate, or dithiocarbamate C, or an N-B-N B). A geometric test
+    cannot see this one -- xyzgraph 1.6.14's mis-bonded M-C sits at an ordinary M-C distance -- so it
+    needs two further graph-only conditions (`_trigonal_donors_qualify`) before X loses its bond: every
+    one of its metal-bound neighbours must itself be a non-carbon heteroatom with a lone pair, and X must
+    not share a metal-free ring with one of them. A sigma-only macrocycle (each ring member independently
+    donating its own lone pair, e.g. a cyclo-As6 crown) is excluded by X's own lone-pair test, since each
+    of its members is a real donor in its own right, not a bridgehead.
+
+    A sigma-silane or sigma-borane bridgehead (eta2-Si-H, B-H: one metal-bound neighbour) fails the first
+    test and is left as read -- it is not graph-provable this way. Logs one warning naming every removed
+    bond. This guard mirrors xyzgraph's own `_prune_crosslinks` and can be dropped once a fixed xyzgraph
+    is installed.
+    """
+    rings = _metal_free_rings(rw, metals) if metals else []
+    bad = []
+    for metal in metals:
+        for x in rw.GetAtomWithIdx(metal).GetNeighbors():
+            xi = x.GetIdx()
+            if xi in metals:
+                continue
+            donors = [
+                n.GetIdx()
+                for n in x.GetNeighbors()
+                if n.GetIdx() != metal and rw.GetBondBetweenAtoms(n.GetIdx(), metal) is not None
+            ]
+            if len(donors) < _BRIDGEHEAD_DONORS_MIN or any(
+                rw.GetBondBetweenAtoms(a, b) is not None for a, b in itertools.combinations(donors, 2)
+            ):
+                continue
+            sigma_to_nonmetal = x.GetTotalDegree() - sum(1 for n in x.GetNeighbors() if n.GetIdx() in metals)
+            trigonal = sigma_to_nonmetal == _TRIGONAL_SIGMA
+            if sigma_to_nonmetal < _BRIDGEHEAD_SIGMA_MIN and not trigonal:
+                continue
+            if _lone_pair(x, metals) > 0:
+                continue
+            if trigonal and not _trigonal_donors_qualify(rw, x, donors, metals, rings):
+                continue
+            bad.append((xi, x.GetSymbol(), metal))
+    for xi, _sym, metal in bad:
+        remove_bond(rw, xi, metal)
+    if bad:
+        logger.warning(
+            "read_xyz: dropped bridgehead bond(s) %s (no lone pair, not a donor); the geometry misread it",
+            ", ".join(f"{sym}{xi}-{metal}" for xi, sym, metal in bad),
+        )
+    return bad
+
+
+def _drop_bridgehead_bonds(mol):
+    """Return `mol` with any bridgehead-mis-bonded M-X bond dropped (see `_prune_donorless_bridgeheads`).
+
+    A no-op when there is no metal or nothing to prune. `read_xyz` always applies this; call it directly
+    only to re-apply the same guard to a Mol built outside `read_xyz` (an independent re-read of output).
+    """
+    metals = set(metal_indices(mol))
+    if not metals:
+        return mol
+    rw = Chem.RWMol(mol)
+    rw.UpdatePropertyCache(strict=False)
+    if not _prune_donorless_bridgeheads(rw, metals):
+        return mol
+    out = rw.GetMol()
+    out.UpdatePropertyCache(strict=False)
+    return out
 
 
 def _apply_metal_charges(mol, charges):
@@ -362,11 +496,13 @@ def _rank_orders(mol, charge):  # noqa: C901 - one linear graph-normalization pa
     """Re-assign bond orders and charges without changing connectivity.
 
     Bonds flatten to single and charges clear (`xyz2mol_tmc`'s three structural charges are re-applied for its
-    calibrated search); a metal-free structure delegates to RDKit. xyz2mol allows hydrogen exactly one valence, so a
-    hydrogen bridging a metal or shared between two nonmetal legs (proton transfer) has its longer contact removed
-    before the search, restored as dative after.
+    calibrated search); a metal-free structure delegates to RDKit. `TRANSITION_METALS_NUM` is narrower than
+    `metal_core.COORDINATION_METALS`: it omits the lanthanides and actinides that calibrated search has no
+    charge model for. xyz2mol allows hydrogen exactly one valence, so a hydrogen bridging a metal or shared
+    between two nonmetal legs (proton transfer) has its longer contact removed before the search, restored as
+    dative after.
     """
-    from .xyz2mol_tmc import TRANSITION_METALS_NUM, get_tmc_mol
+    from .xyz2mol_tmc import SEEDED_STRUCTURAL_CHARGES, TRANSITION_METALS_NUM, get_tmc_mol
 
     if not _has_xyz2mol_metal(mol):
         from rdkit.Chem import rdDetermineBonds
@@ -404,7 +540,7 @@ def _rank_orders(mol, charge):  # noqa: C901 - one linear graph-normalization pa
         distances = [float(np.linalg.norm(pos[n] - pos[h])) for n in ordered]
         metal_bound = bool(set(neighbours) - set(nonmetals))
         shared = (
-            len(ordered) == _SHARED_H_NEIGHBOURS
+            len(ordered) == 2  # noqa: PLR2004  a shared-H ratio test needs exactly two candidate legs
             and distances[0] > 0
             and distances[1] / distances[0] <= _SHARED_H_MAX_RATIO
         )
@@ -440,8 +576,7 @@ def _rank_orders(mol, charge):  # noqa: C901 - one linear graph-normalization pa
         if atom.GetAtomicNum() in TRANSITION_METALS_NUM:
             continue  # preserve a multi-metal backend's oxidation-state allocation
         heavy = sum(1 for n in atom.GetNeighbors() if n.GetAtomicNum() not in TRANSITION_METALS_NUM)
-        seeded = {(7, 4): 1, (8, 3): 1, (5, 4): -1}  # get_basic_mol's, off the metal-free valence
-        atom.SetFormalCharge(seeded.get((atom.GetAtomicNum(), heavy), 0))
+        atom.SetFormalCharge(SEEDED_STRUCTURAL_CHARGES.get((atom.GetAtomicNum(), heavy), 0))
 
     graph = flat.GetMol()
     graph.UpdatePropertyCache(strict=False)

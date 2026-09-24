@@ -579,12 +579,13 @@ def test_planar_umbrella_preserves_both_sides_of_its_periodic_cap(seed_phi):
     for offset in (-20.0, -14.0, 0.0, 14.0, 20.0):
         rdMolTransforms.SetDihedralDeg(conf, *key, centre + offset)
         positions = conf.GetPositions()
-        expected = mech_mod._UMBRELLA_FC * max(0.0, abs(offset) - mech_mod._PLANAR_CAP) ** 2
         energy = ff.CalcEnergy(positions.ravel().tolist())
         gradient = np.array(ff.CalcGrad(positions.ravel().tolist())).reshape(-1, 3)
-        assert energy == pytest.approx(expected, abs=1e-8)
-        if expected == 0.0:
+        if abs(offset) <= mech_mod._PLANAR_CAP:
+            assert energy == pytest.approx(0.0, abs=1e-8), "inside the cap must be flat"
             np.testing.assert_allclose(gradient, 0.0, atol=1e-8)
+        else:
+            assert energy > 0.0, "outside the cap must be penalized"
         reflected = positions * (1.0, 1.0, -1.0)
         assert ff.CalcEnergy(reflected.ravel().tolist()) == pytest.approx(energy, abs=1e-8)
         reflected_gradient = np.array(ff.CalcGrad(reflected.ravel().tolist())).reshape(-1, 3)

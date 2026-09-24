@@ -10,10 +10,11 @@ from rdkit.Chem import rdDistGeom
 
 import rxembed as rx
 from rxembed.pipeline import geom_check as geom
+from tests.conftest import EXAMPLES_DIR
 
 _GRAFT_TOL = 0.01  # a fixed core is held exactly: the frozen-core distance assertion the project guarantees
 _AMIDE_CORE = [0, 1, 2, 3]  # the conserved C-C(=O)-N motif: the same leading indices in every analogue below
-_SN2 = "examples/structures/sn2.xyz"
+_SN2 = str(EXAMPLES_DIR / "sn2.xyz")
 _SN2_CORE = [4, 0, 5]  # F...C...Cl reacting core, from the templated-TS notebook
 
 
@@ -96,7 +97,7 @@ def test_failed_native_embedding_does_not_return_source_coordinates(monkeypatch,
 def test_seed_budget_exhaustion_does_not_claim_geometric_infeasibility(monkeypatch):
     from rxembed.pipeline import dispatch
 
-    def no_seeds(mol, _cons, _iso, n, **_kwargs):
+    def no_seeds(mol, _cons, _iso, n, _params, **_kwargs):
         return mol, [], n
 
     iso = rx.metal("N->[Pt+2](<-[Cl-])(<-[Br-])<-P", "SPL")[0]
@@ -123,9 +124,9 @@ def test_threads_reach_both_seed_dispatches(monkeypatch):
     seen = []
     real = dispatch.seed_conformers
 
-    def capture(mol, _cons, _iso, _n, **kwargs):
-        seen.append(kwargs["threads"])
-        return real(mol, _cons, _iso, _n, **kwargs)
+    def capture(mol, _cons, _iso, _n, params, **kwargs):
+        seen.append(params.threads)
+        return real(mol, _cons, _iso, _n, params, **kwargs)
 
     iso = rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0]
     monkeypatch.setattr(dispatch, "seed_conformers", capture)
@@ -167,6 +168,20 @@ def test_numeric_fix_reaches_explicit_hydrogen():
 def test_unqualified_coordinate_free_metal_fails_loudly():
     with pytest.raises(ValueError, match="plain RDKit embedding does not model metals"):
         rx.embed("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", n=1)
+
+
+def test_readme_coordinate_example_binds_the_named_donor():
+    pocket = rx.metal("N->[Pt](Cl)Cl.CC(C)=O", "SPL").select(index=0)
+    bound = rx.embed(pocket, coordinate="[OX1]", n=1)
+    pt = next(a.GetIdx() for a in bound.mol.GetAtoms() if a.GetSymbol() == "Pt")
+    o = next(a.GetIdx() for a in bound.mol.GetAtoms() if a.GetSymbol() == "O")
+    assert (o, pt) in bound.iso.donor_bonds
+
+
+def test_unknown_coordinate_string_names_the_accepted_forms():
+    pocket = rx.metal("N->[Pt](Cl)Cl.CC(C)=O", "SPL").select(index=0)
+    with pytest.raises(ValueError, match="SMARTS pattern, an atom index, or a list"):
+        rx.embed(pocket, coordinate="auto", n=1)
 
 
 def test_coordinate_free_hydride_uses_the_ml_target_through_a_metal_state():
@@ -500,7 +515,7 @@ def test_numeric_metal_fix_needs_no_input_geometry():
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_spectator_sphere_uses_polyhedron_constraints_without_implicit_shape_holds():
-    source = rx.read_xyz("examples/structures/mn-h2.xyz", metal_charges={0: 2, 1: 1})
+    source = rx.read_xyz(str(EXAMPLES_DIR / "mn-h2.xyz"), metal_charges={0: 2, 1: 1})
     iso = rx.metal(source, "octahedral", center="Mn", fix=[1, 5, 63, 64, 65, 66])[0]
     spectators = {m for m in iso.cons.metals if m != iso.metal}
     assert spectators, "mn-h2 is bimetallic: the ferrocene Fe must be surrogated as a spectator"

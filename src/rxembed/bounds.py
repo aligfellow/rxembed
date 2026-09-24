@@ -12,6 +12,7 @@ import itertools
 import logging
 import math
 from contextlib import nullcontext
+from dataclasses import dataclass
 
 import numpy as np
 from rdkit import Chem, DistanceGeometry, rdBase
@@ -27,7 +28,7 @@ DEFAULT_SEED = 0xF00D  # the one embed seed default; a probe may state its own, 
 _SMOOTH_LOOSE = 0.1  # smoothing beyond this means the constraints are genuinely contradictory, not merely tight
 _MAX_SEED_COUNT = 250  # bound one RDKit DG search; stereo selection reuses this ceiling in small serial batches
 _PROJECTOR_EPS = 1e-10  # Ignore the numerically null centered constant eigenspace.
-_CERTIFICATE_STEPS = 32  # Bounded proposal search, not a feasibility threshold; see benchmark/.
+_CERTIFICATE_STEPS = 32  # accelerated-gradient step budget for the refinement search, not a feasibility threshold
 _CROSS_EPS = 1e-9  # Å, floating-point slack shared by every closed-bound comparison against this matrix
 
 
@@ -66,42 +67,69 @@ def embed_parameters(seed, *, knowledge=True, threads=0, prune_rms=None):
     return p
 
 
-def embedding_options(
-    seed,
-    threads,
-    knowledge,
-    prune_rms=None,
-    embed_params=None,
-    *,
-    coplanar_14=True,
-    metal_floor_relief=True,
-    donor_orientation=True,
-    conjugation=True,
-):
-    """Resolve convenience keywords once, leaving native model choices on their parameter object."""
-    for name, value in (
-        ("coplanar_14", coplanar_14),
-        ("metal_floor_relief", metal_floor_relief),
-        ("donor_orientation", donor_orientation),
-        ("conjugation", conjugation),
-    ):
-        if not isinstance(value, bool):
-            raise TypeError(f"{name} must be True or False")
-    if embed_params is not None:
-        if not isinstance(embed_params, rdDistGeom.EmbedParameters):
-            raise TypeError("embed_params must be an RDKit EmbedParameters object")
-        if knowledge is not None:
-            raise ValueError("use embed_params.useBasicKnowledge/useExpTorsionAnglePrefs, not knowledge together")
-        if seed is None:
-            seed = DEFAULT_SEED if embed_params.randomSeed == -1 else embed_params.randomSeed
-        threads = embed_params.numThreads if threads is None else threads
-        prune_rms = embed_params.pruneRmsThresh if prune_rms is None else prune_rms
-    return (
-        DEFAULT_SEED if seed is None else int(seed),
-        0 if threads is None else int(threads),
-        True if knowledge is None else knowledge,
-        0.1 if prune_rms is None else float(prune_rms),
-    )
+@dataclass(frozen=True, kw_only=True)
+class EmbedParams:
+    """Hold what reproduces one embed's seed batches: sampling, the DG model and rxembed's switches.
+
+    `native` selects RDKit's own `EmbedParameters` model in place of rxembed's default KDG + AIO, and is kept
+    by reference: RDKit's object cannot be copied or pickled, so do not share it between concurrent embeds.
+    `prune_rms` and `knowledge` of ``None`` mean "let the model decide": rxembed's KDG model prunes at 0.1 and
+    keeps basic knowledge on; a native object keeps its own setting.
+    """
+
+    seed: int = DEFAULT_SEED
+    threads: int = 0
+    prune_rms: float | None = None
+    knowledge: bool | None = None
+    native: rdDistGeom.EmbedParameters | None = None
+    coplanar_14: bool = True
+    metal_floor_relief: bool = True
+    donor_orientation: bool = True
+    conjugation: bool = True
+
+    def __post_init__(self):
+        """Check that every setting has exactly one owner: rxembed, or a supplied native object."""
+        for name in ("coplanar_14", "metal_floor_relief", "donor_orientation", "conjugation"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be True or False")
+        if self.knowledge is not None and not isinstance(self.knowledge, bool):
+            raise TypeError("knowledge must be True, False or None")
+        if int(self.seed) < 0:
+            raise ValueError(f"seed={self.seed}: a negative seed draws from RDKit's global RNG and is not reproducible")
+        if self.native is None:
+            return
+        if not isinstance(self.native, rdDistGeom.EmbedParameters):
+            raise TypeError("native must be an RDKit EmbedParameters object")
+        # rxembed owns sampling; a native object must arrive at RDKit's own defaults for these three fields.
+        for rdkit_name, field_name, default in (
+            ("randomSeed", "seed", -1),
+            ("numThreads", "threads", 1),
+            ("pruneRmsThresh", "prune_rms", -1.0),
+        ):
+            current = getattr(self.native, rdkit_name)
+            if current != default:
+                raise ValueError(
+                    f"native.{rdkit_name}={current} is set; pass EmbedParams({field_name}=...) and leave "
+                    f"native.{rdkit_name} at {default}"
+                )
+        # The DG model belongs to RDKit; knowledge= only sets rxembed's own KDG model.
+        if self.knowledge is not None and self.knowledge != self.native.useBasicKnowledge:
+            raise ValueError(
+                f"native.useBasicKnowledge={self.native.useBasicKnowledge} is set; pass "
+                f"knowledge={self.native.useBasicKnowledge} or leave knowledge=None"
+            )
+
+
+def resolve_params(params, seed, threads):
+    """Fold a facade's plain ``seed=``/``threads=`` into one `EmbedParams`, or pass one through unchanged."""
+    if params is None:
+        kwargs = {k: v for k, v in (("seed", seed), ("threads", threads)) if v is not None}
+        return EmbedParams(**kwargs)
+    if not isinstance(params, EmbedParams):
+        raise TypeError("wrap it: EmbedParams(native=...)")
+    if seed is not None or threads is not None:
+        raise ValueError("pass them inside params: dataclasses.replace(params, seed=...)")
+    return params
 
 
 def probe_conformer(mol, seed):
@@ -229,10 +257,8 @@ def coordination_reach(mol, cons, reach, *, native=None):
 def _centering_matrix(n):
     """Return the size-`n` double-centering projector shared by every squared-distance Gram build.
 
-    A pure function of the certificate's atom count, never of chemistry, so it is safe to share across
-    calls. `_euclidean_conflict` only certifies small metal-anchored subsets (route unions bounded by
-    `metal_enumeration._EUCLIDEAN_SUBSET_BUDGET`, mostly 4-6 atoms), so distinct sizes stay well under
-    this cache's bound; an evicted size is just recomputed, never a correctness risk.
+    Depends only on the atom count, never on chemistry, so caching it across calls is safe; an evicted
+    size is just recomputed.
     """
     return np.eye(n) - np.ones((n, n)) / n
 
@@ -317,8 +343,7 @@ def _write(mol, cons, params=None):
     Separate from `_bounds` because smoothing repairs in place: `_feasible_bounds` needs the matrix as
     written, before repair, to diff against the smoothed result.
     """
-    # Bounds generation tries UFF typing even though no force field is requested. The shared wrapper hides
-    # those diagnostics only for charged/metal graphs; exceptions still escape.
+    # see metal_core._bounds_matrix for the UFF-typing diagnostics this triggers on charged/metal graphs
     # Use the same native priors for the edited matrix and its refinement.
     # Labelled ligand stereo temporarily adds dative M-L edges so RDKit has the donor's full CIP basis. Remove
     # only edges owned by a selected metal's explicit M-L distance on a private copy; retain every other edge.
@@ -386,8 +411,8 @@ def _feasible_bounds(mol, cons, params=None):
 
     Smoothing may repair the seed matrix, but must not rewrite the Constraints used for relaxation and
     acceptance. A stated window moved by the repair is named first, even where smoothing moved an unstated
-    pair further, because only a stated one is actionable; a full attribution needs the closure this no
-    longer keeps (see git history).
+    pair further, because only a stated one is actionable; naming every touched pair would need a full
+    shortest-path closure, which this function does not compute.
     """
     bm, tol = _bounds(mol, cons, params)
     if tol <= 0.0:
@@ -428,25 +453,17 @@ def _bring_real_confs(mol, work, ids):
         mol.AddConformer(conf, assignId=False)
 
 
-def seed_coordinates(
-    mol,
-    cons,
-    n,
-    seed=DEFAULT_SEED,
-    prune_rms=0.1,
-    knowledge=True,
-    threads=0,
-    enforce_chirality=True,
-    max_attempts=0,
-    embed_params=None,
-    random_coords=False,
-    coplanar_14=True,
-    metal_floor_relief=True,
-):
+def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attempts=0):
     """Generate ``n`` new conformers with native RDKit parameters and edited bounds."""
     work = _metal.materialise_phantoms(mol, cons.haptic)  # transient centroid dummies for a haptic face; `mol` else
     constrained = bool(cons.distances or cons.angles or cons.planes or cons.coplanar)
     search_count = int(n)
+    embed_params = params.native
+    seed, threads = params.seed, params.threads
+    knowledge = True if params.knowledge is None else params.knowledge
+    prune_rms = params.prune_rms
+    if prune_rms is None:  # rxembed's own KDG model prunes by default; an unset native object keeps RDKit's off
+        prune_rms = -1.0 if embed_params is not None else 0.1
     p = (
         embed_params
         if embed_params is not None
@@ -461,10 +478,10 @@ def seed_coordinates(
         # These switches affect only our matrix edits. UFF and publication retain the complete Constraints.
         dg = (
             cons
-            if coplanar_14 and metal_floor_relief
+            if params.coplanar_14 and params.metal_floor_relief
             else cons.copy(
-                coplanar=cons.coplanar if coplanar_14 else [],
-                dg_floors=cons.dg_floors if metal_floor_relief else {},
+                coplanar=cons.coplanar if params.coplanar_14 else [],
+                dg_floors=cons.dg_floors if params.metal_floor_relief else {},
             )
         )
         bm, _tol = _feasible_bounds(work, dg, p)
@@ -484,9 +501,7 @@ def seed_coordinates(
             setattr(p, name, value)
         for attempt in range(2 if embed_params is None else 1):
             if embed_params is None:
-                p.useRandomCoords = bool(
-                    random_coords or attempt
-                )  # Retry an empty search with the same model and bounds.
+                p.useRandomCoords = bool(attempt)  # Retry an empty search with the same model and bounds.
             with rdBase.BlockLogs() if isolated_h else nullcontext():
                 ids = list(rdDistGeom.EmbedMultipleConfs(work, search_count, p))
             # Counts describe rejected native attempts, even in successful searches, not failed conformers.
@@ -509,7 +524,7 @@ def seed_coordinates(
             if any(cid < 0 for cid in ids):
                 raise TimeoutError(
                     f"native RDKit embedding exceeded timeout={p.timeout}s; "
-                    "increase embed_params.timeout or inspect bounds/stereo with rx.set_verbose('DEBUG')"
+                    "increase native.timeout or inspect bounds/stereo with rx.set_verbose('DEBUG')"
                 )
             if ids:
                 break

@@ -12,9 +12,9 @@ from rdkit.Chem.EnumerateStereoisomers import (
     StereoEnumerationOptions,
 )
 
-from .metal_core import _haptic_sites
+from .metal_core import _haptic_sites, _ligand_graph
 from .utils import (
-    _STEREO_REFS,
+    _cip_cache_key,
     bond_removal_mirrors,
     bond_replacement_mirrors,
     mirror_tag,
@@ -23,11 +23,8 @@ from .utils import (
 )
 
 _MIN_POINT_BRANCHES = 3
-_TETRAHEDRAL_CARRIERS = 4
-_NITROGEN_Z = 7
 _MIN_BLOCKED_ORTHO_CONNECTIONS = 3
 _MIN_BRIDGE_METALS = 2
-_STEREO_ENDS = 2
 _ISOTOPE_ELEMENT_STRIDE = 128  # exceeds the periodic table, so equal-element bridge caps stay distinct
 _ATROP_STEREO = (Chem.BondStereo.STEREOATROPCW, Chem.BondStereo.STEREOATROPCCW)
 _ATROP_WEDGE = (Chem.BondDir.BEGINWEDGE, Chem.BondDir.BEGINDASH)
@@ -120,7 +117,7 @@ def _encoded_bond_stereo(mol):
     for token, entries in records.items():
         atoms = [idx for idx, _code in entries]
         codes = {code for _idx, code in entries}
-        if len(entries) != _STEREO_ENDS or len(set(atoms)) != _STEREO_ENDS or len(codes) != 1:
+        if len(entries) != 2 or len(set(atoms)) != 2 or len(codes) != 1:  # noqa: PLR2004
             raise ValueError(f"CX E/Z record {token} must name two atoms with one configuration")
         pair = frozenset(atoms)
         bond = mol.GetBondBetweenAtoms(*pair)
@@ -277,9 +274,29 @@ def _stereo_label(mol, atom_centers, bond_centers, atrop_centers=(), cap_to_meta
     return ",".join(parts)
 
 
+_CIP_CACHE = {}
+_CIP_CACHE_MAX = 256
+
+
 def _point_cip_codes(mol, centers):
-    """Return absolute R/S or pseudoasymmetric r/s labels RDKit assigns on the current full graph."""
+    """Return absolute R/S or pseudoasymmetric r/s labels RDKit assigns on the current full graph.
+
+    Memoised on the graph's content (atoms, bonds and the centre list, in index order), because the same
+    coordination graph is asked about many times and RDKit's CIP labeller goes superlinear on a metal-closed
+    ring. Chiral tags must be part of the key: a centre's label depends on every other centre's configuration,
+    not just which atoms are bonded to which.
+    """
     centers = list(centers)
+    try:
+        key = _cip_cache_key(mol, centers)
+    except RuntimeError:
+        # An unsanitized/malformed graph (e.g. implicit valence never calculated) fails the same way
+        # AssignCIPLabels would below; skip the cache and let the ordinary except path handle it.
+        key = None
+    if key is not None:
+        cached = _CIP_CACHE.get(key)
+        if cached is not None:
+            return dict(cached)
     probe = Chem.Mol(mol)
     for idx in centers:
         atom = probe.GetAtomWithIdx(idx)
@@ -289,12 +306,18 @@ def _point_cip_codes(mol, centers):
         with rdBase.BlockLogs():
             Chem.AssignCIPLabels(probe, atomsToLabel=centers)
     except RuntimeError:
-        return {}
-    return {
-        idx: code
-        for idx in centers
-        if (code := probe.GetAtomWithIdx(idx).GetPropsAsDict().get("_CIPCode")) in _POINT_CIP
-    }
+        result = {}
+    else:
+        result = {
+            idx: code
+            for idx in centers
+            if (code := probe.GetAtomWithIdx(idx).GetPropsAsDict().get("_CIPCode")) in _POINT_CIP
+        }
+    if key is not None:
+        if len(_CIP_CACHE) >= _CIP_CACHE_MAX:
+            _CIP_CACHE.clear()
+        _CIP_CACHE[key] = dict(result)
+    return dict(result)
 
 
 def _rdkit_3d_point_capable(atom):
@@ -303,8 +326,8 @@ def _rdkit_3d_point_capable(atom):
     total = degree + atom.GetTotalNumHs()
     return (
         degree >= _MIN_POINT_BRANCHES
-        and total <= _TETRAHEDRAL_CARRIERS
-        and (total == _TETRAHEDRAL_CARRIERS or atom.GetAtomicNum() in _THREE_COORDINATE_3D)
+        and total <= 4  # noqa: PLR2004  four tetrahedral carriers
+        and (total == 4 or atom.GetAtomicNum() in _THREE_COORDINATE_3D)  # noqa: PLR2004
     )
 
 
@@ -334,7 +357,7 @@ def _point_capability(mol, work, cap_to_metal=(), exclude=()):
         atom = work.GetAtomWithIdx(index)
         classes = [ranks[neighbor.GetIdx()] for neighbor in atom.GetNeighbors()]
         classes.extend([-1] * atom.GetTotalNumHs())
-        return len(classes) == len(set(classes)) == _TETRAHEDRAL_CARRIERS
+        return len(classes) == len(set(classes)) == 4  # noqa: PLR2004
 
     retained_chelate_nitrogen = {index for index in chelated_nitrogen if distinct_carriers(index)}
     potential = {
@@ -350,7 +373,7 @@ def _point_capability(mol, work, cap_to_metal=(), exclude=()):
         # The coordination convention retains a neutral amine hand only for a metal-closed chelate with four
         # distinct carriers. The graph cannot infer inversion kinetics; stereo='free' is the explicit opt-out.
         and not (
-            work.GetAtomWithIdx(element.centeredOn).GetAtomicNum() == _NITROGEN_Z
+            work.GetAtomWithIdx(element.centeredOn).GetAtomicNum() == 7  # noqa: PLR2004  nitrogen
             and work.GetAtomWithIdx(element.centeredOn).GetFormalCharge() == 0
             and element.centeredOn not in retained_chelate_nitrogen
         )
@@ -367,7 +390,7 @@ def _point_capability(mol, work, cap_to_metal=(), exclude=()):
     potential.difference_update(
         index
         for index in potential - retained_chelate_nitrogen - bridged
-        if work.GetAtomWithIdx(index).GetAtomicNum() == _NITROGEN_Z
+        if work.GetAtomWithIdx(index).GetAtomicNum() == 7  # noqa: PLR2004  nitrogen
         and work.GetAtomWithIdx(index).GetFormalCharge() == 0
     )
     candidates = stated | potential
@@ -556,8 +579,11 @@ def _metal_closed_rings(mol, metals):
 
 def _coordination_atrop_bonds(mol, metals, work):
     """Return native-eligible, ortho-blocked axes inside a metal-closed chelate."""
+    if not metals:
+        return []
     _closed, rings = _metal_closed_rings(mol, metals)
-    ring_bonds = set().union(*(bonds for _atoms, bonds in rings)) if metals else set()
+    ring_bonds = set().union(*(bonds for _atoms, bonds in rings))
+    ranks = list(Chem.CanonicalRankAtoms(work, breakTies=False, includeChirality=True))
     axes = []
     for bond in mol.GetBonds():
         i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
@@ -568,17 +594,16 @@ def _coordination_atrop_bonds(mol, metals, work):
             or bond.IsInRing()
         ):
             continue
-        if _native_atrop_candidate(work, (i, j)):
+        if _native_atrop_candidate(work, (i, j), ranks):
             axes.append(tuple(sorted((i, j))))
     return axes
 
 
-def _native_atrop_candidate(mol, pair):
-    """Return whether RDKit accepts an ortho-blocked single bond as a native atrop axis."""
+def _native_atrop_candidate(mol, pair, ranks):
+    """Return whether RDKit accepts an ortho-blocked single bond as a native atrop axis, given atom `ranks`."""
     bond = mol.GetBondBetweenAtoms(*pair)
     if bond is None or bond.GetBondType() != Chem.BondType.SINGLE or bond.IsInRing():
         return False
-    ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False, includeChirality=True))
     sides = [
         [ranks[n.GetIdx()] for n in mol.GetAtomWithIdx(end).GetNeighbors() if n.GetIdx() not in pair] for end in pair
     ]
@@ -602,14 +627,13 @@ def _native_atrop_candidate(mol, pair):
 def _coordination_locked_double_bonds(mol, metals):
     """Double bonds whose E/Z is fixed by the coordination: endocyclic in a ring closed through the metal.
 
-    Such a bond has one buildable geometry (decided by the coordination isomer, the polyhedron path's job), so
-    enumerating both E and Z is a phantom: the wrong hand forces a bite the chelate can't span and the pipeline
-    burns seeds relaxing it into broken bonds. An alpha-diimine (N=C-C=N chelate) is the type case: both C=N
-    sit in the 5-membered metal ring and were enumerated 2x2.
+    Such a bond has one buildable geometry, decided by the coordination isomer (the polyhedron path's job).
+    Enumerating both E and Z is a phantom: the wrong hand forces a bite the chelate cannot span, and the
+    pipeline burns seeds relaxing it into broken bonds.
 
     RDKit ignores dative M-donor bonds in ring perception, so the metal-closed ring is invisible natively;
     upgrade the datives to single to reveal it. A double bond still in a ring once the metal is removed is a
-    genuine organic ring bond (RDKit already handles its E/Z) and left alone; only a bond cyclic because of the
+    genuine organic ring bond, already handled by RDKit, and is left alone; only a bond cyclic because of the
     metal is locked here.
     """
     metals = set(metals)
@@ -630,11 +654,7 @@ def _coordination_locked_double_bonds(mol, metals):
         if element.type == Chem.StereoType.Bond_Double
         for bond in (closed.GetBondWithIdx(element.centeredOn),)
     }
-    free = Chem.RWMol(mol)  # the metal-free graph: which double bonds are still cyclic without the metal?
-    for m in sorted(metals, reverse=True):
-        for nb in [n.GetIdx() for n in free.GetAtomWithIdx(m).GetNeighbors()]:
-            remove_bond(free, m, nb)
-    free = free.GetMol()
+    free = _ligand_graph(mol, metals)  # the metal-free graph: which double bonds are still cyclic without it?
     Chem.FastFindRings(free)
     locked = set()
     for b in mol.GetBonds():
@@ -766,7 +786,7 @@ def _build_enumeration_graph(mol, exclude):  # noqa: C901 - one graph surgery tr
                 for original in double_bonds:
                     copied = work.GetBondBetweenAtoms(original.GetBeginAtomIdx(), original.GetEndAtomIdx())
                     refs = tuple(d if ref == mi else ref for ref in original.GetStereoAtoms())
-                    if mi in original.GetStereoAtoms() and len(refs) == _STEREO_REFS:
+                    if mi in original.GetStereoAtoms() and len(refs) == 2:  # noqa: PLR2004
                         copied.SetStereoAtoms(*refs)
                         copied.SetStereo(original.GetStereo())
                 work.GetAtomWithIdx(nb).SetNoImplicit(True)
@@ -775,7 +795,7 @@ def _build_enumeration_graph(mol, exclude):  # noqa: C901 - one graph surgery tr
                     conf.SetAtomPosition(d, conf.GetAtomPosition(mi))
     work = work.GetMol()
     Chem.SanitizeMol(work, _STEREO_SANITIZE, catchErrors=True)
-    # The strip above can orphan a C=N whose stereo reference atom WAS the metal, and a flagged bond with no
+    # The strip above can orphan a C=N whose stereo reference atom was the metal, and a flagged bond with no
     # references makes `FindPotentialStereo` below raise ("only can support 2 stereo neighbors"). The
     # tolerant sanitize happens to scrub most of them, but that is luck rather than a contract.
     repair_bond_stereo(work)
@@ -852,7 +872,7 @@ def _cumulene_terminal_controls(work, component, potential_double):
         for atom in (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()):
             incidence.setdefault(atom, []).append(index)
     terminals = [atom for atom, bonds in incidence.items() if len(bonds) == 1]
-    if len(terminals) != _STEREO_ENDS:
+    if len(terminals) != 2:  # noqa: PLR2004
         return None
     out = []
     for atom in terminals:
@@ -954,7 +974,7 @@ def _unassigned_elements(
         for bond in mol.GetBonds()
         if bond.GetBondType() == Chem.BondType.DOUBLE
         and bond.GetStereo() != Chem.BondStereo.STEREONONE
-        and len(bond.GetStereoAtoms()) == _STEREO_REFS
+        and len(bond.GetStereoAtoms()) == 2  # noqa: PLR2004
     } | set(_encoded_bond_stereo(mol))
     stated_bonds = {bond.GetIdx() for pair in stated_pairs if (bond := work.GetBondBetweenAtoms(*pair)) is not None}
     stable_bonds = set(_resonance_stable_ez(work, potential_double, stated_bonds, structural=True))
@@ -998,12 +1018,12 @@ def point_centres(mol, exclude=()):
 def unassigned_centres(mol, exclude=()):
     """Return the unspecified stereo elements as atom-index tuples: ``(atom,)``, or ``(i, j)`` for a double bond.
 
-    The cheap predicate behind `enumerate_unassigned`: what WOULD be expanded, without expanding it. A caller
+    The cheap predicate behind `enumerate_unassigned`: what would be expanded, without expanding it. A caller
     that embeds one species (`Isomer`) uses it to refuse to pool two enantiomers silently.
     """
     work, _caps, _locked, elements, atrop, _unsupported = _unassigned_elements(mol, exclude)
     out = []
-    for e in elements:  # `work` only APPENDS caps, so every index here is a real atom of `mol`
+    for e in elements:  # `work` only appends caps, so every index here is a real atom of `mol`
         if e.type == Chem.StereoType.Atom_Tetrahedral:
             out.append((e.centeredOn,))
         else:
@@ -1128,7 +1148,7 @@ def _non_tetrahedral_points(mol, centres):
             if bond.GetBondType() not in {Chem.BondType.ZERO, Chem.BondType.UNSPECIFIED}
             and not (bond.GetBondType() == Chem.BondType.DATIVE and bond.GetBeginAtomIdx() == idx)
         ]
-        if len(carriers) != _TETRAHEDRAL_CARRIERS:
+        if len(carriers) != 4:  # noqa: PLR2004
             continue  # an implicit H or lone pair supplies no fourth physical position
         points = positions[carriers]
         try:
@@ -1189,7 +1209,7 @@ def stereo_from_3d(mol, exclude=(), *, apply=False):
             source = work.GetBondWithIdx(idx)
             target = mol.GetBondBetweenAtoms(source.GetBeginAtomIdx(), source.GetEndAtomIdx())
             refs = [cap_to_metal.get(ref, (None, None, None, ref))[3] for ref in source.GetStereoAtoms()]
-            if target is not None and len(refs) == _STEREO_REFS:
+            if target is not None and len(refs) == 2:  # noqa: PLR2004
                 target.SetStereoAtoms(*refs)
                 target.SetStereo(source.GetStereo())
         Chem.SetDoubleBondNeighborDirections(mol)
@@ -1229,15 +1249,14 @@ def enumerate_unassigned(
 ):
     """Enumerate unspecified point, double-bond, and native atropisomer stereo.
 
-    Returns ``(variants, n_unassigned, total, unresolved)``: ``variants`` a list of ``(variant_mol, label)``
-    with defined centres held (`onlyUnassigned`), meso/duplicates dropped (`unique`), truncated to ``cap`` of
-    ``total``; ``unresolved`` counts elements RDKit could not enumerate, such as an allene axis, which stays
-    one arbitrary hand for the caller to warn about. Atom order is preserved, so index-based
-    ``fix``/``constrain`` stay valid.
+    Returns ``(variants, n_unassigned, total, unresolved)``: ``variants`` is a list of ``(variant_mol, label)``
+    with defined centres held, meso/duplicates dropped, and truncated to ``cap`` of ``total``. ``unresolved``
+    counts elements RDKit could not enumerate, such as an allene axis, which stays at one arbitrary hand for
+    the caller to warn about. Atom order is preserved, so index-based ``fix``/``constrain`` stay valid.
 
-    A metal complex is safe: the metal is excluded, its handedness being the coordination-isomer path's job
-    and RDKit's dative-metal stereo not order-canonical. A ligand stereocentre is still enumerated, including
-    a chiral-at-P or carbanion donor that drops to degree 3 after the strip. `exclude` is the metal indices.
+    `exclude` is the metal indices. Excluding them is safe: a metal's own handedness is the coordination-
+    isomer path's job, and RDKit's dative-metal stereo is not order-canonical anyway. A ligand stereocentre,
+    including a chiral-at-P or carbanion donor that drops to degree 3 after the strip, is still enumerated.
     """
     n_real = mol.GetNumAtoms()
     work, cap_to_metal, locked, unassigned, atrop_centers, unsupported = _unassigned_elements(

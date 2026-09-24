@@ -6,24 +6,33 @@ The top of the metal stack: it reads `metal_distance` and `metal_donor_orient`, 
 from __future__ import annotations
 
 import itertools
+import math
+from functools import lru_cache
 
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import rdForceFieldHelpers
 
+from . import bounds as _bounds
 from .constraints import Constraints, _graft_owns, add_distance, compose
-from .mechanisms import _ANGLE_TARGET_FC, PIN_FC
+from .mechanisms import _triangle_angles
 from .metal_core import (
-    _FIT_FLOOR,
+    _ETA2,
     VACANT,
     _bounds_matrix,
     _frag_map,
+    _haptic_sites,
+    _ligand_graph,
+    _plane_rms,
     _regular_face,
     _site_height,
     _site_radius,
+    _site_span,
     _vertex_atom,
-    classify_geometry,
+    logger,
     materialized_states,
+    metal_indices,
+    rank_shapes,
+    shape_reading,
 )
 from .metal_distance import _INPUT_HALF_WIDTH, delocalised_charges, ff_terms, ml_distance
 from .metal_donor_orient import (
@@ -36,21 +45,20 @@ from .metal_donor_orient import (
 from .metal_polyhedron import (
     _IMPROPER_VERTICES,
     CHELATE_SPAN_ANGLE,
+    POLYHEDRA,
     _improper,
     _vertex_angle,
-    fit_residual,
-    ordered_fit_residual,
-    orientation_parity,
     record,
+    relaxed_shell,
+    seating_is_exhaustive,
 )
-from .metal_slots import _SPAN_TOL, TRANS_ANGLE, _chelate_bite_window
+from .metal_slots import _SPAN_TOL, _chelate_bite_window
 from .stereo import bond_stereo, metal_referenced_ez, point_stereo
 
 _ML_SEED_HALF_WIDTH = 0.05  # Å: numerical room around an M-L seed target, not a prediction interval
 _TRIGONAL_CARRIERS = 3
 _TETRAHEDRAL_CARRIERS = 4
 _BOND_STEREO_ATOMS = 2
-_OPPOSED_BITES = 2  # two disjoint chelate bites spanning a planar 4-shell: the ring closure's special case
 _STRAIGHT = 180.0
 _SHELL_ATOL = 1e-6  # numerical tolerance for template coplanarity and sector closure
 # Slack on an otherwise-unconstrained compiled L-M-L angle row: wide enough for ordinary distortion, narrow
@@ -100,6 +108,7 @@ def compile_context(mol):
         "charges": delocalised_charges(mol),
         "bounds": _bounds_matrix(mol),
         "topology": Chem.GetDistanceMatrix(mol),
+        "stripped": _ligand_graph(mol),
     }
 
 
@@ -225,128 +234,6 @@ def _add_donor_angle_floors(cons, mol, bounds=None):
     _add_native_pair_floors(cons, mol, pairs, bounds)
 
 
-def _joint_shell_targets(  # noqa: C901 - fit and validate one witness before committing the shared targets
-    metal,
-    vertices,
-    haptic,
-    poly,
-    cons,
-    bites,
-    bounds,
-    blocked=(),
-    overridden=(),
-    same_ligand=(),
-):
-    """Fit one native shell witness, or leave existing angle targets unchanged.
-
-    Native donor-pair distances constrain reach for the whole real donor network;
-    explicit distance constraints take precedence, otherwise RDKit's native bounds
-    are used for every supplied same-ligand real donor pair. Angle windows bias the fit without
-    imposing inconsistent midpoints. An already admitted shell is a no-op. Preserve
-    each prior's angular flexibility when recentering it on a joint witness. A failed
-    search does not establish infeasibility. No centroid/member or cross-fragment
-    van der Waals spans are invented here.
-    """
-    if blocked or VACANT in vertices or not bites or not cons.angles:
-        return
-    directions = np.array(poly.vertex_dirs, dtype=float)
-    directions /= np.linalg.norm(directions, axis=1)[:, None]
-    slot = {donor: i for i, donor in enumerate(vertices)}
-    radial = []
-    for donor in vertices:
-        if tuple(sorted((metal, donor))) in overridden:
-            return
-        window = cons.distances.get(tuple(sorted((metal, donor))))
-        if window is None or not np.all(np.isfinite(window)) or window[0] <= 0 or window[0] > window[1]:
-            return
-        radial.append(window)
-    lengths = tuple(float(np.mean(window)) for window in radial)
-    spans = {}
-    for i, j in itertools.combinations(range(len(vertices)), 2):
-        pair = frozenset((i, j))
-        left, right = vertices[i], vertices[j]
-        pair_key = tuple(sorted((left, right)))
-        span = cons.distances.get(pair_key)
-        if span is None:
-            if left in haptic or right in haptic or pair_key not in same_ligand:
-                continue
-            span = (
-                max(0.0, float(bounds[max(left, right)][min(left, right)]) - _SPAN_TOL),
-                float(bounds[min(left, right)][max(left, right)]) + _SPAN_TOL,
-            )
-        spans[pair] = span
-    shell = Chem.MolFromSmiles(".".join(["*"] * (len(vertices) + 1)))
-    conf = Chem.Conformer(shell.GetNumAtoms())
-    conf.SetPositions(np.vstack([np.zeros(3), directions * np.asarray(lengths)[:, None]]))
-    shell.AddConformer(conf)
-    ff = rdForceFieldHelpers.CreateEmptyForceFieldForMol(shell)
-    ff.AddFixedPoint(0)
-    for index, window in enumerate(radial, 1):
-        ff.AddDistanceConstraint(0, index, *window, PIN_FC)
-    for i, j in itertools.combinations(range(len(vertices)), 2):
-        pair = frozenset((i, j))
-        atoms = (i + 1, 0, j + 1)
-        if pair in spans:
-            ff.AddDistanceConstraint(i + 1, j + 1, *spans[pair], PIN_FC)
-        key = (vertices[i], metal, vertices[j])
-        window = cons.angles.get(key, cons.angles.get(key[::-1]))
-        if window is not None:
-            ff.UFFAddAngleConstraint(*atoms, False, *window, _ANGLE_TARGET_FC)
-    try:
-        ff.Initialize()
-        if ff.CalcEnergy() == 0.0:
-            return
-        if ff.Minimize(maxIts=2000, forceTol=1e-8) != 0:
-            return
-    except (RuntimeError, ValueError):
-        return
-    positions = shell.GetConformer().GetPositions()
-    if not np.all(np.isfinite(positions)):
-        return
-    rays = positions[1:] - positions[0]
-    norms = np.linalg.norm(rays, axis=1)
-    if np.any(norms <= 0):
-        return
-    rays /= norms[:, None]
-    for length, window in zip(norms, radial, strict=True):
-        if not window[0] - 1e-7 <= length <= window[1] + 1e-7:
-            return
-    values = np.degrees(np.arccos(np.clip(rays @ rays.T, -1.0, 1.0)))
-    for pair, span in spans.items():
-        i, j = sorted(pair)
-        value = float(np.linalg.norm(positions[i + 1] - positions[j + 1]))
-        if not span[0] - 1e-7 <= value <= span[1] + 1e-7:
-            return
-    ordered = ordered_fit_residual(rays, directions)
-    if (
-        classify_geometry(shell, 0, tuple(range(1, len(vertices) + 1)), warn=False) != poly.name
-        or ordered > _FIT_FLOOR
-        or not np.isclose(ordered, fit_residual(rays, poly), atol=1e-8, rtol=0.0)
-    ):
-        return
-    # Only reflection-invariant angles leave this auxiliary fit; the isomer's actual hand is checked on embedding.
-    updates = {}
-    for key in tuple(cons.angles):
-        a, centre, b = key
-        if centre != metal or a not in slot or b not in slot:
-            continue
-        value = float(values[slot[a], slot[b]])
-        existing = cons.angles[key]
-        updates[key] = (existing, value)
-    if all(lo - 1e-7 <= value <= hi + 1e-7 for (lo, hi), value in updates.values()):
-        return
-    final = {}
-    for key, ((lo, hi), value) in updates.items():
-        shift = 0.0 if lo <= value <= hi else float(np.clip(value - (lo + hi) / 2, -lo, _STRAIGHT - hi))
-        final[key] = ((lo + shift, hi + shift), value)
-    for key, (window, value) in final.items():
-        cons.angles[key] = window
-        canonical = min(key, key[::-1])
-        cons.pulls.pop(canonical, None)
-        cons.pulls.pop(canonical[::-1], None)
-        cons.pulls[canonical] = value
-
-
 def _add_point_umbrellas(cons, mol, stereo_label, donor_bonds):
     """Keep each retained tetrahedral point in its seeded signed-volume half-space during UFF."""
     metals = {}
@@ -406,40 +293,241 @@ def _add_metal_ez(cons, mol, stereo_label, donor_bonds):
                 cons.coplanar.append(ligand_row)
 
 
-def _tetrahedral_cross_angle(mol, metal, vertices, bites, distances, blocked):
-    """Centre disjoint chelate bites on a realizable tetrahedral ray arrangement, or abstain.
+_EXHAUSTIVE_BITE_CORNERS = 4  # ponytail: 2**k corners is a resource ceiling above this many simultaneous bites;
+# widen only if a real structure needs more than the extremes-plus-single-flips fallback below.
 
-    Opposite pair bisectors and orthogonal pair planes preserve the tetrahedral construction while each
-    bite takes its own midpoint. Their cross-angle cosine is -cos(bite1/2)*cos(bite2/2). These soft angular
-    targets do not certify whole-ligand feasibility. Joining backbones remain ligand restraints:
-    fragment membership does not change this shell identity. Externally held ligands do not qualify.
+
+def _bite_reach(left, right, span):
+    """Return the donor-donor angle range (degrees) two fixed model M-D legs support at a `span` (Å) range.
+
+    `_triangle_angles` encloses angle by interval side lengths; a fixed leg is passed as a degenerate
+    (x, x) interval. It can return ``None`` when the legs and span ranges admit no triangle at all (never
+    observed at these near-point legs, but the fixed-leg law of cosines this replaces never rejected either,
+    so fall back to it rather than lose the row).
     """
-    if len(bites) != 2:  # noqa: PLR2004 - two disjoint donor pairs
+    angles = _triangle_angles((left, left), (right, right), span)
+    if angles is None:
+
+        def angle(d):
+            cosine = (left * left + right * right - d * d) / (2.0 * left * right)
+            return math.acos(max(-1.0, min(1.0, cosine)))
+
+        angles = (angle(span[0]), angle(span[1]))
+    return math.degrees(angles[0]), math.degrees(angles[1])
+
+
+def _bite_window_and_reach(mol, left, right, donors, matrix, lengths, row):
+    """Return (window, reach) for a same-ligand bite pair, one site each, or ``None`` where neither narrows it.
+
+    `reach` is the triangle the two model M-D legs and the native ligand reach (`matrix`, a `_site_span`
+    pair-interval matrix; ``None`` when `bounds.ligand_reach` could not close it for this graph) support
+    (`_SPAN_TOL` numerical slack, `_bite_reach`'s law of cosines). A sigma pair (both sites one atom) keeps
+    the ring-size census (`_CHELATE_BITE`, via `_chelate_bite_window`'s existence test) as its `window`,
+    intersected with `reach`, or `reach` alone where the two are disjoint; with no census row it has no bite
+    at all. A pair with a haptic end has no census row: lower bounds beyond 1-3 are free-ligand preferences
+    that chelation overrides, so `reach` replaces `row` (the pair's own compiled polyhedron angle) outright
+    wherever `reach` excludes part of it, and otherwise the row stands (no bite entry).
+    """
+    prior = None
+    if len(left) == 1 and len(right) == 1:
+        prior = _chelate_bite_window(mol, left[0], right[0], donors)
+        if prior is None:
+            return None
+    if matrix is None:  # ligand_reach could not close a triangle for this graph
+        return (prior, prior) if prior is not None else None
+    left_leg, right_leg = map(float, lengths)
+    lower, upper = _site_span(matrix, left, right)
+    reach = _bite_reach(left_leg, right_leg, (max(0.0, lower - _SPAN_TOL), upper + _SPAN_TOL))
+    if prior is not None:
+        if reach[1] < prior[0] or reach[0] > prior[1]:
+            return reach, reach
+        return (max(prior[0], reach[0]), min(prior[1], reach[1])), reach
+    if reach[0] <= row[0] and reach[1] >= row[1]:
         return None
-    first, second = bites
-    if first & second or len(first | second) != _TETRAHEDRAL_CARRIERS:
+    return reach, reach
+
+
+def _seated_bites(mol, metal, od, haptic, frag_of, ideal_angles, distances, real_od, context, angle_rows=None):
+    """Return each same-ligand donor pair's (window, reach) angle windows, keyed by its seated site pair.
+
+    The one bite owner: `coordination`'s angle-row compilation and `metal_enumeration`'s chelate screens
+    (`_chelate_span_failure`, `_unreachable_span`) all read these same windows, never a second copy of the
+    bite condition or the relaxation it feeds (`metal_polyhedron.relaxed_shell`). `window` is the census wall
+    `_bounded_bites` shrinks inside; `reach` is the backbone triangle it may open a gap box into instead. A
+    haptic end joins on the same terms as a sigma donor: `_bite_window_and_reach` tells them apart by site
+    size. `angle_rows` is `coordination`'s stated polyhedron subset; a pair missing from it falls back to
+    `ideal_angles`, since a haptic pair has no census row of its own to compare `reach` against.
+    """
+    angle_rows = angle_rows or {}
+    bites = {}
+    for i, j in itertools.combinations(range(len(od)), 2):
+        left, right = od[i], od[j]
+        pair = frozenset((i, j))
+        if VACANT in (left, right) or frag_of(left) != frag_of(right) or ideal_angles[pair] >= CHELATE_SPAN_ANGLE:
+            continue
+        keys = ((min(metal, left), max(metal, left)), (min(metal, right), max(metal, right)))
+        if any(key not in distances for key in keys):  # the screen's sigma radial legs carry no haptic leg
+            continue
+        lengths = (0.5 * sum(distances[keys[0]]), 0.5 * sum(distances[keys[1]]))
+        left_site, right_site = haptic.get(left, (left,)), haptic.get(right, (right,))
+        base = angle_rows.get(pair, ideal_angles[pair])
+        row = (max(0.0, base - _ANGLE_PAD), min(_STRAIGHT, base + _ANGLE_PAD))
+        bite_key = ("bite", tuple(sorted(left_site)), tuple(sorted(right_site)), lengths, row)
+        if bite_key not in context:
+            try:
+                native = _fact(
+                    context,
+                    "native_reach",
+                    lambda: _bounds._coordination_reach_base(mol, _bounds.ligand_reach(mol), set(metal_indices(mol))),
+                )
+            except (ValueError, RuntimeError):
+                logger.debug("metal[%s]: native ligand reach unavailable for a bite pair", metal)
+                context["native_reach"] = native = None
+            context[bite_key] = _bite_window_and_reach(mol, left_site, right_site, real_od, native, lengths, row)
+        if (bite := context[bite_key]) is not None:
+            bites[pair] = bite
+    return bites
+
+
+def _bite_corners(bites):
+    """Yield each bite-target combination: every window corner for <= 4 bites, else the extremes plus flips."""
+    keys = list(bites)
+    windows = [bites[key] for key in keys]
+    if len(keys) <= _EXHAUSTIVE_BITE_CORNERS:
+        combos = set(itertools.product(*windows))
+    else:
+        low, high = tuple(window[0] for window in windows), tuple(window[1] for window in windows)
+        combos = {low, high}
+        for i in range(len(keys)):
+            combos.add((*low[:i], high[i], *low[i + 1 :]))
+            combos.add((*high[:i], low[i], *high[i + 1 :]))
+    for combo in combos:
+        yield dict(zip(keys, combo, strict=True))
+
+
+_BITE_BOX_STEPS = 12  # bisection rounds shrinking a bite box toward its anchor; halves the gap each round
+
+
+def _perceived_geometry(rays, radius, name):
+    """Return whether `name` reads within `_FIT_MARGIN` of the best fit for rays scaled to `radius`.
+
+    A synthetic witness carries no chemistry; only the ray directions and the M-L radius decide the reading,
+    checked by the same rule B the acceptance gate applies to a real conformer (`metal_core.shape_reading`,
+    `metal_isomer.retained_geometry`): `name` need not be the strict argmin, only within `_FIT_MARGIN` of it,
+    so enumeration and acceptance agree on a tie. The radius is load-bearing, not decorative: `rank_shapes`'s
+    flatness exclusion compares an absolute Å RMS (`metal_core.COPLANAR_TOL`) against a record's own ideal
+    plane RMS at this witness's bond length. Built at unit length, an ideal seesaw's own plane RMS (0.2449)
+    already undercuts that 0.25 Å tolerance, so ANY symmetric bite closure reads as the flatter square_planar
+    regardless of the actual (much larger) model M-L distance (YEGNAA).
+    """
+    rms = _plane_rms(np.zeros(3), rays * radius)
+    _, _, _, accepted = shape_reading(rank_shapes(rays, rms, radius), name)
+    return accepted
+
+
+def _bite_radius(od, bites, distances, metal):
+    """Return the mean model M-L midpoint (Å) over every donor named in a bite pair.
+
+    The scale `_bounded_bites`'s synthetic witness must be built at, so its flatness test reads against the
+    sphere's real size instead of an arbitrary unit ray (YEGNAA). Shared by `coordination`'s own compiled
+    windows and `metal_enumeration._chelate_span_failure`'s pre-compile screen, each keyed off its own
+    donor-index/window pair.
+    """
+    donors = {od[i] for pair in bites for i in pair}
+    return float(np.mean([0.5 * sum(distances[(min(metal, d), max(metal, d))]) for d in donors]))
+
+
+def _bounded_bites(directions, name, ideal, bites, radius):
+    """Shrink each of `bites`' census windows toward its ideal-clamped anchor until every corner reads as `name`.
+
+    A same-ligand pair's model bite window (`_bite_window_and_reach`) is a ring-size prior, not a promise
+    that every corner of the compiled box still perceives as the requested polyhedron: a macrocycle's
+    tetrahedron can fold into another shape once several bites drift together (a joint effect `_bite_corners`
+    already enumerates jointly, so the bound below checks it jointly too, not one bite at a time). `radius`
+    (Å, from `_bite_radius`) is the scale the synthetic witness reads its flatness bound against; it widens
+    no tolerance, it only makes the witness self-consistent with the model M-L distance. Returns the
+    unmodified census windows when the full box already reads as `name`, or the narrowed windows when
+    shrinking is needed.
+
+    When even the census-clamped anchor does not read as `name`, this is not an immediate reject: it opens a
+    gap box from that anchor out to `far`, the same ideal clamped into each pair's wider backbone-triangle
+    `reach` instead. If the joint `far` corner reads as `name`, each pair's compiled row is the span between
+    its anchor and its far point, un-shrunk (the flexible backbone, not the ring-size census, is trusted
+    there). Returns ``None`` only when even that wider reach cannot support `name`: the backbone itself
+    cannot hold the requested polyhedron, not merely the chelate's own ring-size bite prior.
+    """
+    if not bites:
+        return bites
+    if not _exact_reading(len(directions)):  # an approximate seating ranks shapes; it cannot narrow a wall
+        return {pair: window for pair, (window, _reach) in bites.items()}
+    key = tuple(
+        sorted(
+            ((pair, *bites[pair], ideal[pair]) for pair in bites),
+            key=lambda item: tuple(sorted(item[0])),
+        )
+    )
+    return _bounded_bites_cached(tuple(map(tuple, directions)), name, key, radius)
+
+
+@lru_cache(maxsize=None)
+def _exact_reading(cn):
+    """Return whether every record of `cn` vertices is read by an exhaustive seating search.
+
+    Above that bound `fit_residual` only ranks candidate shapes approximately, so the squeeze must leave the
+    census window standing rather than narrow it against an approximate reading.
+    """
+    return all(seating_is_exhaustive(tuple(map(tuple, p.vertex_dirs))) for p in POLYHEDRA.values() if p.cn == cn)
+
+
+def _corner_key(corner):
+    """Return `corner`'s content key, in the same form `metal_polyhedron.relaxed_shell` builds internally."""
+    return tuple(sorted((tuple(sorted(pair)), float(target)) for pair, target in corner.items()))
+
+
+@lru_cache(maxsize=None)
+def _reads_as_name_cached(directions, corner_key, name, radius):
+    """Return whether `corner_key`'s bite targets relax to a shell that still reads as `name`.
+
+    A same-content probe recurs often: every bisection round in `_bounded_bites_cached` re-tests corners
+    that share most of their targets with the last round, and unrelated candidates frequently share a bite
+    pair's exact model target too. `relaxed_shell` already memoises the relaxation itself on this same
+    content key; this wraps `_perceived_geometry`'s acceptance check (never cached, until now recomputed on
+    every probe including a `relaxed_shell` cache hit) in the same memo, not a second one.
+    """
+    bites = {frozenset(pair): target for pair, target in corner_key}
+    rays = relaxed_shell(directions, bites)
+    return rays is not None and _perceived_geometry(rays, radius, name)
+
+
+@lru_cache(maxsize=None)
+def _bounded_bites_cached(directions, name, key, radius):
+    anchor = {pair: min(max(ideal, lo), hi) for pair, (lo, hi), _reach, ideal in key}
+    windows = {pair: (lo, hi) for pair, (lo, hi), _reach, _ideal in key}
+    far = {pair: min(max(ideal, rlo), rhi) for pair, _window, (rlo, rhi), ideal in key}
+
+    def reads_as_name(corner):
+        return _reads_as_name_cached(directions, _corner_key(corner), name, radius)
+
+    if not reads_as_name(anchor):
+        if reads_as_name(far):
+            return {pair: (min(anchor[pair], far[pair]), max(anchor[pair], far[pair])) for pair in windows}
         return None
-    frag = _frag_map(mol)
-    groups = {frag[vertices[next(iter(pair))]] for pair in bites}
-    if metal in blocked or any(frag[atom] in groups for atom in blocked):
-        return None
-    half = np.radians([0.25 * sum(window) for window in bites.values()])
-    (sa, sb), (ca, cb) = np.sin(half), np.cos(half)
-    rays = np.array([(sa, 0, ca), (-sa, 0, ca), (0, sb, -cb), (0, -sb, -cb)])
-    donors = [vertices[i] for pair in bites for i in sorted(pair)]
-    lengths = np.array([0.5 * sum(distances[tuple(sorted((metal, donor)))]) for donor in donors])
-    witness = Chem.MolFromSmiles("[*].[*].[*].[*].[*]")
-    conf = Chem.Conformer(witness.GetNumAtoms())
-    conf.SetPositions(np.vstack([np.zeros(3), rays * lengths[:, None]]))
-    witness.AddConformer(conf)
-    # Native reach may lie outside the census bite prior. A realizable but almost planar witness must not
-    # redefine the requested shape; use the same perception and fit owners as final geometry validation.
-    if (
-        classify_geometry(witness, 0, (1, 2, 3, 4), warn=False) != "tetrahedral"
-        or fit_residual(rays, record("tetrahedral")) > _FIT_FLOOR
-    ):
-        return None
-    return float(np.degrees(np.arccos(-ca * cb)))
+    if all(reads_as_name(corner) for corner in _bite_corners(windows)):
+        return windows
+
+    def box(t):
+        return {
+            pair: (lo + t * (anchor[pair] - lo), hi - t * (hi - anchor[pair])) for pair, (lo, hi) in windows.items()
+        }
+
+    good, bad = 1.0, 0.0  # t=1 is the anchor itself (degenerate, always reads correctly); t=0 the full window
+    for _ in range(_BITE_BOX_STEPS):
+        mid = 0.5 * (good + bad)
+        if all(reads_as_name(corner) for corner in _bite_corners(box(mid))):
+            good = mid
+        else:
+            bad = mid
+    return box(good)
 
 
 def coordination(  # noqa: C901 - compile each coordination term in one linear transaction
@@ -485,10 +573,16 @@ def coordination(  # noqa: C901 - compile each coordination term in one linear t
     sigma_od = {x for x in od if x != VACANT and x not in haptic}  # single-point donors: the hinge's own ring set
     real_od = set(sigma_od)
     real_od.update(a for face in haptic.values() for a in face)  # real co-donors; centroid keys are not Mol atoms
+    # Group the whole sphere into sigma/pi sites ONCE: `ml_distance` and `overbond_tier` (via `ff_terms`) each
+    # used to regroup it per donor / per non-donor atom, an O(donors x non-donors) whole-molecule cost.
+    haptic_sites = _haptic_sites(mol, real_od)
+    eta = {d: len(site) for site in haptic_sites if len(site) >= _ETA2 for d in site}
     qdel = _fact(context, "charges", lambda: delocalised_charges(mol))
     # A Lewis charge is an artefact, so spread it.
     # The model uses ligand-only classes for either input bond convention. Input lengths do not need typing.
     hyb = _fact(context, "hybridisation", lambda: _stripped_hybridisation(mol))
+    # `_orient_donor` rebuilds this per donor unless it is handed one already built; share it across the sphere.
+    stripped = _fact(context, "stripped", lambda: _ligand_graph(mol)) if donor_orientation else None
     for d in od:
         if d == VACANT:
             continue
@@ -515,12 +609,14 @@ def coordination(  # noqa: C901 - compile each coordination term in one linear t
                 c.distances,
                 metal,
                 d,
-                *_donor_distance_window(mol, metal, d, real_z, real_od, positions=pos, charges=qdel, hyb=hyb),
+                *_donor_distance_window(
+                    mol, metal, d, real_z, real_od, positions=pos, charges=qdel, hyb=hyb, eta=eta.get(d, 0)
+                ),
             )
         # Wall each donor substituent off the metal, the orientation hold a real energy cannot supply itself.
         # Length provenance is independent: measured M-L distances do not determine a partially free M-D-X axis.
         if donor_orientation:
-            _orient_donor(mol, metal, d, real_od, c, hyb=hyb)
+            _orient_donor(mol, metal, d, real_od, c, hyb=hyb, stripped=stripped)
             # cap an sp2 donor's metal at the donor's own sp2 plane: the improper the stripped bond removed.
             _coplanar_donor(mol, metal, d, real_od, c, hyb=hyb)
     if donor_orientation:
@@ -565,32 +661,7 @@ def coordination(  # noqa: C901 - compile each coordination term in one linear t
                 expanded[right_key] = max(expanded.get(right_key, 0.0), right_window[1] * scale)
     for key, upper in expanded.items():
         c.distances[key] = (c.distances[key][0], upper)
-    bites = {}
-    for i, j in pairs:
-        left, right = od[i], od[j]
-        if (
-            VACANT in (left, right)
-            or left in haptic
-            or right in haptic
-            or frag_of(left) != frag_of(right)
-            or ideal_angles[frozenset((i, j))] >= CHELATE_SPAN_ANGLE
-        ):
-            continue
-        bond_bounds = _fact(context, "bounds", lambda: _bounds_matrix(mol))
-        lengths = (
-            0.5 * sum(c.distances[(min(left, metal), max(left, metal))]),
-            0.5 * sum(c.distances[(min(right, metal), max(right, metal))]),
-        )
-        bite_key = ("bite", min(left, right), max(left, right), tuple(lengths))
-        if bite_key not in context:
-            context[bite_key] = _chelate_bite_window(mol, left, right, real_od, bounds=bond_bounds, lengths=lengths)
-        if bite := context[bite_key]:
-            bites[frozenset((i, j))] = bite
-    cross_angle = (
-        _tetrahedral_cross_angle(mol, metal, od, bites, c.distances, set(frozen) | set(coupled_atoms))
-        if poly.name == "tetrahedral"
-        else None
-    )
+    bites = _seated_bites(mol, metal, od, haptic, frag_of, ideal_angles, c.distances, real_od, context, angle_rows)
     # A planar sphere needs every pair to stay in its plane. Sparse template rows are sufficient only at the
     # exact ideal; finite windows leave the omitted cis pairs free to pucker. Chelate bites remain graph-derived.
     if poly.planar:
@@ -606,6 +677,40 @@ def coordination(  # noqa: C901 - compile each coordination term in one linear t
             ):
                 pair = frozenset((i, j))
                 angle_rows.setdefault(pair, ideal_angles[pair])
+    # A tethered chelate's bite pair takes its backbone-derived window outright, bounded so it cannot reach a
+    # corner that would no longer read as this polyhedron (`_bounded_bites`); every other already-compiled row
+    # only widens, by a union with the free, minimum-displacement consequence of rotating just the bite rays
+    # to each bite-window corner (metal_polyhedron.relaxed_shell). A corner whose relaxed shell would change
+    # the template's oriented type simply contributes no image; `metal_enumeration` rejects that arrangement
+    # outright rather than silently keeping the plain ideal +- pad row here. Abstain only when the metal or a
+    # bitten ligand's own atom is externally held: an unrelated frozen atom elsewhere leaves this free (an
+    # opposed planar closure never depended on it either).
+    blocked = set(frozen) | set(coupled_atoms)
+    bite_fragments = {frag_of(od[i]) for pair in bites for i in pair}
+    corner_images, mid_angles = [], None
+    windows = {pair: window for pair, (window, _reach) in bites.items()}
+    if bites and metal not in blocked and not bite_fragments & {frag[atom] for atom in blocked} and VACANT not in od:
+        directions = poly.vertex_dirs
+        radius = _bite_radius(od, bites, c.distances, metal)
+        bites = _bounded_bites(directions, poly.name, ideal_angles, bites, radius) or windows
+        corners = []
+        for corner in _bite_corners(bites):
+            rays = relaxed_shell(directions, corner)
+            if rays is not None:
+                corners.append((corner, rays))
+                corner_images.append(np.degrees(np.arccos(np.clip(rays @ rays.T, -1.0, 1.0))))
+        midpoint = {pair: 0.5 * sum(window) for pair, window in bites.items()}
+        mid_rays = relaxed_shell(directions, midpoint)
+        if mid_rays is None and corners:
+            # The exact midpoint changes this template's oriented type; the pull is a weak bias (not a wall),
+            # so use the surviving corner closest to it rather than leave every row in this sphere pull-free.
+            mid_rays = min(
+                corners, key=lambda item: sum((item[0][pair] - target) ** 2 for pair, target in midpoint.items())
+            )[1]
+        if mid_rays is not None:
+            mid_angles = np.degrees(np.arccos(np.clip(mid_rays @ mid_rays.T, -1.0, 1.0)))
+    else:
+        bites = windows
     for pair, a in angle_rows.items():
         i, j = sorted(pair)
         if (
@@ -631,86 +736,24 @@ def coordination(  # noqa: C901 - compile each coordination term in one linear t
                 bond_bounds = _fact(context, "bounds", lambda: _bounds_matrix(mol))
                 add_distance(c.distances, left, right, bond_bounds[right, left], bond_bounds[left, right])
             continue
+        key = (od[i], metal, od[j])
         if pair in bites:
-            c.angles[(od[i], metal, od[j])] = bites[pair]
-            continue
-        through_bites = any(
-            frozenset((i, k)) in bites and frozenset((j, k)) in bites for k in range(len(od)) if k not in pair
-        )
-        if through_bites and a >= TRANS_ANGLE:
-            c.angles[(od[i], metal, od[j])] = (float(TRANS_ANGLE), _STRAIGHT)
-            continue
-        # Exact enumeration keeps every distinct seating; realised geometry decides whether this pair is feasible.
-        centre = a if cross_angle is None else cross_angle
-        c.angles[(od[i], metal, od[j])] = (max(0.0, centre - _ANGLE_PAD), min(_STRAIGHT, centre + _ANGLE_PAD))
-    shared = _planar_bite_targets(c, od, poly, bites, metal, mol, set(frozen) | set(coupled_atoms), frag)
-    if poly.planar and not shared:
-        real = {i for i, d in enumerate(od) if d != VACANT and d not in haptic}
-        bite_pairs = list(bites)
-        opposed = (
-            len(bite_pairs) == _OPPOSED_BITES
-            and not (bite_pairs[0] & bite_pairs[1])
-            and bite_pairs[0] | bite_pairs[1] == real
-        )
-        if opposed:
-            # Two disjoint bites spanning every real slot of a planar 4-shell: the ring closure leaves no
-            # free parameter beyond the two bites, so cis (the two connecting edges) and trans (the two
-            # diagonals) must be derived from BOTH bites jointly. The old per-bite `180 - bite` complement is
-            # this closure's b1 == b2 special case; TRANS_ANGLE (the fan-case row) plays no part here.
-            (lo1, hi1), (lo2, hi2) = bites.values()
-            cis = (360.0 - hi1 - hi2) / 2.0, (360.0 - lo1 - lo2) / 2.0
-            trans = 180.0 - (max(hi1, hi2) - min(lo1, lo2)) / 2.0, 180.0
-            for pair in angle_rows.keys() - bites.keys():
-                i, j = sorted(pair)
-                key = (od[i], metal, od[j])
-                if key not in c.angles:
-                    continue
-                window = trans if ideal_angles[pair] == _STRAIGHT else cis
-                if pair in stated_pairs:  # the template's own idealised default: the closure supersedes it,
-                    lo0, hi0 = c.angles[key]  # UNLESS the two are disjoint -- a real conflict, not this fix's
-                    if window[1] < lo0 or window[0] > hi0:  # own "ideal 180" assumption reasserting itself
-                        raise ValueError(
-                            f"metal[{metal}]: opposed-bite closure {window} for donors {od[i]},{od[j]} is "
-                            f"disjoint from their stated angle window {(lo0, hi0)}"
-                        )
-                c.angles[key] = window
+            c.angles[key] = bites[pair]
         else:
-            # Retain the existing complementary priors for a planar shell without an opposed-bite closure.
-            # ponytail: linked/held networks still use pairwise priors; replace when a joint model covers them.
-            for pair in angle_rows.keys() - stated_pairs - bites.keys():
-                i, j = sorted(pair)
-                key = (od[i], metal, od[j])
-                if key not in c.angles:
-                    continue
-                complements = [
-                    (_STRAIGHT - hi, _STRAIGHT - lo)
-                    for bite_pair, (lo, hi) in bites.items()
-                    if len(pair & bite_pair) == 1 and ideal_angles.get(pair ^ bite_pair) == _STRAIGHT
-                ]
-                if complements:
-                    lo, hi = max(window[0] for window in complements), min(window[1] for window in complements)
-                    if lo <= hi:
-                        c.angles[key] = (lo, hi)
-    if bites and not shared and cross_angle is None:
-        _joint_shell_targets(
-            metal,
-            od,
-            haptic,
-            poly,
-            c,
-            bites,
-            bond_bounds,
-            set(frozen) | set(coupled_atoms),
-            distance_overrides,
-            {
-                tuple(sorted((left, right)))
-                for left, right in itertools.combinations(od, 2)
-                if left not in haptic
-                and right not in haptic
-                and VACANT not in (left, right)
-                and frag_of(left) == frag_of(right)
-            },
-        )
+            lo, hi = max(0.0, a - _ANGLE_PAD), min(_STRAIGHT, a + _ANGLE_PAD)
+            if corner_images:
+                values = [image[i, j] for image in corner_images]
+                lo, hi = min(lo, *values), max(hi, *values)
+            c.angles[key] = (lo, hi)
+        # Every in-window FF force here is a flat-bottomed wall except Pull, so a compiled row's only
+        # restoring force toward the construction's own arrangement is this pull: gating it to rows the
+        # shell "moves" left the rest riding no bias at all, wide enough for a competing reading to win
+        # (DULPUV).
+        if mid_angles is not None:
+            canonical = min(key, key[::-1])
+            c.pulls.pop(canonical, None)
+            c.pulls.pop(canonical[::-1], None)
+            c.pulls[canonical] = float(mid_angles[i, j])
     # NB an η² π bond needs no hold of its own: the face is a centroid vertex, so one axial pull plus the cone
     # pins both π atoms at the face radius. Two separate M-donor pulls tore C≡C from 1.2 to 1.7 Å.
     coord = [d for d in od if d != VACANT and d not in haptic]
@@ -723,187 +766,13 @@ def coordination(  # noqa: C901 - compile each coordination term in one linear t
             frozen=frozen,
             fragments=frag,
             topology=context.get("topology"),
+            sites=haptic_sites,  # same donor population as `coord`/`real_od`: grouped once above
         )
     _add_umbrella(c, metal, od, poly)
     return _drop_graft_owned(c, frozen, haptic)
 
 
-def _planar_bite_targets(cons, vertices, poly, bites, metal, mol, blocked, fragments=None):  # noqa: C901 - two constructions, one target owner
-    """Derive linked planar bites and their cross windows from one shared shell.
-
-    Rotate independent bites around their template bisectors, retaining the opposite pair's window
-    and the trans windows. For a three-donor fan, keep the central ray and move independent spectators
-    to the plane normals. Neither construction certifies an intact whole-ligand pose; explicit
-    constraints and linked spectator networks remain authoritative. Return True only after committing
-    both the windows and their preferences; otherwise leave them untouched.
-    """
-    if not bites or blocked or VACANT in vertices or cons.fixed or cons.frozen or cons.shapes or any(cons.contacts):
-        return
-    directions = np.array(poly.vertex_dirs, dtype=float)
-    directions /= np.linalg.norm(directions, axis=1)[:, None]
-    candidates = []
-    for pair, window in bites.items():
-        i, j = sorted(pair)
-        normal = np.cross(directions[i], directions[j])
-        if np.isclose(np.linalg.norm(normal), 0.0, atol=1e-8):
-            continue
-        normal /= np.linalg.norm(normal)
-        planar = set(np.flatnonzero(np.abs(directions @ normal) < _SHELL_ATOL))
-        if len(planar) in (_TRIGONAL_CARRIERS, _TETRAHEDRAL_CARRIERS) and all(
-            abs(abs(directions[k] @ normal) - 1.0) <= _SHELL_ATOL for k in range(len(vertices)) if k not in planar
-        ):
-            candidates.append((pair, window, planar))
-    rays = directions.copy()
-    if candidates and all(
-        plane == candidates[0][2] and (pair == candidates[0][0] or not pair & candidates[0][0])
-        for pair, _, plane in candidates
-    ):
-        pair, window, planar = candidates[0]
-        i, j = sorted(pair)
-        if {vertices[i], vertices[j]} & cons.haptic.keys():
-            return
-        fragments = _frag_map(mol) if fragments is None else fragments
-        group = fragments[vertices[i]]
-        attached = {slot for slot, donor in enumerate(vertices) if fragments[_vertex_atom(cons.haptic, donor)] == group}
-        if fragments[vertices[j]] != group or attached & planar != set(pair):
-            return
-        angles = np.degrees(np.arccos(np.clip(directions @ directions.T, -1.0, 1.0)))
-        pairs, windows = [pair], [window]
-        targets = [float(np.clip(angles[i, j], *window))]
-        moved = {frozenset(key) for key in itertools.combinations(planar, 2)} - {pair}
-        if len(planar) == _TRIGONAL_CARRIERS:
-            sectors = [angles[a, b] for a, b in itertools.combinations(planar, 2)]
-            if not all(_SHELL_ATOL < value < 180.0 - _SHELL_ATOL for value in sectors) or not np.isclose(
-                sum(sectors), 360.0, atol=1e-6, rtol=0.0
-            ):
-                return
-        else:
-            if {vertices[k] for k in planar} & cons.haptic.keys():
-                return
-            opposite = frozenset(planar - pair)
-            groups = {
-                frozenset(
-                    k for k, donor in enumerate(vertices) if fragments[_vertex_atom(cons.haptic, donor)] == fragment
-                )
-                for fragment in set(fragments.values())
-            }
-            if any(len(group) > 1 and group not in (pair, opposite) for group in groups):
-                return
-            if opposite in groups and opposite not in bites:
-                return
-            slots = {donor: k for k, donor in enumerate(vertices)}
-            limits = {
-                frozenset((slots[a], slots[b])): value
-                for (a, centre, b), value in cons.angles.items()
-                if centre == metal and a in slots and b in slots
-            }
-            trans = {key for key in moved if np.isclose(angles[tuple(sorted(key))], 180.0)}
-            if len(trans) != 2 or opposite not in limits or not trans <= limits.keys():  # noqa: PLR2004 - two trans pairs
-                return
-            pairs.append(opposite)
-            windows.append(limits[opposite])
-            targets.append(float(np.clip(angles[tuple(sorted(opposite))], *windows[1])))
-            # With opposite bisectors, trans = 180 - |alpha-beta|/2. Project the two closest-to-ideal
-            # bite targets onto this strip; no independent exact-complement assumptions are needed.
-            gap = 2.0 * (180.0 - max(limits[key][0] for key in trans))
-            low, high = sorted(range(2), key=targets.__getitem__)
-            if targets[high] - targets[low] > gap:
-                lo = max(windows[low][0], windows[high][0] - gap)
-                hi = min(windows[low][1], windows[high][1] - gap)
-                if lo > hi:
-                    return
-                targets[low] = float(np.clip((sum(targets) - gap) / 2.0, lo, hi))
-                targets[high] = targets[low] + gap
-            moved -= {opposite, *trans}
-        if all(
-            np.isclose(target, angles[tuple(sorted(pair))], atol=1e-8, rtol=0.0)
-            for pair, target in zip(pairs, targets, strict=True)
-        ):
-            return
-        for (i, j), target in zip((sorted(pair) for pair in pairs), targets, strict=True):
-            bisector, transverse = directions[i] + directions[j], directions[i] - directions[j]
-            bisector /= np.linalg.norm(bisector)
-            transverse /= np.linalg.norm(transverse)
-            half = np.radians(target / 2.0)
-            rays[i] = np.cos(half) * bisector + np.sin(half) * transverse
-            rays[j] = np.cos(half) * bisector - np.sin(half) * transverse
-    elif len(bites) == 2 and not cons.haptic:  # noqa: PLR2004 - two bites share the fan's central donor
-        first, second = map(set, bites)
-        if len(first & second) != 1:
-            return
-        (centre,) = first & second
-        fan = first | second
-        spectators = set(range(len(vertices))) - fan
-        if not spectators:
-            return
-        members = {vertices[i] for i in fan}
-        groups = [set(vertices).intersection(fragment) for fragment in Chem.GetMolFrags(mol)]
-        if members not in groups or any(len(group) > 1 and group != members for group in groups):
-            return
-        outer = sorted(fan - {centre})
-        normal = np.cross(directions[centre], directions[outer[0]])
-        if np.isclose(np.linalg.norm(normal), 0.0, atol=1e-8):
-            return
-        normal /= np.linalg.norm(normal)
-        if any(abs(directions[i] @ normal) > _SHELL_ATOL for i in fan):
-            return
-        for i in outer:
-            tangent = directions[i] - (directions[i] @ directions[centre]) * directions[centre]
-            if np.isclose(np.linalg.norm(tangent), 0.0, atol=1e-8):
-                return
-            tangent /= np.linalg.norm(tangent)
-            angle = np.radians(np.mean(bites[frozenset((centre, i))]))
-            rays[i] = np.cos(angle) * directions[centre] + np.sin(angle) * tangent
-        for i in spectators:
-            component = directions[i] @ normal
-            if np.isclose(component, 0.0, atol=1e-8):
-                return
-            rays[i] = np.sign(component) * normal
-        if np.linalg.matrix_rank(directions) == directions.shape[1] and (
-            np.linalg.matrix_rank(rays) < directions.shape[1] or orientation_parity(rays, directions) < 0
-        ):
-            return
-        moved = {frozenset(key) for key in itertools.combinations(range(len(vertices)), 2)} - bites.keys()
-    else:
-        return
-    fitted = np.degrees(np.arccos(np.clip(rays @ rays.T, -1.0, 1.0)))
-    work = Chem.MolFromSmiles(".".join(["[*]"] * (len(vertices) + 1)))
-    conf = Chem.Conformer(work.GetNumAtoms())
-    lengths = [np.mean(cons.distances[tuple(sorted((metal, donor)))]) for donor in vertices]
-    conf.SetPositions(np.vstack([np.zeros(3), rays * np.asarray(lengths)[:, None]]))
-    work.AddConformer(conf)
-    ordered = ordered_fit_residual(rays, directions)
-    if (
-        classify_geometry(work, 0, tuple(range(1, len(vertices) + 1)), warn=False) != poly.name
-        or ordered > _FIT_FLOOR
-        or not np.isclose(ordered, fit_residual(rays, poly), atol=1e-8, rtol=0.0)
-    ):
-        return
-    slots = {donor: slot for slot, donor in enumerate(vertices)}
-    updated, targets = cons.angles.copy(), {}
-    cross = set()
-    for key, (lo, hi) in cons.angles.items():
-        a, centre, b = key
-        if centre != metal or a not in slots or b not in slots:
-            continue
-        left, right = slots[a], slots[b]
-        value = float(fitted[left, right])
-        if frozenset((left, right)) in moved:
-            shift = float(np.clip(value - (lo + hi) / 2.0, -lo, 180.0 - hi))
-            updated[key] = (lo + shift, hi + shift)
-            cross.add(frozenset((left, right)))
-        if not updated[key][0] - 1e-8 <= value <= updated[key][1] + 1e-8:
-            return
-        targets[min(key, key[::-1])] = value
-    if cross != moved:
-        return
-    # Flat walls admit competing shapes. The weak FF preference uses this same shell, not unrelated midpoints.
-    cons.angles = updated
-    cons.pulls.update(targets)
-    return True
-
-
-def _donor_distance_window(mol, metal, donor, real_z, donors, *, positions=None, charges=None, hyb=None):
+def _donor_distance_window(mol, metal, donor, real_z, donors, *, positions=None, charges=None, hyb=None, eta=None):
     """Return the measured or model M-donor window shared by enumeration, coordination and site filling."""
     if positions is not None:
         target = float(np.linalg.norm(positions[metal] - positions[donor]))
@@ -916,6 +785,7 @@ def _donor_distance_window(mol, metal, donor, real_z, donors, *, positions=None,
         donors,
         charges=delocalised_charges(mol) if charges is None else charges,
         hyb=_stripped_hybridisation(mol) if hyb is None else hyb,
+        eta=eta,
     )
     return target - _ML_SEED_HALF_WIDTH, target + _ML_SEED_HALF_WIDTH
 

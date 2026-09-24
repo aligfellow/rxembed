@@ -50,15 +50,6 @@ _CX_KEEP = (
 _CX_SKIP = int(Chem.CXSmilesFields.CX_ALL) & ~_CX_KEEP
 
 
-def _xyz_block(mol, conf_id):
-    conf = mol.GetConformer(conf_id)
-    out = [str(mol.GetNumAtoms()), ""]
-    for a in mol.GetAtoms():
-        p = conf.GetAtomPosition(a.GetIdx())
-        out.append(f"{a.GetSymbol()} {p.x:.6f} {p.y:.6f} {p.z:.6f}")
-    return "\n".join(out) + "\n"
-
-
 _INVERT = {
     "R": "S",
     "S": "R",
@@ -324,7 +315,7 @@ def signature(mol, conf_id=-1, charge=0, native=True):
     fd, path = tempfile.mkstemp(suffix=".xyz")
     try:
         with os.fdopen(fd, "w") as f:
-            f.write(_xyz_block(mol, conf_id))
+            f.write(Chem.MolToXYZBlock(mol, conf_id))
         graph = xyzgraph.build_graph(path, charge=charge, kekule=True)
         summary = _independent_summary(probe, annotate_stereo(graph))
     finally:

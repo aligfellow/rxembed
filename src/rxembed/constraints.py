@@ -1,15 +1,15 @@
 """The `Constraints` struct every builder fills and every stage reads, plus the ``fix``/``constrain`` resolver.
 
-Two verbs, one resolver (`resolve_core`). ``fix`` is rigid: the named atoms will have this geometry, given
-as a list (own coords, Kabsch graft), ``{i: (x, y, z)}`` (explicit coords), or ``{(i, j): d, ...}`` (scalar
+Two verbs, one resolver (`resolve_core`). ``fix`` is rigid: the named atoms get this geometry, as a list
+(own coords, Kabsch graft), ``{i: (x, y, z)}`` (explicit coords), or ``{(i, j): d, ...}`` (scalar
 distance/angle/dihedral values within 0.001 A / 0.005 deg, or explicit windows; a dict may mix all three).
-``constrain`` is soft: a wider window a real energy may overrule, and the home of pi-stacks (a plane key
-``(ring_a, ring_b): separation``). Held? ``fix``. A bias the search can move off? ``constrain``. A template
-is not a third verb: ``template=(reference, map_or_smarts)`` dissolves into a coords-``fix`` before this
-resolver sees it. See README.md for the full vocabulary, the SMARTS/index-map choice, and worked examples.
+``constrain`` is soft: a wider window a real energy may overrule, and the home of pi-stacks
+(``(ring_a, ring_b): separation``). Held is ``fix``; a bias the search can move off is ``constrain``.
+``template=(reference, map_or_smarts)`` is not a third verb: it dissolves into a coords-``fix`` before this
+resolver sees it. See README.md for the full vocabulary and worked examples.
 
-Keys are 0-based atom indices in xyz/graph order. Strictness is the fix/constrain axis, not a second user
-force constant: a scalar fix carries a point restraint and an acceptance gate; a soft window carries neither.
+Keys are 0-based atom indices in xyz/graph order. Strictness is the fix/constrain axis, not a second force
+constant: a scalar fix carries a point restraint and an acceptance gate; a soft window carries neither.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ class Constraints:
     #   angular keys; `relaxed()` releases exactly these.
 
     # --- Coordination fields. All empty for an organic system, so the shared relax is bit-identical there
-    # rather than branching. They exist because the metal is embedded as a BOND-LESS surrogate: stripping the
+    # rather than branching. They exist because the metal is embedded as a bond-less surrogate: stripping the
     # M-donor bonds also strips every UFF term that came with them, and these put the missing ones back.
     metals: set = field(default_factory=set)  # metal indices, re-typed to bondless Li on the FF copy (ligand
     #   UFF stays native; Li gives weaker nonbonded contacts than the DG carbon surrogate)
@@ -105,10 +105,6 @@ class Constraints:
         for ring_a, ring_b, _ in self.planes:
             s |= set(ring_a) | set(ring_b)
         return s - set(self.phantoms)  # a haptic centroid dummy is transient embed scaffolding, never a real atom
-
-
-def _merge_last_wins(a, b):
-    return {**a, **b}
 
 
 def _graft_owns(atoms, frozen, haptic=None):
@@ -211,9 +207,9 @@ def _merge_pulls(a, b):
 
 
 _MERGE = {  # field -> how two sources combine. See `compose`.
-    "distances": _merge_last_wins,  # a spec landing ON a structural hold is a user override of it (dispatch)
-    "angles": _merge_last_wins,
-    "dihedrals": _merge_last_wins,
+    "distances": lambda a, b: {**a, **b},  # a spec landing ON a structural hold is a user override (dispatch)
+    "angles": lambda a, b: {**a, **b},
+    "dihedrals": lambda a, b: {**a, **b},
     "planes": lambda a, b: [*a, *b],  # never de-duplicated: two identical pi-stacks are the caller's business
     "coplanar": lambda a, b: [*a, *b],
     "frozen": lambda a, b: a | b,
@@ -350,8 +346,6 @@ _CON_PAD = 0.1  # constrain distance half-window when a scalar target is given
 _CON_ANG_PAD = 5.0  # constrain angular half-window
 _SHAPE_PAD = 0.05  # graft pairwise-shape half-window (a rigid hold; the exact graft does the real work)
 _MIN_SHAPE_ATOMS = 3  # below this a core has only a distance to pin, not an orientable 3-D shape
-_PLANE_ATOMS = 3  # the minimum number of distinct points that defines a plane
-_COORD_LEN = 3  # an (x, y, z) coordinate
 _DIST_ATOMS = 2  # a distance key names two atoms
 _ANGLE_ATOMS = 3  # an angle key names three atoms
 _DIHEDRAL_ATOMS = 4  # a dihedral key names four atoms
@@ -493,7 +487,7 @@ def _is_plane_key(key):
 
 def _as_coord(val):
     v = tuple(float(x) for x in val)
-    if len(v) != _COORD_LEN:
+    if len(v) != 3:  # noqa: PLR2004
         raise ValueError(f"a coordinate fix value must be (x, y, z); got {val!r}")
     return v
 
@@ -507,7 +501,7 @@ def _resolve_ring(mol, ring):
             "(get them with mol.GetSubstructMatch / GetRingInfo)"
         )
     atoms = tuple(ring)
-    if len(atoms) < _PLANE_ATOMS:
+    if len(atoms) < 3:  # noqa: PLR2004
         raise ValueError(f"constrain plane needs at least 3 atoms per ring; got {atoms}")
     if any(not _is_index(atom) for atom in atoms):
         raise ValueError(f"constrain plane ring atoms must be integer indices; got {atoms}")
@@ -636,10 +630,6 @@ def _apply_constrain(mol, constrain, cons):
     return d_soft, angular_soft
 
 
-_XYZ_DIM = 3  # an (x, y, z) row
-_TEMPLATE_LEN = 2  # template=(reference, mapping)
-
-
 def reference_positions(reference):
     """Return a template reference's ``(N, 3)`` coordinates, from a Mol, an ``.xyz`` path, or an array.
 
@@ -657,7 +647,7 @@ def reference_positions(reference):
             raise ValueError(f"could not read coordinates from {path!r}")
         return mol.GetConformer().GetPositions()
     arr = np.asarray(reference, float)
-    if arr.ndim == _TEMPLATE_LEN and arr.shape[1] == _XYZ_DIM:
+    if arr.ndim == 2 and arr.shape[1] == 3:  # noqa: PLR2004  a 2D (N, 3) array
         return arr
     raise ValueError("a template reference must be a Mol with a conformer, an .xyz path, or an (N, 3) array")
 
@@ -674,7 +664,9 @@ def template_to_fix(template, fix=None, own=None, target=None):
     one ordered correspondence on each graph, so a symmetric query needs an explicit map instead.
     """
     if not (
-        isinstance(template, (tuple, list)) and len(template) == _TEMPLATE_LEN and isinstance(template[1], (dict, str))
+        isinstance(template, (tuple, list))
+        and len(template) == 2  # noqa: PLR2004  template=(reference, mapping)
+        and isinstance(template[1], (dict, str))
     ):
         raise ValueError(
             "template= must be (reference, SMARTS) or (reference, {target_index: reference_index}). "

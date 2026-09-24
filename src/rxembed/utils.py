@@ -11,21 +11,58 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
-from rdkit import Chem, rdBase
-from rdkit.Chem import rdqueries
+from rdkit import Chem
 
 _PT = Chem.GetPeriodicTable()
 _CARBON_Z = 6
 _SP2_DEGREE = 3  # a planar sp2 centre has exactly three neighbours
-_STEREO_REFS = 2  # a double bond's stereo needs exactly two reference atoms; fewer means surgery orphaned it
 _DISCONNECTED = 1e6  # RDKit's topological distance for atoms in different fragments (it returns ~1e8)
 _TETRAHEDRAL_DEGREE = 4  # the only degree at which a CW/CCW tag has a bond-order parity: see `bond_removal_mirrors`
 _MIRRORED = {  # the two tetrahedral tags; no other ChiralType is a parity over the bond order
     Chem.ChiralType.CHI_TETRAHEDRAL_CW: Chem.ChiralType.CHI_TETRAHEDRAL_CCW,
     Chem.ChiralType.CHI_TETRAHEDRAL_CCW: Chem.ChiralType.CHI_TETRAHEDRAL_CW,
 }
-_RESONANCE_CACHE = {}
-_RESONANCE_CACHE_MAX = 128
+
+
+def _cip_cache_key(mol, centers=()):
+    """Return a hashable key for `mol`'s chemical content, plus an optional labelled-centre tuple.
+
+    A wrong key here silently hands back another molecule's cached answer, so it must cover every field two
+    graphs could differ on: each atom's element, isotope, charge, H count, radical count, aromaticity,
+    chiral tag and explicit/implicit-H flag; each bond's endpoints, type, aromaticity, stereo flag and
+    stereo reference atoms; and each enhanced stereo group's type and member atoms/bonds. The explicit/
+    implicit-H flag has to sit alongside the H count itself: two graphs can agree on the total H count while
+    disagreeing on whether it is fixed or open to recomputation.
+    """
+    atoms = tuple(
+        (
+            a.GetAtomicNum(),
+            a.GetIsotope(),
+            a.GetFormalCharge(),
+            a.GetTotalNumHs(),
+            a.GetNumRadicalElectrons(),
+            a.GetIsAromatic(),
+            a.GetChiralTag(),
+            a.GetNoImplicit(),
+        )
+        for a in mol.GetAtoms()
+    )
+    bonds = tuple(
+        (
+            b.GetBeginAtomIdx(),
+            b.GetEndAtomIdx(),
+            b.GetBondType(),
+            b.GetIsAromatic(),
+            b.GetStereo(),
+            tuple(b.GetStereoAtoms()),
+        )
+        for b in mol.GetBonds()
+    )
+    groups = tuple(
+        (int(g.GetGroupType()), tuple(a.GetIdx() for a in g.GetAtoms()), tuple(b.GetIdx() for b in g.GetBonds()))
+        for g in mol.GetStereoGroups()
+    )
+    return atoms, bonds, groups, tuple(sorted(set(centers)))
 
 
 def flat_ranks(mol, *, break_ties=False):
@@ -63,123 +100,6 @@ def hydrogen_neighbor_order(mol, hydrogen, *, metals, positions=None, ranks=None
             neighbor,
         ),
     )
-
-
-def _resonance_graph(mol):
-    """Return a canonical private graph with chemically perceived conjugation."""
-    normalized = Chem.Mol(mol)
-    for atom in normalized.GetAtoms():
-        atom.SetAtomMapNum(0)  # input correspondence labels are not chemical identity
-    Chem.SanitizeMol(normalized)  # computed hybridization/conjugation must not change the proof's answer
-    zero = [b for b in normalized.GetBonds() if b.GetBondType() == Chem.BondType.ZERO]
-    if zero:
-        # Zero-order identity links are not part of a conjugated chemical graph. RDKit's resonance
-        # engine discounts their degree, but its conjugation perception does not (dithiocarbamate).
-        # Recompute only that property without the links; keep all graph edges and stereo bases intact.
-        chemical = Chem.RWMol(normalized)
-        for bond in zero:
-            chemical.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
-            bond.SetIsConjugated(False)
-        Chem.SanitizeMol(chemical)
-        for bond in chemical.GetBonds():
-            normalized.GetBondBetweenAtoms(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()).SetIsConjugated(
-                bond.GetIsConjugated()
-            )
-    ranks = list(Chem.CanonicalRankAtoms(normalized, breakTies=True))
-    return Chem.RenumberAtoms(normalized, sorted(range(len(ranks)), key=ranks.__getitem__))
-
-
-def _resonance_key(mol):
-    """Serialize a private graph after rebasing supported double stereo."""
-    # Native CX fields retain bond kinds/directions and electrons; coordinates and notes are not identity.
-    fields = (
-        Chem.CXSmilesFields.CX_ENHANCEDSTEREO
-        | Chem.CXSmilesFields.CX_RADICALS
-        | Chem.CXSmilesFields.CX_COORDINATE_BONDS
-        | Chem.CXSmilesFields.CX_ZERO_BONDS
-    )
-    # Rebase double stereo with native CIP priorities without cleaning donor point tags.
-    # Protect absent stereo while shared slash bonds are interpreted in conjugated chains.
-    doubles = [
-        (b, b.GetStereo(), tuple(b.GetStereoAtoms())) for b in mol.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE
-    ]
-    Chem.SetDoubleBondNeighborDirections(mol)
-    for bond, tag, _ in doubles:
-        bond.SetStereo(Chem.BondStereo.STEREOANY if tag <= Chem.BondStereo.STEREOANY else Chem.BondStereo.STEREONONE)
-    Chem.AssignStereochemistry(mol, cleanIt=False, force=True)
-    for bond, tag, refs in doubles:
-        # Native reassignment may not support a donor bearing an extra coordination/site edge.
-        if tag <= Chem.BondStereo.STEREOANY or bond.GetStereo() <= Chem.BondStereo.STEREOANY:
-            if len(refs) == _STEREO_REFS:
-                bond.SetStereoAtoms(*refs)
-            bond.SetStereo(tag)
-    # ponytail: native CX can omit partial/site-linked E/Z; those states need an exact matching path.
-    return Chem.MolToCXSmiles(mol, Chem.SmilesWriteParams(), flags=fields)
-
-
-def resonance_match(query, source, *, flags=0, max_forms=32):
-    """Return whether ``query`` is an RDKit resonance form of ``source``, plus cap status."""
-    if query.GetNumAtoms() != source.GetNumAtoms() or query.GetNumBonds() != source.GetNumBonds():
-        return False, False
-
-    with rdBase.BlockLogs():
-        query, source = _resonance_graph(query), _resonance_graph(source)
-        # Canonical molecular identity cannot key query predicates or orphaned stereo tags; native atrop
-        # keeps its explicit matching path. Enhanced stereo groups are retained in the molecular key.
-        cacheable = not any(atom.HasQuery() for mol in (query, source) for atom in mol.GetAtoms()) and not any(
-            bond.HasQuery()
-            or bond.GetStereo() in (Chem.BondStereo.STEREOATROPCW, Chem.BondStereo.STEREOATROPCCW)
-            or (bond.GetStereo() != Chem.BondStereo.STEREONONE and len(bond.GetStereoAtoms()) != _STEREO_REFS)
-            for mol in (query, source)
-            for bond in mol.GetBonds()
-        )
-        if cacheable:
-            key = (
-                _resonance_key(query),
-                _resonance_key(source),
-                flags,
-                max_forms,
-            )
-            cached = _RESONANCE_CACHE.get(key)
-            if cached is not None:
-                return cached
-        supplier = Chem.ResonanceMolSupplier(source, flags=flags, maxStructs=max_forms + 1)
-        supplier.SetNumThreads(1)
-        if cacheable:
-            # Compare native molecular keys without a potentially exponential subgraph search.
-            matched = False
-            for form in supplier:
-                # Native resonance forms have Kekule bond orders but retain the source's aromatic flags.
-                # Re-perceive aromaticity from those orders, which may now describe a nonaromatic form.
-                for atom in form.GetAtoms():
-                    atom.SetIsAromatic(False)
-                for bond in form.GetBonds():
-                    bond.SetIsAromatic(False)
-                try:
-                    form_key = _resonance_key(_resonance_graph(form))
-                except Chem.MolSanitizeException:
-                    # Native enumeration can yield a valence-invalid form, which cannot prove a valid query.
-                    continue
-                if form_key == key[0]:
-                    matched = True
-                    break
-        else:
-            Chem.Kekulize(query, clearAromaticFlags=False)
-            # Query-only information needs native matching, with equality for zero-valued properties too.
-            # Ordinary Atom matching lets isotope-marked dummy roots match unmarked dummies.
-            for atom in query.GetAtoms():
-                exact = rdqueries.ReplaceAtomWithQueryAtom(query, atom)
-                exact.ExpandQuery(rdqueries.FormalChargeEqualsQueryAtom(exact.GetFormalCharge()))
-                exact.ExpandQuery(rdqueries.IsotopeEqualsQueryAtom(exact.GetIsotope()))
-                exact.ExpandQuery(rdqueries.HCountEqualsQueryAtom(exact.GetTotalNumHs(includeNeighbors=True)))
-                exact.ExpandQuery(rdqueries.NumRadicalElectronsEqualsQueryAtom(exact.GetNumRadicalElectrons()))
-            matched = bool(supplier.GetSubstructMatch(query, useChirality=True))
-        result = matched, not matched and len(supplier) > max_forms
-        if cacheable:
-            if len(_RESONANCE_CACHE) >= _RESONANCE_CACHE_MAX:
-                _RESONANCE_CACHE.clear()
-            _RESONANCE_CACHE[key] = result
-        return result
 
 
 @dataclass(frozen=True)
@@ -240,6 +160,21 @@ def _rcov(z: int) -> float:
     return _PT.GetRcovalent(z)
 
 
+def _lone_pair(atom, metals):
+    """Return `atom`'s nonbonding valence: outer electrons minus formal charge minus bonded valence.
+
+    A bond to a metal is stripped from the bonded-valence term first (`Bond.GetValenceContrib`, zero
+    for a dative donor bond, the bond order for a covalent one), so this reads the same whether `atom`
+    is itself dative- or covalent-bonded to the metal, and the same as passing `metals=()` on a graph
+    that has none. Not a per-element list, so it holds for any main-group atom. A result of at least
+    two means the atom keeps a lone pair it can donate.
+    """
+    to_metal = sum(
+        bond.GetValenceContrib(atom) for bond in atom.GetBonds() if bond.GetOtherAtomIdx(atom.GetIdx()) in metals
+    )
+    return _PT.GetNOuterElecs(atom.GetAtomicNum()) - atom.GetFormalCharge() - (atom.GetTotalValence() - to_metal)
+
+
 def _angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     u, w = a - b, c - b
     scale = np.linalg.norm(u) * np.linalg.norm(w)
@@ -272,13 +207,11 @@ def mirror_tag(tag):
 def bond_removal_mirrors(atom, partner) -> bool:
     """Return whether removing the bond to `partner` changes `atom`'s tetrahedral-tag parity.
 
-    RDKit CW/CCW tags are relative to ``atom.GetBonds()`` order. Removing slot ``p`` changes that basis by
-    ``n - 1 - p`` swaps, so an odd count requires mirroring the tag. Call this on the graph that still has
-    the bond, even if no tag exists yet; the same correction applies inversely when grafting a tag. A plain
-    ``AddBond`` needs no correction because RDKit appends the bond last.
-
-    This parity rule is defined only for degree four. Higher-degree centres are left unchanged; at lower
-    degrees, removing a bond leaves no representable tetrahedral chirality.
+    RDKit's CW/CCW tag is relative to ``atom.GetBonds()`` order. Removing slot ``p`` changes that basis by
+    ``n - 1 - p`` swaps, so an odd count needs the tag mirrored. Call this on the graph that still has the
+    bond, even before a tag exists; the same correction applies inversely when grafting one. A plain
+    ``AddBond`` needs no correction, since RDKit appends the new bond last. Defined only at degree four:
+    higher degrees are left unchanged, and lower degrees have no representable tetrahedral chirality.
     """
     partners = [b.GetOtherAtomIdx(atom.GetIdx()) for b in atom.GetBonds()]
     if len(partners) != _TETRAHEDRAL_DEGREE or partner not in partners:
@@ -297,9 +230,8 @@ def bond_replacement_mirrors(atom, partner) -> bool:
 def remove_bond(rw, i, j) -> None:
     """Remove a bond while preserving the geometry named by degree-four tetrahedral tags.
 
-    RDKit does not update chiral tags on bond removal, so persistent stereochemistry-sensitive edits use this
-    wrapper. Direct removal inverted four chiral-P centres across three structures; RMSD missed
-    equivalent-donor swaps.
+    RDKit does not update chiral tags on bond removal, so a direct `RemoveBond` can silently invert a
+    centre's handedness; every stereochemistry-sensitive edit uses this wrapper instead.
     """
     for a, other in ((int(i), int(j)), (int(j), int(i))):
         atom = rw.GetAtomWithIdx(a)
@@ -312,10 +244,10 @@ def assign_stereo_from_3d(mol, conf_id: int = -1) -> None:
     """Assign 3D stereochemistry in the bond-order basis used by rxembed readers.
 
     RDKit's 3D writer omits a donor-originating dative bond from the centre's neighbour basis, while its CIP
-    and SMILES readers include it. On the sulfoxide fixture, the same geometry is CIP R after parsing and CIP
-    S after raw 3D assignment. Mirror degree-four tags when that difference changes parity, then refresh their
-    CIP labels. Higher-degree tags remain unchanged because the parity rule does not hold there. All production
-    3D assignments use this wrapper.
+    and SMILES readers include it: the same sulfoxide geometry parses as CIP R but assigns from raw 3D as
+    CIP S. Mirror a degree-four tag when that difference changes its parity, then refresh CIP labels.
+    Higher-degree tags are left unchanged, since the parity rule does not hold there. All production 3D
+    assignments use this wrapper.
     """
     Chem.AssignStereochemistryFrom3D(mol, confId=conf_id)
     rebased = False
@@ -331,21 +263,16 @@ def assign_stereo_from_3d(mol, conf_id: int = -1) -> None:
 
 
 def repair_bond_stereo(mol) -> int:
-    """Re-derive (or drop) any bond stereo whose reference atoms were lost to bond surgery; return how many.
+    """Re-derive or drop any bond stereo whose reference atoms were lost to bond surgery; return how many.
 
-    Removing a bond can leave a double bond still FLAGGED ``STEREOZ``/``STEREOE`` while RDKit silently drops its
-    two stereo reference atoms, because one of them was the removed partner. Stripping the M-donor bonds does
-    this routinely: for a coordinated imine, RDKit picks the metal itself as one of the C=N reference atoms.
-    The flag then carries no information, and RDKit's own ETKDG indexes the empty vector and segfaults:
-    a crash no ``try``/``except`` can catch.
+    Removing a bond can leave a double bond still flagged E/Z while RDKit silently drops one of its two
+    stereo reference atoms, because that atom was the removed partner. The flag then carries no information,
+    and RDKit's own ETKDG indexes the empty reference vector and segfaults: a crash no ``try``/``except``
+    can catch.
 
-    Where a conformer survives the surgery the geometry is re-perceived from it, so the E/Z is PRESERVED rather
-    than discarded, re-expressed against the substituents that remain (a bond that was "Z relative to the
-    metal" becomes "E relative to the other ring atom": same 3D arrangement, new reference). Only where no
-    reference survives is the flag dropped, and there the information genuinely did not survive the surgery.
-
-    This is the bond-stereo counterpart of the atom-level cleanups `surrogate_metal` already does (it clears the
-    surrogate's chiral tag for exactly this reason, and `_clear_labile_donor_stereo` clears a donor's).
+    Where a conformer survives the surgery, the geometry is re-perceived from it, so the E/Z is kept,
+    re-expressed against the substituents that remain rather than discarded. Only where no reference
+    survives is the flag dropped, since the information itself did not survive the surgery.
     """
     # Metal-ring SMILES can make RDKit choose the metal as both E/Z references. Once bond surgery removes
     # the metal, the original slash bonds are still the least ambiguous source of the ligand's E/Z. Preserve
@@ -355,8 +282,8 @@ def repair_bond_stereo(mol) -> int:
         for b in mol.GetBonds()
         if b.GetBondType() == Chem.BondType.DOUBLE
         and b.GetStereo() != Chem.BondStereo.STEREONONE
-        and len(b.GetStereoAtoms()) == _STEREO_REFS
-        and len(set(b.GetStereoAtoms())) == _STEREO_REFS
+        and len(b.GetStereoAtoms()) == 2  # noqa: PLR2004
+        and len(set(b.GetStereoAtoms())) == 2  # noqa: PLR2004
     }
     Chem.SetBondStereoFromDirections(mol)
     for idx, (tag, refs) in stated.items():
@@ -368,13 +295,13 @@ def repair_bond_stereo(mol) -> int:
         for b in mol.GetBonds()
         if b.GetBondType() == Chem.BondType.DOUBLE
         and b.GetStereo() != Chem.BondStereo.STEREONONE
-        and len(b.GetStereoAtoms()) != _STEREO_REFS
+        and len(b.GetStereoAtoms()) != 2  # noqa: PLR2004
     ]
     if not orphaned:
         return 0
     if mol.GetNumConformers():  # re-perceive from the geometry: keeps the E/Z, re-referenced
         assign_stereo_from_3d(mol)
     for b in orphaned:  # whatever re-perception could not re-reference carries no information, so drop it
-        if len(b.GetStereoAtoms()) != _STEREO_REFS:
+        if len(b.GetStereoAtoms()) != 2:  # noqa: PLR2004
             b.SetStereo(Chem.BondStereo.STEREONONE)
     return len(orphaned)

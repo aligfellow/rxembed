@@ -3,6 +3,7 @@
 import logging
 from importlib.metadata import PackageNotFoundError, version
 
+from .bounds import EmbedParams
 from .constraints import Constraints, compose, match, resolve_core
 from .embed import Conformers, EmbeddingError, embed, minimize
 from .metal_core import Ligand, ligands
@@ -32,6 +33,7 @@ except PackageNotFoundError:
 __all__ = [
     "Conformers",
     "Constraints",
+    "EmbedParams",
     "EmbeddingError",
     "Isomer",
     "IsomerSet",
