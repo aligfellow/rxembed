@@ -7,15 +7,18 @@ branch. This is the only module that touches xyzgraph's NCI detection.
 
 from __future__ import annotations
 
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING
 
 import networkx as nx
 import numpy as np
 from rdkit import Chem
 
-from rxembed.metal_core import _frag_map, metal_indices
-from rxembed.utils import _CARBON_Z
+from rxembed.bounds import probe_conformer
+from rxembed.metal_core import frag_map, metal_indices
+from rxembed.utils import CARBON_Z, atom_label
 
 if TYPE_CHECKING:
     from xyzgraph.nci import NCIAnalyzer
@@ -92,22 +95,19 @@ class ContactKind:
     anchor: str = "heavy"
 
 
-# The registry: one row per contact type. H-bonds tolerate bending (~140°); sigma-holes are sharply linear.
-# XB 2.5-3.1 is the GFN-FF-surviving window on the I...pyridine probe. CATPI stays at the generic 3.5 A:
-# its cation-dependent GFN-FF optima span 1.55-4.41 A, which one registry row cannot encode without overfitting.
-# Ring values are centroid heights, expanded to atom windows downstream.
+# One row per contact type. Ring values are centroid heights, expanded to atom windows downstream.
 KINDS = {
     k.name: k
     for k in [
         ContactKind("HB", "atom", (1.6, 2.2), orient=(140.0, 180.0), apex="donor", anchor="donor_h"),
-        ContactKind("XB", "atom", (2.5, 3.1), orient=(160.0, 180.0), apex="sigma"),
+        ContactKind("XB", "atom", (2.5, 3.1), orient=(160.0, 180.0), apex="sigma"),  # GFN-FF-surviving on I...pyridine
         ContactKind("ChB", "atom", (3.0, 3.6), orient=(155.0, 180.0), apex="sigma"),
         ContactKind("PnB", "atom", (3.0, 3.6), orient=(155.0, 180.0), apex="sigma"),
         ContactKind("IONIC", "atom", (2.6, 3.8)),
         ContactKind("CATLP", "atom", (2.6, 3.4)),
         ContactKind("CHPI", "ring", 3.0, anchor="ring_h"),
         ContactKind("HBPI", "ring", 3.0, anchor="ring_h"),
-        ContactKind("CATPI", "ring", 3.5, anchor="ring_ion"),
+        ContactKind("CATPI", "ring", 3.5, anchor="ring_ion"),  # generic: GFN-FF optima span 1.55-4.41 A by cation
         ContactKind("ANPI", "ring", 3.5, anchor="ring_ion"),
         ContactKind("HALPI", "ring", 3.5, anchor="ring_ion"),
         ContactKind("MH", "hydride", (1.6, 2.2), orient=(140.0, 180.0), apex="metal", anchor="hydride"),
@@ -148,12 +148,12 @@ def _sigma_apex(mol, x, acceptor, pos):
     if not nbrs:
         return None
     va = pos[acceptor] - pos[x]
-
-    def cone(r):
+    cones = []
+    for r in nbrs:
         vr = pos[r] - pos[x]
-        return float(np.degrees(np.arccos(np.clip(vr @ va / (np.linalg.norm(vr) * np.linalg.norm(va) + 1e-9), -1, 1))))
-
-    return max(nbrs, key=cone)  # R most opposite the acceptor (R-X-A nearest 180 deg)
+        cosine = vr @ va / (np.linalg.norm(vr) * np.linalg.norm(va) + 1e-9)
+        cones.append(float(np.degrees(np.arccos(np.clip(cosine, -1, 1)))))
+    return nbrs[cones.index(max(cones))]  # R most opposite the acceptor (R-X-A nearest 180 deg)
 
 
 def _atom_over_ring(pos, atom, ring, d_centroid):
@@ -181,22 +181,16 @@ def candidate_contacts(mol, kinds=tuple(KINDS), inter_fragment=True, seed=0xC0FF
     work = Chem.Mol(mol)
     if work.GetNumConformers() == 0:
         # `seed` differs from the embed default on purpose: moving it would move every found contact.
-        from rxembed.bounds import probe_conformer
-
         work = probe_conformer(mol, seed) or work
     pos = work.GetConformer().GetPositions()
     an = analyzer(work)
-    frag = _frag_map(work)
-
-    def sym(x):
-        return work.GetAtomWithIdx(x).GetSymbol()
-
+    frag = frag_map(work)
     handler = {"atom": _atom_contacts, "ring": _ring_contacts, "hydride": _metal_hydride_contacts}
     out, seen = {}, set()
     for name in kinds:
         kind = KINDS.get(name)
         if kind is not None:
-            out.update(handler[kind.family](work, an, pos, frag, sym, seen, inter_fragment, kind))
+            out.update(handler[kind.family](work, an, pos, frag, seen, inter_fragment, kind))
     return out
 
 
@@ -284,7 +278,7 @@ def _acceptor_quality(mol, ak):
         if a.GetIsAromatic():
             return 0  # pyrrole/amide-like aromatic N: lone pair in ring
         for nb in a.GetNeighbors():  # amide / amidine / (thio)urea: N-C(=O/=S/=N)
-            if nb.GetAtomicNum() == _CARBON_Z and any(
+            if nb.GetAtomicNum() == CARBON_Z and any(
                 b.GetBondTypeAsDouble() >= 2 and b.GetOtherAtom(nb).GetAtomicNum() in (7, 8, 16)  # noqa: PLR2004
                 for b in nb.GetBonds()
             ):
@@ -316,8 +310,6 @@ def _maximal_assignments(by_near, cap, hard_cap=256):
     each assignment maximal), branching on *which* acceptor it grips. `by_near` is an ordered
     ``[(near, [contacts]), ...]``. Reciprocal 2-cycles are resolved afterwards (``_resolve_reciprocal``).
     """
-    from collections import defaultdict
-
     out = []
 
     def bt(i, chosen, count):
@@ -347,8 +339,6 @@ def _augment_with_aux(combo, aux, cap):
     An aux rides along only where its donor is still free and the acceptor has spare capacity, so a weak
     halogen bond strengthens a real clamp but never stands alone. Mutates and returns `combo`.
     """
-    from collections import defaultdict
-
     used = {c.near for c in combo}
     count = defaultdict(lambda: [0, 0])
     for c in combo:
@@ -361,6 +351,33 @@ def _augment_with_aux(combo, aux, cap):
     return combo
 
 
+def _mode_score(mol, contacts):
+    """Return a binding mode's sort key: contact count, then strength, acceptor basicity and bifurcated clamps."""
+    accs = defaultdict(int)
+    for c in contacts:
+        accs[_acc_key(c)] += 1
+    return (
+        len(contacts),  # most contacts (best grip)
+        sum(_STRENGTH.get(_kind(c), 0) for c in contacts),  # then strongest contact types
+        sum(_acceptor_quality(mol, _acc_key(c)) for c in contacts),  # then each H-bond onto a basic acceptor
+        sum(1 for v in accs.values() if v > 1),  # then bifurcated clamps
+    )
+
+
+def _mode_label(mol, contacts):
+    """Name a binding mode by its contacts, grouped by acceptor, as ``kinds:donors->acceptor`` parts."""
+    groups = defaultdict(list)
+    for c in contacts:
+        groups[_acc_key(c)].append(c)
+    parts = []
+    for ak, gs in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        ks = "/".join(sorted({_kind(c) for c in gs}))
+        donors = ",".join(atom_label(mol, c.near) for c in gs)
+        acc = f"ring{ak[1]}" if ak[0] == "ring" else atom_label(mol, ak[1])
+        parts.append(f"{ks}:{donors}->{acc}")
+    return " + ".join(parts)
+
+
 def auto_binding_modes(mol, kinds=_AUTO_KINDS, inter_fragment=True, acceptor_cap=2, max_modes=8, seed=0xC0FFEE):
     """Enumerate cooperative binding modes, each a maximal combination of compatible contacts.
 
@@ -370,14 +387,8 @@ def auto_binding_modes(mol, kinds=_AUTO_KINDS, inter_fragment=True, acceptor_cap
     auxiliary is its own weak mode. Returns the top `max_modes`, ranked by contact count then strength, as
     ``{mode_label: Contact}``; drive with ``embed(contacts='auto')`` or pass one to ``embed(contacts=)``.
     """
-    from collections import OrderedDict, defaultdict
-
     # Bootstraps a rough conformer itself if `mol` has none, so SMILES input works.
     cands = candidate_contacts(mol, kinds=kinds, inter_fragment=inter_fragment, seed=seed)
-
-    def sym(x):
-        return mol.GetAtomWithIdx(int(x)).GetSymbol()
-
     anchors = [c for c in cands.values() if _kind(c) in _ANCHOR_KINDS]
     aux = sorted(
         (c for c in cands.values() if _kind(c) not in _ANCHOR_KINDS), key=lambda c: -_STRENGTH.get(_kind(c), 0)
@@ -391,35 +402,12 @@ def auto_binding_modes(mol, kinds=_AUTO_KINDS, inter_fragment=True, acceptor_cap
     skeletons = [r for sk in skeletons for r in _resolve_reciprocal(sk, dh)]  # 2-cycle -> two 1-way modes
     augment = bool(anchors)  # anchor combos get aux riders; weak-only don't
 
-    def score(sk):
-        accs = defaultdict(int)
-        for c in sk:
-            accs[_acc_key(c)] += 1
-        return (
-            len(sk),  # most contacts (best grip)
-            sum(_STRENGTH.get(_kind(c), 0) for c in sk),  # then strongest contact types
-            sum(_acceptor_quality(mol, _acc_key(c)) for c in sk),  # then each H-bond onto a basic acceptor
-            sum(1 for v in accs.values() if v > 1),
-        )  # then bifurcated clamps
-
     seen, ranked = set(), []
-    for sk in sorted(skeletons, key=score, reverse=True):
+    for sk in sorted(skeletons, key=partial(_mode_score, mol), reverse=True):
         key = frozenset(id(c) for c in sk)
         if sk and key not in seen:
             seen.add(key)
             ranked.append(sk)
-
-    def label(cs):
-        groups = defaultdict(list)  # group by acceptor for a readable compound tag
-        for c in cs:
-            groups[_acc_key(c)].append(c)
-        parts = []
-        for ak, gs in sorted(groups.items(), key=lambda kv: str(kv[0])):
-            ks = "/".join(sorted({_kind(c) for c in gs}))
-            donors = ",".join(f"{sym(c.near)}{c.near}" for c in gs)
-            acc = f"ring{ak[1]}" if ak[0] == "ring" else f"{sym(ak[1])}{ak[1]}"
-            parts.append(f"{ks}:{donors}->{acc}")
-        return " + ".join(parts)
 
     modes = OrderedDict()
     for sk in ranked[:max_modes]:
@@ -428,12 +416,12 @@ def auto_binding_modes(mol, kinds=_AUTO_KINDS, inter_fragment=True, acceptor_cap
         for c in combo:
             m.distances.update(c.distances)
             m.angles.update(c.angles)
-        m.label = label(combo)
+        m.label = _mode_label(mol, combo)
         modes[m.label] = m
     return modes
 
 
-def _atom_contacts(work, an, pos, frag, sym, seen, inter_fragment, kind):
+def _atom_contacts(work, an, pos, frag, seen, inter_fragment, kind):
     """Build atom-pair contacts (HB / sigma-hole / ionic) from xyzgraph donor->acceptor pairs.
 
     Each pair gives a distance and, for a directional kind, the linear orientation angle.
@@ -466,7 +454,7 @@ def _atom_contacts(work, an, pos, frag, sym, seen, inter_fragment, kind):
         if anchor is None or (eff.name, anchor, b) in seen:
             continue
         seen.add((eff.name, anchor, b))
-        label = f"{eff.name}:{sym(a)}{a}->{sym(b)}{b}"
+        label = f"{eff.name}:{atom_label(work, a)}->{atom_label(work, b)}"
         angles = {}
         if eff.orient:  # hold the contact linear, not just close
             apex = a if eff.apex == "donor" else _sigma_apex(work, a, b, pos) if eff.apex == "sigma" else None
@@ -478,7 +466,7 @@ def _atom_contacts(work, an, pos, frag, sym, seen, inter_fragment, kind):
     return out
 
 
-def _ring_contacts(work, an, pos, frag, sym, seen, inter_fragment, kind):
+def _ring_contacts(work, an, pos, frag, seen, inter_fragment, kind):
     """Build atom-over-ring contacts (CH-pi / cation-pi / ...) as per-ring-atom distances.
 
     The distances place the atom over the centroid: the geometry itself orients it, so no separate angle.
@@ -492,13 +480,13 @@ def _ring_contacts(work, an, pos, frag, sym, seen, inter_fragment, kind):
         if (kind.name, atom, ring) in seen:
             continue
         seen.add((kind.name, atom, ring))
-        label = f"{kind.name}:{sym(atom)}{atom}->ring{ring[0]}"
+        label = f"{kind.name}:{atom_label(work, atom)}->ring{ring[0]}"
         dists = {(i, j): (lo, hi) for i, j, lo, hi in _atom_over_ring(pos, atom, ring, kind.window)}
         out[label] = Contact(distances=dists, label=label, near=atom, far=ring)
     return out
 
 
-def _metal_hydride_contacts(work, an, pos, frag, sym, seen, inter_fragment, kind):
+def _metal_hydride_contacts(work, an, pos, frag, seen, inter_fragment, kind):
     """Build terminal metal-hydride (M-H) H-bond donor contacts, one per hydride to its nearest acceptor.
 
     Nearest N/O/F acceptor in another fragment (so a substrate with many heteroatoms doesn't spawn a
@@ -526,7 +514,7 @@ def _metal_hydride_contacts(work, an, pos, frag, sym, seen, inter_fragment, kind
         if not accs:
             continue
         ai = min(accs, key=lambda x: float(np.linalg.norm(pos[h] - pos[x])))  # nearest acceptor only
-        label = f"{kind.name}:{sym(metal)}{metal}H{h}->{sym(ai)}{ai}"
+        label = f"{kind.name}:{atom_label(work, metal)}H{h}->{atom_label(work, ai)}"
         out[label] = Contact(
             distances={(min(h, ai), max(h, ai)): kind.window},
             angles={(metal, h, ai): kind.orient},

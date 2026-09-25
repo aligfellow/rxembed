@@ -1,83 +1,26 @@
-"""Metal-complex coordination primitives: the surrogate, the sphere perception helpers, the shape holds.
+"""Metal-complex coordination primitives: the metal state records, the surrogate and the ligand graph.
 
 The metal is held purely by distance and angle constraints, its bonds removed, and embedded or relaxed with a
 UFF-typeable surrogate atom in its place, so the whole path is plain RDKit and UFF with no xtb.
-`repair_bond_stereo` lives here too, being the Mol->Mol cleanup that same bond surgery needs.
 """
 
 from __future__ import annotations
 
-import itertools
 import logging
-from functools import lru_cache
 from typing import NamedTuple
 
 import numpy as np
 from rdkit import Chem, rdBase
-from rdkit.Chem import rdDistGeom
 from rdkit.Geometry import Point3D
 
-from .metal_polyhedron import (
-    POLYHEDRA,
-    SLOT_BOND_PROP,
-    best_fit_residual,
-    fit_residual,
-    geometries_for_cn,
-    resolve_geometry,
-)
-from .metal_polyhedron import describe as _describe
+from .metal_polyhedron import SLOT_BOND_PROP
 from .utils import bond_removal_mirrors, flat_ranks, remove_bond, repair_bond_stereo
 
 logger = logging.getLogger("rxembed.metal")  # spelled out, not __name__ ("rxembed.metal_core"): this is
 #   the name `set_verbose` configures and every caplog filter in the suite matches.
 
-# The d-block proper: Sc-Zn, Y-Cd, La, Lu, Hf-Hg. A chemistry set, not the centre predicate. It names the
-# elements the tmQM-fitted tables were trained on (exactly the keys of `metal_distance._METAL_GROUP`), which
-# is why La and Lu are in it and Ce-Yb are not. "Is this atom a coordination centre" is `COORDINATION_METALS`
-# below; every reader that asked the centre question through this name (`metal_distance`, `metal_enumeration`,
-# `metal_smiles`, `pipeline/nci`, `pipeline/ensemble`) now reads that one instead, so no module in `src/`
-# reads this set. It states what the fit covers, and the suite reads it to find the metal in a d-block input.
-TRANSITION_METALS = {
-    21,
-    22,
-    23,
-    24,
-    25,
-    26,
-    27,
-    28,
-    29,
-    30,
-    39,
-    40,
-    41,
-    42,
-    43,
-    44,
-    45,
-    46,
-    47,
-    48,
-    57,
-    71,
-    72,
-    73,
-    74,
-    75,
-    76,
-    77,
-    78,
-    79,
-    80,
-}
-# Any coordination centre, f-block included: the question is meaningful wherever ligands coordinate, and
-# M-L bonds are dative, so a clash gate must exclude them or a metal reads as clashing with its own sphere.
-#
-# One question, one set. Every gate acting on "there is a metal here" reads this one, or two of them disagree
-# about the same atom: `embed._check_bare_mol` refused an un-surrogated centre on the narrow d-block set while
-# `relax.bonding_ok` exempted it from the clash gate on this one, so a lanthanide walked past the guard and
-# then lost the gate that would have caught the result (measured: `[Ce](Cl)(Cl)Cl` embedded, RDKit printing
-# "UFFTYPER: Unrecognized atom type: Ce2+3", while `[Fe](Cl)(Cl)Cl` was correctly refused).
+# Any coordination centre, f-block included, because M-L bonds are dative wherever ligands coordinate. Every
+# gate that asks whether an atom is a metal reads this one set, so no two gates can disagree about a centre.
 COORDINATION_METALS = (
     frozenset(range(21, 31)) | frozenset(range(39, 49)) | frozenset(range(57, 81)) | frozenset(range(89, 113))
 )
@@ -91,6 +34,7 @@ _SURROGATE_SANITIZE = (
     ^ Chem.SanitizeFlags.SANITIZE_FINDRADICALS
 )
 VACANT = -1  # materialized empty vertex; immutable MetalState stores it as None
+EPS_LEN = 1e-9  # a donor sitting on the metal has no direction, so the sphere cannot be read at all
 
 
 class HapticSite(NamedTuple):
@@ -151,7 +95,7 @@ def materialized_states(mol, centres):
 def materialized_state(iso, state):
     """Return transient vertices, haptic faces, windings and donors for one state."""
     centres = tuple(state if current.atom == state.atom else current for current in iso.centres)
-    return materialized_states(iso._graph, centres)[state.atom]
+    return materialized_states(iso.graph, centres)[state.atom]
 
 
 def state_with_winding(state, vertices, winding):
@@ -163,12 +107,12 @@ def state_with_winding(state, vertices, winding):
     return state._replace(vertices=sites)
 
 
-def _frag_map(mol):
+def frag_map(mol):
     """Map each atom index -> its fragment id (same ligand = same fragment)."""
     return {a: fi for fi, f in enumerate(Chem.GetMolFrags(mol)) for a in f}
 
 
-def _vertex_atom(haptic, v):
+def vertex_atom(haptic, v):
     """Resolve a coordination vertex to a representative real atom; a centroid dummy maps through its ring.
 
     Every vertex-keyed enumeration lookup must go through here. A centroid dummy is bond-less, so it carries
@@ -229,19 +173,16 @@ def _retag(mol, hands, ambiguous):
     """Re-apply each stripped donor's tetrahedral tag, in the bond order the strip left behind.
 
     `ambiguous` names the donors whose carried symbol does not determine a hand; there the geometry decides.
+
+    Runs last: the lenient sanitize drops a tag off any donor it types non-SP3, and
+    `repair_bond_stereo`'s 3D stereo assignment wipes one it then refuses to re-derive below degree 4.
+
+    `remove_bond` already re-based every tag in `hands` when it took the M-L bond out, wherever the incoming
+    basis was known. A DATIVE M-L bond at an odd slot is the one case it is not: RDKit's 3D writer leaves
+    that bond out of the basis while its SMILES parser counts it, so the two bases name opposite hands and
+    nothing in the graph says which was meant. Only a conformer can settle it, so an ambiguous donor is
+    resolved here, from the geometry, rather than guessed for every donor.
     """
-    # Needed at all because the lenient sanitize drops a tag off any donor it types non-SP3, and
-    # `repair_bond_stereo`'s AssignStereochemistryFrom3D wipes one it then refuses to re-derive below degree
-    # 4. So the caller runs this last.
-    #
-    # `remove_bond` re-based every tag in `hands` as it took the M-L bond out, which is the whole answer
-    # wherever the incoming basis was known. It is not known for a DATIVE M-L bond at an odd slot, and only
-    # there: RDKit's 3D writer leaves that bond out of the basis and its SMILES parser counts it, so the two
-    # bases name opposite hands and the graph does not record which was used. `utils.assign_stereo_from_3d`
-    # settles it for every tag rxembed writes, but RDKit's own molblock reader writes tags too, so a Mol can
-    # arrive already mis-based and no predicate over the graph can tell. A conformer can. Consulting it HERE
-    # and only here costs the caller a declared hand at that one shape instead of at every donor, which is
-    # what the previous unconditional measure did, silently and with no log line.
     for d, carried in hands.items():
         atom = mol.GetAtomWithIdx(d)
         if carried == Chem.ChiralType.CHI_UNSPECIFIED or atom.GetDegree() < _MIN_STEREO_NEIGHBOURS:
@@ -266,14 +207,14 @@ def _basis_is_ambiguous(mol, donor, metal) -> bool:
 
 def surrogate_metal(mol):
     """Remove metal-donor bonds and swap the metal to a UFF surrogate. Returns (mol, metal, donors, real_Z, real_q)."""
-    mol = _canonical_metal_graph(mol)
+    mol = canonical_metal_graph(mol)
     m = metal_index(mol)
     if m is None:
         raise ValueError("no metal centre found")
     donors = [n.GetIdx() for n in mol.GetAtomWithIdx(m).GetNeighbors()]
     em = Chem.RWMol(mol)
     hands = {}  # donor -> the tag it must carry in the bond order the strip leaves behind
-    ambiguous = {d for d in donors if _basis_is_ambiguous(em, d, m)}  # read BEFORE the bond goes
+    ambiguous = {d for d in donors if _basis_is_ambiguous(em, d, m)}  # read before the bond goes
     for d in donors:
         remove_bond(em, d, m)  # re-bases the tag: an M-L bond at an odd slot mirrors the symbol it leaves
         a = em.GetAtomWithIdx(d)
@@ -336,10 +277,9 @@ def connect_metal(mol, donor_bonds):
     out = rw.GetMol()
     out.ClearComputedProps()  # AddBond preserves cached path matrices from the disconnected graph.
     out.UpdatePropertyCache(strict=False)  # recompute implicit valence (never raises, never moves a formal charge)
-    Chem.FastFindRings(
-        out
-    )  # the dative bonds close chelate rings through the metal, so re-perceive rings or the dedup SMARTS and the
+    # the dative bonds close chelate rings through the metal, so re-perceive rings or the dedup SMARTS and the
     # geometry gate read the wrong ones
+    Chem.FastFindRings(out)
     return out
 
 
@@ -348,6 +288,10 @@ def disconnect_metal(mol):
 
     Constraints own the M-L geometry during DG and UFF, independently of native bonded-metal terms.
     Public coordination bonds are restored after relaxation by `connect_metal`.
+
+    Only dative bonds go: a covalent M-X bond is a real backbone path, so DG topology (`DGContext.topo`)
+    keeps it. `ligand_graph` strips every metal bond, dative or covalent, because it needs ligands read as
+    separate fragments regardless of bond type.
     """
     dative = [
         (b.GetBeginAtomIdx(), b.GetEndAtomIdx())
@@ -378,7 +322,7 @@ def metal_indices(mol):
     return [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS]
 
 
-def _ligand_graph(mol, metals=None):
+def ligand_graph(mol, metals=None):
     """Return the metal-stripped ligand graph: index-stable, so callers reuse `mol`'s atom indices.
 
     The one strip every consumer routes through: `remove_bond` mirrors a chiral tag when removing a bond
@@ -398,29 +342,44 @@ def _ligand_graph(mol, metals=None):
     return out
 
 
-def _ligand_distance_matrix(mol):
+def ligand_distance_matrix(mol):
     """Return graph distances after removing coordination-centre edges."""
     if not metal_indices(mol):
         return Chem.GetDistanceMatrix(mol)
-    return Chem.GetDistanceMatrix(_ligand_graph(mol))
+    return Chem.GetDistanceMatrix(ligand_graph(mol))
 
 
-_ETA2 = 2
+ETA2 = 2  # atoms in the smallest haptic face, an eta2 bond
 
 
-def _haptic_sites(mol, donors, *, pairs=True):
+def _face_joined(mol, a, b, pi, dset, pairs):
+    """Return whether two bonded donors share one site: both on a pi face, or an isolated pair (see `haptic_sites`)."""
+    if a in pi and b in pi:
+        return True
+    if pairs:
+        return all(sum(nb.GetIdx() in dset for nb in mol.GetAtomWithIdx(i).GetNeighbors()) == 1 for i in (a, b))
+    return all(
+        mol.GetAtomWithIdx(i).GetTotalNumHs() == 0
+        and all(
+            neighbor.GetIdx() in {a, b} or neighbor.GetAtomicNum() in COORDINATION_METALS
+            for neighbor in mol.GetAtomWithIdx(i).GetNeighbors()
+        )
+        for i in (a, b)
+    )
+
+
+def haptic_sites(mol, donors, *, pairs=True):
     """Group `donors` into sigma sites and connected pi faces.
 
     A lone sigma donor is its own 1-tuple. A face starts at a donor-donor multiple or aromatic bond and
     extends across adjacent charged or radical donor endpoints; bonds between face atoms then join a diene,
-    allyl, Cp, or arene into one site. A bonded donor pair with no third donor neighbour on either end (a
-    donor-subgraph component of exactly two) is also one site regardless of its perceived Lewis bond order
-    (`pairs=True`, the default): a metallaoxirane's C-O, a kappa2-hydrazide's N-N. A component of three or
-    more donors (ZUDWUQ's encircling As6 ring) keeps the pi-seeded rule instead, so a sigma-only macrocycle
-    stays one sigma site per atom. `pairs=False` keeps only the old isolated-diatomic clause (no hydrogens,
-    no other ligand neighbour), for the two Lewis-bookkeeping callers (`_canonical_metal_graph`'s donor-charge
-    count, `xyz2mol_tmc.lig_checks`'s pairless-sigma-donor count) that must not let site grouping change a
-    reader's bond-order or charge decision.
+    allyl, Cp, or arene into one site. A bonded pair of donors with no third donor neighbour on either end is
+    also one site regardless of its perceived Lewis bond order (`pairs=True`, the default): a metallaoxirane's
+    C-O, a kappa2-hydrazide's N-N. A ring of three or more donors keeps the pi-seeded rule instead, so a
+    sigma-only macrocycle stays one sigma site per atom. `pairs=False` keeps only the isolated-diatomic clause
+    (no hydrogens, no other ligand neighbour), for the two Lewis-bookkeeping callers (`canonical_metal_graph`'s
+    donor-charge count, `xyz2mol_tmc.lig_checks`'s pairless-sigma-donor count) that must not let site grouping
+    change a reader's bond-order or charge decision.
     """
     dset = set(donors)
     pi = set()
@@ -449,21 +408,6 @@ def _haptic_sites(mol, donors, *, pairs=True):
         if not extended:
             break
         pi.update(extended)
-
-    def joined(a, b):
-        if a in pi and b in pi:
-            return True
-        if pairs:
-            return all(sum(nb.GetIdx() in dset for nb in mol.GetAtomWithIdx(i).GetNeighbors()) == 1 for i in (a, b))
-        return all(
-            mol.GetAtomWithIdx(i).GetTotalNumHs() == 0
-            and all(
-                neighbor.GetIdx() in {a, b} or neighbor.GetAtomicNum() in COORDINATION_METALS
-                for neighbor in mol.GetAtomWithIdx(i).GetNeighbors()
-            )
-            for i in (a, b)
-        )
-
     seen, sites = set(), []
     for d in sorted(dset):
         if d in seen:
@@ -478,25 +422,13 @@ def _haptic_sites(mol, donors, *, pairs=True):
             stack += [
                 nb.GetIdx()
                 for nb in mol.GetAtomWithIdx(a).GetNeighbors()
-                if nb.GetIdx() in dset and joined(a, nb.GetIdx())
+                if nb.GetIdx() in dset and _face_joined(mol, a, nb.GetIdx(), pi, dset, pairs)
             ]
         sites.append(tuple(sorted(group)))
     return sorted(sites)
 
 
-def _regular_face(mol, site):
-    """Return True if `site`'s own bond graph is regular: every face atom has the same face-neighbour count.
-
-    Regularity is what makes one shared centroid radius true, so it is the rigidity test. Degree 1 is an edge
-    (eta2), degree 2 a cycle (Cp/arene), while an open allyl is irregular and its centroid sits nearer the
-    inner atoms. One rule for every hapticity: a bond is the smallest rigid face, so eta2 needs no special case.
-    """
-    face = set(site)
-    deg = {sum(1 for nb in mol.GetAtomWithIdx(a).GetNeighbors() if nb.GetIdx() in face) for a in face}
-    return len(deg) == 1
-
-
-def _collapse_haptic(mol, donors):
+def collapse_haptic(mol, donors):
     """Collapse each haptic face to one centroid vertex; sigma donors pass through.
 
     Appends a bond-less carbon centroid per face, leaving existing indices unchanged, seated at the ring
@@ -505,7 +437,7 @@ def _collapse_haptic(mol, donors):
     before storing the real `Isomer`, and only `bounds.seed_coordinates` / `restrained_uff` re-materialise it.
     A mol with no haptic face is returned untouched.
     """
-    sites = _haptic_sites(mol, donors)
+    sites = haptic_sites(mol, donors)
     faces = [s for s in sites if len(s) > 1]  # a face is any mutually-bonded donor group, eta2 included
     vertices = [d for site in sites if len(site) == 1 for d in site]
     if not faces:
@@ -636,19 +568,20 @@ def _canonicalise_delocalised_charge(mol):
     return rw.GetMol()
 
 
-def _canonical_metal_graph(mol):
+def canonical_metal_graph(mol):
     """Return a copy with every M-L bond in the canonical ionic donor-to-metal form.
 
-    Stated total charge, charge magnitude, and non-resonant charges remain authoritative. Only the atom carrying
-    a delocalised aromatic -1 is canonicalized as a representation convention. Neutral underfilled sigma donors
-    receive the integral charge implied by their ligand-side valence, balanced on the adjacent metal. A neutral
-    bridge cannot say which metal owns that balance and therefore requires explicit charges. Every donor and
-    metal formal charge this rewrites is logged at debug level with its atom and old and new charge.
+    Stated total charge, charge magnitude and non-resonant charges stay authoritative. The only charge this
+    moves is a delocalised aromatic -1, canonicalized onto one ring atom as a representation convention.
+    A neutral underfilled sigma donor gets the integral charge its ligand-side valence implies, balanced on
+    the adjacent metal; a neutral bridge cannot say which metal owns that balance, so it needs an explicit
+    charge instead. Every charge this rewrites is logged at debug level with the atom and its old and new
+    value.
 
-    Every metal graph, however it entered (an XYZ read, a parsed SMILES, or rxembed's own ligand-bond
-    restore after a swap), is canonicalized here before its donors are used. A bridgehead M-X bond with no
-    donor orbital of its own (an xyzgraph reader fault) is a separate, connectivity-only problem the XYZ
-    reader corrects before this runs; see `pipeline.perceive._prune_donorless_bridgeheads`.
+    Runs before any donor is read, on every metal graph however it arrived (an XYZ read, a parsed SMILES, or
+    rxembed's own bond restore after a swap). A bridgehead M-X bond with no donor orbital of its own is a
+    separate, connectivity-only fault the XYZ reader fixes first; see
+    `pipeline.perceive._prune_donorless_bridgeheads`.
     """
     rw = Chem.RWMol(mol)
     rw.UpdatePropertyCache(strict=False)
@@ -656,14 +589,14 @@ def _canonical_metal_graph(mol):
     haptic = {
         donor
         for metal in metals
-        for site in _haptic_sites(
+        for site in haptic_sites(
             rw,
             [
                 neighbor.GetIdx()
                 for neighbor in rw.GetAtomWithIdx(metal).GetNeighbors()
                 if neighbor.GetIdx() not in metals
             ],
-            pairs=False,  # Lewis bookkeeping (donor charge balancing): read only the old pi-seeded face rule.
+            pairs=False,  # Lewis bookkeeping (donor charge balancing): read only the pi-seeded face rule.
         )
         if len(site) > 1
         for donor in site
@@ -781,70 +714,7 @@ def strip_phantoms(mol, phantoms):
     return out
 
 
-def _bounds_matrix(mol, params=None, *, set14bounds=True):
-    """Build RDKit bounds without leaking its internal UFF-typing diagnostics for likely noisy graphs."""
-    noisy = any(atom.GetFormalCharge() or atom.GetAtomicNum() in COORDINATION_METALS for atom in mol.GetAtoms())
-    options = {} if params is None else {"embedParams": params}
-    if noisy:
-        with rdBase.BlockLogs():
-            return rdDistGeom.GetMoleculeBoundsMatrix(mol, set14bounds=set14bounds, **options)
-    return rdDistGeom.GetMoleculeBoundsMatrix(mol, set14bounds=set14bounds, **options)
-
-
-def _site_radius(mol, site, *, positions=None):
-    """Return the root-mean-square distance of haptic members from their centroid.
-
-    The identity ``R^2 = sum(i<j, d_ij^2)/n^2`` holds for any point set, including irregular faces.
-    Without explicit positions, RDKit's pair-bound midpoints estimate those distances. They need not jointly
-    describe a realizable point set. The caller owns length provenance; a conformer on `mol` is not authority
-    to measure it. A two-atom eta2 site reduces to half the edge.
-    """
-    if positions is not None:
-        pos = np.asarray(positions)[list(site)]
-        return float(np.sqrt(np.mean(np.sum((pos - pos.mean(0)) ** 2, axis=1))))
-
-    bm = _bounds_matrix(mol)
-    tot = sum(
-        (0.5 * (bm[max(a, b)][min(a, b)] + bm[min(a, b)][max(a, b)])) ** 2 for a, b in itertools.combinations(site, 2)
-    )
-    return float(np.sqrt(tot)) / len(site)
-
-
-def _site_span(matrix, left, right):
-    """Return the (lower, upper) centroid-to-centroid distance between two donor sites.
-
-    ``|cA - cB|^2 = mean cross d^2 - R_A^2 - R_B^2`` holds for any two point sets (`_site_radius`'s same
-    identity, one radius per site): the lower distance bound pairs the cross term's lower bound with each
-    site's own upper-bound radius, and the upper bound pairs the reverse. A one-atom site has zero radius,
-    so a sigma donor pair reduces to `matrix`'s own cell, unchanged by this.
-    """
-
-    def lo(a, b):
-        return 0.0 if a == b else float(matrix[max(a, b)][min(a, b)])
-
-    def hi(a, b):
-        return 0.0 if a == b else float(matrix[min(a, b)][max(a, b)])
-
-    def radius_sq(site, bound):
-        return sum(bound(a, b) ** 2 for a, b in itertools.combinations(site, 2)) / len(site) ** 2
-
-    cross_lo = sum(lo(a, b) ** 2 for a in left for b in right) / (len(left) * len(right))
-    cross_hi = sum(hi(a, b) ** 2 for a in left for b in right) / (len(left) * len(right))
-    radius_hi = radius_sq(left, hi) + radius_sq(right, hi)
-    radius_lo = radius_sq(left, lo) + radius_sq(right, lo)
-    return float(np.sqrt(max(0.0, cross_lo - radius_hi))), float(np.sqrt(max(0.0, cross_hi - radius_lo)))
-
-
-def _site_height(radius, member_lengths):
-    """Estimate centroid distance using ``|M-c|^2 = mean(|M-member|^2) - R^2``.
-
-    Retain the existing 0.5 A scaffold floor; it is not a feasibility proof for fitted member distances.
-    """
-    mean_squared_length = float(np.mean(np.square(member_lengths)))
-    return float(np.sqrt(max(mean_squared_length - radius * radius, 0.25)))
-
-
-def _reject_metal_bonds(mol):
+def reject_metal_bonds(mol):
     """Reject direct metal-metal bonds until their bond type can be restored losslessly."""
     metals = set(metal_indices(mol))
     direct = [
@@ -858,7 +728,7 @@ def _reject_metal_bonds(mol):
         )
 
 
-def _reject_boron_cages(mol):
+def reject_boron_cages(mol):
     """Reject a period-2 atom bonded past its octet, the multi-centre cage case.
 
     A period-2 atom with fewer than four valence electrons (Li, Be, B) fills its octet in four two-centre
@@ -888,17 +758,17 @@ def surrogate_all_metals(mol):
     Returns ``(mol, metals)`` where ``metals`` is ``[(idx, real_z, real_q), ...]``, the element and formal
     charge `restore_metal` needs. Sanitised leniently, since a stripped η⁵-Cp is a radical fragment.
     """
-    mol = _canonical_metal_graph(mol)
+    mol = canonical_metal_graph(mol)
     idxs = metal_indices(mol)
     if not idxs:
         raise ValueError("no metal centre found")
-    _reject_metal_bonds(mol)
+    reject_metal_bonds(mol)
     em = Chem.RWMol(mol)
     metals, hands, ambiguous = [], {}, set()
     for m in idxs:
         metals.append((m, em.GetAtomWithIdx(m).GetAtomicNum(), em.GetAtomWithIdx(m).GetFormalCharge()))
         for d in [n.GetIdx() for n in em.GetAtomWithIdx(m).GetNeighbors()]:
-            if _basis_is_ambiguous(em, d, m):  # read BEFORE the bond goes, as in `surrogate_metal`
+            if _basis_is_ambiguous(em, d, m):  # read before the bond goes, as in `surrogate_metal`
                 ambiguous.add(d)
             remove_bond(em, d, m)  # as in `surrogate_metal`; a bridging donor's two strips compose here
             a = em.GetAtomWithIdx(d)
@@ -917,238 +787,3 @@ def surrogate_all_metals(mol):
     repair_bond_stereo(out)
     _retag(out, hands, ambiguous)
     return out, metals
-
-
-_APICAL_MIN = 3  # a face of this many atoms caps a face (a piano stool); an eta2 alkene fills one ordinary
-#   in-plane site. Site occupancy, not geometry: it steers the default-polyhedron guess, never the embed.
-
-
-_EPS_LEN = 1e-9  # a donor sitting on the metal has no direction, so the sphere cannot be read at all
-_FIT_FLOOR = (
-    0.45  # Procrustes residual above which no record really fits. `classify_geometry` is an unconditional argmin
-)
-# and the acceptance gate compares it with the request, not itself; the argmin is still returned even above
-# this floor, it is a name, not a reading. Sized on 45 corpus centres (median 0.069, 90th 0.30), clearing the
-# real band by ~50%.
-_FIT_MARGIN = 0.01  # the resolution of a reading: within it two shapes tie, for the input, the acceptance
-# gate (`shape_reading`, rule B) and `observed_only`. Below this a near-tie input's output ties the same way
-# at every seed instead of a seed lottery (measured on VALRAE, TILFAW).
-COPLANAR_TOL = (
-    0.25  # Å RMS out-of-plane of {metal + vertices} above which a sphere is not planar. One constant for two jobs,
-)
-# the accept gate on a declared-`planar` record and the `classify_geometry` exclusion. The price: an
-# absolute RMS means a shallow real pyramid (M[N(SiMe3)2]3) reads `trigonal_planar`.
-
-
-def _plane_rms(metal_pos, verts):
-    """Return the RMS distance of {metal + coordination vertices} from their best-fit plane (Å).
-
-    Fewer than 4 points define a plane exactly, so they score 0: trivially coplanar.
-    """
-    pts = np.array([metal_pos, *verts])
-    if len(pts) < 4:  # noqa: PLR2004  a plane needs >=3 points; <4 total is trivially coplanar
-        return 0.0
-    dev = (pts - pts.mean(0)) @ np.linalg.svd(pts - pts.mean(0))[2][2]  # signed distance from best-fit plane
-    return float(np.sqrt(np.mean(dev**2)))
-
-
-@lru_cache(maxsize=None)
-def _ideal_plane_rms(p, r):
-    """Return the out-of-plane RMS the record's own ideal sphere measures at M-L bond length `r` (Å).
-
-    Pure in `(p, r)` (a fixed `Polyhedron` record, hashable, and a bond length), so memoised: a `classify_geometry`
-    call repeated at the same witness radius -- routine while a gap-rule sweep holds `radius` fixed and re-probes
-    every same-CN record -- costs one lookup per record instead of a fresh SVD.
-    """
-    return _plane_rms(np.zeros(3), [r * np.array(d, float) / np.linalg.norm(d) for d in p.vertex_dirs])
-
-
-def _too_flat_for(p, rms, r):
-    """Return True if an out-of-plane RMS of `rms` at bond length `r` rules the non-planar record `p` out.
-
-    The bound is the QA tolerance or the record's own ideal, whichever is smaller, so a record can never be
-    excluded by a sphere that is that record at any bond length. An ideal sphere lands exactly on its bound
-    and a float round-trip moves it by ~1e-17, hence the closeness guard rather than a bare ``<``.
-    """
-    bound = min(COPLANAR_TOL, _ideal_plane_rms(p, r))
-    return rms < bound and not np.isclose(rms, bound)
-
-
-def _read_sphere(mol, metal, sites, cid=-1):
-    """Return `(obs, rms, r)`: unit rays, coplanarity RMS and mean bond length for `sites` at `metal`.
-
-    ``sites`` are coordination sites, not atoms: a haptic face is one vertex via its centroid. Returns
-    ``None`` when there are no sites, or a site sits on the metal with no defined direction.
-    """
-    pos = mol.GetConformer(cid).GetPositions()
-    points = []
-    for site in sites:
-        atoms = [site] if isinstance(site, (int, np.integer)) else list(site)
-        points.append(np.mean([pos[a] for a in atoms], axis=0))
-    if not points:
-        return None
-    obs = np.array([p - pos[metal] for p in points], float)
-    if not np.all(np.linalg.norm(obs, axis=1) > _EPS_LEN):
-        return None
-    obs = obs / np.linalg.norm(obs, axis=1, keepdims=True)
-    rms = _plane_rms(pos[metal], points)
-    r = float(np.mean([np.linalg.norm(p - pos[metal]) for p in points]))
-    return obs, rms, r
-
-
-def rank_shapes(obs, rms, r, *, vacancy=None):
-    """Return every same-CN polyhedron's fit residual to `obs`, best first: ``[(residual, name), ...]``.
-
-    `obs`, `rms` and `r` are `_read_sphere`'s output, so a caller that already has them pays no repeat cost.
-    `vacancy` is ``(name, ideal_dirs)``: a requested polyhedron's own occupied-vertex-subset directions,
-    ranked under `name` alongside the genuine records at this coordination number, needed only when a vertex
-    is vacant and so `name` is absent from `POLYHEDRA` at this CN. Ties break by `POLYHEDRA` insertion order
-    (a stable sort).
-    """
-    same_cn = [(n, p) for n, p in POLYHEDRA.items() if p.cn == len(obs)]
-    kept = [(n, p) for n, p in same_cn if p.planar or not _too_flat_for(p, rms, r)]
-    if not kept:  # CN>=5 has no planar record, so a flat sphere there excludes everything: rank them all
-        kept = same_cn  # rather than name nothing (stable sort still breaks an exact tie)
-    ranked = [(fit_residual(obs, p), name) for name, p in kept]
-    if vacancy is not None:
-        name, ideal = vacancy
-        ideal = np.asarray(ideal, float)
-        ideal = ideal / np.linalg.norm(ideal, axis=1, keepdims=True)
-        ranked.append((best_fit_residual(obs, ideal), name))
-    return sorted(ranked, key=lambda t: t[0])
-
-
-def shape_reading(ranked, requested):
-    """Return ``(requested residual, next name, next residual, accepted)`` for `requested` in a ranking.
-
-    `ranked` is `rank_shapes`' sorted output. `next` is the best-reading polyhedron other than `requested`
-    (``None`` when there is none to compare against). `accepted` is rule B, the tie predicate the acceptance
-    gate, `observed_only` and the input reading all share: `requested` is accepted when it reads within
-    `_FIT_MARGIN` of the best reading, `ranked[0]`. Returns ``(None, None, None, False)`` if `requested` has
-    no entry in `ranked` at all (a different coordination number).
-    """
-    requested_err = next((err for err, name in ranked if name == requested), None)
-    if requested_err is None:
-        return None, None, None, False
-    best_err, best_name = ranked[0]
-    if best_name == requested:
-        next_err, next_name = ranked[1] if len(ranked) > 1 else (None, None)
-    else:
-        next_err, next_name = best_err, best_name
-    accepted = next_err is None or requested_err - best_err < _FIT_MARGIN
-    return requested_err, next_name, next_err, accepted
-
-
-def shape_gap(mol, metal, vertices, haptic, requested, cid=-1):
-    """Return `shape_reading` for `requested` at `metal`, reading `mol`'s conformer `cid`.
-
-    `vertices`/`haptic` are one centre's per-slot donor map, as `materialized_state` returns them; a vacant
-    slot (`VACANT`) is read against the occupied coordination number, ranked alongside `requested`'s own
-    occupied-vertex subset. Returns ``(None, None, None, True)``, a neutral read, when there is no conformer
-    or the sphere cannot be read at all (see `_read_sphere`).
-    """
-    if mol.GetNumConformers() == 0:
-        return None, None, None, True
-    occupied = [i for i, v in enumerate(vertices) if v != VACANT]
-    sites = [haptic.get(vertices[i], vertices[i]) for i in occupied]
-    sphere = _read_sphere(mol, metal, sites, cid)
-    if sphere is None:
-        return None, None, None, True
-    obs, rms, r = sphere
-    vacancy = None
-    if len(occupied) < len(vertices):
-        poly = POLYHEDRA.get(requested)
-        if poly is None:
-            return None, None, None, True
-        vacancy = (requested, [poly.vertex_dirs[i] for i in occupied])
-    return shape_reading(rank_shapes(obs, rms, r, vacancy=vacancy), requested)
-
-
-def classify_geometry(mol, metal, sites, cid=-1, *, warn=True):
-    """Name the coordination polytope by flatness exclusion and best orthogonal vertex fit.
-
-    Returns ``None`` only when no record has that vertex count. Returns the argmin and names the runner-up:
-    `rank_shapes` gives both residuals, and the acceptance gate accepts an output whose requested shape is
-    within `_FIT_MARGIN` of the best one (`shape_reading`). Warns above `_FIT_FLOOR`, where the name is the
-    nearest record rather than a reading of the sphere, and warns, naming the runner-up, when the two
-    residuals are within `_FIT_MARGIN`: always the argmin, never both, so a near-tie is reported, not
-    reclassified. Set ``warn=False`` for repeated internal validation.
-
-    Flatness excludes one way only: a flat sphere cannot be a record whose metal sits off its vertex plane,
-    but the converse says nothing, since an out-of-plane sphere is a distorted planar shape as readily as a
-    3-D one. This is what separates `trigonal_planar` from the CN3 pyramid, where an angle boundary would
-    have to be fitted and this has a natural zero.
-
-    The fit preserves vertex correspondence while allowing rotation, reflection and donor reordering.
-    `metal_polyhedron.fit_residual` owns the bounded-exact seating search and its high-CN approximation.
-    """
-    sphere = _read_sphere(mol, metal, sites, cid)
-    if sphere is None:
-        return None
-    obs, rms, r = sphere
-    ranked = rank_shapes(obs, rms, r)
-    if not ranked:
-        return None
-    best_err, best = ranked[0]
-    poor = best_err > _FIT_FLOOR  # no record fits; the argmin is still returned, but it is a name, not a reading
-    runner_err, runner_name = ranked[1] if len(ranked) > 1 else (None, None)
-    near_tie = runner_err is not None and runner_err - best_err < _FIT_MARGIN
-    runner = f"; next {_describe(runner_name)} {runner_err:.3f}" if runner_name is not None else ""
-    if poor and warn:
-        logger.warning(
-            "geometry: no shape fits; nearest %s (residual %.3f > %.2f). Pass geometry= to state it",
-            _describe(best),
-            best_err,
-            _FIT_FLOOR,
-        )
-    elif near_tie and warn:  # the argmin is kept either way; this only names the runner-up, per shape_reading
-        logger.warning(
-            "geometry: near-tie, kept %s over %s (%.3f vs %.3f)",
-            _describe(best),
-            _describe(runner_name),
-            best_err,
-            runner_err,
-        )
-    else:
-        logger.debug("geometry: %s residual %.3f%s", _describe(best), best_err, runner)
-    logger.debug(
-        "sphere: %s; coplanarity RMS %.3f A vs %.2f tol; M-L %.2f A",
-        "in-plane" if rms <= COPLANAR_TOL else "out-of-plane",
-        rms,
-        COPLANAR_TOL,
-        r,
-    )
-    return best
-
-
-def geometry_for(n_donors, has_apical=False):
-    """Default coordination polyhedron name for `n_donors`, or None.
-
-    An apical (eta>=3) face is an axial cone, so a CN4 carrying one is a piano stool, never the flat
-    `square_planar` the vertex count would pick, which would seat a ligand trans through the ring. Only CN4
-    flips. An eta2 face is not apical: it is an ordinary single-site vertex and keeps the default.
-    """
-    gs = geometries_for_cn(n_donors)  # best-default first
-    g = gs[0].name if gs else None
-    if has_apical and g == "square_planar":
-        return "tetrahedral"
-    return g
-
-
-def coplanar(pos, metal, donors, tol=COPLANAR_TOL, haptic=None):
-    """Return True if the metal and its coordination vertices lie in one plane.
-
-    The feasibility test for a declared planar record: a bite squeezing the in-plane angles is still planar,
-    but an arrangement that can only satisfy its ligands by twisting out of plane (an impossible trans-chelate)
-    is not. An eta>=3 face is one vertex, so `haptic` collapses each face to its centroid first; that
-    bookkeeping is all this adds over `_plane_rms`.
-    """
-    ring_atoms = {a for ring in (haptic or {}).values() for a in ring}
-    verts = [pos[d] for d in donors if d not in ring_atoms]  # each sigma/eta2 donor is its own vertex
-    verts += [np.mean([pos[a] for a in ring], axis=0) for ring in (haptic or {}).values()]  # each face -> centroid
-    return _plane_rms(pos[metal], verts) <= tol
-
-
-def n_sites(geometry):
-    """Return the number of coordination vertices the geometry has (name or 3-letter code)."""
-    return len(POLYHEDRA[resolve_geometry(geometry)].vertex_dirs)  # unknown geometry -> KeyError (deliberate)

@@ -20,6 +20,31 @@ optional dependencies are loaded only by the operation that needs them.
 `__init__.py` composes the public facade. `core.py` is the low-level engine facade. Implementation dependencies
 point from pipeline to core.
 
+## Layers
+
+A module imports only modules listed before it in its own row, or modules in rows above it. Imports sit at
+module top, except optional dependencies at their point of use.
+
+| layer | modules | owns |
+|---|---|---|
+| 0 base | `utils`, `constraints` | RDKit graph and geometry facts; the `Constraints` payload and its measurement |
+| 1 shapes | `metal_polyhedron` | polyhedron registry, symmetry, fits, slot notes |
+| 2 metal graph | `metal_core` | metal state records, surrogate surgery, ligand graph, charge canonicalisation |
+| 3 graph chemistry | `stereo`, `metal_distance` | organic stereo; the M-L length model |
+| 4 DG and force-field engine | `mechanisms`, `relax`, `bounds` | constraint-to-bounds and UFF terms; restrained UFF; RDKit bounds matrices, native ligand reach, seeding |
+| 5 metal models and perception | `metal_donor_orient`, `metal_perceive`, `metal_stereo`, `metal_slots` | donor fold model; reading a sphere from coordinates; canonical metal stereo; slot assignments |
+| 6 compile | `metal_constraints` | one metal state to `Constraints` |
+| 7 identity | `metal_isomer` | `Isomer`, `IsomerSet` |
+| 8 screen and enumeration | `metal_screen`, `metal_enumeration` | feasibility screen; candidate generation |
+| 9 strings | `metal_smiles` | dative SMILES and CXSMILES |
+| 10 orchestration | `embed` | seeding, acceptance and recovery (`Conformers`) |
+| 11 facade | `core` | low-level API |
+| 12 pipeline | `calculators`, `search`, `xyz2mol_local`, `xyz2mol_tmc`, `perceive`, `nci`, `select`, `viz`, `metrics`, `stereo_check`, `geom_check`, `ensemble`, `dispatch`, then `pipeline/__init__` and `rxembed/__init__` | workflow |
+
+The engine sits below the metal compile on purpose: `mechanisms`, `relax` and `bounds` read `Constraints` as
+data and know nothing about metal identity, while the compile and the screen use them as tools. Data still flows
+compile, then engine, then embed.
+
 ## Flow
 
 ```text
@@ -34,15 +59,18 @@ source
 ```
 
 `pipeline.dispatch` expands organic stereo, metal identities, vacant-site coordination, and automatic contacts
-into candidates. `_execute` is the only place a pipeline candidate enters core. Selected metal and
-`coordinate=` candidates must succeed. Expanded organic stereoisomers and automatic contact modes may warn and
-skip, but the call fails, with the last concrete cause, if none survive.
+into candidates. `_execute` is the only place a pipeline candidate enters core. When a call expands into two or
+more candidates, one that raises `EmbeddingError`, at seeding or at relaxation, is skipped with one warning
+line and kept in `EnsembleSet.errors`, and the result stays an `EnsembleSet`; the call raises only when none
+embeds. A lone candidate, such as one selected `Isomer`, raises its own error. Expanded organic stereoisomers
+and automatic contact modes also record any other `ValueError` or `RuntimeError` there, as an `EmbeddingError`
+naming the stereoisomer or mode.
 
 `embed.prepare` converts a `Mol` or selected `Isomer` plus `fix` and `constrain` into one `Constraints` value.
 `seed_conformers` edits RDKit's native ETKDG bounds matrix, embeds, grafts fixed coordinates, and filters raw
 coordination stereo. `Conformers` owns restrained relaxation, structural acceptance, and replacement;
 `Ensemble` adds workflow checks for connectivity, requested stereo, and donor hand. `embed.prepare_relax` and
-`pipeline.api.minimize` share that same preparation and graft for search-free restrained-UFF relaxation of
+`pipeline.dispatch.minimize` share that same preparation and graft for search-free restrained-UFF relaxation of
 existing coordinates.
 
 ## Rules
@@ -71,8 +99,8 @@ enumerated states share this compiler. Model M–L distances (`lengths='model'`)
 polyhedron and ligand graph in both modes.
 
 `metal_slots.py` reduces donor-slot assignments by proper rotations and ligand equivalence. `metal_enumeration.py`
-combines metal, ligand, and haptic stereo and owns feasibility screening: single-centre real-atom networks are
-screened against compiled constraints and native ligand reach, using RDKit's native 1-4 interval for
+combines metal, ligand, and haptic stereo, and `metal_screen.py` owns feasibility screening: single-centre
+real-atom networks are screened against compiled constraints and native ligand reach, using RDKit's native 1-4 interval for
 ring-closed paths and a torsion-independent upper envelope for free acyclic paths. Triangle contradictions and
 interval-certified Euclidean contradictions can reject a candidate; failed optimization and successful
 screening prove neither infeasibility nor feasibility. Virtual centroids are omitted from that joint screen,
@@ -120,8 +148,11 @@ individual donor-metal-donor windows bias that fit rather than acting as separat
 windows, donor orientation, coplanarity, and umbrella caps remain direct postconditions.
 
 Convergence and identity are kept separate. An unconverged endpoint or a restored seed may survive only if it
-passes the structural contract, and lands in `.unrelaxed` without a comparable energy. Exhausted mandatory
-identity requests raise instead of publishing a wrong state.
+passes the structural contract, lands in `.unrelaxed` without a comparable energy, and is reported by one
+warning. Exhausted mandatory identity requests raise `EmbeddingError` instead of publishing a wrong state.
+Every `Failure` is built by the check that finds it, in chemistry words, and grouped by `Failure.key` (kind and
+site). Retries log at DEBUG; an error is one sentence naming the isomer, the most common failure and one remedy,
+with the counts on `EmbeddingError.failures`.
 
 `pipeline.Ensemble` adds workflow stereo checks and, with the `workflow` extra, connectivity checks using quick
 perception and distance thresholds. `.check()` reports physical QA diagnostics and `.filter("geometry")`
@@ -148,11 +179,12 @@ extras.
 | `bounds.py`, `embed.py`, `relax.py` | ETKDG setup, orchestration, restrained UFF, and core acceptance |
 | `metal_core.py` | metal state, graph surgery, and coordination primitives |
 | `metal_isomer.py`, `metal_enumeration.py` | selected isomers, collections, and candidate enumeration |
+| `metal_screen.py` | feasibility screen of candidate arrangements against compiled constraints and ligand reach |
 | `metal_polyhedron.py`, `metal_slots.py`, `metal_stereo.py` | shape tables, reachable slot assignments, and canonical metal stereo |
 | `metal_constraints.py`, `metal_distance.py`, `metal_donor_orient.py` | compile selected metal states into geometry constraints |
-| `metal_perceive.py` | coordination-sphere perception and geometry checks |
+| `metal_perceive.py` | reading a coordination sphere from coordinates: shape, overbonding, donor orientation |
 | `metal_smiles.py`, `stereo.py`, `utils.py` | metal strings, organic stereo, and shared RDKit geometry facts |
-| `pipeline/api.py`, `pipeline/dispatch.py`, `pipeline/ensemble.py` | public workflow verbs, candidate routing, and chainable results |
+| `pipeline/dispatch.py`, `pipeline/ensemble.py` | the `embed`, `metal` and `minimize` verbs with candidate routing; chainable results and `wrap` |
 | `pipeline/perceive.py`, `pipeline/xyz2mol_*.py` | coordinate input and bond perception |
 | `pipeline/nci.py`, `pipeline/search.py`, `pipeline/select.py` | contacts, conformer search, pruning, and selection |
 | `pipeline/calculators.py`, `pipeline/geom_check.py`, `pipeline/metrics.py`, `pipeline/stereo_check.py`, `pipeline/viz.py` | optional calculators, QA, metrics, stereo checks, and visualisation |

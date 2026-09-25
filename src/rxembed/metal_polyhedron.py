@@ -18,24 +18,24 @@ import numpy as np
 from .constraints import FIX_ANGLE_TOL
 
 
-def _vertex_angle(u, v):
+def vertex_angle(u, v):
+    """Return the angle between u and v, rounded to whole degrees."""
     u, v = np.array(u), np.array(v)
     return round(float(np.degrees(np.arccos(np.clip(u @ v / (np.linalg.norm(u) * np.linalg.norm(v)), -1, 1)))))
 
 
 _FLAT_EPS = 1e-6  # smallest singular value below which a point set is one plane
-_IMPROPER_VERTICES = 3  # an improper states exactly three vertices; a CN4 record would be held 3-of-4
+IMPROPER_VERTICES = 3  # an improper states exactly three vertices; a CN4 record would be held 3-of-4
 CHELATE_SPAN_ANGLE = 135  # a same-ligand donor pair this wide needs a trans-spanning backbone
 # Measured on the first 100 tmQMg sample and the named issue corpus: every tractable pool was <=504 raw
 # proper-rotation orbits, while the first factorial cliff began at 1,680. This is a resource limit, not chemistry.
-_MAX_EXHAUSTIVE_ORBITS = 1_000
+MAX_EXHAUSTIVE_ORBITS = 1_000
 _AXIS_EPS = 1e-12  # a bite pair this close to antipodal has no well-defined rotation axis
 _SHELL_DAMPING = 0.5  # relaxed_shell's per-round step; undamped, a closed bite cycle oscillates, never converging
-_SPACE_DIMS = 3  # a lower vertex-direction rank means the metal and every vertex share one plane
 
 
-def _improper(p1, p2, p3, p4):
-    """Signed improper dihedral 1-2-3-4 in degrees, the convention `rdMolTransforms.GetDihedralDeg` uses."""
+def improper_dihedral(p1, p2, p3, p4):
+    """Return the signed improper dihedral 1-2-3-4 in degrees, in `rdMolTransforms.GetDihedralDeg`'s convention."""
     b1, b2, b3 = p2 - p1, p3 - p2, p4 - p3
     n1, n2 = np.cross(b1, b2), np.cross(b2, b3)
     m = np.cross(n1, b2 / np.linalg.norm(b2))
@@ -74,12 +74,12 @@ class Polyhedron:
         The scale-free improper states pyramidalisation without a bond-length-dependent D-M-D window. It is
         exact only for the ideal record; a distorted sphere still needs measurement.
         """
-        if self.planar or self.cn != _IMPROPER_VERTICES:
+        if self.planar or self.cn != IMPROPER_VERTICES:
             return None
         v = np.array([np.asarray(d, float) / np.linalg.norm(d) for d in self.vertex_dirs])
         if np.linalg.svd(v - v.mean(axis=0))[1][2] > _FLAT_EPS:  # a 3-D vertex set: not one umbrella
             return None
-        return abs(_improper(v[0], v[1], v[2], np.zeros(3)))
+        return abs(improper_dihedral(v[0], v[1], v[2], np.zeros(3)))
 
     @property
     def resolved_angles(self):
@@ -87,7 +87,7 @@ class Polyhedron:
         if self.angles is not None:
             return self.angles
         v = self.vertex_dirs
-        return tuple((i, j, _vertex_angle(v[i], v[j])) for i in range(len(v)) for j in range(i + 1, len(v)))
+        return tuple((i, j, vertex_angle(v[i], v[j])) for i in range(len(v)) for j in range(i + 1, len(v)))
 
 
 # The supported polyhedra, one record each. Insertion order is the classify_geometry tie-break;
@@ -214,7 +214,7 @@ POLYHEDRA: dict[str, Polyhedron] = {
             name="octahedral",
             code="OCT",
             default_rank=0,
-            vertex_dirs=((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)),  # trans PAIRS:
+            vertex_dirs=((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)),  # trans pairs:
             #   0,1 / 2,3 / 4,5, unlike square_planar, where the trans partner of 0 is 2
             angles=None,  # every cis pair is one point-group orbit; a smaller fixed subset is frame-dependent
         ),
@@ -222,7 +222,7 @@ POLYHEDRA: dict[str, Polyhedron] = {
             name="trigonal_prismatic",
             code="TPR",
             default_rank=1,
-            vertex_dirs=(  # two ECLIPSED equilateral triangles (D3h). Regular => every edge equal, so the
+            vertex_dirs=(  # two eclipsed equilateral triangles (D3h). Regular => every edge equal, so the
                 (0.7559289, 0.0, 0.6546537),  # half-height is sqrt(3)/2 of the circumradius: (cos t, sin t,
                 (-0.3779645, 0.6546537, 0.6546537),  # +-sqrt(3)/2), normalised. Spectrum 81.8 x9 / 135.6 x6.
                 (-0.3779645, -0.6546537, 0.6546537),
@@ -230,8 +230,8 @@ POLYHEDRA: dict[str, Polyhedron] = {
                 (-0.3779645, 0.6546537, -0.6546537),
                 (-0.3779645, -0.6546537, -0.6546537),
             ),
-            angles=None,  # DERIVED, unlike its CN6 neighbour: octahedral's minimal subset was measured to be
-            #   sufficient AND better than all-pairs, and nobody has run that measurement on this record.
+            angles=None,  # derived, unlike its CN6 neighbour: octahedral's minimal subset was measured to be
+            #   sufficient and better than all-pairs, and nobody has run that measurement on this record.
             #   Deriving is the honest default; a subset here would be a guess wearing octahedral's evidence.
         ),
         Polyhedron(
@@ -316,7 +316,7 @@ POLYHEDRA: dict[str, Polyhedron] = {
                 (-0.5792812, 0.0, 0.8151278),  # angles are solved, not tabulated: they minimise the spread of
                 (0.0, 0.5792812, -0.8151278),  # the 18 edges (8 vertices, 18 edges, 12 faces; Euler checks).
                 (0.0, -0.5792812, -0.8151278),  # An exactly equal-edge form does not exist on a sphere, which
-                (0.0, 0.9626917, 0.2706004),  # is why the literature calls this the MOST SPHERICAL compromise;
+                (0.0, 0.9626917, 0.2706004),  # is why the literature calls this the most spherical compromise;
                 (0.0, -0.9626917, 0.2706004),  # residual spread 0.091. It sits 9.1 deg from square_antiprism
                 (0.9626917, 0.0, -0.2706004),  # in the angle spectrum, so the two are separable.
                 (-0.9626917, 0.0, -0.2706004),
@@ -425,7 +425,25 @@ def _fit_trace(h):
     return float(np.linalg.svd(h, compute_uv=False).sum())
 
 
-def _seat_by_alignment(dd, v_ideal, rounds=3):
+def _greedy_order(dd, v_ideal, rot):
+    """Assign every vertex to the donor pointing most nearly at it, under rotation `rot`."""
+    fit = (dd @ rot) @ v_ideal.T  # fit[donor, vertex]
+    order, taken_d, taken_v = [0] * len(v_ideal), set(), set()
+    for d, v in zip(*np.unravel_index(np.argsort(fit, axis=None)[::-1], fit.shape), strict=True):
+        if d not in taken_d and v not in taken_v:
+            order[int(v)] = int(d)
+            taken_d.add(d)
+            taken_v.add(v)
+    return order
+
+
+def _best_rotation(dd, v_ideal, donors, vertices):
+    """Return the orthogonal map, reflections allowed, that best aligns the chosen donors onto the vertices."""
+    u, _s, vt = np.linalg.svd(dd[list(donors)].T @ v_ideal[list(vertices)])
+    return u @ vt
+
+
+def seat_by_alignment(dd, v_ideal, rounds=3):
     """Seat donors on ideal vertices; return ``order`` from vertex to donor-list index.
 
     Search every proper-rotation orbit while that exact pool is bounded. Above the shared resource limit,
@@ -443,32 +461,17 @@ def _seat_by_alignment(dd, v_ideal, rounds=3):
 
     width = min(3, n)
     rank = np.linalg.matrix_rank(v_ideal)
-
-    def conditioning(vertices):
-        singular = np.linalg.svd(v_ideal[list(vertices)], compute_uv=False)
-        return float(np.prod(singular[:rank]))
-
-    anchor = max(itertools.combinations(range(n), width), key=conditioning)
-
-    def complete(rot):
-        """Assign every vertex to the donor pointing most nearly at it, under rotation `rot`."""
-        fit = (dd @ rot) @ v_ideal.T  # fit[donor, vertex]
-        order, taken_d, taken_v = [0] * n, set(), set()
-        for d, v in zip(*np.unravel_index(np.argsort(fit, axis=None)[::-1], fit.shape), strict=True):
-            if d not in taken_d and v not in taken_v:
-                order[int(v)] = int(d)
-                taken_d.add(d)
-                taken_v.add(v)
-        return order
-
-    def align(donors, vertices):
-        u, _s, vt = np.linalg.svd(dd[list(donors)].T @ v_ideal[list(vertices)])
-        return u @ vt
-
-    seeds = {tuple(complete(align(seed, anchor))) for seed in itertools.permutations(range(n), width)}
+    anchor = max(
+        itertools.combinations(range(n), width),
+        key=lambda vertices: float(np.prod(np.linalg.svd(v_ideal[list(vertices)], compute_uv=False)[:rank])),
+    )
+    seeds = {
+        tuple(_greedy_order(dd, v_ideal, _best_rotation(dd, v_ideal, seed, anchor)))
+        for seed in itertools.permutations(range(n), width)
+    }
     best = max(seeds, key=score)
     for _ in range(rounds):  # refine: re-align on the winner, re-assign, until it stops moving
-        nxt = complete(align(best, range(n)))
+        nxt = _greedy_order(dd, v_ideal, _best_rotation(dd, v_ideal, best, range(n)))
         if score(nxt) <= score(best):
             break
         best = tuple(nxt)
@@ -572,7 +575,7 @@ def _polygon_faces(dirs):
     """
     t = np.asarray(dirs, float)
     t = t / np.linalg.norm(t, axis=1, keepdims=True)
-    if np.linalg.matrix_rank(t, tol=_SYM_TOL) < _SPACE_DIMS:
+    if np.linalg.matrix_rank(t, tol=_SYM_TOL) < 3:  # noqa: PLR2004 - a lower rank means everything shares one plane
         return ()
     pts = np.vstack([t, np.zeros(3)])
     faces = set()
@@ -618,9 +621,8 @@ def isomer_permutations(geometry):
 def seat_properly(dirs_obs, dirs, order):
     """Re-seat `order` so the observed sphere is reached by rotation, not reflection.
 
-    Reflection leaves the alignment score unchanged, so one improper template symmetry flips the fitted
-    parity without another search. This distinguished all 7 chiral centres in the 45-structure corpus.
-    Re-seating changed the minimal angle subset on 3 structures; `metal_constraints` handles the chelate case.
+    Reflection leaves the alignment score unchanged, so one improper template symmetry can flip the fitted
+    parity without another search; `metal_constraints` handles the chelate case separately.
     """
     refl = point_group(tuple(map(tuple, dirs)))[1]
     if not refl or orientation_parity(np.asarray(dirs_obs)[list(order)], dirs) >= 0:
@@ -636,27 +638,18 @@ def orientation_parity(dirs_obs, dirs):
 
 
 def relaxed_shell(dirs, bites, iters=500):
-    """Return unit rays for `dirs`, each bite pair rotated symmetrically to its target angle, or ``None``.
+    """Return unit rays for `dirs` with each bite pair closed or opened to its target angle, or None.
 
-    Every bite pair ``frozenset({i, j})`` in `bites` (a target angle in degrees) is closed or opened about
-    its own great-circle bisector until every bite is within `constraints.FIX_ANGLE_TOL` of its target; a
-    vertex outside every bite moves only to keep a non-triangular hull face of the template planar, so every
-    other row is the free, minimum-displacement consequence of the bite rays' new positions (the H-invariant
-    shell: see ARCHITECTURE.md). Folding a polygon face along a diagonal is a named distortion path: a square
-    pyramid's base gives the Berry pseudorotation toward trigonal bipyramidal, a trigonal prism's rectangles
-    give the Bailar twist toward octahedral. The per-round step is damped by
-    `_SHELL_DAMPING`: undamped, a vertex shared by two bite pairs on a closed cycle (a porphyrin's four
-    donors) overshoots each round and settles into a limit cycle instead of converging. Returns ``None``
-    when a bite pair cannot be rotated (already antipodal), when the relaxation has not converged after
-    `iters` rounds, or when the relaxed shell's oriented type -- the sign of every nonzero vertex triple
-    product not spanned by a template trans pair (`CHELATE_SPAN_ANGLE` or wider), or every nonzero in-plane
-    pair orientation for a planar template -- no longer matches the ideal template. That is a different
-    geometry, not a chelate distortion; returns None, so the caller refuses the arrangement. A trans pair is
-    excluded because it bends either way about its own axis without changing the arrangement, so its sign is
-    not a shape identity.
+    Only the bite rays move on purpose; every other vertex shifts just enough to keep the template's hull
+    faces planar (folding a face is a named path: a square pyramid's base gives the Berry pseudorotation, a
+    trigonal prism's rectangles give the Bailar twist), so the rest of the shell follows the bites rather
+    than holding its own shape. The per-round step is damped (`_SHELL_DAMPING`): undamped, a vertex shared
+    by two bite pairs on a closed cycle overshoots and oscillates instead of converging. Returns None when a
+    bite pair is already antipodal, when the shell has not converged after `iters` rounds, or when the
+    result's oriented type (`_oriented_signs`) no longer matches the ideal template: that is a different
+    geometry, not a distortion of this one.
 
-    Pure in `(dirs, bites, iters)`, so results are memoised: a repeated enumeration-time input costs one cache
-    lookup, and the returned array is read-only so a cached result cannot be mutated by a caller.
+    Pure in `(dirs, bites, iters)` and memoised; the returned array is read-only.
     """
     key = tuple(sorted((tuple(sorted(pair)), float(target)) for pair, target in bites.items()))
     return _relaxed_shell_cached(tuple(map(tuple, dirs)), key, iters)
@@ -665,10 +658,9 @@ def relaxed_shell(dirs, bites, iters=500):
 def _cross3(a, b):
     """Cross product of two (N, 3) arrays, bit-identical to `np.cross(a, b)` (verified by fuzz test).
 
-    `np.cross` dispatches through generic per-call axis handling meant for arbitrary axis positions; at the
-    fixed (N, 3) shape every call in `_relaxed_shell_cached`'s hot loop uses, that dispatch alone was half
-    the loop's cost. The formula below is exactly what `np.cross` reduces to for this shape, so it changes
-    nothing about which shell a target relaxes to, only how many numpy calls that costs.
+    `np.cross`'s generic axis handling costs about half of `_relaxed_shell_cached`'s hot loop; this is the
+    exact formula it reduces to at this fixed shape, so it changes nothing about which shell a target
+    relaxes to, only how many numpy calls that costs.
     """
     out = np.empty_like(a)
     out[..., 0] = a[..., 1] * b[..., 2] - a[..., 2] * b[..., 1]
@@ -730,7 +722,8 @@ def _trans_pairs(template):
 def _oriented_signs(r, planar, template):
     """Return each triple's signed orientation, or each pair's signed in-plane sense for a planar template.
 
-    A triple that contains a `template` trans pair is dropped from the non-planar case: see `relaxed_shell`.
+    Drops any triple containing a `template` trans pair: a trans pair bends either way about its own axis
+    without changing the arrangement, so its sign is not part of the shape's identity.
     """
     if planar:
         normal = np.cross(r[0], r[1])
@@ -750,7 +743,7 @@ def _oriented_signs(r, planar, template):
 
 def _keeps_oriented_type(template, r):
     """Return whether `r` keeps every nonzero orientation `template` states, with the same sign."""
-    planar = np.linalg.matrix_rank(template, tol=_SYM_TOL) < _SPACE_DIMS  # vertices and the metal share one plane
+    planar = np.linalg.matrix_rank(template, tol=_SYM_TOL) < 3  # noqa: PLR2004 - vertices and the metal share one plane
     before, after = _oriented_signs(template, planar, template), _oriented_signs(r, planar, template)
     return all(
         abs(value) < _SYM_TOL or (after[key] * value > 0 and abs(after[key]) > _SYM_TOL)
@@ -763,6 +756,12 @@ def _link_items(links):
     return links.items() if hasattr(links, "items") else ((edge, 0) for edge in links)
 
 
+def _slot_form(q, keys, labelled):
+    """Return the site keys and labelled links of one arrangement in the frame `q`, as a comparable tuple."""
+    seats = tuple(sorted((q[v], keys[v]) for v in range(len(q)) if keys[v] is not None))
+    return seats, tuple(sorted((tuple(sorted((q[a], q[b]))), label) for (a, b), label in labelled))
+
+
 def canonical_slots(dirs, keys, links=frozenset()):
     """Return ``slots[vertex]`` minimised over proper template rotations.
 
@@ -770,16 +769,10 @@ def canonical_slots(dirs, keys, links=frozenset()):
     atom order. A renderer must retain the link-preserving donor-to-slot pairing when tied sites are folded.
     """
     rot = point_group(tuple(map(tuple, dirs)))[0]
-    n = len(dirs)
     if not rot:
         return None
     labelled = [(tuple(edge), label) for edge, label in _link_items(links)]
-
-    def form(q):
-        seats = tuple(sorted((q[v], keys[v]) for v in range(n) if keys[v] is not None))
-        return seats, tuple(sorted((tuple(sorted((q[a], q[b]))), label) for (a, b), label in labelled))
-
-    return list(min(rot, key=form))
+    return list(min(rot, key=lambda q: _slot_form(q, keys, labelled)))
 
 
 _SLOT_NOTE = re.compile(r"^s(\d+)([+-]?)$")  # a donor's canonical slot, with an optional haptic winding sign
@@ -803,6 +796,15 @@ def read_slot_notes(note):
     return None if any(value is None for value in values) else values
 
 
+def _decorated_form(q, label, labelled):
+    """Return the per-vertex labels and labelled donor links of the decorated arrangement in the frame `q`."""
+    verts = [None] * len(q)
+    for source, target in enumerate(q):
+        verts[target] = label[source]
+    links = tuple(sorted((tuple(sorted((q[a], q[b]))), value) for (a, b), value in labelled))
+    return tuple(verts), links
+
+
 def handedness(dirs, order, donor_class, chelate_links=frozenset()):
     """Return ``'delta'``, ``'lambda'``, or ``''`` for an achiral or incomplete centre.
 
@@ -816,17 +818,9 @@ def handedness(dirs, order, donor_class, chelate_links=frozenset()):
     rot, refl = point_group(tuple(map(tuple, dirs)))
     label = {v: donor_class[order[v]] for v in range(n)}
     labelled = [(tuple(edge), value) for edge, value in _link_items(chelate_links)]
-
-    def form(q):  # the decorated arrangement in the frame `q`: (per-vertex labels, labelled donor links)
-        verts = [None] * n
-        for source, target in enumerate(q):
-            verts[target] = label[source]
-        links = tuple(sorted((tuple(sorted((q[a], q[b]))), value) for (a, b), value in labelled))
-        return tuple(verts), links
-
-    forms = {q: form(q) for q in rot | refl}
+    forms = {q: _decorated_form(q, label, labelled) for q in rot | refl}
     base = forms[tuple(range(n))]
-    if any(forms[q] == base for q in refl):  # a mirror fixes labels AND bites -> no handedness
+    if any(forms[q] == base for q in refl):  # a mirror fixes labels and bites -> no handedness
         return ""
     q_star = min(forms, key=lambda q: forms[q])  # the canonicalising frame; its parity is the sign
     return DELTA if q_star in rot else LAMBDA
@@ -840,14 +834,14 @@ def ordered_fit_residual(dirs_obs, dirs_ideal):
 
 def best_fit_residual(dirs_obs, dirs_ideal):
     """Return a bounded-exact, otherwise approximate unrestricted fit RMS."""
-    order = _seat_by_alignment(dirs_obs, dirs_ideal)
+    order = seat_by_alignment(dirs_obs, dirs_ideal)
     return ordered_fit_residual(dirs_obs[order], dirs_ideal)
 
 
 def seating_is_exhaustive(dirs):
     """Return whether donor seating searches every proper-rotation orbit."""
     directions = tuple(map(tuple, dirs))
-    return math.factorial(len(directions)) // len(point_group(directions)[0]) <= _MAX_EXHAUSTIVE_ORBITS
+    return math.factorial(len(directions)) // len(point_group(directions)[0]) <= MAX_EXHAUSTIVE_ORBITS
 
 
 def fit_residual(dirs_obs, record):

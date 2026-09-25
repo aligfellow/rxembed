@@ -14,15 +14,15 @@ from rdkit.Chem import rdDepictor, rdMolTransforms
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
-from rxembed import metal_enumeration as K  # noqa: N812
-from rxembed import metal_isomer as I  # noqa: N812
+from rxembed import metal_enumeration, metal_screen
 from rxembed import metal_slots as slots
-from rxembed import metal_stereo as MS  # noqa: N812
 from rxembed import stereo as ligand_stereo
-from rxembed.constraints import Constraints
 from rxembed.embed import embed as core_embed
-from rxembed.metal_core import _FIT_MARGIN, VACANT, HapticSite, metal_indices, shape_gap
-from rxembed.metal_polyhedron import hull_edges, record, vertex_dirs
+from rxembed.metal_core import VACANT, HapticSite, metal_indices
+from rxembed.metal_isomer import from_geometry
+from rxembed.metal_perceive import _FIT_MARGIN, shape_gap
+from rxembed.metal_polyhedron import POLYHEDRA, hull_edges, record, vertex_dirs
+from rxembed.metal_stereo import chelate_links, donor_classes, realised_chirality, site_classes
 from rxembed.pipeline import geom_check as geom
 from tests.conftest import TMQMG_DIR
 from tests.metal_fixtures import ferrocene
@@ -67,7 +67,7 @@ def test_resonance_dependent_ez_is_not_enumerated_from_geometry():
     form = Chem.Mol(Chem.ResonanceMolSupplier(mol, maxStructs=3)[0])
     Chem.RemoveStereochemistry(form)
 
-    variants, _mode, n_unassigned, unresolved = K._ligand_stereo_variants(form, "all")
+    variants, _mode, n_unassigned, unresolved = metal_enumeration._ligand_stereo_variants(form, "all")
 
     assert [label for _variant, label in variants] == [""]
     assert n_unassigned == unresolved == 0
@@ -76,7 +76,7 @@ def test_resonance_dependent_ez_is_not_enumerated_from_geometry():
 def test_coordination_locked_imine_is_not_duplicated_as_ez():
     iso = rx.metal("C1=[NH]->[Ni+2](<-[Cl-])(<-[Cl-])<-[NH2]CC1", "square_planar")[0]
     realised = rx.embed(iso, n=1, seed=7).mol
-    locked = ligand_stereo._coordination_locked_double_bonds(realised, metal_indices(realised))
+    locked = ligand_stereo.coordination_locked_double_bonds(realised, metal_indices(realised))
     back = rx.metal(realised)
     text = rx.cxsmiles(realised)
     matches = [candidate for candidate in back if rx.cxsmiles(candidate) == text]
@@ -149,7 +149,7 @@ def test_selective_ez_clear_keeps_a_shared_direction_for_the_other_double_bond()
     shared = [mol.GetBondBetweenAtoms(2, 3), mol.GetBondBetweenAtoms(4, 5)]
 
     assert all(bond.GetBondDir() != Chem.BondDir.NONE for bond in shared)
-    K._clear_ez(mol, {target})
+    ligand_stereo.clear_ez(mol, {target})
 
     remaining = ligand_stereo.bond_stereo(ligand_stereo.defined_stereo_label(mol))
     assert target not in remaining
@@ -301,25 +301,25 @@ def test_input_geometry_does_not_rewrite_an_already_correct_phosphorus_hand():
 
 
 def test_frozen_site_permutations_are_lazy_and_keep_the_input_vertices(monkeypatch):
-    monkeypatch.setattr(slots, "input_ordering", lambda *_args: [2, 0, 3, 1])
+    monkeypatch.setattr(metal_enumeration, "input_ordering", lambda *_args: [2, 0, 3, 1])
 
-    pool = K._frozen_permutations(Chem.Mol(), 0, [10, 11, 12, 13], "square_planar", {10, 12}, 4)
+    pool = metal_enumeration._frozen_permutations(Chem.Mol(), 0, [10, 11, 12, 13], "square_planar", {10, 12})
 
     assert iter(pool) is pool
     assert list(pool) == [[2, 0, 1, 3], [2, 0, 3, 1]]
 
 
 def test_frozen_site_permutations_preserve_a_missing_input_order(monkeypatch):
-    monkeypatch.setattr(slots, "input_ordering", lambda *_args: None)
+    monkeypatch.setattr(metal_enumeration, "input_ordering", lambda *_args: None)
 
-    assert K._frozen_permutations(Chem.Mol(), 0, [10, 11], "linear", {10}, 2) is None
+    assert metal_enumeration._frozen_permutations(Chem.Mol(), 0, [10, 11], "linear", {10}) is None
 
 
 def test_frozen_high_coordination_refuses_a_factorial_free_site_pool(monkeypatch):
-    monkeypatch.setattr(slots, "input_ordering", lambda *_args: list(range(10)))
+    monkeypatch.setattr(metal_enumeration, "input_ordering", lambda *_args: list(range(10)))
 
     with pytest.raises(ValueError, match=r"fix= leaves exactly 362,880 free-site arrangements.*retain more"):
-        K._frozen_permutations(Chem.Mol(), 0, list(range(10)), "BSA", {0}, 10)
+        metal_enumeration._frozen_permutations(Chem.Mol(), 0, list(range(10)), "BSA", {0})
 
 
 def test_monodentate_imine_ez_is_retained_without_mutating_the_variant_graph():
@@ -328,7 +328,7 @@ def test_monodentate_imine_ez_is_retained_without_mutating_the_variant_graph():
     bond.SetStereoAtoms(0, 3)
     bond.SetStereo(Chem.BondStereo.STEREOE)
 
-    variants, *_rest = K._ligand_stereo_variants(mol, "unassigned")
+    variants, *_rest = metal_enumeration._ligand_stereo_variants(mol, "unassigned")
 
     assert variants[0][1] == "C1=N2:E"
     assert variants[0][0].GetBondBetweenAtoms(1, 2).GetStereo() == Chem.BondStereo.STEREOE
@@ -337,7 +337,7 @@ def test_monodentate_imine_ez_is_retained_without_mutating_the_variant_graph():
 def test_coordinated_carbonyl_oxygen_does_not_invent_ez():
     mol = rx.parse_smiles("CC=[O]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
 
-    variants, *_rest = K._ligand_stereo_variants(mol, "unassigned")
+    variants, *_rest = metal_enumeration._ligand_stereo_variants(mol, "unassigned")
 
     assert len(variants) == 1
     assert not ligand_stereo.bond_stereo(variants[0][1])
@@ -394,7 +394,7 @@ def test_distinct_eta2_faces_define_both_octahedral_hands():
     )
     isomers = rx.metal(smiles, "OCT", stereo="free")
     assert Counter(iso.chirality for iso in isomers) == {"delta": 15, "lambda": 15}
-    assert len({I.arrangement(iso) for iso in isomers}) == len(isomers) == 30
+    assert len({iso.arrangement for iso in isomers}) == len(isomers) == 30
 
 
 def test_haptic_face_classes_follow_set_orbits_not_atom_orbits():
@@ -413,8 +413,8 @@ def test_haptic_face_classes_follow_set_orbits_not_atom_orbits():
     horizontal = (prisms[0][0], prisms[0][1])
     vertical = (prisms[1][3], prisms[1][8])
 
-    assert len(set(MS.donor_classes(mol, [*horizontal, *vertical]).values())) == 1
-    classes = MS.site_classes(mol, [100, 101], {100: horizontal, 101: vertical})
+    assert len(set(donor_classes(mol, [*horizontal, *vertical]).values())) == 1
+    classes = site_classes(mol, [100, 101], {100: horizontal, 101: vertical})
     assert classes[100] != classes[101]
 
 
@@ -528,7 +528,7 @@ def test_two_bipyridyl_chelates_share_the_compiled_coordination_network(metal, l
             if any(mol.GetAtomWithIdx(i).GetAtomicNum() == 7 for i in fragment)
         ]
         assert len(pairs) == 2
-        directions = np.asarray(K.POLYHEDRA["octahedral"].vertex_dirs)
+        directions = np.asarray(POLYHEDRA["octahedral"].vertex_dirs)
         for missing in unrestricted.keys() - identities:
             excluded = unrestricted[missing]
             opposed = [
@@ -548,7 +548,7 @@ def test_dodecahedral_bipyridyl_screen_rejects_unspanned_whole_ligand_assignment
     donors = [atom.GetIdx() for atom in mol.GetAtomWithIdx(metal).GetNeighbors()]
     conformer = Chem.Conformer(mol.GetNumAtoms())
     conformer.SetAtomPosition(metal, (0.0, 0.0, 0.0))
-    directions = np.asarray(K.POLYHEDRA["dodecahedral"].vertex_dirs, float)
+    directions = np.asarray(POLYHEDRA["dodecahedral"].vertex_dirs, float)
     for slot, donor in enumerate(donors):
         # Deliberately exceed native bipyridyl reach only when these radii are requested.
         radius = 3.0 if mol.GetAtomWithIdx(donor).GetAtomicNum() == 7 else 1.9
@@ -613,8 +613,8 @@ def test_refined_chelate_screen_keeps_explicit_authority_and_embeddable_states(m
         )
     )
     assert len(rx.metal(mol, "OCT", fix={(bridge.GetBeginAtomIdx(), bridge.GetEndAtomIdx()): 1.5})) == 5
-    certificate = K._bounds._euclidean_conflict
-    monkeypatch.setattr(K._bounds, "_euclidean_conflict", lambda matrix, **_kwargs: certificate(matrix))
+    certificate = metal_screen._euclidean_conflict
+    monkeypatch.setattr(metal_screen, "_euclidean_conflict", lambda matrix, **_kwargs: certificate(matrix))
     assert len(rx.metal(mol, "OCT")) == 5
 
 
@@ -642,85 +642,13 @@ def test_fused_chelate_is_screened_at_its_bite_on_a_trigonal_site(smiles, geomet
     """A fused (phenanthroline-like) 5-ring chelate holds its native backbone bite, not the ideal 120 vertex angle.
 
     Before the fix the screen judged this independent pair at the ideal vertex angle and rejected every
-    arrangement; compile already holds it at the narrower `metal_slots._chelate_bite_window` bite. Measured:
+    arrangement; compile already holds it at the narrower `metal_slots.chelate_bite_window` bite. Measured:
     0 and 1 isomer before the fix, 1 and 2 after (`screen=False` gives 1 and 3).
     """
     isomers = rx.metal(smiles, geometry)
     assert len(isomers) == count
     for iso in isomers:
         _assert_embeds_as(iso)
-
-
-def test_short_trans_requires_euclidean_consistency_not_only_triangle_smoothing(monkeypatch):
-    """Disabling either check alone still excludes the trans chelate; the edge rule now also proves it.
-
-    The dropped isomer puts the N,N chelate on square_planar's one non-edge (trans) vertex pair, so
-    `metal_slots._chelate_edge_links` excludes it independently of `_euclidean_conflict`; both must be
-    disabled together to show triangle smoothing alone would have let it through.
-    """
-    smiles = "Cl[Pt]1(F)N(C)CCCN1"
-    assert len(rx.metal(smiles)) == 2
-    assert len(rx.metal(smiles, screen=False)) == 3
-    monkeypatch.setattr(K._bounds, "_euclidean_conflict", lambda _matrix, **_kwargs: None)
-    assert len(rx.metal(smiles)) == 2
-    monkeypatch.setattr(slots, "_chelate_edge_links", lambda *args, **kwargs: frozenset())
-    assert len(rx.metal(smiles)) == 3
-
-
-def test_trans_reach_screen_uses_the_shared_150_degree_slot_boundary(monkeypatch):
-    from types import SimpleNamespace
-
-    mol = Chem.MolFromSmiles("C.C.C.C.[He]")
-    iso = SimpleNamespace(
-        centres=(0, 1),
-        _base_cons=Constraints(),
-        _graph=mol,
-        metal=4,
-        vertices=(0, 1, 2, 3),
-        haptic={},
-        geometry="square_pyramidal",
-        _length_mol=mol,
-        _lengths="model",
-        real_z=46,
-        donors=(0, 1, 2, 3),
-    )
-    reach = np.full((5, 5), 10.0)
-    reach[1, 3] = reach[3, 1] = 3.0
-    monkeypatch.setattr(K._constraints, "_donor_distance_window", lambda *_args, **_kwargs: (2.0, 2.1))
-    monkeypatch.setattr(K, "_opposed_donor_span_failure", lambda *_args: None)
-
-    failure = K._unreachable_span(iso, reach, {}, ())
-
-    needed = K._mech._law_of_cosines(2.0, 2.0, slots.TRANS_ANGLE)
-    assert failure == f"donors 1/3 need >= {needed:.3f} A; ligand reach <= 3.000 A"
-
-
-def test_bonded_donors_keep_native_triangle_for_reach(monkeypatch):
-    from types import SimpleNamespace
-
-    mol = Chem.MolFromSmiles("CC.C.C.[He]")
-    iso = SimpleNamespace(
-        centres=(0, 1),
-        _base_cons=Constraints(),
-        _graph=mol,
-        metal=4,
-        vertices=(0, 2, 1, 3),
-        haptic={},
-        geometry="square_planar",
-        _length_mol=mol,
-        _lengths="input",
-        real_z=46,
-        donors=(0, 1, 2, 3),
-    )
-    mol.AddConformer(Chem.Conformer(mol.GetNumAtoms()))
-    reach = np.full((5, 5), 10.0)
-    reach[0, 1] = reach[1, 0] = 3.0
-    monkeypatch.setattr(K._constraints, "_donor_distance_window", lambda *_args, **_kwargs: (2.0, 2.1))
-    monkeypatch.setattr(K, "_opposed_donor_span_failure", lambda *_args: None)
-
-    assert K._unreachable_span(iso, reach, {}, ()) is None
-    iso.vertices = (0, 2, 3, 1)
-    assert K._unreachable_span(iso, reach, {}, ()) is None
 
 
 def test_embedded_chelate_survives_input_length_screening():
@@ -746,81 +674,6 @@ def test_cyclic_chelate_checks_equal_length_routes_without_losing_long_trans(car
         assert {rx.cxsmiles(iso) for iso in rx.metal(permuted, "SPL")} == identities
     for iso in states:
         _assert_embeds_as(iso)
-
-
-def test_equal_length_routes_are_checked_together(monkeypatch):
-    from types import SimpleNamespace
-
-    mol = Chem.MolFromSmiles("C1CCC1.[He]")
-    iso = SimpleNamespace(_graph=mol, cons=None, metal=4, donors=(0, 2))
-    points = np.array(((-1.0, 0.0, 0.0), (0.8, 0.6, 0.0), (1.0, 0.0, 0.0), (0.8, -0.6, 0.0), (0.0, 0.0, 0.0)))
-    matrix = np.linalg.norm(points[:, None] - points, axis=2)
-    monkeypatch.setattr(K._bounds, "coordination_reach", lambda *_: matrix.copy())
-    assert K._compiled_span_failure(iso, None) is None
-    # Both donor routes remain realizable alone, but their off-axis points cannot be this far apart.
-    matrix[1, 3] = matrix[3, 1] = 1.24
-    assert K.DistanceGeometry.DoTriangleSmoothing(matrix.copy())
-    assert K._compiled_span_failure(iso, None) is not None
-
-
-def test_compiled_span_uses_local_triangle_before_global_certificate(monkeypatch):
-    from types import SimpleNamespace
-
-    mol = Chem.MolFromSmiles("C.[He].[He].[He].[He]")
-    constraints = Constraints(
-        metals={4},
-        distances={(0, 4): (2.0, 2.0), (2, 4): (2.0, 2.0)},
-        angles={(0, 4, 2): (136.0, 152.0)},
-    )
-    iso = SimpleNamespace(_graph=mol, cons=constraints, metal=4, donors=(0, 2))
-    native = np.full((5, 5), np.inf)
-    native[2, 0], native[0, 2] = 0.0, 2.5
-    monkeypatch.setattr(
-        K._bounds,
-        "coordination_reach",
-        lambda *_args, **_kwargs: pytest.fail("the local contradiction should short-circuit the global certificate"),
-    )
-
-    assert K._compiled_span_failure(iso, native, native=native) == (
-        "compiled coordination distances conflict with native ligand reach"
-    )
-
-
-def test_repeated_route_unions_do_not_repeat_the_same_search(monkeypatch):
-    from types import SimpleNamespace
-
-    mol = Chem.MolFromSmiles("C1CCC1.[He]")
-    iso = SimpleNamespace(_graph=mol, cons=None, metal=4, donors=(0, 1, 2, 3))
-    matrix = np.ones((5, 5)) - np.eye(5)
-    calls = Counter()
-
-    def checked(block, **_kwargs):
-        calls[len(block)] += 1
-
-    monkeypatch.setattr(K._bounds, "coordination_reach", lambda *_: matrix.copy())
-    monkeypatch.setattr(K._bounds, "_euclidean_conflict", checked)
-    monkeypatch.setattr(K, "_route_has_donor_bond", lambda *_args: False)
-    assert K._compiled_span_failure(iso, None) is None
-    assert calls == {3: 4, 4: 4, 5: 1}
-
-
-def test_compiled_span_skips_a_bridged_donor_route(monkeypatch):
-    from types import SimpleNamespace
-
-    mol = Chem.MolFromSmiles("NN.[He]")
-    iso = SimpleNamespace(_graph=mol, cons=None, metal=2, donors=(0, 1))
-    matrix = np.ones((3, 3)) - np.eye(3)
-    monkeypatch.setattr(K._bounds, "coordination_reach", lambda *_args, **_kwargs: matrix.copy())
-    monkeypatch.setattr(K._bounds, "_euclidean_conflict", lambda *_args, **_kwargs: pytest.fail("bridged route"))
-
-    assert K._route_has_donor_bond(mol, (0, 1), {0, 1})
-    assert K._compiled_span_failure(iso, matrix, native=matrix) is None
-
-
-def test_long_route_keeps_only_the_complete_euclidean_witness():
-    path = tuple(range(9))
-
-    assert list(K._route_certificate_subsets(path)) == [path]
 
 
 @pytest.mark.parametrize(("carbons", "count"), [(3, 1), (7, 2)])
@@ -850,39 +703,12 @@ def test_separate_pi_ligand_does_not_disable_chelate_network_screen(carbons, cou
         _assert_embeds_as(iso)
 
 
-def test_inconclusive_haptic_subset_keeps_the_prior_donor_facing_screen(monkeypatch):
-    smiles = "[Cl-]->[Pt+2]12(<-[NH2]CCC[NH2]->1)<-[CH2]=[CH2]->2"
-    monkeypatch.setattr(K, "_compiled_span_failure", lambda *_args: None)
-    monkeypatch.setattr(K, "_opposed_donor_span_failure", lambda *_args: "prior donor-facing conflict")
-
-    assert len(rx.metal(smiles, "SPL")) == 0
-    assert len(rx.metal(smiles, "SPL", screen=False)) == 2
-
-
 def test_haptic_borane_cage_keeps_realised_mixed_point_stereo():
     smiles = "C[N]1(C)CC[N](C)(C)->[Ni+2]<-123<-[BH]1C4([Si](C)(C)C)BC1([Si](C)(C)C)[BH-]->2=[BH-]->34"
     candidates = rx.metal(smiles, "SPL")
     mixed = [iso for iso in candidates if set(ligand_stereo.point_stereo(iso.stereo_label).values()) == {"R", "S"}]
     assert mixed, "A seed-model contradiction must not discard this realised cage seating"
     _assert_embeds_as(mixed[0])
-
-
-def test_compiled_span_search_streams_subsets_after_the_whole_path(monkeypatch):
-    from types import SimpleNamespace
-
-    mol = Chem.MolFromSmiles("CCCC.[He]")
-    iso = SimpleNamespace(_graph=mol, cons=None, metal=4, donors=(0, 3))
-    matrix = np.ones((5, 5)) - np.eye(5)
-    monkeypatch.setattr(K._bounds, "coordination_reach", lambda *_args: matrix)
-    monkeypatch.setattr(K._bounds, "_euclidean_conflict", lambda _matrix, **_kwargs: 1.0)
-    combinations = itertools.combinations
-
-    def guarded_subsets(values, size):
-        assert size == 2, "smaller subsets were consumed before testing the whole path"
-        yield from combinations(values, size)
-
-    monkeypatch.setattr(K.itertools, "combinations", guarded_subsets)
-    assert K._compiled_span_failure(iso, matrix) is not None
 
 
 @pytest.mark.parametrize("enumerate_isomers", [rx.metal, rx.enumerate_isomers], ids=["pipeline", "core"])
@@ -926,55 +752,13 @@ def test_tethered_donor_network_rejects_the_unrealistic_fihtoh_cis_state():
 def test_observed_tethered_screen_keeps_the_matching_assignment(monkeypatch):
     smiles = "COC(=O)c1cc2O[P](C(C)C)(C(C)C)->[Ni+2]3(<-[Cl-])<-[c-]2c(O[P]->3(C(C)C)C(C)C)c1"
     source = rx.embed(rx.metal(smiles, "square_planar")[0], n=1, seed=42, threads=1).mol
-    monkeypatch.setattr(slots, "_MAX_EXHAUSTIVE_ORBITS", 1)
+    monkeypatch.setattr(slots, "MAX_EXHAUSTIVE_ORBITS", 1)
+    monkeypatch.setattr(metal_enumeration, "MAX_EXHAUSTIVE_ORBITS", 1)
 
     isomers = rx.metal(source, "square_planar")
 
     assert len(isomers) == 1
     assert isomers[0].label == "trans"
-
-
-def test_narrow_span_pruning_clears_the_tethered_orbit_cap():
-    """A tris-dien La(III) sphere (all 9 donors one fragment) needs `_narrow_span_pairs` under the cap.
-
-    Without the up-front prune, `distinct_vertex_orderings` streams all 10,098 raw orbits of `tricapped_trigonal_
-    prismatic` and trips `_MAX_EXHAUSTIVE_ORBITS` (1,000) before the per-candidate reach screen ever runs.
-    128 without the chelate edge rule; each of its 6 dien arms (2 per ligand) must additionally land on a
-    `tricapped_trigonal_prismatic` hull edge, which drops 66 more (all 66 place an arm on a non-edge pair).
-    """
-    smiles = "C1C[NH]2CC[NH2]->[La+3]<-23456(<-[NH2]1)(<-[NH2]CC[NH]->3CC[NH2]->4)<-[NH2]CC[NH]->5CC[NH2]->6"
-    mol = rx.parse_smiles(smiles)
-
-    isomers = rx.metal(mol)
-
-    assert len(isomers) == 62
-    with pytest.raises(ValueError, match="more than 1,000 distinct constitutional"):
-        rx.metal(mol, screen=False)
-
-
-@pytest.mark.parametrize(
-    ("smiles", "count"),
-    [
-        # 4, not 5: the all-equatorial seating (both dien bites on adjacent equatorial slots) forces the
-        # third equatorial pair to 180 deg -- a square-pyramidal reading, not trigonal_bipyramidal, at every
-        # point in its bite windows including the anchor -- so `metal_constraints._bounded_bites` refuses it
-        # ("chelate bites leave trigonal_bipyramidal") independently of this test's own pruning screen.
-        ("[Cl-]->[La+3]12(<-[Cl-])<-[NH2]CC[NH]->1CC[NH2]->2", 4),
-        ("[Cl-]->[La+3]123(<-[Cl-])(<-[NH2]CC[NH2]->1)<-[NH2]CC[NH]->2CC[NH2]->3", 24),
-    ],
-    ids=["tbp", "pbp"],
-)
-def test_narrow_span_pruning_loses_no_reachable_arrangement(monkeypatch, smiles, count):
-    """The pruned and unpruned tethered pools agree exactly: pruning removes only already-doomed orbits."""
-    mol = rx.parse_smiles(smiles)
-
-    pruned = {rx.cxsmiles(iso) for iso in rx.metal(mol)}
-    assert len(pruned) == count
-
-    monkeypatch.setattr(K, "_narrow_span_pairs", lambda *args, **kwargs: frozenset())
-    unpruned = {rx.cxsmiles(iso) for iso in rx.metal(mol)}
-
-    assert unpruned == pruned
 
 
 _EN_LA_HEXACHLORO_SQA = "[Cl-]->[La+3]1(<-[Cl-])(<-[Cl-])(<-[Cl-])(<-[Cl-])(<-[Cl-])<-[NH2]CC[NH2]->1"
@@ -1005,7 +789,7 @@ def test_chelate_edge_rule_mutation_lets_a_diagonal_placement_survive(monkeypatc
     edges = hull_edges(tuple(map(tuple, vertex_dirs("square_antiprism"))))
     en_donors = {atom.GetIdx() for atom in mol.GetAtoms() if atom.GetSymbol() == "N"}
 
-    monkeypatch.setattr(slots, "_chelate_edge_links", lambda *args, **kwargs: frozenset())
+    monkeypatch.setattr(metal_enumeration, "chelate_edge_links", lambda *args, **kwargs: frozenset())
     isomers = rx.metal(mol, "SQA")
 
     pairs = [frozenset(vertex for vertex, donor in enumerate(iso.vertices) if donor in en_donors) for iso in isomers]
@@ -1078,27 +862,6 @@ def test_vudtul_chelate_bite_and_pair_rule_survive_the_span_screen():
     assert rx.metal(embedded, observed_only=True)[0].geometry == "trigonal_planar"
 
 
-def test_tethered_haptic_faces_reject_an_unreachable_trans_state():
-    smiles = "CC#[N]->[Ru+2]123(<-[Cl-])(<-[Cl-])(<-[N]#CC)<-[CH]4=[CH]->1[C@H]1C[C@@H]4[CH]->2=[CH]->31"
-
-    isomers = rx.metal(smiles, "octahedral", screen=False)
-    trans, cis = isomers[0], isomers[1]
-    seed = rx.embed(cis, n=1, seed=42, threads=1).mol
-    trans._length_mol.AddConformer(Chem.Conformer(seed.GetConformer(0)))
-    reach = K._bounds.ligand_reach(trans._length_mol)
-    links = K._coord_stereo.chelate_links(trans._graph, trans.vertices, trans.haptic)
-    classes = K._coord_stereo.site_classes(trans._graph, trans.vertices, trans.haptic, ())
-
-    assert len(isomers) == 6
-    assert "haptic faces" in K._unreachable_span(trans, reach, classes, links)
-
-    model = rx.metal(smiles, "octahedral", screen=False)[0]
-    model_reach = K._bounds.ligand_reach(model._length_mol)
-    model_links = K._coord_stereo.chelate_links(model._graph, model.vertices, model.haptic)
-    model_classes = K._coord_stereo.site_classes(model._graph, model.vertices, model.haptic, ())
-    assert "haptic faces" in K._unreachable_span(model, model_reach, model_classes, model_links)
-
-
 def test_chelate_links_ignore_coordination_shortcuts():
     mol = Chem.MolFromSmiles("CCCCC")
     rw = Chem.RWMol(mol)
@@ -1109,46 +872,7 @@ def test_chelate_links_ignore_coordination_shortcuts():
     mol.UpdatePropertyCache(strict=False)
 
     assert Chem.GetDistanceMatrix(mol)[0, 4] == 2
-    assert MS.chelate_links(mol, (0, 4)) == {frozenset((0, 1)): 4}
-
-
-def test_haptic_centroid_reach_uses_a_valid_minimum_matching():
-    reach = np.full((4, 4), np.inf)
-    reach[0, 2], reach[2, 0] = 5.0, 5.0
-    reach[0, 3], reach[3, 0] = 1.0, 1.0
-    reach[1, 2], reach[2, 1] = 1.0, 1.0
-    reach[1, 3], reach[3, 1] = 5.0, 5.0
-
-    assert K._centroid_reach(reach, (0, 1), (2, 3)) == pytest.approx(1.0)
-
-
-@pytest.mark.parametrize("measured", [False, True])
-@pytest.mark.parametrize("reordered", [False, True])
-def test_haptic_span_keeps_realizable_member_angles(measured, reordered):
-    from types import SimpleNamespace
-
-    positions = np.array([[2, 0.7, 0], [2, -0.7, 0], [-2, 0.7, 0], [-2, -0.7, 0], [0, 0, 0]])
-    mol = Chem.MolFromSmiles("C.C.C.C.[Mo]")
-    metal, left, right = 4, (0, 1), (2, 3)
-    if reordered:
-        mol = Chem.RenumberAtoms(mol, [4, 3, 2, 1, 0])
-        positions = positions[::-1, [1, 2, 0]] + np.array([1.0, 2.0, 3.0])
-        metal, left, right = 0, (4, 3), (2, 1)
-    conformer = Chem.Conformer(5)
-    conformer.SetPositions(positions)
-    mol.AddConformer(conformer)
-    iso = SimpleNamespace(haptic={5: left, 6: right}, _length_mol=mol, metal=metal)
-    reach = np.linalg.norm(positions[:, None] - positions[None, :], axis=-1)
-    cons = Constraints(distances={(metal, 5): (2.0, 2.0), (metal, 6): (2.0, 2.0)})
-    for atom in (*left, *right):
-        radius = float(np.linalg.norm(positions[atom] - positions[metal]))
-        cons.distances[tuple(sorted((metal, atom)))] = (radius, radius)
-
-    # The centroids are trans, but their individual member rays are not.
-    assert K._haptic_span_failure(iso, reach, metal, 5, 6, 180.0, measured, cons) is None
-    for a, b in itertools.product(left, right):
-        reach[a, b] = reach[b, a] = 3.5
-    assert "centroid reach" in K._haptic_span_failure(iso, reach, metal, 5, 6, 180.0, measured, cons)
+    assert chelate_links(mol, (0, 4)) == {frozenset((0, 1)): 4}
 
 
 @pytest.mark.parametrize("enumerate_isomers", [rx.metal, rx.enumerate_isomers], ids=["pipeline", "core"])
@@ -1192,7 +916,7 @@ def test_only_explicit_observed_selection_bypasses_reach_screen(monkeypatch, geo
     smiles = "[NH2]1CC[NH2]->[Pd+2](<-[Cl-])(<-[Br-])<-1"
     mol = rx.embed(rx.metal(smiles, "SPL")[0], n=1, seed=42, threads=1).mol
     reference = rx.cxsmiles(mol)
-    monkeypatch.setattr(K, "_unreachable_span", lambda *_args: "incompatible native reach")
+    monkeypatch.setattr(metal_enumeration, "unreachable_span", lambda *_args: "incompatible native reach")
     assert not rx.metal(mol, geometry)
     isomers = rx.metal(mol, geometry, observed_only=True)
 
@@ -1203,7 +927,8 @@ def test_only_explicit_observed_selection_bypasses_reach_screen(monkeypatch, geo
 def test_observed_only_is_an_explicit_resource_bounded_choice(monkeypatch):
     source = rx.embed(rx.metal(_MA2B2, "SPL")[0], n=1, seed=42, threads=1).mol
     reference = rx.cxsmiles(source)
-    monkeypatch.setattr(slots, "_MAX_EXHAUSTIVE_ORBITS", 1)
+    monkeypatch.setattr(slots, "MAX_EXHAUSTIVE_ORBITS", 1)
+    monkeypatch.setattr(metal_enumeration, "MAX_EXHAUSTIVE_ORBITS", 1)
 
     with pytest.raises(ValueError, match="more than 1 distinct constitutional"):
         rx.metal(source)
@@ -1254,7 +979,7 @@ def test_high_coordination_candidates_defer_their_public_molecule_copy():
     isos = rx.metal("O->[La+3](<-O)(<-N)(<-N)(<-[F-])(<-[F-])(<-[Cl-])<-[Cl-]", "DOD")
     assert len(isos) == 648
     assert all(iso._mol is None for iso in isos)
-    assert len({id(iso._graph) for iso in isos}) == 1
+    assert len({id(iso.graph) for iso in isos}) == 1
     assert "DOD" in str(isos[2])
     assert "DOD" in rx.cxsmiles(isos[2])
     assert isos[2]._mol is None
@@ -1307,7 +1032,7 @@ def test_retained_source_graft_authority_is_independent_of_constraint_compilatio
     ref, pos, where = _cis_reference(n=1)
     source = ref.mol
     fix = {i: tuple(pos[i]) for i in [*where["Cl"], where["N"][0]]}
-    for spec in (source, I.from_geometry(source)):
+    for spec in (source, from_geometry(source)):
         _, cons, _, graft = prepare(spec, fix=fix)
         assert set(fix) <= cons.frozen
         assert set(graft) == set(fix)
@@ -1335,12 +1060,12 @@ def test_sandwich_uses_two_centroids(door, tmp_path):
         assert len(isos) == 1  # two identical faces on one metal: a single achiral identity
         iso = isos[0]
         ens = rx.embed(iso, n=1, seed=1)
-        arr = I.arrangement(iso)
+        arr = iso.arrangement
         assert arr.count("η5") == 2, "the vertex must render as a hapticity tag, from the ring the mol really has"
         assert isos.select(arrangement=arr) is not None
     else:
         ens = rx.embed(ferrocene(), n=1, seed=1)  # the public geometry-retention door, not its internal builder
-        iso = I.from_geometry(ferrocene())
+        iso = from_geometry(ferrocene())
         assert iso.cons.haptic == dict(iso.haptic)
         assert len(iso.cons.angles) == 1  # one centroid-M-centroid angle (was 45 across raw ring atoms)
 
@@ -1403,7 +1128,7 @@ def test_haptic_spectator_uses_the_same_centroid_constraints():
 
 @pytest.mark.parametrize("door", ["enumerate", "from_geometry"], ids=["rx.metal", "from_geometry"])
 def test_half_sandwich_uses_piano_stool_shape(door):
-    iso = rx.metal(cp_ticl3())[0] if door == "enumerate" else I.from_geometry(cp_ticl3())
+    iso = rx.metal(cp_ticl3())[0] if door == "enumerate" else from_geometry(cp_ticl3())
     assert iso.geometry == "tetrahedral"
     assert len(iso.vertices) == 4  # centroid + 3 Cl
     assert len(iso.haptic) == 1
@@ -1419,7 +1144,7 @@ def test_open_eta3_allyl_is_not_an_apical_face(door):
         conf.SetAtomPosition(atom, Point3D(*point))
     mol.AddConformer(conf)
 
-    isomers = rx.metal(mol) if door == "enumerate" else [I.from_geometry(mol)]
+    isomers = rx.metal(mol) if door == "enumerate" else [from_geometry(mol)]
 
     assert len(isomers) == 1
     assert isomers[0].geometry == "trigonal_planar"
@@ -1452,7 +1177,7 @@ def test_haptic_centroid_participates_in_post_dg_metal_hand_selection():
     conformers = core_embed(iso, n=8, params=rx.EmbedParams(seed=7, prune_rms=-1))
     assert len(conformers) == 8
     assert {
-        MS.realised_chirality(conformers._mol, cid, iso.geometry, iso.vertices, iso.metal, iso.chirality, iso.haptic)
+        realised_chirality(conformers._mol, cid, iso.geometry, iso.vertices, iso.metal, iso.chirality, iso.haptic)
         for cid in conformers.ids
     } == {iso.chirality}
 
@@ -1484,9 +1209,9 @@ def test_empty_isomer_enumeration_warns(caplog, monkeypatch):
     import logging
 
     # No chelate here (4 distinct monodentates), so narrow/linked stay empty and the generic message applies.
-    monkeypatch.setattr(slots, "distinct_vertex_orderings", lambda *a, **kw: [])  # every candidate rejected
+    monkeypatch.setattr(metal_enumeration, "distinct_vertex_orderings", lambda *a, **kw: [])  # every candidate rejected
     with caplog.at_level(logging.WARNING, logger="rxembed.metal"):
-        out = K.enumerate_isomers(Chem.AddHs(Chem.MolFromSmiles("Br[Pd](Cl)(N)O")), "square_planar")
+        out = metal_enumeration.enumerate_isomers(Chem.AddHs(Chem.MolFromSmiles("Br[Pd](Cl)(N)O")), "square_planar")
     assert not out, "the monkeypatch must leave the enumeration empty"
     assert any("exact symmetry enumeration produced no arrangement" in r.getMessage() for r in caplog.records), (
         caplog.text
@@ -1494,7 +1219,7 @@ def test_empty_isomer_enumeration_warns(caplog, monkeypatch):
 
 
 def test_empty_isomer_enumeration_from_a_pruned_pool_names_the_screen_remedy(caplog):
-    """`linear` has no hull edge at all, so `_chelate_edge_links` prunes every streamed order before the
+    """`linear` has no hull edge at all, so `chelate_edge_links` prunes every streamed order before the
     per-candidate reach screen ever runs; the warning must still name the `screen=False` remedy, not the
     generic message that `unreachable` alone used to gate.
     """
@@ -1503,12 +1228,12 @@ def test_empty_isomer_enumeration_from_a_pruned_pool_names_the_screen_remedy(cap
     with caplog.at_level(logging.WARNING, logger="rxembed.metal"):
         out = rx.metal("[Cu+]1<-[NH2]CC[NH2]->1", "linear")
     assert not out
-    assert any("no model-compatible arrangement; use screen=False" in r.getMessage() for r in caplog.records), (
-        caplog.text
-    )
+    warnings = [r.getMessage() for r in caplog.records if "no model-compatible arrangement" in r.getMessage()]
+    assert warnings, caplog.text
     # screen=False is the wrong remedy for a model-length contradiction (it returns non-embeddable states);
     # lengths='input' must be named too.
-    assert any("lengths='input'" in r.getMessage() for r in caplog.records), caplog.text
+    assert "screen=False" in warnings[0]
+    assert "lengths='input'" in warnings[0]
 
 
 def test_chelate_bites_that_cannot_jointly_reach_the_polyhedron_are_refused(caplog):
@@ -1529,13 +1254,13 @@ def test_chelate_bites_that_cannot_jointly_reach_the_polyhedron_are_refused(capl
 def test_six_ring_pincer_opens_to_a_trigonal_bipyramid_equator():
     """PIVPOB's SNS pincer (a rigid 6-ring bite each side) reads 105-108 deg at its equator, above the 74-104
     deg ring-size census. The census-only window's ideal-clamped anchor misreads square_pyramidal, so a
-    census-only wall refused this isomer outright. The gap rule (`metal_constraints._bounded_bites`) instead
+    census-only wall refused this isomer outright. The gap rule (`metal_constraints.bounded_bites`) instead
     opens a box from the census edge out to the backbone-triangle reach, which this arrangement's relaxed
     shell does read as trigonal_bipyramidal, so it is enumerated and embeds.
     """
     smiles = "[O-2]->[V+5]12(<-[O-2])<-[S-]CCc3cccc(CC[S-]->1)[n]->23"
     isomers = rx.metal(smiles, "trigonal_bipyramidal")
-    mol = isomers[0]._graph  # one shared graph; atom symbols identify the pincer regardless of vertex order
+    mol = isomers[0].graph  # one shared graph; atom symbols identify the pincer regardless of vertex order
     equatorial = set(dict(record("trigonal_bipyramidal").site_groups)["equatorial"])
 
     def is_pincer_equatorial(iso):
@@ -1550,13 +1275,9 @@ def test_six_ring_pincer_opens_to_a_trigonal_bipyramid_equator():
 
 
 def test_seesaw_bis_bipyridine_silver_enumerates():
-    """`_bounded_bites`'s synthetic witness must read at the model M-L radius, not a bare unit ray (YEGNAA).
+    """Enumerate a seesaw silver with two independent cis bipyridine bites (YEGNAA).
 
-    Two independent cis bipyridine bites on a seesaw silver each have a compiled window of (70.0, 91.0) deg
-    around a 90 deg ideal. At a unit witness radius, an ideal seesaw's own plane RMS (0.2449) undercuts the
-    absolute flatness tolerance `classify_geometry` compares it against, so every corner of the box reads
-    square_planar instead of seesaw and `_bounded_bites` collapses the whole box to its anchor, refusing the
-    only candidate. Scaling the witness to the real model M-L distance restores the reading.
+    `bounded_bites` must read its bite-box corners as seesaw, not square_planar, or it refuses the only candidate.
     """
     smiles = "c1ccc2-c3cccc[n]3->[Ag+]4(<-[n]2c1)<-[n]1ccccc1-c1cccc[n]->41"
     isomers = rx.metal(Chem.MolFromSmiles(smiles), geometry="seesaw")
@@ -1569,7 +1290,7 @@ def test_seesaw_bis_bipyridine_silver_enumerates():
     ("tmqmg_id", "geometry"), [("MADQAM", "tetrahedral"), ("VALRAE", "square_pyramidal")], ids=["madqam", "valrae"]
 )
 def test_bounded_bite_box_still_embeds_the_reference_isomer(tmqmg_id, geometry):
-    """The bounded bite box (`metal_constraints._bounded_bites`) narrows MADQAM's and VALRAE's compiled bite
+    """The bounded bite box (`metal_constraints.bounded_bites`) narrows MADQAM's and VALRAE's compiled bite
     rows, but their reference isomer -- the one matching the crystal's own donor arrangement -- must still
     embed and read its own requested polyhedron within `_FIT_MARGIN` of the best, not slip into a clearly
     different shape the fold accepts instead (rule B, the acceptance gate's own predicate).

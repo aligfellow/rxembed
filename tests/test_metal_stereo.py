@@ -146,6 +146,27 @@ def test_site_markers_do_not_suppress_dithiocarbamate_resonance():
     assert sites[sulfurs[0]] == sites[sulfurs[1]]
 
 
+def test_bis_dithiolene_lewis_forms_give_one_isomer_set():
+    """A Mo bis-dithiolene chelate enumerates alike whether one wing is drawn dithiolate or dithione.
+
+    Same connectivity, H counts and total charge either way; the metal absorbs the difference (Mo(VI) with
+    two dithiolates vs Mo(IV) with one dithiolate and one neutral dithione). Before this identity ignored
+    charge everywhere, the mixed reading's dithione wing carried a different conjugated-system charge than
+    its dithiolate twin, so the two chemically identical ligands looked inequivalent and the enumeration lost
+    the ligand-exchange symmetry the dithiolate reading has, giving 5 isomers instead of 3.
+    """
+    dithiolate = "[Mo+6]12(<-[Cl-])(<-[Br-])(<-[S-]C=C[S-]->1)<-[S-]C=C[S-]->2"
+    mixed = "[Mo+4]12(<-[Cl-])(<-[Br-])(<-[S-]C=C[S-]->1)<-S=CC=S->2"
+    isos_a, isos_b = rx.metal(dithiolate, "OCT"), rx.metal(mixed, "OCT")
+
+    assert len(isos_a) == len(isos_b)
+    for isos in (isos_a, isos_b):
+        iso = isos[0]
+        classes = metal.site_classes(iso.graph, iso.donors, coordination=iso.roles)
+        sulfurs = [d for d in iso.donors if iso.graph.GetAtomWithIdx(d).GetAtomicNum() == 16]
+        assert len({classes[s] for s in sulfurs}) == 1, "all four dithiolene sulfurs must be one site class"
+
+
 def test_face_winding_abstains_at_the_plane_and_is_scale_invariant():
     face_mol = Chem.MolFromSmiles("[c-]1(F)c(Br)ccc1")
     rw = Chem.RWMol(Chem.CombineMols(face_mol, Chem.MolFromSmiles("[Fe+2]")))

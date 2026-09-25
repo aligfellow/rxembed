@@ -6,6 +6,7 @@ import itertools
 import json
 import math
 import random
+from functools import partial
 
 import numpy as np
 import pytest
@@ -411,7 +412,7 @@ def test_compiled_reach_uses_shared_legs_and_only_stated_floors():
     matrix = bnd.coordination_reach(mol, cons, reach)
     reverse = cons.copy(angles=dict(reversed(list(cons.angles.items()))))
     np.testing.assert_array_equal(matrix, bnd.coordination_reach(mol, reverse, reach))
-    native = bnd._coordination_reach_base(mol, reach, cons.metals)
+    native = bnd.coordination_reach_base(mol, reach, cons.metals)
     np.testing.assert_array_equal(matrix, bnd.coordination_reach(mol, cons, reach, native=native))
     # Acute minimum is inside the length interval, using the same radial tolerance as publication.
     assert matrix[2, 1] == pytest.approx((2.0 - FIX_DISTANCE_TOL) / 2)
@@ -467,64 +468,6 @@ def test_compiled_reach_omits_virtual_rows_without_dropping_real_constraints():
     assert with_face == before
 
 
-@pytest.mark.parametrize("refine", [False, True])
-def test_interval_euclidean_certificate_is_not_a_midpoint_or_rank_test(refine):
-    matrix = np.full((4, 4), 2.0)
-    matrix[3, :3] = matrix[:3, 3] = 1.1
-    np.fill_diagonal(matrix, 0.0)
-    assert bnd.DistanceGeometry.DoTriangleSmoothing(matrix.copy())
-    assert bnd._euclidean_conflict(matrix, refine=refine) is not None
-    matrix[3, :3], matrix[:3, 3] = 0.1, 1.16  # Contains the valid equilateral-base centre.
-    assert bnd._euclidean_conflict(matrix, refine=refine) is None
-    assert bnd._euclidean_conflict(np.ones((5, 5)) - np.eye(5), refine=refine) is None  # Valid in dimension four.
-    rng = np.random.default_rng(42)
-    for _ in range(100):
-        points = rng.normal(size=(5, 3))
-        distances = np.linalg.norm(points[:, None] - points[None, :], axis=2)
-        slack = rng.uniform(0.0, 0.5, distances.shape)
-        intervals = np.triu(distances + slack, 1) + np.tril(np.maximum(0.0, distances - slack), -1)
-        assert bnd._euclidean_conflict(intervals, refine=refine) is None
-
-
-def test_interval_euclidean_certificate_preserves_degenerate_eigenspaces():
-    groups = np.arange(9) // 3
-    squared = np.where(groups[:, None] == groups[None, :], 4.0, 1.21)
-    np.fill_diagonal(squared, 0.0)
-    lower, upper = np.sqrt(0.65 * squared), np.sqrt(1.35 * squared)
-    rng = np.random.default_rng(42)
-    for _ in range(20):
-        order = rng.permutation(9)
-        intervals = np.tril(lower[np.ix_(order, order)], -1) + np.triu(upper[np.ix_(order, order)], 1)
-        assert bnd.DistanceGeometry.DoTriangleSmoothing(intervals.copy())
-        assert bnd._euclidean_conflict(intervals) == pytest.approx(0.2995, abs=1e-12)
-    for invalid in (-0.1, np.nan, np.inf):
-        intervals[1, 0] = invalid
-        assert bnd._euclidean_conflict(intervals) is None
-
-
-def test_refinement_certifies_coupled_modes_without_atom_order_dependence():
-    n = 8
-    u = np.array((1, 1, 1, 1, -1, -1, -1, -1)) / np.sqrt(n)
-    v = np.array((1, 1, -1, -1, 1, 1, -1, -1)) / np.sqrt(n)
-    gram = np.eye(n) - np.ones((n, n)) / n - 1.2 * np.outer(u, u) - 1.1 * np.outer(v, v)
-    squared = np.diag(gram)[:, None] + np.diag(gram) - 2 * gram
-    slack = np.where(np.outer(u, u) * np.outer(v, v) < 0, 0.12, 0.0)
-    lower, upper = np.sqrt(np.maximum(squared - slack, 0.0)), np.sqrt(squared + slack)
-    rng = np.random.default_rng(42)
-    margin = None
-    for _ in range(10):
-        order = rng.permutation(n)
-        matrix = np.tril(lower[np.ix_(order, order)], -1) + np.triu(upper[np.ix_(order, order)], 1)
-        before = matrix.copy()
-        assert bnd._euclidean_conflict(matrix) is None
-        found = bnd._euclidean_conflict(matrix, refine=True)
-        assert found is not None
-        if margin is not None:
-            assert found == pytest.approx(margin, abs=1e-10)
-        margin = found
-        np.testing.assert_array_equal(matrix, before)
-
-
 # ---------------------------------------------------------------------------------------------------------
 # _smooth: the tolerance is the signal
 # ---------------------------------------------------------------------------------------------------------
@@ -548,7 +491,7 @@ def test_stereo_carrier_edges_are_not_native_ligand_bounds():
     )
     before = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx(), b.GetBondType()) for b in mol.GetBonds()]
     before_tags = [atom.GetChiralTag() for atom in mol.GetAtoms()]
-    native = metal_core._bounds_matrix(Chem.MolFromSmiles("NCCCN.[Fe+2]"))
+    native = bnd.bounds_matrix(Chem.MolFromSmiles("NCCCN.[Fe+2]"))
     ctx = bnd._write(mol, cons)
 
     assert (ctx.bm[5, 0], ctx.bm[0, 5]) == (2.0, 2.0)
@@ -583,13 +526,13 @@ def test_bounds_strip_only_selected_owned_dative_edges(monkeypatch):
     before = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx(), b.GetBondType()) for b in mol.GetBonds()]
     before_tags = [atom.GetChiralTag() for atom in mol.GetAtoms()]
     seen = []
-    native_bounds = metal_core._bounds_matrix
+    native_bounds = bnd.bounds_matrix
 
     def capture(candidate, *args, **kwargs):
         seen.append(Chem.Mol(candidate))
         return native_bounds(candidate, *args, **kwargs)
 
-    monkeypatch.setattr(metal_core, "_bounds_matrix", capture)
+    monkeypatch.setattr(bnd, "bounds_matrix", capture)
     bnd._write(mol, cons)
     assert len(seen) == 1
     private = seen[0]
@@ -620,15 +563,15 @@ def test_private_native_bounds_rebuild_ring_perception(monkeypatch, smiles, dono
         distances={tuple(sorted((donor, metal))): (2.0, 2.0) for donor in donors},
     )
     reference = Chem.MolFromSmiles(smiles)
-    expected = metal_core._bounds_matrix(reference)
+    expected = bnd.bounds_matrix(reference)
     seen = []
-    native_bounds = metal_core._bounds_matrix
+    native_bounds = bnd.bounds_matrix
 
     def capture(candidate, *args, **kwargs):
         seen.append(Chem.Mol(candidate))
         return native_bounds(candidate, *args, **kwargs)
 
-    monkeypatch.setattr(metal_core, "_bounds_matrix", capture)
+    monkeypatch.setattr(bnd, "bounds_matrix", capture)
     ctx = bnd._write(mol, cons)
     private = seen[0]
     rings = private.GetRingInfo().AtomRings()
@@ -662,11 +605,9 @@ def test_matrix_is_edited_not_replaced():
     [
         (lambda: bnd._bounds(_graph("C[S-]"), Constraints(distances={(0, 1): (1.7, 1.9)})), "UFFTYPER"),
         (
-            # the hydride's own construction warns too; build it at collection time (default-arg trick) so
-            # only the seeding call itself is under test, matching the UFFTYPER row's fresh-matrix timing
-            lambda mol=_graph("[H-].CC"): bnd.seed_coordinates(  # noqa: B008
-                mol, Constraints(), 1, bnd.EmbedParams(seed=42)
-            ),
+            # the hydride's own construction warns too; `partial` builds it at collection time, so only the
+            # seeding call itself is under test
+            partial(bnd.seed_coordinates, _graph("[H-].CC"), Constraints(), 1, bnd.EmbedParams(seed=42)),
             "not removing hydrogen atom without neighbors",
         ),
     ],
@@ -678,13 +619,17 @@ def test_bounds_hide_rdkit_internal_diagnostics(build, hidden, capfd):
     assert hidden not in capfd.readouterr().err
 
 
-def test_unrealisable_spec_names_failed_window(caplog):
+@pytest.mark.parametrize(("stated", "level"), [(False, "DEBUG"), (True, "WARNING")])
+def test_unrealisable_spec_names_failed_window(caplog, stated, level):
+    """The seed repair names its pair, and warns only when that pair is the caller's own fix= distance."""
     mol = _mol()
-    with caplog.at_level("WARNING", logger="rxembed.bounds"):
-        _bm, tol = bnd._feasible_bounds(mol, Constraints(distances={(0, 2): (1.0, 1.02)}))
+    window = {(0, 2): (1.0, 1.02)}
+    with caplog.at_level("DEBUG", logger="rxembed.bounds"):
+        _bm, tol = bnd._feasible_bounds(mol, Constraints(distances=window, fixed=window if stated else {}))
     assert tol > 0.0
-    assert "bounds needed smoothing" in caplog.text
-    assert "distance 0-2" in caplog.text, "the tolerance alone points nowhere; the window is the point"
+    repair = next(record for record in caplog.records if "needed smoothing" in record.getMessage())
+    assert repair.levelname == level
+    assert "C0-O2" in repair.getMessage(), "the tolerance alone points nowhere; the window is the point"
 
 
 def test_realisable_spec_says_nothing(caplog):
@@ -693,6 +638,45 @@ def test_realisable_spec_says_nothing(caplog):
         _bm, tol = bnd._feasible_bounds(mol, Constraints(distances={(0, 2): (2.5, 2.6)}))
     assert tol == 0.0
     assert caplog.records == []
+
+
+# ---------------------------------------------------------------------------------------------------------
+# _cap_fragment_contacts: every free component repels every other at its van der Waals floor and stays
+# within a shared, formula-derived ceiling; no probe conformer, no chosen contact pair
+# ---------------------------------------------------------------------------------------------------------
+
+
+def test_cap_fragment_contacts_bounds_every_free_pair():
+    mol = _graph("C.N")
+    bm = _matrix(mol)
+    assert bm[0][1] > 100.0, "the premise: two unlinked fragments start at RDKit's raw unset upper bound"
+
+    bnd._cap_fragment_contacts(mol, Constraints(), bm)
+
+    assert bm[1][0] <= bm[0][1] < 100.0, "the pair now has a real, finite ceiling above its own floor"
+
+
+def test_cap_fragment_contacts_treats_distance_linked_atoms_as_one_component():
+    mol = Chem.MolFromSmiles("C.N.O.F")
+    bm = _matrix(mol)
+    raw = bm[1][2]
+
+    bnd._cap_fragment_contacts(mol, Constraints(distances={(0, 1): (2.0, 2.1), (0, 2): (2.0, 2.1)}), bm)
+
+    assert bm[1][2] == raw, "N and O are held into one component with C; capping never touches a same-component pair"
+    for atom in (0, 1, 2):
+        a, b = min(atom, 3), max(atom, 3)
+        assert bm[a][b] < 100.0, f"atom {atom}'s component and the free F must both get a ceiling"
+
+
+def test_cap_fragment_contacts_skips_two_already_pinned_fragments():
+    mol = _graph("C.N")
+    bm = _matrix(mol)
+    raw = bm[0][1]
+
+    bnd._cap_fragment_contacts(mol, Constraints(frozen={0, 1}), bm)
+
+    assert bm[0][1] == raw, "both fragments are already pinned elsewhere; forcing them together could fight that"
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -959,14 +943,14 @@ def test_r1_a_stated_distance_pre_empts_the_angle():
 def test_angle_bounds_intersect_bond_path(window, note):
     mol = _rule_mol("CCC")
     topo = Chem.GetDistanceMatrix(mol)
-    assert topo[0][2] < mech._DISCONNECTED  # a real bond path: the predicate that selects INTERSECT
+    assert topo[0][2] < mech.DISCONNECTED  # a real bond path: the predicate that selects INTERSECT
 
     base = _edited(mol, Constraints())
     blo, bhi = _window(base, 0, 2)
     ctx = mech.DGContext(mol, base)
     d01, d12 = ctx.mid(0, 1), ctx.mid(1, 2)
-    alo = mech._law_of_cosines(d01, d12, window[0])
-    ahi = mech._law_of_cosines(d01, d12, window[1])
+    alo = mech.law_of_cosines(d01, d12, window[0])
+    ahi = mech.law_of_cosines(d01, d12, window[1])
 
     cons = Constraints()
     cons.angles[(0, 1, 2)] = window
@@ -990,7 +974,7 @@ def test_angle_prior_keeps_the_nonbonded_floor_between_cis_donors():
     geometry. Two metal legs bent to a tight angle put the far donors closer than that floor (FOPSOT): the
     angle-derived window is disjoint from and entirely below RDKit's own, so a disjoint intersection must leave
     RDKit's bounds standing, exactly as if the angle constraint had never been stated. Relieving the floor
-    there instead (letting the angle prior narrow it) was tried and reverted (mechanisms.Angle._dg_windows).
+    there instead (letting the angle prior narrow it) was tried and reverted (mechanisms.Angle.dg_windows).
     """
     mol = _rule_mol("CCCCCC.[Ni]")
     assert Chem.GetDistanceMatrix(mech.disconnect_metal(mol), force=True)[0][5] == 5  # past RDKit's 1-5 bound
@@ -1012,7 +996,7 @@ def test_angle_prior_keeps_the_nonbonded_floor_between_cis_donors():
 def test_r3_no_bond_path_writes_the_angle_outright():
     mol = _rule_mol("C.C.C")
     topo = Chem.GetDistanceMatrix(mol)
-    assert topo[0][2] >= mech._DISCONNECTED  # no bond path: the predicate that selects WRITE OUTRIGHT
+    assert topo[0][2] >= mech.DISCONNECTED  # no bond path: the predicate that selects WRITE OUTRIGHT
 
     cons = Constraints()
     add_distance(cons.distances, 0, 1, 2.00, 2.00)

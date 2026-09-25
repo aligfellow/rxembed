@@ -16,16 +16,16 @@ from rdkit.Chem.rdMolTransforms import GetAngleDeg, GetBondLength, SetBondLength
 
 import rxembed as rx
 from rxembed import bounds as bnd
-from rxembed import metal_core as _metal
-from rxembed import stereo as _stereo
 from rxembed.constraints import FIX_ANGLE_TOL, FIX_DISTANCE_TOL, Constraints, resolve_core
 from rxembed.embed import BASE_STIFFNESS, Conformers, Failure, embed, fold_substrate, minimize
-from rxembed.metal_core import TRANSITION_METALS, coplanar
+from rxembed.metal_core import COORDINATION_METALS, VACANT, donor_chirality_sign, metal_indices, state_with_winding
 from rxembed.metal_enumeration import enumerate_isomers
 from rxembed.metal_isomer import Isomer, from_geometry
+from rxembed.metal_perceive import SHAPE_PROP, classify_geometry, coplanar
 from rxembed.metal_polyhedron import POLYHEDRA
 from rxembed.metal_smiles import cxsmiles, parse_smiles
-from rxembed.relax import UFFOptimizationError, UFFTypingError, bonding_ok, restrained_uff
+from rxembed.relax import UFFOptimizationError, UFFRecord, UFFTypingError, bonding_failure, restrained_uff
+from rxembed.stereo import axis_stereo, bond_stereo, point_stereo, stereo_from_3d
 
 emb = importlib.import_module("rxembed.embed")  # the engine implementation module, not the public facade
 
@@ -184,7 +184,7 @@ def test_coordination_gate_rejects_a_poor_nearest_shape():
     for donor in iso.donors:
         conf.SetAtomPosition(donor, (metal + np.array([1.0, 0.0, 0.0])).tolist())
 
-    assert not emb._coordination_state_ok(confs._mol, confs.ids[0], iso)
+    assert emb._coordination_state_failure(confs._mol, confs.ids[0], iso) is not None
 
 
 def test_coordination_gate_rejects_another_named_shape_below_the_residual_floor():
@@ -195,7 +195,7 @@ def test_coordination_gate_rejects_another_named_shape_below_the_residual_floor(
     for donor, direction in zip(iso.vertices, POLYHEDRA["seesaw"].vertex_dirs, strict=True):
         conf.SetAtomPosition(donor, tuple(map(float, 2 * np.asarray(direction))))
 
-    assert not emb._coordination_state_ok(confs._mol, confs.ids[0], iso)
+    assert emb._coordination_state_failure(confs._mol, confs.ids[0], iso) is not None
 
 
 def test_coordination_gate_rejects_a_nearer_cn7_shape_below_the_residual_floor():
@@ -206,8 +206,8 @@ def test_coordination_gate_rejects_a_nearer_cn7_shape_below_the_residual_floor()
         conf.SetAtomPosition(donor, tuple(map(float, 2 * np.asarray(direction))))
     iso.mol.AddConformer(conf)
 
-    assert _metal.classify_geometry(iso.mol, iso.metal, list(iso.vertices), 0) == "capped_trigonal_prismatic"
-    assert not emb._coordination_state_ok(iso.mol, 0, iso)
+    assert classify_geometry(iso.mol, iso.metal, list(iso.vertices), 0) == "capped_trigonal_prismatic"
+    assert emb._coordination_state_failure(iso.mol, 0, iso) is not None
 
 
 def test_coordination_gate_accepts_an_ideal_mixed_high_coordination_state():
@@ -218,7 +218,7 @@ def test_coordination_gate_accepts_an_ideal_mixed_high_coordination_state():
         conf.SetAtomPosition(donor, tuple(map(float, 2 * np.asarray(direction))))
     iso.mol.AddConformer(conf)
 
-    assert emb._coordination_state_ok(iso.mol, 0, iso)
+    assert emb._coordination_state_failure(iso.mol, 0, iso) is None
 
 
 def test_coordination_gate_rejects_a_better_exact_search_slot_assignment():
@@ -234,35 +234,32 @@ def test_coordination_gate_rejects_a_better_exact_search_slot_assignment():
     for donor, direction in zip(iso.vertices, observed, strict=True):
         conf.SetAtomPosition(donor, tuple(2.0 * direction))
 
-    assert _metal.classify_geometry(confs._mol, iso.metal, list(iso.vertices), confs.ids[0]) == "square_pyramidal"
-    assert not emb._coordination_state_ok(confs._mol, confs.ids[0], iso)
+    assert classify_geometry(confs._mol, iso.metal, list(iso.vertices), confs.ids[0]) == "square_pyramidal"
+    assert emb._coordination_state_failure(confs._mol, confs.ids[0], iso) is not None
 
 
 def test_cobalt_tetraammine_vacancy_rejects_a_trigonal_bipyramidal_shell():
     """A CN6 octahedral request with one vacancy (Co(NH3)4Cl, 5 donors) is read against its 5 occupied sites.
 
-    An ideal trigonal_bipyramidal shell -- not the octahedral-minus-one square pyramid its own vacant subset
-    would read as -- is a clear miss, named with both residuals; the old gate never read a vacant centre's
-    shape at all (`_retained_polyhedron` returned None for any vacancy, so this shell passed unchecked).
+    An ideal trigonal_bipyramidal shell, not the octahedral-minus-one square pyramid its own vacant subset
+    would read as, is a clear miss, named by both shape codes.
     """
     iso = _isomer("[Co](N)(N)(N)(N)Cl", "octahedral")
     confs = embed(iso, n=1, seed=1)
     conf = confs._mol.GetConformer(confs.ids[0])
     conf.SetAtomPosition(iso.metal, (0.0, 0.0, 0.0))
-    donors = [v for v in iso.vertices if v != _metal.VACANT]
+    donors = [v for v in iso.vertices if v != VACANT]
     for donor, direction in zip(donors, POLYHEDRA["trigonal_bipyramidal"].vertex_dirs, strict=True):
         conf.SetAtomPosition(donor, tuple(map(float, 2 * np.asarray(direction))))
 
     failure = emb._coordination_state_failure(confs._mol, confs.ids[0], iso)
     assert failure is not None
-    assert "expected octahedral" in str(failure)
-    assert "reads trigonal_bipyramidal" in str(failure)
-    assert len(re.findall(r"\d\.\d{3}", str(failure))) >= 2
+    assert re.fullmatch(rf"Co{iso.metal} relaxes from OCT \(\d\.\d{{3}}\) to TBP \(\d\.\d{{3}}\)", str(failure))
 
 
 def test_fe_pentacarbonyl_square_pyramid_shell_is_rejected_with_numbers():
     """Fe(CO)5 requesting trigonal_bipyramidal, given an ideal square_pyramidal shell: residual 0.233, well
-    under `_FIT_FLOOR` (0.45) but not a near-tie, so an identity-only gate would accept it. The rejection
+    under `FIT_FLOOR` (0.45) but not a near-tie, so an identity-only gate would accept it. The rejection
     must carry both residual numbers, not just a name.
     """
     iso = _isomer("[Fe](N)(O)(F)(Cl)Br", "trigonal_bipyramidal")
@@ -282,7 +279,7 @@ def test_fe_pentacarbonyl_conformer_carries_its_shape_record():
     iso = _isomer("[Fe](N)(O)(F)(Cl)Br", "trigonal_bipyramidal")
     confs = embed(iso, n=1, seed=1).minimize()
 
-    prop = confs._mol.GetConformer(confs.ids[0]).GetProp(emb.SHAPE_PROP)
+    prop = confs._mol.GetConformer(confs.ids[0]).GetProp(SHAPE_PROP)
     assert prop.startswith("Fe0 TBP")
 
 
@@ -291,8 +288,8 @@ def test_publication_rejects_a_different_coordination_arrangement():
     selected = embed(isomers[0], n=1, seed=1, threads=1)
     alternate = embed(isomers[1], n=1, seed=1, threads=1)
 
-    assert not emb._coordination_state_ok(alternate.mol, 0, isomers[0])
-    assert emb._coordination_state_ok(selected.mol, 0, isomers[0])
+    assert emb._coordination_state_failure(alternate.mol, 0, isomers[0]) is not None
+    assert emb._coordination_state_failure(selected.mol, 0, isomers[0]) is None
 
 
 def test_octahedral_hand_does_not_replace_full_donor_slot_identity():
@@ -308,7 +305,7 @@ def test_octahedral_hand_does_not_replace_full_donor_slot_identity():
         for atom, direction in zip(iso.vertices, directions, strict=True):
             conf.SetAtomPosition(atom, 2 * direction)
         mol.AddConformer(conf)
-        assert emb._coordination_state_ok(mol, 0, requested) == (index == 0), (
+        assert (emb._coordination_state_failure(mol, 0, requested) is None) == (index == 0), (
             f"accepted the wrong seating or rejected the requested one: {iso}"
         )
 
@@ -318,7 +315,7 @@ def test_coordination_gate_rejects_nonfinite_donor_coordinates():
     confs = embed(iso, n=1, seed=1)
     confs._mol.GetConformer(confs.ids[0]).SetAtomPosition(iso.donors[0], (float("nan"), 0.0, 0.0))
 
-    assert not emb._coordination_state_ok(confs._mol, confs.ids[0], iso)
+    assert emb._coordination_state_failure(confs._mol, confs.ids[0], iso) is not None
 
 
 def test_structural_gate_rejects_undefined_coplanarity():
@@ -329,39 +326,41 @@ def test_structural_gate_rejects_undefined_coplanarity():
     cons = Constraints(coplanar=[(0, 1, 2, 3, 180.0, 10.0)])
 
     assert emb._structural_failure(mol, 0, cons) == Failure(
-        "structural_constraint", "coplanarity deviation (0, 1, 2, 3): undefined deg; expected [0, 12] deg"
+        "structural_constraint", "coplanarity C0-C1-C2-C3 is undefined", atoms=(0, 1, 2, 3)
     )
 
 
 @pytest.mark.parametrize(
-    ("cons", "kind", "detail"),
+    ("cons", "kind", "detail", "atoms"),
     [
         (
             Constraints(metals={0}, distances={(0, 2): (2.0, 2.1)}),
             "ml_distance",
-            "M-L distance (0, 2): 1.414 (excess 0.576) A; "
-            f"expected [{2.0 - emb._ML_WINDOW_TOL:g}, {2.1 + emb._ML_WINDOW_TOL:g}] A",
+            "M-L distance He0-He2 1.41 A, 0.58 A outside 1.99-2.11",
+            (0, 2),
         ),
         (
             Constraints(coplanar=[(0, 1, 2, 3, None, 10.0)]),
             "structural_constraint",
-            "coplanarity deviation (0, 1, 2, 3): 45.000 (excess 33) deg; expected [0, 12] deg",
+            "coplanarity He0-He1-He2-He3 45.0 deg, 33 deg outside 0.0-12.0",
+            (0, 1, 2, 3),
         ),
         (
             Constraints(umbrellas={(0, 1, 2, 3): 60.0}),
             "structural_constraint",
-            "absolute umbrella dihedral (0, 1, 2, 3): 45.000 (excess 13) deg; expected [58, 92] deg",
+            "umbrella He0-He1-He2-He3 45.0 deg, 13 deg outside 58.0-92.0",
+            (0, 1, 2, 3),
         ),
     ],
 )
-def test_geometry_failure_names_the_structural_measurement(cons, kind, detail):
+def test_geometry_failure_names_the_structural_measurement(cons, kind, detail, atoms):
     mol = Chem.MolFromSmiles("[He].[He].[He].[He]")
     conf = Chem.Conformer(4)
     conf.SetPositions(np.array(((0, 1, 0), (0, 0, 0), (1, 0, 0), (1, 1, 1)), dtype=float))
     mol.AddConformer(conf)
     conformers = Conformers(mol, [0], cons)
 
-    assert conformers._geometry_failure(0) == Failure(kind, detail)
+    assert conformers._geometry_failure(0) == Failure(kind, detail, atoms=atoms)
 
 
 def test_structural_failure_reports_excess_below_display_precision():
@@ -373,7 +372,7 @@ def test_structural_failure_reports_excess_below_display_precision():
 
     failure = emb._structural_failure(mol, 0, cons)
     assert failure.kind == "ml_distance"
-    assert "excess 0.0004" in failure.detail
+    assert "0.0004 A outside" in failure.detail
 
 
 def test_model_ml_window_accepts_physical_slack_a_fixed_distance_does_not():
@@ -395,8 +394,9 @@ def test_model_ml_window_accepts_physical_slack_a_fixed_distance_does_not():
     failure = emb._structural_failure(mol, 0, fixed)
     assert failure == Failure(
         "ml_distance",
-        f"M-L distance (0, 1): 2.106 (excess {0.006 - FIX_DISTANCE_TOL:.3g}) A; "
-        f"expected [{2.0 - FIX_DISTANCE_TOL:g}, {2.1 + FIX_DISTANCE_TOL:g}] A",
+        f"M-L distance He0-He1 2.11 A, {0.006 - FIX_DISTANCE_TOL:.2g} A outside "
+        f"{2.0 - FIX_DISTANCE_TOL:.2f}-{2.1 + FIX_DISTANCE_TOL:.2f}",
+        atoms=(0, 1),
     )
 
 
@@ -411,17 +411,17 @@ def test_donor_orientation_seed_wall_is_not_a_structural_postcondition():
     assert emb._structural_failure(mol, 0, cons) is None
 
 
-def test_donor_angle_failure_warns_without_rejecting_the_conformer(monkeypatch, caplog):
+def test_donor_angle_failure_logs_without_rejecting_the_conformer(monkeypatch, caplog):
     confs = embed(_isomer(), n=1, seed=1, threads=1).minimize()
     cid = confs.ids[0]
     assert confs._geometry_failure(cid) is None
     detail = "C1 (sp3) M-D-X to Si2: 99.5° < census floor 104°; inspect donor geometry and restraints"
     monkeypatch.setattr(emb, "donor_orientation", lambda *args: [SimpleNamespace(detail=detail)])
 
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
+    with caplog.at_level(logging.DEBUG, logger="rxembed"):
         failure = confs._geometry_failure(cid)
     assert failure is None, "a donor-orientation floor violation must not reject the conformer"
-    assert f"donor orientation: {detail}" in caplog.text
+    assert [record.levelno for record in caplog.records if detail in record.getMessage()] == [logging.DEBUG]
 
 
 @pytest.mark.parametrize(("real_window", "expected"), [((0.9, 2.2), True), ((1.9, 2.2), False)])
@@ -479,11 +479,11 @@ def test_surrogate_is_internal_and_output_restores_metal():
     confs = embed(iso, n=2, seed=0xF00D).minimize()
 
     internal = confs._mol.GetAtomWithIdx(iso.metal)
-    assert internal.GetAtomicNum() not in TRANSITION_METALS, "the working mol must still hold the surrogate"
+    assert internal.GetAtomicNum() not in COORDINATION_METALS, "the working mol must still hold the surrogate"
     assert internal.GetDegree() == 0, "the surrogate must stay bond-less: a bonded Li makes UFF singular"
 
     restored = confs.mol.GetAtomWithIdx(iso.metal)
-    assert restored.GetAtomicNum() in TRANSITION_METALS
+    assert restored.GetAtomicNum() in COORDINATION_METALS
     assert restored.GetFormalCharge() == iso.real_q
     assert Chem.GetFormalCharge(confs.mol) == Chem.GetFormalCharge(src)
     assert len(Chem.GetMolFrags(confs.mol)) == 1, "the M-donor bonds are re-added, so the complex is one fragment"
@@ -612,60 +612,28 @@ def test_graft_allows_one_sphere_atom_not_two():
     assert iso.donors[0] in _fold(iso, fix={iso.donors[0]: (0.0, 0.0, 0.0)}).frozen
 
 
-# ---------------------------------------------------------------------------------------------------------
-# encounter bounds: a probe geometry decides a discrete question, so it must not read process history
-# ---------------------------------------------------------------------------------------------------------
+def test_ammonium_acetate_stays_within_contact_range():
+    """A simple salt's two free ions embed together, not scattered apart.
 
-
-def _two_fragments():
-    return _mol("OC(=O)CCCc1ccccc1.NCCCCN")
-
-
-def _burn_global_rng(n=64):
-    """Consume RDKit global randomness, standing in for whatever ran before us in a real session."""
-    for _ in range(n):
-        m = _mol("CCCCO")
-        rdDistGeom.EmbedMolecule(m, rdDistGeom.ETKDGv3())  # deliberately unseeded
-
-
-def test_encounter_bounds_ignore_global_rng():
-    mol = _two_fragments()
-    assert len(Chem.GetMolFrags(mol)) >= 2, "fixture must be multi-fragment to exercise the encounter bounds"
-    before = emb.encounter_bounds(mol)
-    assert before, "no inter-fragment bound was produced: the fixture is not exercising the code"
-    _burn_global_rng()
-    assert emb.encounter_bounds(mol) == before
-
-
-def test_probe_seed_is_forwarded(monkeypatch):
-    seen = []
-    real = bnd.probe_conformer
-    monkeypatch.setattr(emb, "probe_conformer", lambda m, s: (seen.append(s), real(m, s))[1])
-    emb.encounter_bounds(_two_fragments(), seed=4321)
-    assert seen == [4321]
-
-
-def test_float_bounds_apply_only_without_pins():
-    mol = _two_fragments()
-    assert emb.float_encounter_bounds(mol, Constraints()), "every pair of a free multi-fragment mol must be bounded"
-
-    i, j = sorted(f[0] for f in Chem.GetMolFrags(mol))
-    assert emb.float_encounter_bounds(mol, Constraints(distances={(i, j): (3.0, 3.5)})) == {}
-    assert emb.float_encounter_bounds(_mol("CCO"), Constraints()) == {}
-
-
-def test_encounter_bounds_treat_distance_linked_ligands_as_one_component():
-    mol = Chem.MolFromSmiles("C.N.O.F")
-    bounds = emb.float_encounter_bounds(mol, Constraints(distances={(0, 1): (2.0, 2.1), (0, 2): (2.0, 2.1)}))
-
-    assert len(bounds) == 1
-    assert 3 in next(iter(bounds))
-
-
-def test_encounter_bounds_do_not_move_two_separately_fixed_fragments():
-    mol = Chem.MolFromSmiles("C.N")
-
-    assert emb.float_encounter_bounds(mol, Constraints(frozen={0, 1})) == {}
+    Every fragment repels every other one at its van der Waals floor (`bnd._cap_fragment_contacts`); nothing
+    picks a contact atom, so the ions can settle anywhere within that shared range, never beyond it.
+    """
+    mol = _mol("CC(=O)[O-].[NH4+]")
+    confs = embed(mol, n=6, seed=42)
+    assert confs.ids, "the salt must actually embed for this test to say anything"
+    pt = Chem.GetPeriodicTable()
+    frags = Chem.GetMolFrags(confs.mol)
+    assert len(frags) == 2, "acetate and ammonium stay their own fragments; nothing bonds them"
+    for cid in confs.ids:
+        pos = confs.mol.GetConformer(cid).GetPositions()
+        for i in [a for a in frags[0] if confs.mol.GetAtomWithIdx(a).GetAtomicNum() > 1]:
+            for j in [a for a in frags[1] if confs.mol.GetAtomWithIdx(a).GetAtomicNum() > 1]:
+                d = float(np.linalg.norm(pos[i] - pos[j]))
+                vdw = pt.GetRvdw(confs.mol.GetAtomWithIdx(i).GetAtomicNum()) + pt.GetRvdw(
+                    confs.mol.GetAtomWithIdx(j).GetAtomicNum()
+                )
+                assert d >= vdw - 0.05, f"{i}-{j} sits inside its van der Waals floor"
+                assert d < 15.0, f"{i}-{j} drifted out of contact range ({d:.1f} A)"
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -740,7 +708,7 @@ def test_minimize_holds_isomer_polyhedron():
         assert lo - 0.15 <= d <= hi + 0.15, f"sphere not held: d({i},{j}) = {d:.2f}, window ({lo:.2f}, {hi:.2f})"
     assert coplanar(pos, iso.metal, iso.donors), "the relax was pulled toward the declared square plane"
 
-    assert confs.mol.GetAtomWithIdx(iso.metal).GetAtomicNum() in TRANSITION_METALS
+    assert confs.mol.GetAtomWithIdx(iso.metal).GetAtomicNum() in COORDINATION_METALS
     assert len(Chem.GetMolFrags(confs.mol)) == 1, "the M-donor bonds are re-added, so the complex is one fragment"
     assert confs._mol is not iso.mol, "the relax works on a copy: the caller keeps its isomer"
     assert np.allclose(iso.mol.GetConformer().GetPositions(), before)
@@ -749,7 +717,7 @@ def test_minimize_holds_isomer_polyhedron():
 @pytest.mark.parametrize("lengths", ["model", "input"])
 def test_minimize_uses_model_distances_unless_input_requested(lengths):
     mol = _with_geometry("Cl[Pd](Cl)(N)N")
-    pd = next(a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS)
+    pd = next(a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS)
     donors = [n.GetIdx() for n in mol.GetAtomWithIdx(pd).GetNeighbors()]
     before = [GetBondLength(mol.GetConformer(0), pd, d) for d in donors]
 
@@ -790,13 +758,13 @@ def test_stiffness_ladder_retries_only_the_unresolved_conformer(monkeypatch):
     constraints = []
     latest = {}
 
-    def marked_uff(_mol, _cons, *, stiffness, max_iters, conf_ids, _statuses=None, **_kw):
+    def marked_uff(_mol, _cons, *, stiffness, max_iters, conf_ids, record=None, **_kw):
         ids = tuple(conf_ids)
         calls.append((ids, stiffness, max_iters))
         constraints.append(_cons)
         latest.update(dict.fromkeys(ids, stiffness))
-        if _statuses is not None:
-            _statuses.update(dict.fromkeys(ids, 0))
+        if record is not None:
+            record.statuses.update(dict.fromkeys(ids, 0))
         return np.zeros(len(ids))
 
     def injected_failure(_self, cid, _iso=None):
@@ -806,13 +774,33 @@ def test_stiffness_ladder_retries_only_the_unresolved_conformer(monkeypatch):
     monkeypatch.setattr(Conformers, "_geometry_failure", injected_failure)
     confs._relax_constrained(BASE_STIFFNESS, max_iters=10)
 
-    assert calls[:2] == [
+    assert calls == [
         (tuple(confs.ids), BASE_STIFFNESS, 10),
         ((victim,), 3 * BASE_STIFFNESS, 10),
     ]
-    assert calls[-1] == (tuple(confs.ids), BASE_STIFFNESS, 0)
     assert all(active is confs.cons for active in constraints)
     assert victim not in confs.unrelaxed
+
+
+def test_replacement_batches_reuse_one_coordination_prep_per_isomer(monkeypatch):
+    """One isomer's coordination-state prep must be built once, then shared across every ladder rung.
+
+    `_relax_constrained` copies `self` with `dataclasses.replace()` at every rung, and each rung checks the
+    shape for every conformer; a per-copy cache would rebuild the same isomer's prep on each of those checks.
+    """
+    real_prep = emb._coordination_state_prep
+    calls = []
+
+    def spy(iso):
+        calls.append(True)
+        return real_prep(iso)
+
+    monkeypatch.setattr(emb, "_coordination_state_prep", spy)
+
+    confs = embed(_isomer(_NI_N), n=2, seed=1, threads=1).minimize()
+
+    assert confs.ids
+    assert len(calls) == 1
 
 
 def test_relax_ladder_does_not_escalate_a_converged_wrong_coordination_shape(monkeypatch):
@@ -820,10 +808,10 @@ def test_relax_ladder_does_not_escalate_a_converged_wrong_coordination_shape(mon
     confs = Conformers(mol, [0], Constraints(), params=bnd.EmbedParams(seed=1))
     calls = []
 
-    def marked_uff(_mol, _cons, *, max_iters, conf_ids, _statuses=None, **_kw):
+    def marked_uff(_mol, _cons, *, max_iters, conf_ids, record=None, **_kw):
         calls.append(max_iters)
-        if _statuses is not None:
-            _statuses.update(dict.fromkeys(conf_ids, 0))
+        if record is not None:
+            record.statuses.update(dict.fromkeys(conf_ids, 0))
         return np.zeros(len(conf_ids))
 
     monkeypatch.setattr(emb, "restrained_uff", marked_uff)
@@ -835,7 +823,33 @@ def test_relax_ladder_does_not_escalate_a_converged_wrong_coordination_shape(mon
 
     confs._relax_constrained(BASE_STIFFNESS, max_iters=10)
 
-    assert calls == [10, 0]
+    assert calls == [10]
+    assert confs.unrelaxed == [0]
+    assert confs.relax_failures[0].kind == "coordination_shape"
+
+
+def test_relax_ladder_does_not_escalate_an_unconverged_wrong_coordination_shape(monkeypatch):
+    """A wrong shape is a wrong basin whether or not UFF's optimizer reports convergence at it."""
+    mol = _with_geometry("CCO")
+    confs = Conformers(mol, [0], Constraints(), params=bnd.EmbedParams(seed=1))
+    calls = []
+
+    def marked_uff(_mol, _cons, *, max_iters, conf_ids, record=None, **_kw):
+        calls.append(max_iters)
+        if record is not None:
+            record.statuses.update(dict.fromkeys(conf_ids, 1))  # not converged
+        return np.zeros(len(conf_ids))
+
+    monkeypatch.setattr(emb, "restrained_uff", marked_uff)
+    monkeypatch.setattr(
+        Conformers,
+        "_geometry_failure",
+        lambda *_args: Failure("coordination_shape", "coordination state at M0: expected SPY, found TBP"),
+    )
+
+    confs._relax_constrained(BASE_STIFFNESS, max_iters=10)
+
+    assert calls == [10]
     assert confs.unrelaxed == [0]
     assert confs.relax_failures[0].kind == "coordination_shape"
 
@@ -852,12 +866,12 @@ def test_relax_ladder_checks_requested_haptic_face_before_accepting(monkeypatch,
     seed = confs._mol.GetConformer(cid).GetPositions().copy()
     assert confs._metal_states()[cid]
     if not requested:
-        state = _metal.state_with_winding(iso.centres[0], iso.vertices, {})
-        confs.iso = iso._with_stereo((state,))
+        state = state_with_winding(iso.centres[0], iso.vertices, {})
+        confs.iso = iso.with_stereo((state,))
         assert not emb._stereo_targets(confs.iso)
     attempts, faces = [], []
 
-    def flip_then_recover(mol, _cons, *, stiffness, max_iters, conf_ids, _statuses=None, _snapshots=None, **_kw):
+    def flip_then_recover(mol, _cons, *, stiffness, max_iters, conf_ids, record=None, **_kw):
         if max_iters:
             attempts.append(stiffness)
             assert np.array_equal(mol.GetConformer(cid).GetPositions(), seed)
@@ -870,10 +884,10 @@ def test_relax_ladder_checks_requested_haptic_face_before_accepting(monkeypatch,
             else:
                 pos[:, 0] += 0.1
             mol.GetConformer(cid).SetPositions(pos)
-            assert _statuses is not None
-            assert _snapshots is not None
-            _statuses[cid] = 0
-            _snapshots[cid] = [pos.copy()]
+            assert record is not None
+            assert record.snapshots is not None
+            record.statuses[cid] = 0
+            record.snapshots[cid] = [pos.copy()]
             faces.append(confs._metal_states()[cid])
         return np.zeros(len(conf_ids))
 
@@ -905,21 +919,21 @@ def test_finite_gate_valid_max_iteration_endpoint_is_retained(monkeypatch):
     before = mol.GetConformer().GetPositions().copy()
     calls = []
 
-    def stalled_uff(mol, _cons, *, max_iters, conf_ids, _statuses=None, **_kw):
+    def stalled_uff(mol, _cons, *, max_iters, conf_ids, record=None, **_kw):
         calls.append(max_iters)
         if max_iters:
-            assert _statuses is not None
+            assert record is not None
             moved = mol.GetConformer(0).GetPositions().copy()
             moved[0, 0] += 0.2
             mol.GetConformer(0).SetPositions(moved)
-            _statuses[0] = 1
+            record.statuses[0] = 1
         return np.zeros(len(conf_ids))
 
     monkeypatch.setattr(emb, "restrained_uff", stalled_uff)
     monkeypatch.setattr(Conformers, "_geometry_failure", lambda _self, _cid, _iso=None: None)
     confs._relax_constrained(BASE_STIFFNESS, max_iters=10)
 
-    assert calls == [10, 0]
+    assert calls == [10]
     assert confs.unrelaxed == [0]
     assert not np.array_equal(mol.GetConformer().GetPositions(), before)
 
@@ -932,14 +946,14 @@ def test_relax_ladder_corrects_free_metal_mirrors_before_geometry_acceptance(mon
     seed = confs._mol.GetConformer(cid).GetPositions().copy()
     attempts = []
 
-    def reflect(mol, _cons, *, max_iters, conf_ids, _statuses=None, _snapshots=None, **_kw):
+    def reflect(mol, _cons, *, max_iters, conf_ids, record=None, **_kw):
         if max_iters:
             attempts.append(max_iters)
             emb._reflect(mol, cid)
-            if _snapshots is not None:
-                _snapshots[cid] = [mol.GetConformer(cid).GetPositions().copy()]
-            assert _statuses is not None
-            _statuses[cid] = 0
+            assert record is not None
+            if record.snapshots is not None:
+                record.snapshots[cid] = [mol.GetConformer(cid).GetPositions().copy()]
+            record.statuses[cid] = 0
         return np.zeros(len(conf_ids))
 
     monkeypatch.setattr(emb, "restrained_uff", reflect)
@@ -967,12 +981,12 @@ def test_relax_ladder_leaves_inactive_metal_mirrors_untouched(monkeypatch):
     emb._reflect(confs._mol, inactive)
     before = confs._mol.GetConformer(inactive).GetPositions().copy()
 
-    def reflect(mol, _cons, *, conf_ids, max_iters, _statuses=None, **_kw):
+    def reflect(mol, _cons, *, conf_ids, max_iters, record=None, **_kw):
         assert conf_ids == [cid]
         if max_iters:
             emb._reflect(mol, cid)
-            assert _statuses is not None
-            _statuses[cid] = 0
+            assert record is not None
+            record.statuses[cid] = 0
         return np.zeros(len(conf_ids))
 
     monkeypatch.setattr(emb, "restrained_uff", reflect)
@@ -1010,14 +1024,14 @@ def test_later_uff_failure_preserves_already_accepted_endpoints(monkeypatch, vic
     endpoint = seed + np.array([0.1, 0.0, 0.0])
     calls = []
 
-    def fail_second_attempt(mol, _cons, *, conf_ids, _statuses, _snapshots, **_kw):
+    def fail_second_attempt(mol, _cons, *, conf_ids, record, **_kw):
         calls.append(list(conf_ids))
         if len(calls) > 1:
             raise UFFTypingError("unavailable")
         for cid in conf_ids:
             mol.GetConformer(cid).SetPositions(endpoint)
-            _statuses[cid] = 0
-            _snapshots[cid] = [endpoint.copy()]
+            record.statuses[cid] = 0
+            record.snapshots[cid] = [endpoint.copy()]
         return np.zeros(len(conf_ids))
 
     monkeypatch.setattr(emb, "restrained_uff", fail_second_attempt)
@@ -1054,11 +1068,11 @@ def test_uff_optimizer_failure_is_not_relabelled_as_unavailable(monkeypatch, con
 def test_higher_uff_ceiling_preserves_ni_seed_diversity():
     confs = embed(_isomer(_NI_N), n=20, params=bnd.EmbedParams(seed=42, threads=1, prune_rms=-1))
     raw = {cid: confs._mol.GetConformer(cid).GetPositions().copy() for cid in confs.ids}
-    statuses = {}
-    restrained_uff(confs._mol, confs.cons, conf_ids=confs.ids, _statuses=statuses)
+    record = UFFRecord()
+    restrained_uff(confs._mol, confs.cons, conf_ids=confs.ids, record=record)
 
     assert len(confs.ids) == 20
-    assert statuses == dict.fromkeys(confs.ids, 0)
+    assert record.statuses == dict.fromkeys(confs.ids, 0)
     final = {cid: confs._mol.GetConformer(cid).GetPositions().copy() for cid in confs.ids}
     pairs = [
         (_aligned_rms(raw[i], raw[j]), _aligned_rms(final[i], final[j]))
@@ -1072,7 +1086,9 @@ def test_constrained_embed_returns_intact_or_seed():
     confs = embed(_mol("CCCl"), fix={(1, 2): 2.4}, n=4, seed=1).minimize()
     assert len(confs) >= 1
     for cid in confs.ids:
-        assert bonding_ok(confs.mol, int(cid), constrained=confs.cons.distances), f"conformer {cid} came back torn"
+        assert bonding_failure(confs.mol, int(cid), constrained=confs.cons.distances) is None, (
+            f"conformer {cid} came back torn"
+        )
 
 
 def test_minimize_preserves_count_and_energies():
@@ -1106,6 +1122,7 @@ def test_constrained_energies_share_one_final_objective(monkeypatch):
 
 
 def test_relax_result_is_rescored_on_a_common_objective(monkeypatch):
+    """`_relax_constrained` leaves scoring to `_rescore_restrained`, one single point on the caller's stiffness."""
     mol = Chem.AddHs(parse_smiles("[Pd](Cl)(Cl)(Cl)([N@H](C)O)"))
     iso = enumerate_isomers(mol, "square_planar")[0]
     confs = embed(iso, n=1, seed=2)
@@ -1118,10 +1135,15 @@ def test_relax_result_is_rescored_on_a_common_objective(monkeypatch):
         return result
 
     monkeypatch.setattr(emb, "restrained_uff", spy_uff)
-    energies = confs._relax_constrained(BASE_STIFFNESS)
+    ran = confs._relax_constrained(BASE_STIFFNESS)
+    assert ran is not None
+    assert all(max_iters != 0 for max_iters, _result in calls), "the ladder itself must not take a single point"
+
+    confs._rescore_restrained(BASE_STIFFNESS)
+    settled = [cid for cid in confs.ids if cid not in confs.unrelaxed]
 
     assert calls[-1][0] == 0
-    assert np.array_equal(energies, calls[-1][1])
+    assert [confs.energies[cid] for cid in settled] == list(calls[-1][1])
 
 
 @pytest.mark.parametrize("operation", ["embed", "minimize"])
@@ -1131,26 +1153,50 @@ def test_rejected_uff_endpoint_reason_survives_seed_restoration(monkeypatch, cap
     seed = mol.GetConformer().GetPositions().copy()
     assert confs._geometry_failure(0) is None
 
-    def tear_bond(mol, _cons, *, conf_ids, max_iters, _statuses=None, **_kw):
+    def tear_bond(mol, _cons, *, conf_ids, max_iters, record=None, **_kw):
         if max_iters:
-            assert _statuses is not None
+            assert record is not None
             for cid in conf_ids:
                 positions = mol.GetConformer(cid).GetPositions()
                 positions[0, 0] += 100.0
                 mol.GetConformer(cid).SetPositions(positions)
-                _statuses[cid] = 0  # numerical convergence does not guarantee a valid molecule
+                record.statuses[cid] = 0  # numerical convergence does not guarantee a valid molecule
         return np.zeros(len(conf_ids))
 
     monkeypatch.setattr(emb, "restrained_uff", tear_bond)
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
+    with caplog.at_level(logging.DEBUG, logger="rxembed"):
         confs._relax_constrained(BASE_STIFFNESS, operation=operation)
 
     assert np.array_equal(mol.GetConformer().GetPositions(), seed)
     assert confs._geometry_failure(0) is None
     assert confs.unrelaxed == [0]
-    assert f"{operation}: rejected 1/1 UFF endpoints" in caplog.text
-    assert "heavy-atom bonding/clash failure" in caplog.text
-    assert "restored seeds" in caplog.text
+    assert confs.relax_failures[0].kind == "bonding"
+    retry = f"{operation}: rejected 1/1 UFF results (1x bond C0-C1 stretched to"
+    assert [record.levelno for record in caplog.records if record.getMessage().startswith(retry)] == [logging.DEBUG]
+
+
+def test_a_rejected_uff_result_that_a_fresh_seed_replaces_logs_no_warning(monkeypatch, caplog):
+    """A retry is bookkeeping: a first UFF result that fails, then a fresh seed that passes, logs no WARNING."""
+    confs = embed(_isomer(), n=1, seed=1)
+    first, cid = confs._mol, confs.ids[0]
+    first.GetConformer(cid).SetAtomPosition(0, (100.0, 0.0, 0.0))  # the restored seed must fail the gate too
+    real = emb.restrained_uff
+
+    def tear_the_first_seed(mol, cons, **kwargs):
+        energies = real(mol, cons, **kwargs)
+        if mol is first and kwargs.get("max_iters"):
+            for conf_id in kwargs["conf_ids"]:
+                mol.GetConformer(int(conf_id)).SetAtomPosition(0, (100.0, 0.0, 0.0))
+        return energies
+
+    monkeypatch.setattr(emb, "restrained_uff", tear_the_first_seed)
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        confs.minimize()
+
+    assert cid in confs.relax_failures, "the first UFF result was not rejected, so nothing was retried"
+    assert confs.ids == [cid]
+    assert not confs.unrelaxed, "the fresh seed must replace the restored one"
+    assert [record.getMessage() for record in caplog.records] == []
 
 
 def test_relax_retry_rejects_an_inverted_donor_hand(monkeypatch, caplog):
@@ -1159,32 +1205,33 @@ def test_relax_retry_rejects_an_inverted_donor_hand(monkeypatch, caplog):
     cid, donor = confs.ids[0], 4
     seed_pos = {cid: confs._mol.GetConformer(cid).GetPositions().copy()}
     references = [iso.metal]
-    hand = _metal.donor_chirality_sign(confs._mol, cid, donor, references)
+    hand = donor_chirality_sign(confs._mol, cid, donor, references)
     inverted = []
     confs.unrelaxed = [cid]
 
-    def reflect(mol, _cons, *, conf_ids, max_iters, _statuses=None, **_kw):
+    def reflect(mol, _cons, *, conf_ids, max_iters, record=None, **_kw):
         if max_iters == 0:
             return np.zeros(len(conf_ids))
         for conf_id in conf_ids:
             positions = mol.GetConformer(conf_id).GetPositions()
             positions[:, 0] *= -1.0
             mol.GetConformer(conf_id).SetPositions(positions)
-            assert _statuses is not None
-            _statuses[conf_id] = 0
-            inverted.append(_metal.donor_chirality_sign(mol, conf_id, donor, references))
+            assert record is not None
+            record.statuses[conf_id] = 0
+            inverted.append(donor_chirality_sign(mol, conf_id, donor, references))
         return np.zeros(len(conf_ids))
 
     monkeypatch.setattr(emb, "restrained_uff", reflect)
     monkeypatch.setattr(Conformers, "_geometry_failure", lambda _self, _cid, _iso=None: None)
-    with caplog.at_level(logging.INFO, logger="rxembed"):
+    with caplog.at_level(logging.DEBUG, logger="rxembed"):
         confs._relax_constrained(BASE_STIFFNESS, 10)
 
     assert inverted
     assert set(inverted) != {hand}
     assert confs.unrelaxed == [cid]
     assert np.array_equal(confs._mol.GetConformer(cid).GetPositions(), seed_pos[cid])
-    assert "coordinated ligand hand changed" in caplog.text
+    assert str(confs.relax_failures[cid]) == f"coordinated donor N{donor} inverts"
+    assert f"coordinated donor N{donor} inverts" in caplog.text
 
 
 def test_relax_retry_can_recover_a_donor_hand_at_a_stronger_rung(monkeypatch):
@@ -1192,18 +1239,18 @@ def test_relax_retry_can_recover_a_donor_hand_at_a_stronger_rung(monkeypatch):
     confs = embed(iso, n=1, seed=2)
     cid, donor = confs.ids[0], 4
     references = [iso.metal]
-    wanted = _metal.donor_chirality_sign(confs._mol, cid, donor, references)
+    wanted = donor_chirality_sign(confs._mol, cid, donor, references)
     attempts = []
 
-    def flip_once(mol, _cons, *, stiffness, max_iters, conf_ids, _statuses=None, **_kw):
+    def flip_once(mol, _cons, *, stiffness, max_iters, conf_ids, record=None, **_kw):
         attempts.append(stiffness)
         for conf_id in conf_ids:
             if max_iters and stiffness == BASE_STIFFNESS:
                 positions = mol.GetConformer(conf_id).GetPositions()
                 positions[:, 0] *= -1.0
                 mol.GetConformer(conf_id).SetPositions(positions)
-            if _statuses is not None:
-                _statuses[conf_id] = 0
+            if record is not None:
+                record.statuses[conf_id] = 0
         return np.zeros(len(conf_ids))
 
     monkeypatch.setattr(emb, "restrained_uff", flip_once)
@@ -1213,7 +1260,7 @@ def test_relax_retry_can_recover_a_donor_hand_at_a_stronger_rung(monkeypatch):
 
     assert attempts[:2] == [BASE_STIFFNESS, 3 * BASE_STIFFNESS]
     assert confs.unrelaxed == []
-    assert _metal.donor_chirality_sign(confs._mol, cid, donor, references) == wanted
+    assert donor_chirality_sign(confs._mol, cid, donor, references) == wanted
 
 
 def test_relax_failure_keeps_the_first_physical_reason_when_donor_hand_also_changes(monkeypatch):
@@ -1221,14 +1268,14 @@ def test_relax_failure_keeps_the_first_physical_reason_when_donor_hand_also_chan
     confs = embed(iso, n=1, seed=2)
     cid, donor = confs.ids[0], 4
     references = [iso.metal]
-    hand = _metal.donor_chirality_sign(confs._mol, cid, donor, references)
+    hand = donor_chirality_sign(confs._mol, cid, donor, references)
     monkeypatch.setattr(
         Conformers,
         "_geometry_failure",
         lambda _self, _cid, _iso=None: Failure("bonding", "heavy-atom bonding/clash failure"),
     )
     monkeypatch.setattr(
-        emb._metal,
+        emb,
         "donor_chirality_sign",
         lambda *_args, **_kwargs: "S" if hand != "S" else "R",
     )
@@ -1244,26 +1291,28 @@ def test_trajectory_keeps_only_the_accepted_stiffness(monkeypatch):
     seed = mol.GetConformer(0).GetPositions().copy()
     attempts = []
 
-    def marked_uff(mol, cons, *, stiffness, max_iters, conf_ids=None, _snapshots=None, _statuses=None, **_kw):
+    def marked_uff(mol, cons, *, stiffness, max_iters, conf_ids=None, record=None, **_kw):
         if max_iters == 0:
             return np.array([0.0])
         attempts.append(stiffness)
         cid = int(conf_ids[0]) if conf_ids else 0
-        if _statuses is not None:
-            _statuses[cid] = 0
+        if record is not None:
+            record.statuses[cid] = 0
         positions = mol.GetConformer(cid).GetPositions().copy()
         positions[0, 0] = len(attempts)
         for atom, xyz in enumerate(positions):
             mol.GetConformer(cid).SetAtomPosition(atom, xyz.tolist())
-        if _snapshots is not None:
-            _snapshots[cid] = [positions.copy()]
+        if record is not None and record.snapshots is not None:
+            record.snapshots[cid] = [positions.copy()]
         return np.array([float(stiffness)])
 
     monkeypatch.setattr(emb, "restrained_uff", marked_uff)
     monkeypatch.setattr(
         Conformers,
         "_geometry_failure",
-        lambda _self, _cid, _iso=None: "injected failure" if len(attempts) < 2 else None,
+        lambda _self, _cid, _iso=None: (
+            Failure("structural_constraint", "injected failure") if len(attempts) < 2 else None
+        ),
     )
     frames = []
     confs._relax_constrained(BASE_STIFFNESS, _frames=frames)
@@ -1344,8 +1393,10 @@ def test_minimize_preserves_isomer_hand():
 
 
 def test_unfixable_metal_hand_fails_instead_of_returning_the_wrong_identity():
-    with pytest.raises(ValueError, match="the requested metal state"):
+    with pytest.raises(emb.EmbeddingError) as caught:
         minimize(_mirrored_input(_CO_EN_ME))
+    assert caught.value.isomer is not None
+    assert str(caught.value).startswith(f"{caught.value.isomer}: ")
 
 
 @pytest.mark.parametrize(
@@ -1373,8 +1424,10 @@ def test_hard_relax_failure_before_or_after_replacement_is_required(monkeypatch,
     monkeypatch.setattr(Conformers, "_acceptance_failures", wrong_failure)
     monkeypatch.setattr(Conformers, "_replace_failed", broken_replacement)
 
-    with pytest.raises(ValueError, match="the requested metal state"):
+    with pytest.raises(emb.EmbeddingError) as caught:
         confs.minimize()
+    assert caught.value.isomer is iso
+    assert replacement in str(caught.value)
 
 
 def test_requested_coordination_shape_must_fill_seed_count(monkeypatch):
@@ -1388,8 +1441,37 @@ def test_requested_coordination_shape_must_fill_seed_count(monkeypatch):
     )
     monkeypatch.setattr(Conformers, "_replace_failed", lambda _self, failed, *_args, **_kwargs: list(failed))
 
-    with pytest.raises(ValueError, match="could not satisfy the requested metal state"):
+    with pytest.raises(emb.EmbeddingError, match=r"Pt0 is nonplanar in 1/1 rejected seeds; try the other hand"):
         confs.minimize()
+
+
+@pytest.mark.parametrize(
+    ("request_kind", "kind", "remedy"),
+    [
+        ("molecule", "bonding", "try another seed="),
+        ("fixed molecule", "bonding", "try a looser fix="),
+        ("smiles isomer", "bonding", "try another isomer"),
+        ("smiles isomer", "ml_distance", "try another isomer"),
+        ("geometry isomer", "ml_distance", "try lengths='input' or another isomer"),
+        ("smiles isomer", "metal_state", "try the other hand from rx.metal"),
+    ],
+)
+def test_embedding_error_offers_only_remedies_the_request_can_use(monkeypatch, request_kind, kind, remedy):
+    if request_kind.endswith("molecule"):
+        cons = Constraints(frozen={0}) if request_kind == "fixed molecule" else Constraints()
+        confs = Conformers(_with_geometry("CC"), [0], cons)
+    else:
+        iso = _isomer()
+        if request_kind == "geometry isomer":
+            iso = from_geometry(embed(iso, n=1, seed=1).minimize().mol)
+        confs = embed(iso, n=1, seed=1)
+    monkeypatch.setattr(
+        Conformers, "_acceptance_failures", lambda self, *_args, **_kw: {Failure(kind, "synthetic"): list(self.ids)}
+    )
+
+    with pytest.raises(emb.EmbeddingError) as caught:
+        confs._accept_relaxed(BASE_STIFFNESS, 1, operation="embed", allow_replacement=False)
+    assert str(caught.value).endswith(f": synthetic in 1/1 rejected seeds; {remedy}")
 
 
 def test_coordination_gate_accepts_a_graph_equivalent_site_swap():
@@ -1400,7 +1482,7 @@ def test_coordination_gate_accepts_a_graph_equivalent_site_swap():
     positions[[left, right]] = positions[[right, left]]
     conformers._mol.GetConformer().SetPositions(positions)
 
-    assert emb._coordination_state_ok(conformers._mol, conformers.ids[0], conformers.iso)
+    assert emb._coordination_state_failure(conformers._mol, conformers.ids[0], conformers.iso) is None
 
 
 def test_handed_coordination_gate_rejects_an_improper_equivalent_reseating():
@@ -1411,7 +1493,7 @@ def test_handed_coordination_gate_rejects_an_improper_equivalent_reseating():
     }
     n, o, p = donors[7], donors[8], donors[15]
     state = iso.centres[0]._replace(vertices=(o[0], n[0], n[1], p[0], p[1], o[1]), hand="delta")
-    iso = iso._with_stereo((state,))
+    iso = iso.with_stereo((state,))
     directions = np.array(
         [
             [0.333, 0.753, -0.568],
@@ -1427,12 +1509,12 @@ def test_handed_coordination_gate_rejects_an_improper_equivalent_reseating():
         conf.SetAtomPosition(atom, 2 * directions[slot])
     iso.mol.AddConformer(conf)
 
-    achiral = iso._with_stereo((state._replace(hand=""),))
-    assert emb._coordination_state_ok(achiral.mol, 0, achiral), "the distorted octahedron itself is valid"
+    achiral = iso.with_stereo((state._replace(hand=""),))
+    assert emb._coordination_state_failure(achiral.mol, 0, achiral) is None, "the distorted octahedron itself is valid"
     targets = emb._stereo_targets(iso)
     ranks, eta2 = emb._winding_ranks(iso.mol, targets)
     assert emb._seed_stereo_matches(iso.mol, 0, iso, targets, ranks, eta2, False)
-    assert not emb._coordination_state_ok(iso.mol, 0, iso), "an improper donor swap is the other hand"
+    assert emb._coordination_state_failure(iso.mol, 0, iso) is not None, "an improper donor swap is the other hand"
 
 
 def test_partial_coordination_gate_preserves_vacancy_and_equivalent_sites():
@@ -1451,21 +1533,21 @@ def test_partial_coordination_gate_preserves_vacancy_and_equivalent_sites():
     positions = conf.GetPositions().copy()
     positions[fluorines] = positions[fluorines[::-1]]
     conf.SetPositions(positions)
-    assert emb._coordination_state_ok(conformers._mol, conformers.ids[0], conformers.iso)
+    assert emb._coordination_state_failure(conformers._mol, conformers.ids[0], conformers.iso) is None
 
     positions = conf.GetPositions().copy()
     positions[[fluorines[0], chlorine]] = positions[[chlorine, fluorines[0]]]
     conf.SetPositions(positions)
-    assert not emb._coordination_state_ok(conformers._mol, conformers.ids[0], conformers.iso)
+    assert emb._coordination_state_failure(conformers._mol, conformers.ids[0], conformers.iso) is not None
 
 
 def test_independent_ligand_ez_is_restored_when_relaxation_changes_it():
     isomer = enumerate_isomers(_mol(r"C/N1=C(/C)CCCCCC[NH2]->[Pt+2](<-[Cl-])(<-[Cl-])<-1"), "square_planar")[0]
     confs = embed(isomer, n=1, seed=7).minimize()
-    realised = _stereo.bond_stereo(_stereo.stereo_from_3d(confs.mol, exclude=_metal.metal_indices(confs.mol)))
+    realised = bond_stereo(stereo_from_3d(confs.mol, exclude=metal_indices(confs.mol)))
 
     assert len(confs) == 1
-    assert realised == _stereo.bond_stereo(isomer.stereo_label)
+    assert realised == bond_stereo(isomer.stereo_label)
 
 
 def test_metal_referenced_imine_ez_is_selected_before_relaxation():
@@ -1474,11 +1556,11 @@ def test_metal_referenced_imine_ez_is_selected_before_relaxation():
     for isomer in isomers:
         conformers = embed(isomer, n=3, seed=42)
         assert len(conformers) == 3
-        wanted = _stereo.bond_stereo(isomer.stereo_label)
+        wanted = bond_stereo(isomer.stereo_label)
         published = conformers.mol
         for cid in conformers.ids:
             one = Chem.Mol(published, False, int(cid))
-            realised = _stereo.bond_stereo(_stereo.stereo_from_3d(one, exclude=_metal.metal_indices(one)))
+            realised = bond_stereo(stereo_from_3d(one, exclude=metal_indices(one)))
             assert realised == wanted
 
 
@@ -1493,7 +1575,10 @@ def test_stereo_selection_streams_one_bounded_seed_budget(monkeypatch, caplog):
     monkeypatch.setattr(emb, "seed_count", lambda *_args, **_kwargs: 10)
     monkeypatch.setattr(emb, "seed_coordinates", reject_all)
 
-    with pytest.raises(RuntimeError, match="bounded DG seed budget"):
+    with (
+        caplog.at_level(logging.DEBUG, logger="rxembed"),
+        pytest.raises(emb.EmbeddingError, match="found 0/1 DG seeds"),
+    ):
         embed(isomer, n=1, seed=42)
     assert seen == [(4, 42), (4, 43), (2, 44)]
     assert "DG search returned 0 candidates; 0/1 satisfied requested stereo selection" in caplog.text
@@ -1502,7 +1587,7 @@ def test_stereo_selection_streams_one_bounded_seed_budget(monkeypatch, caplog):
 def test_relax_gate_rejects_inverted_ligand_point_stereo(monkeypatch):
     isomer = _isomer("C[C@H](F)C[NH2]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
     conformers = embed(isomer, n=1, seed=7)
-    atom, expected = next(iter(_stereo.point_stereo(isomer.stereo_label).items()))
+    atom, expected = next(iter(point_stereo(isomer.stereo_label).items()))
     found = {"R": "S", "S": "R"}[expected]
     symbol = isomer.mol.GetAtomWithIdx(atom).GetSymbol()
 
@@ -1510,48 +1595,46 @@ def test_relax_gate_rejects_inverted_ligand_point_stereo(monkeypatch):
         assert published.GetBondBetweenAtoms(*isomer.donor_bonds[0]).GetBondType() == Chem.BondType.DATIVE
         return f"{symbol}{atom}:{found}"
 
-    monkeypatch.setattr(_stereo, "stereo_from_3d", inverted)
+    monkeypatch.setattr(emb, "stereo_from_3d", inverted)
     monkeypatch.setattr(emb, "_coordination_state_failure", lambda *_args, **_kwargs: None)
 
-    assert str(conformers._geometry_failure(conformers.ids[0])) == (
-        f"wrong ligand point stereo at atom {atom}: expected {expected}, found {found}"
-    )
+    assert str(conformers._geometry_failure(conformers.ids[0])) == f"{symbol}{atom} reads {found}, not {expected}"
 
 
 def test_relax_gate_distinguishes_unassigned_ligand_stereo(monkeypatch):
     isomer = _isomer("C[C@H](F)C[NH2]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
-    monkeypatch.setattr(_stereo, "stereo_from_3d", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(emb, "stereo_from_3d", lambda *_args, **_kwargs: "")
 
     failure = emb._ligand_stereo_failure(isomer.mol, isomer)
 
     assert failure.kind == "ligand_stereo_unassigned"
-    assert Conformers(_with_geometry("CC"), [0], Constraints())._required_failure({failure: [0]}) == (
-        "requested ligand stereo",
-    )
+    assert Conformers(_with_geometry("CC"), [0], Constraints())._required_failure({failure: [0]}) == {
+        "ligand_stereo_unassigned"
+    }
 
 
 def test_relax_gate_rejects_reflected_ligand_axial_stereo():
     mol = Chem.AddHs(Chem.MolFromSmiles("CC1=CC=CC(I)=C1N1C(C)=CC=C1Br |wU:7.7|"))
     assert rdDistGeom.EmbedMolecule(mol, randomSeed=7) == 0
-    wanted = _stereo.stereo_from_3d(mol)
+    wanted = stereo_from_3d(mol)
     request = SimpleNamespace(stereo_label=wanted)
-    pair, expected = next(iter(_stereo.axis_stereo(wanted).items()))
+    pair, expected = next(iter(axis_stereo(wanted).items()))
     positions = mol.GetConformer().GetPositions()
     positions[:, 0] *= -1
     mol.GetConformer().SetPositions(positions)
-    found = _stereo.axis_stereo(_stereo.stereo_from_3d(mol))[pair]
+    found = axis_stereo(stereo_from_3d(mol))[pair]
 
     failure = emb._ligand_stereo_failure(mol, request)
-    assert str(failure) == f"wrong ligand axial stereo at bond {pair}: expected {expected}, found {found}"
-    assert Conformers(mol, [0], Constraints())._required_failure({failure: [0]}) == ("requested ligand stereo",)
+    a, b = sorted(pair)
+    names = f"{mol.GetAtomWithIdx(a).GetSymbol()}{a}-{mol.GetAtomWithIdx(b).GetSymbol()}{b}"
+    assert str(failure) == f"axis {names} reads {found}, not {expected}"
+    assert Conformers(mol, [0], Constraints())._required_failure({failure: [0]}) == {"ligand_stereo"}
 
 
 def test_required_failure_policy_uses_kind_not_message_wording():
     conformers = Conformers(_with_geometry("CC"), [0], Constraints())
-    assert conformers._required_failure({Failure("ligand_stereo", "reworded completely"): [0]}) == (
-        "requested ligand stereo",
-    )
-    assert conformers._required_failure({Failure("bonding", "wrong ligand E/Z at bond 1-2"): [0]}) == ()
+    assert conformers._required_failure({Failure("ligand_stereo", "reworded completely"): [0]}) == {"ligand_stereo"}
+    assert conformers._required_failure({Failure("bonding", "double bond C1=C2 reads Z, not E"): [0]}) == set()
 
 
 @pytest.mark.parametrize("operation", ["embed", "minimize"])
@@ -1564,7 +1647,7 @@ def test_total_embed_rejection_reports_original_bond_failure(operation, survivor
     conformers = Conformers(mol, [conf.GetId() for conf in mol.GetConformers()])
 
     if operation == "embed" and not survivor:
-        with pytest.raises(emb.EmbeddingError, match=r"heavy-atom bonding/clash failure.*publication gate"):
+        with pytest.raises(emb.EmbeddingError, match=r"embed: bond C0-C1 stretched to 10.00 A in 1/1 rejected seeds"):
             conformers._accept_relaxed(BASE_STIFFNESS, 1, operation=operation, allow_replacement=False)
     else:
         failures = conformers._accept_relaxed(BASE_STIFFNESS, 1, operation=operation, allow_replacement=False)
@@ -1619,7 +1702,7 @@ def test_replacements_rank_valid_settled_scores_without_touching_survivors(monke
     def accept(_batch, operation, validator=None):
         assert operation == "embed"
         assert validator is marker
-        return {"invalid lowest energy": [0]}
+        return {Failure("physical_geometry", "invalid lowest energy"): [0]}
 
     monkeypatch.setattr(emb, "seed_conformers", seeds)
     monkeypatch.setattr(Conformers, "_relax_once", relax)
@@ -1694,7 +1777,8 @@ def test_replacement_searches_three_bounded_serial_batches(monkeypatch, success_
     def accept(self, *_args, **_kwargs):
         nonlocal attempts
         attempts += 1
-        return {"missed structural constraint": list(self.ids)} if attempts < success_on else {}
+        missed = Failure("structural_constraint", "missed structural constraint")
+        return {missed: list(self.ids)} if attempts < success_on else {}
 
     monkeypatch.setattr(Conformers, "_acceptance_failures", accept)
 
@@ -1706,16 +1790,142 @@ def test_replacement_searches_three_bounded_serial_batches(monkeypatch, success_
     assert child.params is confs.params
     assert child._mol is confs._mol
     assert child.unrelaxed is not confs.unrelaxed
-    assert child.uff_surrogates is not confs.uff_surrogates
+    assert child.uff is not confs.uff
+
+
+# ---------------------------------------------------------------------------------------------------------
+# replacement's two stop rules: a single crossed seating, or the same (kind, atoms) twice in a row
+# ---------------------------------------------------------------------------------------------------------
+
+
+_REPLACEMENT_VICTIM = 5  # an arbitrary id distinct from the fresh batch's own conformer id (0)
+
+
+def _replacement_owner(monkeypatch, *, accept, relax_failures=None, ladder=None):
+    """Build a one-atom `Conformers` whose fresh-seed batches each seed exactly conformer 0.
+
+    ``accept`` stands in for `_acceptance_failures`; every batch relaxes as a no-op that records ``ladder``,
+    when given, as its seed's rejected UFF endpoint reason.
+    """
+    victim_mol = Chem.MolFromSmiles("[He]")
+    victim_conf = Chem.Conformer(1)
+    victim_conf.SetId(_REPLACEMENT_VICTIM)
+    victim_mol.AddConformer(victim_conf, assignId=False)
+    owner = Conformers(
+        victim_mol,
+        [_REPLACEMENT_VICTIM],
+        params=bnd.EmbedParams(seed=1),
+        relax_failures=relax_failures or {},
+    )
+    batch_mol = Chem.MolFromSmiles("[He]")
+    batch_mol.AddConformer(Chem.Conformer(1), assignId=False)  # id 0: a fresh batch's own seed
+    calls = []
+
+    def seeds(*_args, **_kwargs):
+        calls.append(True)
+        return Chem.Mol(batch_mol), [0], None
+
+    monkeypatch.setattr(emb, "seed_conformers", seeds)
+
+    def relax(batch, *_args, **_kwargs):
+        if ladder is not None:
+            batch.relax_failures = dict.fromkeys(batch.ids, ladder)
+
+    monkeypatch.setattr(Conformers, "_relax_once", relax)
+    monkeypatch.setattr(Conformers, "_relax_constrained", relax)
+    monkeypatch.setattr(Conformers, "_acceptance_failures", accept)
+    return owner, _REPLACEMENT_VICTIM, calls
+
+
+def test_replacement_stops_after_two_batches_tear_the_same_ligand_bond(monkeypatch):
+    tear = Failure("bonding", "heavy-atom bonding/clash failure (bond 3-6 2.500 A above 1.690 A)", atoms=(3, 6))
+    owner, victim, calls = _replacement_owner(monkeypatch, accept=lambda self, *_a, **_k: {tear: list(self.ids)})
+
+    result = owner._replace_failed([victim], BASE_STIFFNESS, 1)
+
+    assert len(calls) == 2, "a third fresh batch cannot tear the same bond differently"
+    assert result == [victim]
+
+
+def test_replacement_keeps_searching_after_one_batch_reads_the_same_wrong_trigonal_bipyramid(monkeypatch):
+    wrong_shape = Failure("coordination_shape", "coordination state at M0: expected SPY, found TBP", atoms=(0,))
+    attempts = []
+
+    def accept(self, *_args, **_kwargs):
+        attempts.append(True)
+        return {wrong_shape: list(self.ids)} if len(attempts) == 1 else {}
+
+    owner, victim, calls = _replacement_owner(monkeypatch, accept=accept)
+
+    result = owner._replace_failed([victim], BASE_STIFFNESS, 1)
+
+    assert len(calls) == 2, "one bad batch alone must not stop the search (the refuted one-batch rule)"
+    assert result == []
+
+
+def test_replacement_keeps_searching_after_two_batches_read_the_same_wrong_shape(monkeypatch):
+    """A near-tie shape residual can still cross on a third seed, so the two-batch rule must not apply to it.
+
+    A square-pyramidal-vs-trigonal-bipyramidal near tie (VALRAE, seed 1/2 of `enumerate_isomers`) needed its
+    third replacement round to succeed; a same-shape-twice stop cost that rescue.
+    """
+    wrong_shape = Failure("coordination_shape", "coordination state at M0: expected SPY, found TBP", atoms=(0,))
+    attempts = []
+
+    def accept(self, *_args, **_kwargs):
+        attempts.append(True)
+        return {wrong_shape: list(self.ids)} if len(attempts) <= 2 else {}
+
+    owner, victim, calls = _replacement_owner(monkeypatch, accept=accept)
+
+    result = owner._replace_failed([victim], BASE_STIFFNESS, 1)
+
+    assert len(calls) == 3, "a wrong labelled shape never stops on repetition, only a fresh seed can rescue it"
+    assert result == []
+
+
+def test_replacement_keeps_searching_when_planar_stereo_is_wrong_twice(monkeypatch):
+    site_less = Failure("metal_state", "requested metal hand or haptic winding was not retained")
+    attempts = []
+
+    def accept(self, *_args, **_kwargs):
+        attempts.append(True)
+        return {site_less: list(self.ids)} if len(attempts) <= 2 else {}
+
+    owner, victim, calls = _replacement_owner(monkeypatch, accept=accept)
+
+    result = owner._replace_failed([victim], BASE_STIFFNESS, 1)
+
+    assert len(calls) == 3, "a whole-molecule failure names no atoms, so it never trips the same-atoms rule"
+    assert result == []
+
+
+def test_replacement_stops_when_every_seed_crosses_to_another_seating(monkeypatch):
+    wrong_shape = Failure("coordination_shape", "coordination state at M0 is nonplanar", atoms=(0,))
+    crossed = Failure("seating_crossed", "coordination state at M0 crossed its donor-slot seating", atoms=(0,))
+    owner, victim, calls = _replacement_owner(
+        monkeypatch,
+        accept=lambda self, *_a, **_k: {crossed: list(self.ids)},
+        relax_failures={_REPLACEMENT_VICTIM: wrong_shape},  # this endpoint can reach a wrong labelled shape
+        ladder=wrong_shape,  # the seed's UFF endpoint read a wrong shape; its restored seed crossed seating
+    )
+
+    result = owner._replace_failed([victim], BASE_STIFFNESS, 1)
+
+    assert len(calls) == 1, "today's behaviour: every seed crossing seating stops after one batch"
+    assert result == [victim]
 
 
 def test_requested_metal_hand_must_fill_the_seed_count(monkeypatch, caplog):
     iso = next(i for i in enumerate_isomers(_mol(_CO_EN), "octahedral") if i.chirality)
     monkeypatch.setattr(emb, "_seed_stereo_matches", lambda *_args, **_kwargs: False)
 
-    with pytest.raises(RuntimeError, match=r"found 0/1 seeds with the requested stereo state") as caught:
+    with caplog.at_level(logging.DEBUG, logger="rxembed"), pytest.raises(emb.EmbeddingError) as caught:
         embed(iso, n=1, seed=1)
-    assert str(iso) in str(caught.value)
+    assert (
+        str(caught.value) == f"{iso}: found 0/1 DG seeds with the requested metal and ligand stereo; try another isomer"
+    )
+    assert caught.value.isomer is iso
     summary = next(record for record in caplog.records if record.msg.startswith("DG search returned"))
     assert summary.args[0] > 0
     assert "0/1 satisfied requested stereo selection" in summary.message
@@ -1767,6 +1977,29 @@ def test_stereo_seed_selection_prefers_a_seed_with_the_requested_geometry(monkey
     assert seeded.GetConformer(ids[0]).GetAtomPosition(0).x == 2.0
 
 
+def test_hand_only_cobalt_ethylenediamine_seed_selection_ranks_no_windings(monkeypatch):
+    """A hand-only target has no haptic face, so seed selection must never read a winding for it.
+
+    This checks an internal call count, not a public result: `_seed_stereo_matches` compares an empty
+    realised winding against an empty requested one, which is always a match, so the comparison is skipped
+    rather than performed for nothing.
+    """
+    iso = next(i for i in enumerate_isomers(_mol(_CO_EN), "octahedral") if i.chirality)
+    real_winding_signature = emb.winding_signature
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(True)
+        return real_winding_signature(*args, **kwargs)
+
+    monkeypatch.setattr(emb, "winding_signature", spy)
+
+    confs = embed(iso, n=1, seed=1)
+
+    assert confs.ids
+    assert not calls
+
+
 _PHEN_W_CO3 = "[O+]#[C-]->[W]1(<-[C-]#[O+])(<-[C-]#[O+])<-n2cccc3ccc4ccc[n]->1c4c32"
 
 
@@ -1785,10 +2018,10 @@ def test_nonpoint_ligand_stereo_does_not_enable_the_point_fallback(monkeypatch, 
     mol, cons, prepared, graft = emb.prepare(iso)
     calls = []
     if kind == "axial":
-        monkeypatch.setattr(_stereo, "bond_stereo", lambda _label: {})
-        monkeypatch.setattr(_stereo, "axis_stereo", lambda _label: {(0, 1): "Ra"})
+        monkeypatch.setattr(emb, "bond_stereo", lambda _label: {})
+        monkeypatch.setattr(emb, "axis_stereo", lambda _label: {(0, 1): "Ra"})
     else:
-        monkeypatch.setattr(_stereo, "axis_stereo", lambda _label: {})
+        monkeypatch.setattr(emb, "axis_stereo", lambda _label: {})
 
     def seeds(candidate, _cons, n, _params, *, enforce_chirality=True, **kwargs):
         calls.append((enforce_chirality, kwargs["max_attempts"]))
@@ -1843,9 +2076,10 @@ def test_free_chirality_seed_selection_still_rejects_the_ligand_mirror():
     seeded = embed(iso, n=1, seed=5)
     cid = seeded.ids[0]
 
-    assert emb._seed_ligand_stereo_matches(seeded._mol, cid, iso)
+    no_metal_targets = (seeded._mol, cid, iso, [], {}, None, False)
+    assert emb._seed_stereo_matches(*no_metal_targets, check_ligand=True)
     emb._reflect(seeded._mol, cid)
-    assert not emb._seed_ligand_stereo_matches(seeded._mol, cid, iso)
+    assert not emb._seed_stereo_matches(*no_metal_targets, check_ligand=True)
 
 
 def test_unconstrained_max_iteration_replaces_invalid_geometry_and_keeps_status(monkeypatch):
@@ -1856,9 +2090,9 @@ def test_unconstrained_max_iteration_replaces_invalid_geometry_and_keeps_status(
         ids = kwargs.get("conf_ids") or [conf.GetId() for conf in mol.GetConformers()]
         if mol is owner:
             mol.GetConformer(ids[0]).SetAtomPosition(0, (99.0, 99.0, 99.0))
-        statuses = kwargs.get("_statuses")
-        if statuses is not None:
-            statuses.update(dict.fromkeys(ids, 1))
+        record = kwargs.get("record")
+        if record is not None:
+            record.statuses.update(dict.fromkeys(ids, 1))
         return [0.0] * len(ids)
 
     monkeypatch.setattr(emb, "restrained_uff", stall)

@@ -9,11 +9,11 @@ from rdkit.Chem import rdDistGeom
 
 from rxembed.utils import (
     Violation,
-    _angle,
-    _dihedral,
     assign_stereo_from_3d,
+    bond_angle,
     bond_removal_mirrors,
     conjugated_quartets,
+    dihedral_angle,
     flat_ranks,
     remove_bond,
     repair_bond_stereo,
@@ -44,15 +44,15 @@ def _without(mol, atom):
 
 def test_angle_and_signed_dihedral_conventions():
     o, x, y = np.zeros(3), np.array([1.0, 0, 0]), np.array([0, 1.0, 0])
-    assert _angle(x, o, y) == pytest.approx(90.0)
-    assert _angle(x, o, -x) == pytest.approx(180.0)
+    assert bond_angle(x, o, y) == pytest.approx(90.0)
+    assert bond_angle(x, o, -x) == pytest.approx(180.0)
     with np.errstate(all="raise"):
-        assert np.isnan(_angle(o, o, x))
+        assert np.isnan(bond_angle(o, o, x))
 
     p0, p1, p2 = np.array([1.0, 0, 0]), np.zeros(3), np.array([0, 0, 1.0])
     plus, minus = np.array([0, 1.0, 1.0]), np.array([0, -1.0, 1.0])
-    assert _dihedral(p0, p1, p2, plus) == pytest.approx(-_dihedral(p0, p1, p2, minus))
-    assert _dihedral(p0, p1, p2, plus) != 0.0
+    assert dihedral_angle(p0, p1, p2, plus) == pytest.approx(-dihedral_angle(p0, p1, p2, minus))
+    assert dihedral_angle(p0, p1, p2, plus) != 0.0
 
 
 # ---------------------------------------------------------------------------------------------------------

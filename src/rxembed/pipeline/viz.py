@@ -42,8 +42,10 @@ def project(feats, method="pca", seed=42):
     raise ValueError(method)
 
 
-def landscape(ens, color="cluster", method="pca", nci=True, reduce=None, min_cluster=3, show_dropped=True):
+def landscape(ens, mol, color="cluster", method="pca", nci=True, reduce=None, min_cluster=3, show_dropped=True):
     """2D conformer landscape, coloured by binding-mode cluster or energy.
+
+    ``mol`` is the ensemble's working Mol, which still carries the conformers `prune()` dropped.
 
     Colours (clusters) and coordinates both come from one latent, `feature_matrix` (rotatable dihedrals,
     + NCI fingerprint if any contacts, + L-M-L angles if a metal). `method` only sets the positions;
@@ -54,7 +56,7 @@ def landscape(ens, color="cluster", method="pca", nci=True, reduce=None, min_clu
     plt = _setup()
     kept = list(ens.ids)
     dropped = [i for i in dict.fromkeys(ens.discarded) if i not in set(kept)] if show_dropped else []
-    feats = feature_matrix(ens._mol, kept + dropped, nci)  # dropped conformers are private but visible here
+    feats = feature_matrix(mol, kept + dropped, nci)
     xy = project(feats, method)
     xk, xd = xy[: len(kept)], xy[len(kept) :]
     fig, ax = plt.subplots()

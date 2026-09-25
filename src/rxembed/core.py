@@ -10,7 +10,7 @@ from .metal_core import Ligand, ligands
 from .metal_enumeration import enumerate_isomers
 from .metal_isomer import Isomer, IsomerSet
 from .metal_smiles import cxsmiles, dative_smiles, parse_smiles
-from .relax import ff_energies, restrained_uff
+from .relax import UFFRecord, ff_energies, restrained_uff
 
 logger = logging.getLogger("rxembed")
 
@@ -38,6 +38,7 @@ __all__ = [
     "Isomer",
     "IsomerSet",
     "Ligand",
+    "UFFRecord",
     "__version__",
     "compose",
     "cxsmiles",

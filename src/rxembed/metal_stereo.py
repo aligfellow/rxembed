@@ -5,19 +5,18 @@ from __future__ import annotations
 import numpy as np
 from rdkit import Chem
 
-from . import metal_polyhedron as _poly
 from .metal_core import (
-    _EPS_LEN,
-    _ETA2,
     COORDINATION_METALS,
+    EPS_LEN,
+    ETA2,
     VACANT,
-    _frag_map,
-    _ligand_distance_matrix,
-    _vertex_atom,
+    frag_map,
+    ligand_distance_matrix,
     metal_indices,
+    vertex_atom,
 )
-from .metal_polyhedron import vertex_dirs
-from .stereo import _apply_encoded_bond_stereo, _coordination_locked_double_bonds
+from .metal_polyhedron import DELTA, LAMBDA, handedness, orientation_parity, vertex_dirs
+from .stereo import apply_encoded_bond_stereo, coordination_locked_double_bonds
 from .utils import bond_removal_mirrors, mirror_tag
 
 _FACE_EPS = 1e-8
@@ -79,6 +78,18 @@ def remove_routine_hydrogens(mol, keep=()):
     return out, at
 
 
+def _p_block_centre(atom):
+    """Return whether an atom is a main-group 13-17 element that is not a coordination metal."""
+    z = atom.GetAtomicNum()
+    return z not in COORDINATION_METALS and _PT.GetNOuterElecs(z) in _P_BLOCK_OUTER
+
+
+def _terminal_chalcogen(atom):
+    """Return whether an atom is a group 16 element with one heavy neighbour."""
+    heavy_degree = sum(neighbor.GetAtomicNum() != 1 for neighbor in atom.GetNeighbors())
+    return _PT.GetNOuterElecs(atom.GetAtomicNum()) == _CHALCOGEN_OUTER and heavy_degree == 1
+
+
 def _hypervalent_bond(bond):
     """Return whether a bond joins a p-block centre to one of its terminal chalcogen donors.
 
@@ -86,28 +97,19 @@ def _hypervalent_bond(bond):
     (group 16, one heavy neighbour) bonded to a p-block centre (groups 13-17, not a coordination metal) is
     added by this same graph fact: X=O and X(+)-O(-) are one drawing choice, exactly as a carboxylate's are.
     """
-
-    def centre(atom):
-        z = atom.GetAtomicNum()
-        return z not in COORDINATION_METALS and _PT.GetNOuterElecs(z) in _P_BLOCK_OUTER
-
-    def terminal(atom):
-        heavy_degree = sum(neighbor.GetAtomicNum() != 1 for neighbor in atom.GetNeighbors())
-        return _PT.GetNOuterElecs(atom.GetAtomicNum()) == _CHALCOGEN_OUTER and heavy_degree == 1
-
     begin, end = bond.GetBeginAtom(), bond.GetEndAtom()
-    return (centre(begin) and terminal(end)) or (centre(end) and terminal(begin))
+    return (_p_block_centre(begin) and _terminal_chalcogen(end)) or (
+        _p_block_centre(end) and _terminal_chalcogen(begin)
+    )
 
 
-# Resonance moves bond orders and charges only inside one conjugated system, so ranking a graph that gives
-# every conjugated bond one type and every atom of a system that system's total charge, leaving everything
-# else exact, proves the same identity as form enumeration: two roots share a rank exactly when a resonance
-# form maps one onto the other, at any molecule size and with no cap. `_hypervalent_bond` extends the same
-# rule to a p-block centre's expanded-octet donors, which RDKit's own conjugation perception cannot reach,
-# and the two kinds of bond share one systems graph, so a hypervalent group merges with an adjoining
-# conjugated system wherever they touch with no extra code.
 def _root_classes(mol, roots):
-    """Classify roots by graph symmetry after erasing each conjugated system's drawn Lewis form."""
+    """Classify roots by graph symmetry after erasing each conjugated system's drawn Lewis form.
+
+    Resonance and metal-ligand redox move only bond orders and formal charges, with connectivity and H counts
+    fixed, so ranking the graph with every conjugated bond one type and every charge zero proves the same
+    identity as enumerating every form, at any molecule size.
+    """
     roots = list(dict.fromkeys(roots))
     chemical = Chem.RWMol(mol)
     for bond in mol.GetBonds():
@@ -126,12 +128,11 @@ def _root_classes(mol, roots):
             flat.GetBondBetweenAtoms(begin, end).SetBondType(Chem.BondType.AROMATIC)
             flat.GetBondBetweenAtoms(begin, end).SetIsAromatic(False)
         for atoms in Chem.GetMolFrags(systems, sanitizeFrags=False):
-            charge = sum(mol.GetAtomWithIdx(index).GetFormalCharge() for index in atoms)
             for index in atoms:
                 atom = flat.GetAtomWithIdx(index)
                 atom.SetNumExplicitHs(mol.GetAtomWithIdx(index).GetTotalNumHs())
                 atom.SetNoImplicit(True)
-                atom.SetFormalCharge(charge)
+                atom.SetFormalCharge(0)
                 atom.SetIsAromatic(False)
         flat.UpdatePropertyCache(strict=False)
         ranks = list(Chem.CanonicalRankAtoms(flat, breakTies=False))
@@ -165,13 +166,15 @@ def site_classes(mol, sites, haptic=None, coordination=()):
     atoms = {atom for site in occupied for atom in (haptic.get(site) or (site,))}
     atoms.update(donor for donor, _metal, _atomic_num, _charge in coordination)
     rw = Chem.RWMol(mol)
-    for donor, metal, atomic_num, charge in coordination:
+    for donor, metal, atomic_num, _charge in coordination:
         if min(donor, metal) < 0 or max(donor, metal) >= mol.GetNumAtoms():
             continue
         atom = rw.GetAtomWithIdx(metal)
         atom.SetAtomicNum(atomic_num)
-        atom.SetFormalCharge(charge)
-        atom.SetIsotope(1000 + charge)
+        # Formal charge stays out of identity here too, for the reason beside _root_classes: a redox split
+        # only moves charge between the metal and a ligand it is bonded to.
+        atom.SetFormalCharge(0)
+        atom.SetIsotope(1000)
         if rw.GetBondBetweenAtoms(donor, metal) is None:
             rw.AddBond(donor, metal, Chem.BondType.ZERO)
     work = rw.GetMol()
@@ -180,12 +183,12 @@ def site_classes(mol, sites, haptic=None, coordination=()):
         if bond.GetBondType() == Chem.BondType.ZERO:
             bond.SetBondType(Chem.BondType.SINGLE)
     ring = ring.GetMol()
-    locked = _coordination_locked_double_bonds(ring, metal_indices(ring))
+    locked = coordination_locked_double_bonds(ring, metal_indices(ring))
     for pair in locked:
         bond = work.GetBondBetweenAtoms(*pair)
         if bond is not None:
             bond.SetStereo(Chem.BondStereo.STEREONONE)
-    _apply_encoded_bond_stereo(work, skip=locked)
+    apply_encoded_bond_stereo(work, skip=locked)
     # Complete the donor's stereo carriers before removing H and rebasing its point tag.
     ranked, at = remove_routine_hydrogens(work, atoms)
     rw = Chem.RWMol(ranked)
@@ -273,7 +276,7 @@ def _canonical_face_walk(mol, face, ranks):
 
 def _eta2_centres(mol, face, ranks, metal=None):
     """Return CIP-orderable trigonal centres on an eta2 face."""
-    if len(face) != _ETA2 or mol.GetBondBetweenAtoms(*face) is None:
+    if len(face) != ETA2 or mol.GetBondBetweenAtoms(*face) is None:
         return []
     out = []
     for atom in face:
@@ -355,7 +358,7 @@ def eta2_signatures(mol, face, ranks=None):
 
 def face_has_orientation(mol, face, ranks):
     """Return whether a haptic face has two distinguishable mirror orientations."""
-    if len(face) == _ETA2:
+    if len(face) == ETA2:
         signature, mirror = eta2_signatures(mol, face)
         return bool(signature and signature != mirror)
     return _canonical_face_walk(mol, face, ranks) is not None
@@ -376,7 +379,7 @@ def face_winding(mol, pos, metal, face, ranks, eta2_ranks=None):
     Proper rotation preserves the sign and reflection flips it. The sign remains authoritative when RDKit's
     CIP ranks cannot supply a conventional re/si or planar descriptor.
     """
-    if len(face) == _ETA2:
+    if len(face) == ETA2:
         try:
             eta2_ranks = list(Chem.ComputeAtomCIPRanks(mol)) if eta2_ranks is None else eta2_ranks
         except (RuntimeError, ValueError):
@@ -403,6 +406,20 @@ def face_winding(mol, pos, metal, face, ranks, eta2_ranks=None):
     return "+" if side > 0 else "-" if side < 0 else ""
 
 
+def _face_reference(ranks, sequence):
+    """Return a face's unique top-ranked atom and its higher-ranked ring neighbour, or None on a tie."""
+    highest = max(ranks[atom] for atom in sequence)
+    pilots = [atom for atom in sequence if ranks[atom] == highest]
+    if len(pilots) != 1:
+        return None
+    pilot = pilots[0]
+    i = sequence.index(pilot)
+    previous, following = sequence[i - 1], sequence[(i + 1) % len(sequence)]
+    if ranks[previous] == ranks[following]:
+        return None
+    return pilot, following if ranks[following] > ranks[previous] else previous
+
+
 def face_descriptors(mol, donors, haptic, windings):
     """Return re/si or ``Rₚ``/``Sₚ`` labels for priority-orderable haptic faces.
 
@@ -410,19 +427,6 @@ def face_descriptors(mol, donors, haptic, windings):
     """
     if not windings:
         return {}
-
-    def reference(ranks, sequence):
-        highest = max(ranks[atom] for atom in sequence)
-        pilots = [atom for atom in sequence if ranks[atom] == highest]
-        if len(pilots) != 1:
-            return None
-        pilot = pilots[0]
-        i = sequence.index(pilot)
-        previous, following = sequence[i - 1], sequence[(i + 1) % len(sequence)]
-        if ranks[previous] == ranks[following]:
-            return None
-        return pilot, following if ranks[following] > ranks[previous] else previous
-
     try:
         priorities = Chem.ComputeAtomCIPRanks(mol)
         unmarked = Chem.Mol(mol)
@@ -434,7 +438,7 @@ def face_descriptors(mol, donors, haptic, windings):
     out = {}
     for dummy, winding in windings.items():
         face = haptic.get(dummy, ())
-        if len(face) == _ETA2:
+        if len(face) == ETA2:
             signature, mirror = eta2_signatures(mol, face, priorities)
             if winding in "+-" and signature and signature != mirror:
                 selected = min(signature, mirror) if winding == "+" else max(signature, mirror)
@@ -444,8 +448,8 @@ def face_descriptors(mol, donors, haptic, windings):
         if winding not in "+-" or canonical is None or not canonical[1]:
             continue
         sequence = canonical[0]
-        choice = reference(priorities, sequence)
-        if choice is None or choice != reference(constitutional, sequence):
+        choice = _face_reference(priorities, sequence)
+        if choice is None or choice != _face_reference(constitutional, sequence):
             continue
         pilot, toward_second = choice
         following = sequence[(sequence.index(pilot) + 1) % len(sequence)]
@@ -457,17 +461,17 @@ def face_descriptors(mol, donors, haptic, windings):
 def chelate_links(mol, vertices, haptic=None, distances=None):
     """Return same-ligand vertex pairs labelled by their shortest graph distance."""
     haptic = haptic or {}
-    frag = _frag_map(mol)
+    frag = frag_map(mol)
     occupied = [vertex for vertex in range(len(vertices)) if vertices[vertex] != VACANT]
     pairs = [
         (a, b)
         for i, a in enumerate(occupied)
         for b in occupied[i + 1 :]
-        if frag[_vertex_atom(haptic, vertices[a])] == frag[_vertex_atom(haptic, vertices[b])]
+        if frag[vertex_atom(haptic, vertices[a])] == frag[vertex_atom(haptic, vertices[b])]
     ]
     if not pairs:
         return {}
-    distances = _ligand_distance_matrix(mol) if distances is None else distances
+    distances = ligand_distance_matrix(mol) if distances is None else distances
     return {
         frozenset((a, b)): min(
             int(distances[left][right])
@@ -487,7 +491,7 @@ def chirality_of(mol, geometry, vertices, haptic=None, coordination=(), *, class
     dirs = vertex_dirs(geometry)
     if dirs is None:
         return ""
-    return _poly.handedness(
+    return handedness(
         dirs,
         list(vertices),
         site_classes(mol, vertices, haptic, coordination) if classes is None else classes,
@@ -502,15 +506,15 @@ def realised_chirality(mol, cid, geometry, vertices, metal, chirality, haptic=No
         return ""
     pos = mol.GetConformer(int(cid)).GetPositions()
     haptic = haptic or {}
-
-    def point(atom):
-        face = haptic.get(atom)
-        return np.mean(pos[list(face)], axis=0) if face else pos[atom]
-
-    observed = np.asarray([point(atom) - pos[metal] for atom in vertices])
+    observed = np.asarray(
+        [
+            (np.mean(pos[list(haptic[atom])], axis=0) if haptic.get(atom) else pos[atom]) - pos[metal]
+            for atom in vertices
+        ]
+    )
     lengths = np.linalg.norm(observed, axis=1, keepdims=True)
-    if not np.all(np.isfinite(observed)) or not np.all(lengths > _EPS_LEN):
+    if not np.all(np.isfinite(observed)) or not np.all(lengths > EPS_LEN):
         return ""
-    if _poly.orientation_parity(observed / lengths, dirs) > 0:
+    if orientation_parity(observed / lengths, dirs) > 0:
         return chirality
-    return _poly.LAMBDA if chirality == _poly.DELTA else _poly.DELTA
+    return LAMBDA if chirality == DELTA else DELTA

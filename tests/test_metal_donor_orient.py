@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 from importlib.util import find_spec
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -11,7 +12,7 @@ from rdkit import Chem
 from rdkit.Chem import rdMolTransforms as T
 
 import rxembed as rx
-from rxembed import metal_donor_orient as DO  # noqa: N812
+from rxembed import metal_donor_orient
 from rxembed.constraints import Constraints
 from tests.conftest import EXAMPLES_DIR, TMQMG_DIR
 
@@ -19,7 +20,7 @@ _MN_H2 = str(EXAMPLES_DIR / "mn-h2.xyz")  # a frozen-TS bimetallic
 _MN_H2_RC = [1, 5, 63, 64, 65, 66]  # its reacting core
 
 # the N-bound Ni(II) linkage isomer: a carboxylate O donor (one heavy neighbour) and an amidate N donor (two
-# heavy neighbours) on the same metal: one fixture exercises both `_coplanar_donor` permutations.
+# heavy neighbours) on the same metal: one fixture exercises both `coplanar_donor` permutations.
 NI_N = "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1"
 _ETA2_SMI = "CC(C)(C)[C]1#[C](C#C[Si](C)(C)C)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1"
 # a Ni(II) thiosemicarbazone: the thione C=S SULFUR is a conjugated sp2 donor the old {7, 8} N/O list dropped
@@ -46,30 +47,23 @@ def _capped(iso):
     return {e[1] for e in iso.cons.coplanar}
 
 
-class _TorsionSpy:
-    """Record every UFF torsion constraint an `_ff_terms` writer emits, as `(i, j, k, w, lo, hi, fc)`."""
-
-    def __init__(self):
-        self.torsions = []
-
-    def UFFAddTorsionConstraint(self, i, j, k, w, relative, lo, hi, fc):  # noqa: N802 (RDKit FF API name)
-        self.torsions.append((i, j, k, w, lo, hi, fc))
-
-
 def _emitted_caps(iso, seed=1):
-    """Every torsion `Coplanar._ff_terms` actually writes on a seed conformer of `iso`."""
+    """Every torsion `Coplanar.uff_terms` writes on a seed conformer of `iso`, as `(i, j, k, w, lo, hi, fc)`."""
     from rxembed.mechanisms import Coplanar
 
     ens = rx.embed(iso, n=1, seed=seed)
-    # `_mol`, not `.mol`: `_ff_terms` reads `conf.GetOwningMol()` to decide plane-sharing, so it must see the
+    # `_mol`, not `.mol`: `uff_terms` reads `conf.GetOwningMol()` to decide plane-sharing, so it must see the
     # bond-less surrogate the FF relaxes; `.mol`'s dative M-L bonds would change which caps look redundant.
-    spy = _TorsionSpy()
-    Coplanar()._ff_terms(spy, ens.cons, ens._mol.GetConformer(ens.ids[0]), 1e4)
-    return spy.torsions
+    spy = mock.Mock(spec=["UFFAddTorsionConstraint"])
+    Coplanar().uff_terms(spy, ens.cons, ens._mol.GetConformer(ens.ids[0]), 1e4)
+    return [
+        (i, j, k, w, lo, hi, fc)
+        for (i, j, k, w, _relative, lo, hi, fc), _ in spy.UFFAddTorsionConstraint.call_args_list
+    ]
 
 
 def _emitted_cap_donors(iso, seed=1):
-    """Donor indices for which `Coplanar._ff_terms` actually writes a torsion on a seed conformer of `iso`."""
+    """Donor indices for which `Coplanar.uff_terms` actually writes a torsion on a seed conformer of `iso`."""
     return {t[1] for t in _emitted_caps(iso, seed)}
 
 
@@ -90,12 +84,12 @@ def test_proton_walls_require_calibrated_donor(smi, walled):
     assert bool(protons) == walled, f"{smi}: {len(protons)} proton walls, expected {'some' if walled else 'none'}"
 
 
-@pytest.mark.parametrize("writer", [DO._orient_donor, DO._coplanar_donor])
+@pytest.mark.parametrize("writer", [metal_donor_orient.orient_donor, metal_donor_orient.coplanar_donor])
 def test_donor_writers_use_supplied_classification_including_abstention(writer, monkeypatch):
     iso = rx.metal("[Cl-]->[Pd+2](<-[Cl-])(<-[NH3])<-n1ccccc1", "SPL")[0]
-    mol, donors = iso._graph, set(iso.donors)
+    mol, donors = iso.graph, set(iso.donors)
     donor = next(d for d in donors if mol.GetAtomWithIdx(d).GetIsAromatic())
-    hyb = DO._stripped_hybridisation(mol)
+    hyb = metal_donor_orient.stripped_hybridisation(mol)
     expected = Constraints()
     writer(mol, iso.metal, donor, donors, expected)
     assert expected.angles or expected.coplanar
@@ -103,7 +97,7 @@ def test_donor_writers_use_supplied_classification_including_abstention(writer, 
     def reclassified(_mol):
         pytest.fail("a supplied graph classification must not be recomputed")
 
-    monkeypatch.setattr(DO, "_stripped_hybridisation", reclassified)
+    monkeypatch.setattr(metal_donor_orient, "stripped_hybridisation", reclassified)
     actual = Constraints()
     writer(mol, iso.metal, donor, donors, actual, hyb=hyb)
     assert actual == expected
@@ -122,11 +116,11 @@ def test_free_sp2_donor_accepts_native_ligand_bisector(ligand):
 
     iso = rx.metal(f"[Cl-]->[Pd+2](<-[Cl-])(<-[NH3])<-{ligand}", "SPL")[0]
     donor = next(
-        d for d in iso.donors if sum(n.GetAtomicNum() > 1 for n in iso._graph.GetAtomWithIdx(d).GetNeighbors()) == 2
+        d for d in iso.donors if sum(n.GetAtomicNum() > 1 for n in iso.graph.GetAtomWithIdx(d).GetNeighbors()) == 2
     )
-    left, right = [n.GetIdx() for n in iso._graph.GetAtomWithIdx(donor).GetNeighbors()]
+    left, right = [n.GetIdx() for n in iso.graph.GetAtomWithIdx(donor).GetNeighbors()]
     maps = []
-    fragments = Chem.GetMolFrags(iso._graph, asMols=True, fragsMolAtomMapping=maps)
+    fragments = Chem.GetMolFrags(iso.graph, asMols=True, fragsMolAtomMapping=maps)
     block, indices = next((block, indices) for block, indices in zip(fragments, maps, strict=True) if donor in indices)
     params = rdDistGeom.ETKDGv3()
     params.randomSeed, params.numThreads = 42, 1
@@ -138,7 +132,7 @@ def test_free_sp2_donor_accepts_native_ligand_bisector(ligand):
     rays /= np.linalg.norm(rays, axis=1)[:, None]
     external = -rays.sum(axis=0)
     external /= np.linalg.norm(external)
-    work = Chem.Mol(iso._graph)
+    work = Chem.Mol(iso.graph)
     work.RemoveAllConformers()
     conf = Chem.Conformer(work.GetNumAtoms())
     for atom, position in zip(indices, xyz, strict=True):
@@ -148,7 +142,7 @@ def test_free_sp2_donor_accepts_native_ligand_bisector(ligand):
     angles = {key: window for key, window in iso.cons.angles.items() if key[:2] == (iso.metal, donor)}
     assert len(angles) == 2
     ff = rdForceFieldHelpers.CreateEmptyForceFieldForMol(work)
-    Angle()._ff_terms(ff, Constraints(angles=angles), work.GetConformer(), 1.0)
+    Angle().uff_terms(ff, Constraints(angles=angles), work.GetConformer(), 1.0)
     ff.Initialize()
     assert ff.CalcEnergy() == pytest.approx(0.0, abs=1e-8), "donor walls oppose the native ligand's external bisector"
     work.GetConformer().SetAtomPosition(iso.metal, origin + 2.0 * rays[0])
@@ -157,7 +151,7 @@ def test_free_sp2_donor_accepts_native_ligand_bisector(ligand):
     order = list(reversed(range(work.GetNumAtoms())))
     permuted = Chem.RenumberAtoms(work, order)
     changed = Constraints()
-    DO._orient_donor(permuted, order.index(iso.metal), order.index(donor), {order.index(donor)}, changed)
+    metal_donor_orient.orient_donor(permuted, order.index(iso.metal), order.index(donor), {order.index(donor)}, changed)
     remapped = {tuple(order[i] for i in key): value for key, value in changed.angles.items()}
     assert remapped == angles, "atom order or source coordinates changed the graph-derived donor windows"
 
@@ -226,7 +220,7 @@ def test_hybridisation_uses_metal_stripped_graph():
     params = Chem.SmilesParserParams()
     params.removeHs = False  # a hydride is a DONOR here, so it has to survive the parse as its own atom
     mol = Chem.MolFromSmiles("[H][Ru]([H])(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]", params)
-    hyb = DO._stripped_hybridisation(mol)
+    hyb = metal_donor_orient.stripped_hybridisation(mol)
     metal = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "Ru")
     carbons = [n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors() if n.GetAtomicNum() == 6]
     hydrides = [n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors() if n.GetAtomicNum() == 1]
@@ -243,14 +237,14 @@ def test_explicit_triple_bond_outranks_an_aromatic_flag():
     triple = mol.GetBondWithIdx(0)
     atoms = (triple.GetBeginAtomIdx(), triple.GetEndAtomIdx())
     assert all(mol.GetAtomWithIdx(i).GetIsAromatic() for i in atoms), "fixture premise"
-    assert all(DO._stripped_hybridisation(mol)[i] == Chem.HybridizationType.SP for i in atoms)
+    assert all(metal_donor_orient.stripped_hybridisation(mol)[i] == Chem.HybridizationType.SP for i in atoms)
 
 
 def test_ambiguous_anionic_aryl_nitrogen_abstains_from_a_planar_donor_model():
     mol = rx.parse_smiles("C[Si](C)(C)[N-]c1ccccc1->[Pd+2](<-[Cl-])(<-[Cl-])<-Cl")
     nitrogen = next(atom.GetIdx() for atom in mol.GetAtoms() if atom.GetSymbol() == "N")
 
-    assert nitrogen not in DO._stripped_hybridisation(mol)
+    assert nitrogen not in metal_donor_orient.stripped_hybridisation(mol)
 
 
 # MOCQIE's N12: xyz2mol writes the cumulated O=[N+]=C Kekule form. Both estimators type the metal-bound N sp,
@@ -265,7 +259,7 @@ def test_metal_bound_cumulated_sp_donor_is_retyped_sp2():
     mol = rx.parse_smiles(_CUMULATED_NITRO_SMI)
     nitrogen = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "N")
     assert mol.GetAtomWithIdx(nitrogen).GetHybridization() == Chem.HybridizationType.SP, "fixture premise"
-    assert DO._stripped_hybridisation(mol)[nitrogen] == Chem.HybridizationType.SP2
+    assert metal_donor_orient.stripped_hybridisation(mol)[nitrogen] == Chem.HybridizationType.SP2
 
 
 def test_retyped_cumulated_donor_gets_an_md_x_orientation_wall():
@@ -275,7 +269,7 @@ def test_retyped_cumulated_donor_gets_an_md_x_orientation_wall():
     oxygen = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "O")
     donors = {n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors()}
     cons = Constraints()
-    DO._orient_donor(mol, metal, nitrogen, donors, cons)
+    metal_donor_orient.orient_donor(mol, metal, nitrogen, donors, cons)
     assert (metal, nitrogen, oxygen) in cons.angles
 
 
@@ -285,9 +279,9 @@ def test_genuine_terminal_sp_nitrile_donor_keeps_sp_and_gets_no_coplanar_wall():
     metal = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "Pd")
     nitrogen = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "N")
     donors = {n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors()}
-    assert DO._stripped_hybridisation(mol)[nitrogen] == Chem.HybridizationType.SP
+    assert metal_donor_orient.stripped_hybridisation(mol)[nitrogen] == Chem.HybridizationType.SP
     cons = Constraints()
-    DO._coplanar_donor(mol, metal, nitrogen, donors, cons)
+    metal_donor_orient.coplanar_donor(mol, metal, nitrogen, donors, cons)
     assert not cons.coplanar, "a genuine sp donor has no in-plane lone pair to hold coplanar"
 
 
@@ -298,7 +292,7 @@ def test_internal_sp_centres_keep_their_native_class(smiles):
         for work in (mol, Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))):
             native = [a.GetIdx() for a in work.GetAtoms() if a.GetHybridization() == Chem.HybridizationType.SP]
             assert native
-            agreed = DO._stripped_hybridisation(work)
+            agreed = metal_donor_orient.stripped_hybridisation(work)
             assert all(agreed[i] == Chem.HybridizationType.SP for i in native)
 
 
@@ -312,7 +306,7 @@ def test_linear_reference_does_not_create_a_donor_plane(end):
             for d in iso.donors
             if iso.mol.GetAtomWithIdx(d).GetFormalCharge() == -1 and iso.mol.GetAtomWithIdx(d).GetAtomicNum() == 7
         )
-        assert DO.inplane_sp2_donor(iso.mol, donor)
+        assert metal_donor_orient.inplane_sp2_donor(iso.mol, donor)
         assert any(key[1] == donor for key in iso.cons.angles), "retain the donor's supported bend restraint"
         assert not iso.cons.coplanar, "a linear N-C-X reference does not define a plane"
 
@@ -332,12 +326,14 @@ def test_only_terminal_sp_donors_get_end_on_restraints(smiles, terminal):
         metal = next(a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 78)
         donors = {a.GetIdx() for a in mol.GetAtomWithIdx(metal).GetNeighbors()}
         donor = next(d for d in donors if mol.GetAtomWithIdx(d).GetAtomicNum() == 6)
-        hyb = DO._stripped_hybridisation(mol)
+        hyb = metal_donor_orient.stripped_hybridisation(mol)
         assert hyb[donor] == Chem.HybridizationType.SP
-        assert (DO.donation_axis(mol, donor, donors, hyb=hyb) is not None) == terminal
-        assert DO.donation_axis(mol, donor, donors) == DO.donation_axis(mol, donor, donors, hyb=hyb)
+        assert (metal_donor_orient.donation_axis(mol, donor, donors, hyb=hyb) is not None) == terminal
+        assert metal_donor_orient.donation_axis(mol, donor, donors) == metal_donor_orient.donation_axis(
+            mol, donor, donors, hyb=hyb
+        )
         cons = Constraints()
-        DO._orient_donor(mol, metal, donor, donors, cons)
+        metal_donor_orient.orient_donor(mol, metal, donor, donors, cons)
         assert bool(cons.angles) == terminal
         if terminal:
             assert all(lo > 150 for lo, _ in cons.angles.values())
@@ -388,7 +384,7 @@ def test_a_bonded_codonor_pair_removes_the_donation_axis(build, kept):
     """
     mol, donor, sphere = build()
 
-    axis = DO.donation_axis(mol, donor, sphere)
+    axis = metal_donor_orient.donation_axis(mol, donor, sphere)
 
     substituent = next(
         nb.GetIdx()
@@ -425,8 +421,8 @@ def test_backbone_target_picks_the_nearer_donor_across_a_bridging_donor():
     mol.UpdatePropertyCache(strict=False)
     donors = {na, pmid, nb}
 
-    assert DO._backbone_targets(mol, na, donors) == {ca: pmid}
-    assert DO._backbone_targets(mol, nb, donors) == {cb: pmid}
+    assert metal_donor_orient._backbone_targets(mol, na, donors) == {ca: pmid}
+    assert metal_donor_orient._backbone_targets(mol, nb, donors) == {cb: pmid}
 
 
 def test_symmetric_dithiolate_chelate_keeps_both_backbone_arms_walled():
@@ -453,8 +449,8 @@ def test_orientation_wall_never_uses_a_sigma_codonor_as_a_substituent():
     mol.UpdatePropertyCache(strict=False)
     cons = Constraints()
 
-    DO._orient_donor(mol, metal, left, {left, right}, cons)
-    DO._orient_donor(mol, metal, right, {left, right}, cons)
+    metal_donor_orient.orient_donor(mol, metal, left, {left, right}, cons)
+    metal_donor_orient.orient_donor(mol, metal, right, {left, right}, cons)
 
     assert (metal, left, right) not in cons.angles
     assert (metal, right, left) not in cons.angles
@@ -469,7 +465,7 @@ def test_orientation_wall_never_uses_a_sigma_codonor_as_a_substituent():
 def test_sulfoxide_lewis_forms_are_pyramidal_donors(smi):
     iso = rx.metal(smi, "square_planar", stereo="free")[0]
     sulfur = _donor(iso, "S")
-    assert DO._stripped_hybridisation(iso.mol)[sulfur] == Chem.HybridizationType.SP3
+    assert metal_donor_orient.stripped_hybridisation(iso.mol)[sulfur] == Chem.HybridizationType.SP3
     assert len([k for k in iso.cons.angles if k[1] == sulfur]) == 3
     assert sulfur not in _capped(iso)
 
@@ -479,7 +475,7 @@ def test_tricoordinate_aromatic_phosphorus_gets_the_pyramidal_orientation_wall()
     iso = rx.metal(smi, "square_planar")[0]
     phosphorus = _donor(iso, "P")
 
-    assert DO._stripped_hybridisation(iso.mol)[phosphorus] == Chem.HybridizationType.SP3
+    assert metal_donor_orient.stripped_hybridisation(iso.mol)[phosphorus] == Chem.HybridizationType.SP3
     assert len([key for key in iso.cons.angles if key[1] == phosphorus]) == 3
 
 
@@ -513,24 +509,24 @@ def test_coplanar_permutations_each_define_one_plane():
     ((_i, _n, k, w, _anc, _cap),) = [e for e in iso.cons.coplanar if e[1] == n]
     heavy = {nb.GetIdx() for nb in mol.GetAtomWithIdx(n).GetNeighbors() if nb.GetAtomicNum() > 1}
     assert {k, w} == heavy, "the improper's plane atoms are the N's own two DIRECT heavy substituents"
-    assert _anc == DO._COPLANAR_ANCHOR, "two direct substituents define the external anti sector"
+    assert _anc == metal_donor_orient._COPLANAR_ANCHOR, "two direct substituents define the external anti sector"
 
 
 def test_conjugated_bridge_chelate_gets_the_measured_ring_closure_hinge():
     # Replaces the old bridged D-X-D branch (_BRIDGED_COPLANAR_CAP): a bridging carboxylate is a conjugated
-    # 4-ring, exactly `_ring_hinge`'s case now, at the measured 4-ring cap and one row per donor (no reciprocal
+    # 4-ring, exactly `ring_hinge`'s case now, at the measured 4-ring cap and one row per donor (no reciprocal
     # duplicate: unlike the deleted branch, the pairwise ring walk never needs a dedup guard).
     source = Chem.MolFromSmiles("CC1=[O]->[Zn+2](Cl)(Cl)<-[O-]1")
     for mol in (source, Chem.RenumberAtoms(source, list(reversed(range(source.GetNumAtoms()))))):
         iso = rx.metal(mol, "tetrahedral")[0]
-        hinge = [row for row in iso.cons.coplanar if row[5] == DO._HINGE_CAP[4]]
+        hinge = [row for row in iso.cons.coplanar if row[5] == metal_donor_orient._HINGE_CAP[4]]
 
         assert len(hinge) == 2, "one row per donor of the ring"
         oxygens = {donor for donor in iso.donors if iso.mol.GetAtomWithIdx(donor).GetAtomicNum() == 8}
         for metal, d, other, bridge, anchor, _cap in hinge:
             assert metal == iso.metal
             assert {d, other} == oxygens
-            assert anchor == DO._COPLANAR_ANCHOR
+            assert anchor == metal_donor_orient._COPLANAR_ANCHOR
             assert iso.mol.GetBondBetweenAtoms(bridge, d) is not None
             assert iso.mol.GetBondBetweenAtoms(bridge, other) is not None
 
@@ -541,7 +537,7 @@ def test_conjugated_dithiolate_ring_gets_both_hinge_rows():
     # passes, since ring size alone no longer distinguishes a real chelate from an unconjugated one).
     iso = rx.metal("Cl[Pd]1(Cl)<-[S-]c2ccccc2[S-]->1", "square_planar")[0]
     s1, s2 = (d for d in iso.donors if iso.mol.GetAtomWithIdx(d).GetSymbol() == "S")
-    hinge = [row for row in iso.cons.coplanar if row[5] == DO._HINGE_CAP[5]]
+    hinge = [row for row in iso.cons.coplanar if row[5] == metal_donor_orient._HINGE_CAP[5]]
 
     assert len(hinge) == 2, "one row per donor of the ring"
     assert {row[1] for row in hinge} == {s1, s2}
@@ -549,7 +545,7 @@ def test_conjugated_dithiolate_ring_gets_both_hinge_rows():
         assert metal == iso.metal
         assert other == (s2 if d == s1 else s1)
         assert iso.mol.GetBondBetweenAtoms(d, x) is not None, "X is D's own ring neighbour"
-        assert anchor == DO._COPLANAR_ANCHOR
+        assert anchor == metal_donor_orient._COPLANAR_ANCHOR
 
 
 @pytest.mark.parametrize(
@@ -562,7 +558,7 @@ def test_conjugated_dithiolate_ring_gets_both_hinge_rows():
 def test_nonconjugated_and_oversized_rings_get_no_hinge_row(name, smi, geometry):
     # Mutation: allow ring sizes 4-6 (drop the `_HINGE_CAP` size gate) and acac-Zn picks up a spurious row.
     iso = rx.metal(smi, geometry)[0]
-    hinge = [row for row in iso.cons.coplanar if row[5] in DO._HINGE_CAP.values()]
+    hinge = [row for row in iso.cons.coplanar if row[5] in metal_donor_orient._HINGE_CAP.values()]
     assert not hinge, f"{name}: no ring here is both small enough and fully conjugated"
 
 
@@ -583,7 +579,7 @@ def test_fiscit_dithiolate_hinge_holds_the_measured_fold():
     isos = rx.metal(ref, lengths="model")
     ref_cx = rx.cxsmiles(ref)
     iso = next(i for i in isos if rx.cxsmiles(i) == ref_cx)
-    hinge = [row for row in iso.cons.coplanar if row[5] in DO._HINGE_CAP.values()]
+    hinge = [row for row in iso.cons.coplanar if row[5] in metal_donor_orient._HINGE_CAP.values()]
     assert hinge, "FISCIT's two dithiolate rings must each get a hinge row"
 
     ens = rx.embed(iso, n=3, seed=42, threads=1)
@@ -618,7 +614,7 @@ def test_kappa2_dithiocarbamate_hinge_holds_the_measured_fold_and_rereads_kappa2
     Chem.SanitizeMol(mol, catchErrors=True)
 
     iso = rx.metal(mol, "square_planar")[0]
-    hinge = [row for row in iso.cons.coplanar if row[5] == DO._HINGE_CAP[4]]
+    hinge = [row for row in iso.cons.coplanar if row[5] == metal_donor_orient._HINGE_CAP[4]]
     assert len(hinge) == 4, "one row per donor, per ring"
 
     ens = rx.embed(iso, n=3, seed=42, threads=1)
@@ -648,7 +644,7 @@ def test_only_an_inplane_sp2_donor_is_capped():
         assert isos, f"{name}: nothing was enumerated, so no cap was ever inspected"
         for iso in isos:
             for _i, d, _k, _w, _anc, _cap in iso.cons.coplanar:
-                assert DO.inplane_sp2_donor(iso.mol, d), f"{name}: a non-sp2 donor was capped"
+                assert metal_donor_orient.inplane_sp2_donor(iso.mol, d), f"{name}: a non-sp2 donor was capped"
                 haptic = any(nb.GetIdx() in set(iso.donors) for nb in iso.mol.GetAtomWithIdx(d).GetNeighbors())
                 assert not haptic, f"{name}: a haptic donor was capped"
 
@@ -671,7 +667,7 @@ def test_graph_recovers_missed_donors(name, smi, symbol, conjugated):
         and (symbol != "C" or iso.mol.GetAtomWithIdx(x).GetIsAromatic())
     )
     assert any(b.GetIsConjugated() for b in iso.mol.GetAtomWithIdx(d).GetBonds()) is conjugated, f"{name}: fixture"
-    assert DO.inplane_sp2_donor(iso.mol, d), f"{name} must satisfy the derived in-plane sp2 predicate"
+    assert metal_donor_orient.inplane_sp2_donor(iso.mol, d), f"{name} must satisfy the derived in-plane sp2 predicate"
     assert d in _capped(iso), f"{name} must receive a coplanarity cap"
 
 
@@ -690,7 +686,7 @@ def test_aryl_thiolate_sulfur_gets_the_pyramidal_orientation_wall():
     sulfur = _donor(iso, "S")
     carbon = next(nb.GetIdx() for nb in iso.mol.GetAtomWithIdx(sulfur).GetNeighbors() if nb.GetAtomicNum() > 1)
 
-    assert DO._stripped_hybridisation(iso.mol)[sulfur] == Chem.HybridizationType.SP3
+    assert metal_donor_orient.stripped_hybridisation(iso.mol)[sulfur] == Chem.HybridizationType.SP3
     assert (iso.metal, sulfur, carbon) in iso.cons.angles
 
 
@@ -713,7 +709,7 @@ def test_cap_window_has_declared_width_and_force_constant():
     from rxembed import mechanisms
     from rxembed.mechanisms import _coplanar_window
 
-    cap = DO._COPLANAR_CAP
+    cap = metal_donor_orient.COPLANAR_CAP
     for phi, well in ((3.0, 0.0), (-3.0, 0.0), (177.0, 180.0), (-177.0, -180.0), (100.0, 180.0)):
         lo, hi = _coplanar_window(phi, cap)
         assert hi - lo == pytest.approx(cap), f"phi={phi}: the window is not `cap` wide: a pin holds nothing softly"
@@ -748,7 +744,7 @@ def _cap_deviation(smi, seeds, n):
 
 
 def test_relax_lands_inside_cap_without_flattening():
-    cap = DO._COPLANAR_CAP
+    cap = metal_donor_orient.COPLANAR_CAP
     dev = _cap_deviation(NI_N, (6,), n=1)
     assert dev, "no capped donor was measured: the fixture is wrong"
     for j, arr in dev.items():
@@ -833,7 +829,7 @@ def test_local_donor_caps_do_not_collapse_the_ester():
 
 def test_length_source_does_not_control_partial_freeze_walls():
 
-    def walls(lengths):  # (metal, donor, substituent) windows, i.e. `_orient_donor`'s, not the polyhedron's
+    def walls(lengths):  # (metal, donor, substituent) windows, i.e. `orient_donor`'s, not the polyhedron's
         source = rx.read_xyz(_MN_H2, metal_charges={0: 2, 1: 1})
         iso = rx.metal(source, "octahedral", center="Mn", fix=_MN_H2_RC, lengths=lengths)[0]
         return {k: v for k, v in iso.cons.angles.items() if k[0] == iso.metal and k[1] != iso.metal}

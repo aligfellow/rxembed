@@ -18,9 +18,12 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import TorsionFingerprints, rdMolTransforms
 
-from rxembed.metal_core import COORDINATION_METALS, _frag_map, metal_index
-from rxembed.metal_perceive import _coordinating
-from rxembed.utils import _angle
+from rxembed.metal_core import COORDINATION_METALS, frag_map, metal_index
+from rxembed.metal_perceive import coordinating_atoms
+from rxembed.metal_slots import realised_label
+from rxembed.utils import bond_angle
+
+from .nci import analyzer
 
 
 def rotatable_quads(mol):
@@ -50,8 +53,8 @@ _MIN_DONORS = 2  # two donors are needed to define an L-M-L angle
 _EPS = 1e-9  # std floor for z-scoring
 
 
-def _metal_donors(mol, ids):
-    """``(metal, its coordination sphere)``, or ``(None, None)`` when there is no metal.
+def metal_donors(mol, ids):
+    """Return ``(metal, its coordination sphere)``, or ``(None, None)`` when there is no metal.
 
     A bonded graph states the complete non-metal sphere directly; a bond-less wrapped Mol falls back to
     `metal_perceive`'s covalent-radius rule (a flat 2.8 Å cutoff misses long La-Se bonds and admits nearby
@@ -65,28 +68,24 @@ def _metal_donors(mol, ids):
     neighbors = list(mol.GetAtomWithIdx(m).GetNeighbors())
     if neighbors:
         return m, sorted(n.GetIdx() for n in neighbors if n.GetAtomicNum() not in COORDINATION_METALS)
-    return m, sorted(_coordinating(mol, pos0, m))
+    return m, sorted(coordinating_atoms(mol, pos0, m))
 
 
 def _metal_features(mol, ids):
     """L-M-L angles per conformer, capturing the coordination polyhedron or isomer. None if no metal."""
-    m, donors = _metal_donors(mol, ids)
+    m, donors = metal_donors(mol, ids)
     pairs = list(itertools.combinations(donors or (), 2))
     if not pairs:
         return None
     out = []
     for i in ids:
         pos = mol.GetConformer(i).GetPositions()
-        out.append([_angle(pos[a], pos[m], pos[b]) for a, b in pairs])
+        out.append([bond_angle(pos[a], pos[m], pos[b]) for a, b in pairs])
     return np.array(out)
 
 
-def _metal_present(mol):
-    return metal_index(mol) is not None
-
-
-def _interfragment_contacts(an, positions, fmap):
-    """NCI contacts whose two sites span different fragments -> list of (type, frozenset(atoms), pair).
+def interfragment_contacts(an, positions, fmap):
+    """Return NCI contacts whose two sites span different fragments as (type, frozenset(atoms), pair) rows.
 
     `pair` is the ``(lo, hi)`` fragment-index pair the contact bridges, so an H-bond to substrate and one
     to solvent are distinguishable. Intramolecular NCIs are excluded (conformational detail the dihedral
@@ -109,19 +108,27 @@ def _nci_features(mol, ids):
     surrogate strips coordinate bonds, so without this guard every ligand looks like a separate fragment
     and coordination/inter-ligand contacts would pollute the latent.
     """
-    if _metal_present(mol):
+    if metal_index(mol) is not None:
         return None
-    from . import nci as nci_mod
-
-    fmap = _frag_map(mol)
+    fmap = frag_map(mol)
     if len(set(fmap.values())) < 2:  # noqa: PLR2004  single molecule -> no binding-mode block
         return None
-    an = nci_mod.analyzer(mol)
-    sigs = [{(t, a) for t, a, _ in _interfragment_contacts(an, mol.GetConformer(i).GetPositions(), fmap)} for i in ids]
+    an = analyzer(mol)
+    sigs = [{(t, a) for t, a, _ in interfragment_contacts(an, mol.GetConformer(i).GetPositions(), fmap)} for i in ids]
     universe = sorted({k for s in sigs for k in s})
     if not universe:
         return None
     return np.array([[float(k in s) for k in universe] for s in sigs])
+
+
+def _pose_features(pos, anchor_centroid, anchor_atoms, other_atoms):
+    """Return one fragment's pose relative to the anchor as its centroid distance and two sorted distance lists."""
+    oc = pos[other_atoms].mean(0)
+    return [
+        float(np.linalg.norm(oc - anchor_centroid)),
+        *sorted(float(np.linalg.norm(pos[a] - oc)) for a in anchor_atoms),
+        *sorted(float(np.linalg.norm(pos[h] - anchor_centroid)) for h in other_atoms),
+    ]
 
 
 def _relpose_features(mol, ids):
@@ -133,37 +140,24 @@ def _relpose_features(mol, ids):
     planar anchor apart (the NCI fingerprint resolves that once a contact forms). None for a single
     fragment or a metal, whose relative pose is the L-M-L block.
     """
-    if _metal_present(mol):
+    if metal_index(mol) is not None:
         return None
     frags = Chem.GetMolFrags(mol)
     if len(frags) < 2:  # noqa: PLR2004  a single fragment has no relative pose to describe
         return None
-
-    def heavy(f):
-        return [a for a in f if mol.GetAtomWithIdx(a).GetAtomicNum() > 1]
-
-    hf = [heavy(f) or list(f) for f in frags]
+    hf = [[a for a in f if mol.GetAtomWithIdx(a).GetAtomicNum() > 1] or list(f) for f in frags]
     anchor = max(range(len(frags)), key=lambda i: (len(hf[i]), -min(frags[i])))  # largest, ties->low idx
     a_atoms = hf[anchor]
     smi = [Chem.MolToSmiles(m) for m in Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False)]
     others = [i for i in range(len(frags)) if i != anchor]
     groups = [[o for o in others if smi[o] == s] for s in sorted({smi[o] for o in others})]  # fixed order
-
-    def sub(pos, ac, o):
-        oc = pos[hf[o]].mean(0)
-        return [
-            float(np.linalg.norm(oc - ac)),
-            *sorted(float(np.linalg.norm(pos[a] - oc)) for a in a_atoms),
-            *sorted(float(np.linalg.norm(pos[h] - ac)) for h in hf[o]),
-        ]
-
     rows = []
     for cid in ids:
         pos = mol.GetConformer(cid).GetPositions()
         ac = pos[a_atoms].mean(0)
         feat = []
         for grp in groups:
-            feat += [x for s in sorted(sub(pos, ac, o) for o in grp) for x in s]
+            feat += [x for s in sorted(_pose_features(pos, ac, a_atoms, hf[o]) for o in grp) for x in s]
         rows.append(feat)
     mat = np.array(rows, float)
     sd = mat.std(0)
@@ -221,18 +215,16 @@ def active_feature_kinds(mol, ids, nci=True):
     matrix, but agrees with what ``feature_matrix`` concatenates.
     """
     blocks = ["dihedral"]
-    if _metal_present(mol):
-        _, donors = _metal_donors(mol, ids)
+    if metal_index(mol) is not None:
+        _, donors = metal_donors(mol, ids)
         if donors and len(donors) >= _MIN_DONORS:
             blocks.append("metal")
         return blocks  # a metal suppresses relpose/nci (its mode = L-M-L)
-    if len(set(_frag_map(mol).values())) >= 2:  # noqa: PLR2004  two or more fragments
+    if len(set(frag_map(mol).values())) >= 2:  # noqa: PLR2004  two or more fragments
         blocks.append("relpose")  # multi-fragment -> relative-pose block always present
         if nci:
-            from . import nci as nci_mod
-
-            an, fmap = nci_mod.analyzer(mol), _frag_map(mol)
-            if any(_interfragment_contacts(an, mol.GetConformer(i).GetPositions(), fmap) for i in ids):
+            an, fmap = analyzer(mol), frag_map(mol)
+            if any(interfragment_contacts(an, mol.GetConformer(i).GetPositions(), fmap) for i in ids):
                 blocks.append("nci")
     return blocks
 
@@ -264,17 +256,13 @@ def mode_signature(mol, ids, nci=True):
         return None
     sigs = [[] for _ in ids]
     if "nci" in blocks:
-        from . import nci as nci_mod
-
-        an = nci_mod.analyzer(mol)
-        fmap = _frag_map(mol)
+        an = analyzer(mol)
+        fmap = frag_map(mol)
         for k, i in enumerate(ids):  # which (contact type, partner-fragment-pair)s
-            contacts = _interfragment_contacts(an, mol.GetConformer(i).GetPositions(), fmap)
+            contacts = interfragment_contacts(an, mol.GetConformer(i).GetPositions(), fmap)
             sigs[k].append(("nci", frozenset((t, p) for t, _a, p in contacts)))
     if "metal" in blocks:
-        from rxembed.metal_slots import realised_label
-
-        m, donors = _metal_donors(mol, ids)
+        m, donors = metal_donors(mol, ids)
         if donors:
             for k, i in enumerate(ids):
                 sigs[k].append(("metal", realised_label(mol, m, donors, i)))
@@ -342,10 +330,6 @@ def apply(
     en = energies[order]
     coords = np.array([mol.GetConformer(i).GetPositions() for i in ids_s])
     atoms = np.array([a.GetSymbol() for a in mol.GetAtoms()])
-
-    def keep_mask(mask):
-        return [ids_s[k] for k in range(len(mask)) if mask[k]], {}
-
     if method == "none":
         return ids_s, {}
     if method == "moi":
@@ -354,24 +338,26 @@ def apply(
         except ImportError as exc:
             raise ImportError("apply needs prism_pruner; pip install 'rxembed[workflow]'") from exc
 
-        return keep_mask(prune_by_moi(coords, atoms, moi_dev, en, energy_window)[1])
-    if method == "rmsd":
+        mask = prune_by_moi(coords, atoms, moi_dev, en, energy_window)[1]
+    elif method == "rmsd":
         try:
             from prism_pruner.pruner import prune_by_rmsd
         except ImportError as exc:
             raise ImportError("apply needs prism_pruner; pip install 'rxembed[workflow]'") from exc
 
-        return keep_mask(prune_by_rmsd(coords, atoms, max_rmsd, None, en, energy_window)[1])
-    if method == "descriptor":
+        mask = prune_by_rmsd(coords, atoms, max_rmsd, None, en, energy_window)[1]
+    elif method == "descriptor":
         quads = rotatable_quads(mol)
         feats = np.array([dihedrals(mol, i, quads) for i in ids_s])
-        return keep_mask(descriptor_prune(coords, feats, en, max_dist=max_dist, energy_window=energy_window))
-    if method == "energy":
-        return keep_mask(energy_prune(en, energy_tol=energy_tol))
-    raise ValueError(
-        f"unknown dedup method {method!r} (use 'moi' | 'rmsd' | 'descriptor' | 'energy' | 'none', "
-        f"or representatives() for a binding-mode summary)"
-    )
+        mask = descriptor_prune(coords, feats, en, max_dist=max_dist, energy_window=energy_window)
+    elif method == "energy":
+        mask = energy_prune(en, energy_tol=energy_tol)
+    else:
+        raise ValueError(
+            f"unknown dedup method {method!r} (use 'moi' | 'rmsd' | 'descriptor' | 'energy' | 'none', "
+            f"or representatives() for a binding-mode summary)"
+        )
+    return list(itertools.compress(ids_s, mask)), {}
 
 
 def energy_prune(energies, *, labels=None, energy_tol=0.05):
@@ -397,7 +383,7 @@ def energy_prune(energies, *, labels=None, energy_tol=0.05):
 def _descriptor_config():
     """Prism config with a custom similarity: a frame-invariant descriptor gated by a discrete label.
 
-    Built on demand because its base class is prism's, which the `select` extra provides; a module-level
+    Built on demand because its base class is prism's, which the `workflow` extra provides; a module-level
     subclass would make importing this module require the extra.
     """
     try:

@@ -9,63 +9,155 @@ from __future__ import annotations
 import logging
 import math
 from collections import Counter
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 
 import numpy as np
 from rdkit import Chem
 from rdkit.Numerics import rdAlignment
 
-from . import metal_core as _metal
-from . import metal_polyhedron as _poly
-from . import metal_stereo as _metal_stereo
-from . import stereo as _stereo
-from .bounds import (
-    _MAX_SEED_COUNT,
-    DEFAULT_SEED,
-    EmbedParams,
-    probe_conformer,
-    resolve_params,
-    seed_coordinates,
-    seed_count,
-)
+from .bounds import MAX_SEED_COUNT, EmbedParams, resolve_params, seed_coordinates, seed_count
 from .constraints import (
-    _ANGLE_ATOMS,
-    _DIHEDRAL_ATOMS,
-    _DIST_ATOMS,
+    ANGLE_ATOMS,
+    DIHEDRAL_ATOMS,
+    DIST_ATOMS,
     FIX_ANGLE_TOL,
     FIX_DISTANCE_TOL,
     Constraints,
-    _stated_dihedral,
-    _structural_dihedral_owned,
+    canonical_key,
     compose,
     constraint_value,
     resolve_atom,
     resolve_core,
+    stated_dihedral,
+    structural_dihedral_owned,
     template_to_fix,
     within_window,
 )
-from .metal_core import VACANT, materialized_state
-from .metal_isomer import Isomer, from_geometry, isomer_roles, winding_signature
-from .metal_perceive import donor_orientation
-from .relax import MAX_ITERS, UFFTypingError, _bonding_failure, _error_summary, restrained_uff
+from .metal_constraints import compile_constraints
+from .metal_core import (
+    ETA2,
+    VACANT,
+    MetalState,
+    connect_metal,
+    donor_chirality_sign,
+    materialized_state,
+    materialized_states,
+    metal_index,
+    metal_indices,
+    surrogate_all_metals,
+)
+from .metal_isomer import Isomer, from_geometry, winding_signature
+from .metal_perceive import (
+    FIT_FLOOR,
+    SHAPE_PROP,
+    SHAPE_REQUEST_PROP,
+    coplanar,
+    donor_orientation,
+    encode_shape_request,
+    rank_shapes,
+    shape_clause,
+    shape_gap,
+    shape_reading,
+)
+from .metal_polyhedron import POLYHEDRA, Polyhedron, ordered_fit_residual, orientation_parity, seating_is_exhaustive
+from .metal_stereo import (
+    chelate_links,
+    donor_classes,
+    equivalent_site_assignments,
+    face_winding,
+    realised_chirality,
+    site_classes,
+)
+from .relax import MAX_ITERS, UFFRecord, UFFTypingError, bonding_failure, error_summary, restrained_uff
+from .stereo import apply_point_stereo, axis_stereo, bond_stereo, point_stereo, stereo_from_3d
+from .utils import atom_label
 
 logger = logging.getLogger("rxembed")  # configured by rxembed.set_verbose
 
 
 class EmbeddingError(ValueError):
-    """Report that bounded conformer generation could not satisfy a requested identity."""
+    """Report that bounded conformer generation could not build a requested identity.
+
+    The message is one sentence. `failures` counts every rejected seed by `Failure.key`, each group keyed by
+    its first `Failure`; `isomer` is the requested `Isomer`, or ``None`` for a plain molecule.
+    """
+
+    def __init__(self, message, failures=None, isomer=None):
+        """Keep the one-sentence message with the rejected-seed counts and the requested isomer."""
+        super().__init__(message)
+        self.failures = Counter() if failures is None else failures
+        self.isomer = isomer
 
 
 @dataclass(frozen=True)
 class Failure:
-    """Separate an acceptance policy key from its user-facing explanation."""
+    """Separate an acceptance policy key from its user-facing explanation.
+
+    `atoms` names the site the failure was read at, when one is known; it is `()` for a whole-molecule
+    failure such as an unresolved requested stereo state. Replacement's two-batch stop rule reads it.
+    """
 
     kind: str
     detail: str
+    atoms: tuple = ()
+
+    @property
+    def key(self):
+        """Return ``(kind, atoms)``, which groups the same failure at the same site across seeds."""
+        return self.kind, self.atoms
 
     def __str__(self):
         """Return the user-facing explanation."""
         return self.detail
+
+
+# The remedies each `Failure.kind` offers, as objects of "try"; an unlisted kind offers another isomer, and
+# "seeding" is a candidate with no DG seed. `remedy` drops those the request cannot use.
+_ISOMER, _LOOSER_FIX, _LOOSER_CONSTRAIN = "another isomer", "a looser fix=", "a looser constrain="
+_INPUT_LENGTHS = "lengths='input'"
+_REMEDY = {
+    "coordination_shape": ("geometry=", _ISOMER),
+    "ml_distance": (_INPUT_LENGTHS, _ISOMER),
+    "metal_state": ("the other hand from rx.metal",),
+    "bonding": (_LOOSER_FIX, _ISOMER),
+    "rigid_body": (_LOOSER_FIX, _ISOMER),
+    "numeric_fix": (_LOOSER_FIX, "constrain="),
+    "connectivity": (_LOOSER_FIX, _ISOMER),
+    "requested_stereo": ("stereo='free'", _ISOMER),
+    "seeding": (_LOOSER_FIX, _LOOSER_CONSTRAIN, _ISOMER),
+}
+
+
+def remedy(kind, iso, cons):
+    """Return one ``try ...`` clause from the remedies for `kind` that this request can use, else a new seed."""
+    usable = {
+        _ISOMER: iso is not None,
+        _LOOSER_FIX: bool(cons.frozen or cons.fixed),
+        _LOOSER_CONSTRAIN: any(cons.contacts),
+        _INPUT_LENGTHS: iso is not None and iso.lengths == "model" and bool(iso.length_mol.GetNumConformers()),
+    }
+    options = [option for option in _REMEDY.get(kind, (_ISOMER,)) if usable.get(option, True)]
+    return f"try {' or '.join(options or ['another seed='])}"
+
+
+def _group_failures(failures):
+    """Count failures by `Failure.key`, each group keyed by its first `Failure`."""
+    first, counts = {}, Counter()
+    for failure in failures:
+        counts[first.setdefault(failure.key, failure)] += 1
+    return counts
+
+
+def _describe_groups(groups):
+    """Return grouped failures as ``'3x detail, 1x detail'``, most common first."""
+    return ", ".join(f"{count}x {failure}" for failure, count in groups.most_common())
+
+
+def _headline(groups, iso, cons):
+    """Return the most common failure, its share of the rejected seeds and its remedy as one clause."""
+    failure, count = groups.most_common(1)[0]
+    return f"{failure} in {count}/{sum(groups.values())} rejected seeds; {remedy(failure.kind, iso, cons)}"
 
 
 def _high_force_candidate(reason):
@@ -73,36 +165,57 @@ def _high_force_candidate(reason):
     return isinstance(reason, Failure) and reason.kind == "ml_distance"
 
 
+_STABLE_SHAPE_KINDS = {"coordination_shape", "seating_crossed"}
+
+
 def _stable_coordination_failure(reason):
-    """Return whether a converged endpoint settled on another labelled coordination shape."""
-    return isinstance(reason, Failure) and reason.kind == "coordination_shape"
+    """Return whether an endpoint settled into another labelled coordination shape or donor-slot seating.
+
+    Both are a wrong basin, converged or not: `restrained_uff` stops strengthening angle and dihedral walls at
+    1x, so no higher stiffness rung can move the donors onto the requested polyhedron. Only a fresh DG seed
+    can; handedness and structural failures stay on the escalation ladder.
+    """
+    return isinstance(reason, Failure) and reason.kind in _STABLE_SHAPE_KINDS
 
 
 _EPS = 1e-6  # near-zero norm floor for the graft axis
 _STRUCT_CAP_SLACK = 2.0  # deg: finite-force settling tolerance on coplanarity and umbrella caps
 _SHAPE_TEAR_TOL = 0.10  # A beyond a rigid body's own 0.1 A all-pairs windows
-# A model M-L window (about 0.05 A half-width) is a fitted target, not a user-stated number. FIX_DISTANCE_TOL's
-# 0.001 A slack is force-field convergence noise, not measurement precision. On RITCIG's limiting M-L pair the
-# restrained-UFF residual falls as C/fc with C = 0.56 A, so 0.001 A needs fc ~ 560, while 0.01 A only needs
-# the 100x rung; the 300x/1000x rungs in _HIGH_FC_ESCALATION stay for the cases that rung misses.
+# A model M-L window is a fitted target, so FIX_DISTANCE_TOL's 0.001 A would only measure UFF convergence. On
+# RITCIG's limiting pair the residual falls as C/fc with C = 0.56 A: 0.01 A needs the 100x rung, 0.001 A fc ~ 560.
 _ML_WINDOW_TOL = 0.01  # A: physical slack for a model-derived (not user-fixed) M-L window
 
 
-def _structural_failure(mol, cid, cons):
+def _real_graph(mol, iso):
+    """Return a conformer-free copy of `mol` with `iso`'s surrogated metals restored, for naming atoms."""
+    return mol if iso is None else iso.restore(Chem.Mol(mol, True))
+
+
+def _window_failure(graph, cons, label, atoms, value, window):
+    """Return a `Failure` naming a measured value outside its accepted window.
+
+    A two-atom window is the M-L distance; anything longer is a structural angle. `graph` names the atoms and
+    a haptic centroid is named by its face.
+    """
+    names = "-".join(
+        f"({','.join(atom_label(graph, a) for a in cons.haptic[atom])})"
+        if atom in cons.haptic
+        else atom_label(graph, atom)
+        for atom in atoms
+    )
+    kind, unit, digits = ("ml_distance", "A", 2) if len(atoms) == DIST_ATOMS else ("structural_constraint", "deg", 1)
+    if value is None or not np.isfinite(value):
+        return Failure(kind, f"{label} {names} is undefined", atoms=tuple(atoms))
+    lo, hi = window
+    excess = max(lo - value, value - hi, 0.0)
+    detail = f"{label} {names} {value:.{digits}f} {unit}, {excess:.2g} {unit} outside {lo:.{digits}f}-{hi:.{digits}f}"
+    return Failure(kind, detail, atoms=tuple(atoms))
+
+
+def _structural_failure(mol, cid, cons, iso=None):
     """Name the first missed structural postcondition, including its measured value and accepted range."""
     conf = mol.GetConformer(int(cid))
     pos = conf.GetPositions()
-
-    def failed(label, atoms, value, window, unit, kind="structural_constraint"):
-        measured = "undefined"
-        if value is not None and np.isfinite(value):
-            excess = max(window[0] - value, value - window[1], 0.0)
-            measured = f"{value:.3f} (excess {excess:.3g})"
-        return Failure(
-            kind,
-            f"{label} {atoms}: {measured} {unit}; expected [{window[0]:g}, {window[1]:g}] {unit}",
-        )
-
     for atoms, window in cons.distances.items():
         # A phantom is private scaffolding, not a postcondition on the flexible face's real centroid.
         if atoms in cons.contacts[0] or cons.phantoms.intersection(atoms) or not cons.metals.intersection(atoms):
@@ -113,64 +226,38 @@ def _structural_failure(mol, cid, cons):
         value = constraint_value(pos, atoms, cons.haptic, window)
         if not within_window(value, window, tol):
             accepted = window[0] - tol, window[1] + tol
-            return failed("M-L distance", atoms, value, accepted, "A", kind="ml_distance")
+            return _window_failure(_real_graph(mol, iso), cons, "M-L distance", atoms, value, accepted)
     for key in cons.coplanar:
         atoms, cap = key[:4], key[5]
-        if _stated_dihedral(cons, *atoms):
+        if stated_dihedral(cons, *atoms):
             continue
         measured = constraint_value(pos, atoms, cons.haptic)
         accepted = 0.0, cap + _STRUCT_CAP_SLACK
         if measured is None or not np.isfinite(measured):
-            return failed("coplanarity deviation", atoms, measured, accepted, "deg")
+            return _window_failure(_real_graph(mol, iso), cons, "coplanarity", atoms, measured, accepted)
         value = abs(measured)
         deviation = min(value, 180.0 - value)
         if deviation > accepted[1]:
-            return failed("coplanarity deviation", atoms, deviation, accepted, "deg")
+            return _window_failure(_real_graph(mol, iso), cons, "coplanarity", atoms, deviation, accepted)
     for atoms, ideal in cons.umbrellas.items():
-        if ideal in (None, 0.0) or isinstance(ideal, tuple) or _stated_dihedral(cons, *atoms, improper=True):
+        if ideal in (None, 0.0) or isinstance(ideal, tuple) or stated_dihedral(cons, *atoms, improper=True):
             continue
         measured = constraint_value(pos, atoms, cons.haptic)
         accepted = ideal - _STRUCT_CAP_SLACK, 90.0 + _STRUCT_CAP_SLACK
         if measured is None or not np.isfinite(measured):
-            return failed("absolute umbrella dihedral", atoms, measured, accepted, "deg")
+            return _window_failure(_real_graph(mol, iso), cons, "umbrella", atoms, measured, accepted)
         value = abs(measured)
         if not accepted[0] <= value <= accepted[1]:
-            return failed("absolute umbrella dihedral", atoms, value, accepted, "deg")
+            return _window_failure(_real_graph(mol, iso), cons, "umbrella", atoms, value, accepted)
     return None
-
-
-SHAPE_PROP = "shape"  # RDKit conformer property an accepted conformer carries: see `_shape_clause`
-# Machine-readable {metal atom: requested geometry} beside SHAPE_PROP, one accepted conformer at a time.
-# metal_smiles.cxsmiles reads this to write CX in the requested frame instead of re-perceiving by argmin;
-# a conformer without it (a raw geometry, never through the acceptance gate) keeps the argmin reading.
-SHAPE_REQUEST_PROP = "shape_request"
-
-
-def _encode_shape_request(requests):
-    """Return `requests` (``{metal atom: requested geometry}``) as one `SHAPE_REQUEST_PROP` string."""
-    return ";".join(f"{atom}:{geometry}" for atom, geometry in sorted(requests.items()))
-
-
-def _decode_shape_request(value):
-    """Return the `{metal atom: requested geometry}` a `SHAPE_REQUEST_PROP` string encodes."""
-    pairs = (pair.split(":", 1) for pair in value.split(";") if pair)
-    return {int(atom): geometry for atom, geometry in pairs}
-
-
-def _shape_clause(geometry, residual, next_name, next_err):
-    """Format one shape reading as its code, residual and runner-up: ``'TBP 0.053 (next SPY 0.198)'``."""
-    clause = f"{_poly.record(geometry).code} {residual:.3f}"
-    if next_name is not None:
-        clause += f" (next {_poly.record(next_name).code} {next_err:.3f})"
-    return clause
 
 
 @dataclass(frozen=True)
 class _CentreStatePrep:
     """Cache one metal centre's per-isomer coordination-state geometry, reused across every conformer."""
 
-    state: _metal.MetalState
-    poly: _poly.Polyhedron
+    state: MetalState
+    poly: Polyhedron
     centre: str
     vertices: list
     haptic: dict
@@ -187,10 +274,10 @@ def _coordination_state_prep(iso):
     """Return `iso`'s per-centre coordination-state geometry, independent of any conformer's coordinates."""
     if iso is None:
         return None
-    parts = _metal.materialized_states(iso.mol, iso.centres)
+    parts = materialized_states(iso.mol, iso.centres)
     prepped = []
     for state in iso.centres:
-        poly = _poly.POLYHEDRA.get(state.geometry)
+        poly = POLYHEDRA.get(state.geometry)
         if poly is None:
             continue
         centre = f"{Chem.GetPeriodicTable().GetElementSymbol(state.atomic_num)}{state.atom}"
@@ -200,22 +287,19 @@ def _coordination_state_prep(iso):
             continue
         ideal = np.array([poly.vertex_dirs[slot] for slot in occupied], float)
         ideal /= np.linalg.norm(ideal, axis=1, keepdims=True)
-        classes = _metal_stereo.site_classes(iso._graph, vertices, haptic, isomer_roles(iso))
+        classes = site_classes(iso.graph, vertices, haptic, iso.roles)
         keys = [None if site == VACANT else classes[site] for site in vertices]
-        links = _metal_stereo.chelate_links(iso._graph, vertices, haptic)
+        links = chelate_links(iso.graph, vertices, haptic)
         constitutionally_equivalent = len({keys[slot] for slot in occupied}) == 1 and not links
         orders = None
         if not constitutionally_equivalent:
             row = {slot: i for i, slot in enumerate(occupied)}
             orders = [
-                [row[assignment[slot]] for slot in occupied]
-                for assignment in _metal_stereo.equivalent_site_assignments(keys, links)
+                [row[assignment[slot]] for slot in occupied] for assignment in equivalent_site_assignments(keys, links)
             ]
         # A graph input (no conformer) has no input part: `shape_gap` reads `iso.mol`, not the conformer under
         # validation, once per Isomer rather than once per conformer.
-        residual, next_name, next_err, _accepted = _metal.shape_gap(
-            iso.mol, state.atom, vertices, haptic, state.geometry
-        )
+        residual, next_name, next_err, _accepted = shape_gap(iso.mol, state.atom, vertices, haptic, state.geometry)
         prepped.append(
             _CentreStatePrep(
                 state=state,
@@ -227,7 +311,7 @@ def _coordination_state_prep(iso):
                 occupied=occupied,
                 ideal=ideal,
                 constitutionally_equivalent=constitutionally_equivalent,
-                exhaustive=_poly.seating_is_exhaustive(ideal),
+                exhaustive=seating_is_exhaustive(ideal),
                 orders=orders,
                 input_reading=None if residual is None else (residual, next_name, next_err),
             )
@@ -243,47 +327,50 @@ def _centre_observed(pos, prep):
     """
     state, poly, centre = prep.state, prep.poly, prep.centre
     vertices, haptic, donors = prep.vertices, prep.haptic, prep.donors
-    occupied = prep.occupied
-
-    def failed(detail):
-        return Failure("coordination_shape", detail)
-
+    occupied, atoms = prep.occupied, (state.atom,)
     if not np.all(np.isfinite(pos[state.atom])):
-        return failed(f"coordination state at {centre} has non-finite metal coordinates")
+        return Failure("coordination_shape", f"{centre} has non-finite coordinates", atoms=atoms)
     points = {}
     for slot in occupied:
         vertex = vertices[slot]
         point = np.mean(pos[list(haptic[vertex])], axis=0) if vertex in haptic else pos[vertex]
         if not np.all(np.isfinite(point)):
-            return failed(f"coordination state at {centre} has non-finite donor coordinates")
+            return Failure("coordination_shape", f"{centre} has a non-finite donor position", atoms=atoms)
         points[slot] = point
-    if poly.planar and donors and not _metal.coplanar(pos, state.atom, donors, haptic=haptic):
-        return failed(f"coordination state at {centre} is nonplanar; expected {state.geometry}")
+    if poly.planar and donors and not coplanar(pos, state.atom, donors, haptic=haptic):
+        return Failure(
+            "coordination_shape", f"{centre} donors leave the {_shape_code(state.geometry)} plane", atoms=atoms
+        )
     if (
         not poly.planar
         and len(occupied) >= 3  # noqa: PLR2004 - fewer donors gives no plane to test against
         and np.linalg.matrix_rank(np.array([poly.vertex_dirs[i] for i in occupied], float)) == 3  # noqa: PLR2004
-        and _metal.coplanar(pos, state.atom, donors, haptic=haptic)
+        and coplanar(pos, state.atom, donors, haptic=haptic)
     ):
-        return failed(f"coordination state at {centre} collapsed into a plane; expected {state.geometry}")
+        return Failure("coordination_shape", f"{centre} donors fall into a plane", atoms=atoms)
     observed = []
     for slot in occupied:
         direction = points[slot] - pos[state.atom]
         if not np.all(np.isfinite(direction)):
-            return failed(f"coordination state at {centre} has a non-finite donor direction")
+            return Failure("coordination_shape", f"{centre} has a non-finite donor direction", atoms=atoms)
         length = np.linalg.norm(direction)
         if length <= _EPS:
-            return failed(f"coordination state at {centre} has a donor collapsed onto the metal")
+            return Failure("coordination_shape", f"{centre} has a donor collapsed onto it", atoms=atoms)
         observed.append(direction / length)
     return points, np.array(observed)
 
 
 def _shape_line(prep, requested_residual, next_name, next_err):
     """Format one accepted centre's `SHAPE_PROP` line: its reading, and the input's when there is one."""
-    line = f"{prep.centre} {_shape_clause(prep.state.geometry, requested_residual, next_name, next_err)}"
+    line = f"{prep.centre} {shape_clause(prep.state.geometry, requested_residual, next_name, next_err)}"
     if prep.input_reading is not None:
-        line += f"; input {_shape_clause(prep.state.geometry, *prep.input_reading)}"
+        line += f"; input {shape_clause(prep.state.geometry, *prep.input_reading)}"
     return line
+
+
+def _shape_code(geometry):
+    """Return a geometry's three-letter code, or its name when the registry has no code for it."""
+    return getattr(POLYHEDRA.get(geometry), "code", None) or geometry
 
 
 def _centre_state_failure(pos, mol, cid, prep, lines=None, requests=None):
@@ -293,52 +380,41 @@ def _centre_state_failure(pos, mol, cid, prep, lines=None, requests=None):
     `requests` (see `SHAPE_REQUEST_PROP`) when it passes.
     """
     state, centre, occupied, ideal = prep.state, prep.centre, prep.occupied, prep.ideal
-
-    def failed(detail):
-        return Failure("coordination_shape", detail)
-
+    atoms, code = (state.atom,), _shape_code(state.geometry)
     result = _centre_observed(pos, prep)
     if isinstance(result, Failure):
         return result
-    points, observed = result
-    # Rule B: the requested shape is accepted within `_FIT_MARGIN` of the best reading (`_metal.shape_reading`);
+    _points, observed = result
+    # Rule B: the requested shape is accepted within `_FIT_MARGIN` of the best reading (`shape_reading`);
     # a vacant site is read against the occupied coordination number. This residual doubles as `unrestricted_fit`
     # and, when constitutionally equivalent, `equivalent_fit` below: one ranking, not a repeat exhaustive search.
-    pts = [points[slot] for slot in occupied]
-    rms = _metal._plane_rms(pos[state.atom], pts)
-    r = float(np.mean([np.linalg.norm(pt - pos[state.atom]) for pt in pts]))
     vacant = len(occupied) < len(prep.vertices)
-    ranked = _metal.rank_shapes(observed, rms, r, vacancy=(state.geometry, ideal) if vacant else None)
-    requested_residual, next_name, next_err, accepted = _metal.shape_reading(ranked, state.geometry)
+    ranked = rank_shapes(observed, vacancy=(state.geometry, ideal) if vacant else None)
+    requested_residual, next_name, next_err, accepted = shape_reading(ranked, state.geometry)
     if not accepted:
-        return failed(
-            f"coordination state at {centre}: expected {state.geometry} {requested_residual:.3f}, "
-            f"reads {next_name} {next_err:.3f}"
-        )
+        detail = f"{centre} relaxes from {code} ({requested_residual:.3f}) to {_shape_code(next_name)} ({next_err:.3f})"
+        return Failure("coordination_shape", detail, atoms=atoms)
     unrestricted_fit = requested_residual if prep.exhaustive else None
     if prep.constitutionally_equivalent:
         equivalent_fit = requested_residual
     else:
         equivalent_fit = min(
             (
-                _poly.ordered_fit_residual(observed[order], ideal)
+                ordered_fit_residual(observed[order], ideal)
                 for order in prep.orders
-                if not state.hand or _poly.orientation_parity(observed[order], ideal) > 0
+                if not state.hand or orientation_parity(observed[order], ideal) > 0
             ),
             default=None,
         )
         if equivalent_fit is None:
-            return failed(f"coordination state at {centre} has no donor-slot seating compatible with {state.geometry}")
-    if equivalent_fit > _metal._FIT_FLOOR:
-        return failed(
-            f"coordination state at {centre} does not fit {state.geometry}: "
-            f"residual {equivalent_fit:.3f} > {_metal._FIT_FLOOR:.2f}"
-        )
+            return Failure("coordination_shape", f"{centre} donors fit no {code} slot seating", atoms=atoms)
+    if equivalent_fit > FIT_FLOOR:
+        return Failure("coordination_shape", f"{centre} distorts far from {code} ({equivalent_fit:.2f})", atoms=atoms)
     # An exact unrestricted search is an identity witness: another constitutional seating fitting better means
     # this endpoint crossed its slot boundary. Above the resource cap it is only an approximation, so it
     # cannot reject an otherwise compatible labelled state.
     if unrestricted_fit is not None and equivalent_fit > unrestricted_fit + _EPS:
-        return failed(f"coordination state at {centre} crossed its donor-slot seating")
+        return Failure("seating_crossed", f"{centre} donors swap sites (another isomer)", atoms=atoms)
     if lines is not None:
         lines.append(_shape_line(prep, requested_residual, next_name, next_err))
     if requests is not None:
@@ -364,56 +440,55 @@ def _coordination_state_failure(mol, cid, iso, states=None):
     if lines:
         mol.GetConformer(int(cid)).SetProp(SHAPE_PROP, " | ".join(lines))
     if requests:
-        mol.GetConformer(int(cid)).SetProp(SHAPE_REQUEST_PROP, _encode_shape_request(requests))
+        mol.GetConformer(int(cid)).SetProp(SHAPE_REQUEST_PROP, encode_shape_request(requests))
     return None
 
 
-def _coordination_state_ok(mol, cid, iso, states=None):
-    """Return whether one conformer retains each selected polyhedron."""
-    return _coordination_state_failure(mol, cid, iso, states=states) is None
-
-
 def _donor_facing_failure(mol, donors, frozen):
-    """Warn on a donor angle below its census floor; never reject a conformer for it.
+    """Log a donor angle below its census floor at DEBUG; never reject a conformer for it.
 
     A floor violation is not proof of folding: real crystal donors cross it too (see
     `metal_perceive.donor_orientation`), so refusing a conformer for this alone would refuse a legitimate
-    geometry. Each warning names the donor, its substituent, and the measured angle.
+    geometry. The gate reads every rung and replacement seed, so `Ensemble.check` reports it on kept ones.
     """
     for violation in donor_orientation(mol, mol.GetConformer().GetPositions(), donors, frozen):
-        logger.warning("donor orientation: %s", violation.detail)
+        logger.debug("donor orientation: %s", violation.detail)
+
+
+def _ligand_stereo_fault(site, expected, found, atoms):
+    """Return a ligand stereo `Failure`, kept apart when the element reads as unassigned rather than inverted."""
+    if found == "unassigned":
+        return Failure("ligand_stereo_unassigned", f"{site} no longer reads {expected}", atoms=atoms)
+    return Failure("ligand_stereo", f"{site} reads {found}, not {expected}", atoms=atoms)
 
 
 def _ligand_stereo_failure(mol, iso):
     """Return the first ligand point, E/Z or axial mismatch on the restored public graph."""
-
-    def failed(detail, found):
-        kind = "ligand_stereo_unassigned" if found == "unassigned" else "ligand_stereo"
-        return Failure(kind, detail)
-
-    wanted_points = _stereo.point_stereo(iso.stereo_label)
-    wanted_ez = _stereo.bond_stereo(iso.stereo_label)
-    wanted_axes = _stereo.axis_stereo(iso.stereo_label)
+    wanted_points = point_stereo(iso.stereo_label)
+    wanted_ez = bond_stereo(iso.stereo_label)
+    wanted_axes = axis_stereo(iso.stereo_label)
     if not (wanted_points or wanted_ez or wanted_axes):
         return None
-    realised = _stereo.stereo_from_3d(mol, exclude=_metal.metal_indices(mol))
-    realised_points = _stereo.point_stereo(realised)
+    realised = stereo_from_3d(mol, exclude=metal_indices(mol))
+    realised_points = point_stereo(realised)
     for atom, expected in wanted_points.items():
         if realised_points.get(atom) != expected:
             found = realised_points.get(atom, "unassigned")
-            return failed(f"wrong ligand point stereo at atom {atom}: expected {expected}, found {found}", found)
-    realised_ez = _stereo.bond_stereo(realised)
+            return _ligand_stereo_fault(atom_label(mol, atom), expected, found, (atom,))
+    realised_ez = bond_stereo(realised)
     for pair, expected in wanted_ez.items():
         if realised_ez.get(pair) != expected:
             found = realised_ez.get(pair, "unassigned")
-            return failed(f"wrong ligand E/Z at bond {tuple(sorted(pair))}: expected {expected}, found {found}", found)
-    realised_axes = _stereo.axis_stereo(realised)
+            a, b = sorted(pair)
+            return _ligand_stereo_fault(
+                f"double bond {atom_label(mol, a)}={atom_label(mol, b)}", expected, found, (a, b)
+            )
+    realised_axes = axis_stereo(realised)
     for pair, expected in wanted_axes.items():
         if realised_axes.get(pair) != expected:
             found = realised_axes.get(pair, "unassigned")
-            return failed(
-                f"wrong ligand axial stereo at bond {tuple(sorted(pair))}: expected {expected}, found {found}", found
-            )
+            a, b = sorted(pair)
+            return _ligand_stereo_fault(f"axis {atom_label(mol, a)}-{atom_label(mol, b)}", expected, found, (a, b))
     return None
 
 
@@ -426,67 +501,13 @@ _REPLACEMENT_FACTOR = 4
 _REPLACEMENT_ROUNDS = 3
 
 
-def encounter_bounds(mol, slack=1.5, seed=DEFAULT_SEED, *, fragments=None):
-    """Keep each fragment pair near van der Waals contact through its closest heavy atoms."""
-    tmp = probe_conformer(mol, seed)
-    if tmp is None:
-        return {}
-    pt = Chem.GetPeriodicTable()
-    pos = tmp.GetConformer().GetPositions()
-    frags = Chem.GetMolFrags(mol) if fragments is None else fragments
-
-    def heavy(f):
-        return [i for i in f if mol.GetAtomWithIdx(i).GetAtomicNum() > 1]
-
-    bounds = {}
-    for a in range(len(frags)):
-        for b in range(a + 1, len(frags)):
-            fa, fb = heavy(frags[a]), heavy(frags[b])
-            if not fa or not fb:
-                continue
-            i, j = min(((i, j) for i in fa for j in fb), key=lambda p: np.linalg.norm(pos[p[0]] - pos[p[1]]))
-            vdw = pt.GetRvdw(mol.GetAtomWithIdx(i).GetAtomicNum()) + pt.GetRvdw(mol.GetAtomWithIdx(j).GetAtomicNum())
-            bounds[(i, j)] = (vdw, vdw + slack)
-    return bounds
-
-
-def float_encounter_bounds(mol, cons):
-    """Keep metric components near each other with one encounter bound per component pair."""
-    frags = Chem.GetMolFrags(mol)
-    if len(frags) < 2:  # noqa: PLR2004 - fewer than two fragments leaves no pair to bound
-        return {}
-    frag_of = {a: fi for fi, f in enumerate(frags) for a in f}
-    groups = [set(fragment) for fragment in frags]
-    for i, j in cons.distances:
-        if i not in frag_of or j not in frag_of:
-            continue  # a haptic centroid is materialised only after this step
-        left, right = frag_of[i], frag_of[j]
-        if groups[left] is groups[right]:
-            continue
-        joined = groups[left] | groups[right]
-        for atom in joined:
-            groups[frag_of[atom]] = joined
-    components = list({id(group): tuple(sorted(group)) for group in groups}.values())
-    if len(components) < 2:  # noqa: PLR2004 - fewer than two components leaves no pair to bound
-        return {}
-    component_of = {atom: ci for ci, component in enumerate(components) for atom in component}
-    touched = {component_of[atom] for atom in cons.constrained_atoms() if atom in component_of}
-    if len(touched) == len(components):
-        return {}
-    return {
-        pair: window
-        for pair, window in encounter_bounds(mol, fragments=components).items()
-        if component_of[pair[0]] not in touched or component_of[pair[1]] not in touched
-    }
-
-
 def graft_frozen(mol, conf_ids, frozen, ref):
     """Kabsch-fit and restore a frozen core exactly after distance geometry."""
     frozen = list(frozen)
     core = np.asarray(ref, float)  # input core, input frame
     if len(frozen) <= 1:  # a point has no shape to restore
         return
-    if len(frozen) == _DIST_ATOMS:  # a bond: keep one atom, slide the other to the template distance along the
+    if len(frozen) == DIST_ATOMS:  # a bond: keep one atom, slide the other to the template distance along the
         dt = float(np.linalg.norm(core[0] - core[1]))  # embedded axis: no orientation to restore, just length
         for c in conf_ids:
             conf = mol.GetConformer(c)
@@ -540,14 +561,13 @@ def fold_substrate(base, sub, graft_ref, *, protect_arrangement=True):
         )
     sphere_d = set(base.distances)
     soft_d, soft_angular = sub.contacts
-    canonical = lambda key: min(tuple(key), tuple(reversed(key)))  # noqa: E731
-    sphere_angular = {canonical(k) for k in base.angles}
+    sphere_angular = {canonical_key(k) for k in base.angles}
     overlap = sorted(
         (soft_d & sphere_d)
         | {
             k
             for k in soft_angular
-            if canonical(k) in sphere_angular or (len(k) == _DIHEDRAL_ATOMS and _structural_dihedral_owned(base, k))
+            if canonical_key(k) in sphere_angular or (len(k) == DIHEDRAL_ATOMS and structural_dihedral_owned(base, k))
         }
     )
     if overlap:
@@ -572,17 +592,17 @@ def _stereo_targets(iso):
 
 def _winding_ranks(mol, targets):
     """Return donor and eta2 CIP ranks needed by the stated haptic windings."""
+    if not any(winding for _state, _vertices, _haptic, winding in targets):
+        return {}, None  # no target names a face: skip the surrogate graph and donor-class work below
     rank_mol = mol
-    if _metal.metal_indices(mol):
-        rank_mol, _metals = _metal.surrogate_all_metals(Chem.Mol(mol))
+    if metal_indices(mol):
+        rank_mol, _metals = surrogate_all_metals(Chem.Mol(mol))
     ranks = {}
     for state, vertices, haptic, winding in targets:
         donors = [d for d in vertices if d != VACANT and d not in haptic]
         donors += [atom for face in haptic.values() for atom in face]
-        ranks[state.atom] = _metal_stereo.donor_classes(rank_mol, donors) if winding else {}
-    eta2 = any(
-        len(haptic[dummy]) == _metal._ETA2 for _state, _vertices, haptic, winding in targets for dummy in winding
-    )
+        ranks[state.atom] = donor_classes(rank_mol, donors) if winding else {}
+    eta2 = any(len(haptic[dummy]) == ETA2 for _state, _vertices, haptic, winding in targets for dummy in winding)
     return ranks, list(Chem.ComputeAtomCIPRanks(rank_mol)) if eta2 else None
 
 
@@ -592,12 +612,7 @@ def _restore_connected(mol, cid, iso):
     Shared by seed selection and the post-relax gate, which both need this real-metal, real-bond view.
     """
     restored = iso.restore(Chem.Mol(mol, False, int(cid)))
-    return _metal.connect_metal(restored, iso.donor_bonds)
-
-
-def _seed_ligand_stereo_matches(mol, cid, iso):
-    """Return whether a raw seed retains all stated ligand stereo on the restored public graph."""
-    return _ligand_stereo_failure(_restore_connected(mol, cid, iso), iso) is None
+    return connect_metal(restored, iso.donor_bonds)
 
 
 def _seed_stereo_matches(mol, cid, iso, targets, winding_ranks, eta2_ranks, reflectable, check_ligand=False):
@@ -606,7 +621,7 @@ def _seed_stereo_matches(mol, cid, iso, targets, winding_ranks, eta2_ranks, refl
     for state, vertices, haptic, winding in targets:
         hand = state.hand
         realised = (
-            _metal_stereo.realised_chirality(
+            realised_chirality(
                 mol,
                 cid,
                 state.geometry,
@@ -623,20 +638,17 @@ def _seed_stereo_matches(mol, cid, iso, targets, winding_ranks, eta2_ranks, refl
             realised, pos = hand, mol.GetConformer(int(cid)).GetPositions()
         if hand and realised != hand:
             return False
-        realised_winding = {
-            dummy: sign
-            for dummy in winding
-            if (
-                sign := _metal_stereo.face_winding(
-                    mol, pos, state.atom, haptic[dummy], winding_ranks[state.atom], eta2_ranks
-                )
-            )
-        }
-        if len(realised_winding) != len(winding) or winding_signature(
-            iso, state, realised_winding
-        ) != winding_signature(iso, state, winding):
-            return False
-    return not check_ligand or _seed_ligand_stereo_matches(mol, cid, iso)
+        if winding:  # an empty winding reads back as an empty winding: comparing them is always a match
+            realised_winding = {
+                dummy: sign
+                for dummy in winding
+                if (sign := face_winding(mol, pos, state.atom, haptic[dummy], winding_ranks[state.atom], eta2_ranks))
+            }
+            if len(realised_winding) != len(winding) or winding_signature(
+                iso, state, realised_winding
+            ) != winding_signature(iso, state, winding):
+                return False
+    return not check_ligand or _ligand_stereo_failure(_restore_connected(mol, cid, iso), iso) is None
 
 
 def _seed_geometry_matches(mol, cid, iso):
@@ -651,16 +663,16 @@ def _seed_geometry_matches(mol, cid, iso):
         vertices, haptic, _winding, _donors = materialized_state(iso, state)
         if VACANT in vertices:
             continue
-        if not _metal.shape_gap(mol, state.atom, vertices, haptic, state.geometry, cid)[3]:
+        if not shape_gap(mol, state.atom, vertices, haptic, state.geometry, cid)[3]:
             return False
     return True
 
 
-def _stereo_donor_bonds(mol, iso):
+def stereo_donor_bonds(mol, iso):
     """Return bonds that give labelled donors their full CIP reference during ETKDG."""
     if iso is None:
         return []
-    points = set(_stereo.point_stereo(iso.stereo_label))
+    points = set(point_stereo(iso.stereo_label))
     return [
         (donor, metal)
         for donor, metal in iso.donor_bonds
@@ -676,28 +688,17 @@ def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
     """Seed `n` conformers, selecting metal and donor hands before cleanup and grafting a fixed core exactly."""
     if n is not None and int(n) <= 0:  # `n or seed_count(...)` below would treat 0 as "use the default"
         raise ValueError(f"n={n}: give a positive conformer count, or None for the flexibility-scaled default")
-    cons.distances.update(float_encounter_bounds(mol, cons))  # keep free/stray fragments from drifting off
     frozen, ref_core = _frozen_core_ref(mol, cons.frozen, graft_ref or {})
     target = n or seed_count(mol, constrained=cons.is_constrained)
     targets = _stereo_targets(iso)
-    point_stereo = bool(iso and _stereo.point_stereo(iso.stereo_label))
-    ligand_stereo = bool(
-        iso and (point_stereo or _stereo.bond_stereo(iso.stereo_label) or _stereo.axis_stereo(iso.stereo_label))
-    )
+    has_point_stereo = bool(iso and point_stereo(iso.stereo_label))
+    ligand_stereo = bool(iso and (has_point_stereo or bond_stereo(iso.stereo_label) or axis_stereo(iso.stereo_label)))
     needs_selection = bool(targets or ligand_stereo)
     hands = sum(bool(state.hand) for state, _vertices, _haptic, _winding in targets)
     windings = sum(len(winding) for _state, _vertices, _haptic, winding in targets)
     winding_ranks, eta2_ranks = _winding_ranks(mol, targets)
-    stereo_bonds = _stereo_donor_bonds(mol, iso)
-
-    def generate(count, trial_params, *, hard_chirality=True):
-        max_attempts = 30 if point_stereo else 0
-        return list(
-            seed_coordinates(
-                mol, cons, count, trial_params, enforce_chirality=hard_chirality, max_attempts=max_attempts
-            )
-        )
-
+    stereo_bonds = stereo_donor_bonds(mol, iso)
+    max_attempts = 30 if has_point_stereo else 0
     reflectable = _reflection_is_free(mol, iso, cons, targets, stereo_bonds)
     if stereo_bonds:
         missing = {
@@ -709,15 +710,15 @@ def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
         if missing:
             full = Chem.Mol(mol)
             iso.restore(full)
-            full = _metal.connect_metal(full, iso.donor_bonds)
-            _stereo.apply_point_stereo(full, iso.stereo_label, missing)
+            full = connect_metal(full, iso.donor_bonds)
+            apply_point_stereo(full, iso.stereo_label, missing)
             tags = {donor: full.GetAtomWithIdx(donor).GetChiralTag() for donor in missing}
         iso.restore(mol)  # use the actual metal, not an isotope surrogate, as the donor's fourth reference
-        mol = _metal.connect_metal(mol, stereo_bonds)
+        mol = connect_metal(mol, stereo_bonds)
         for donor, tag in tags.items():
             mol.GetAtomWithIdx(donor).SetChiralTag(tag)
     if not needs_selection:
-        ids = generate(target, params)
+        ids = seed_coordinates(mol, cons, target, params, enforce_chirality=True, max_attempts=max_attempts)
         if ref_core is not None:
             graft_frozen(mol, ids, frozen, ref_core)  # restore the exact frozen core
     else:
@@ -727,15 +728,17 @@ def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
         # A spare-success margin for independent binary metal states; a free reflection needs no margin.
         bits = hands + windings
         trials = target if reflectable else 2**bits * (target + 2 * (math.isqrt(target - 1) + 1))
-        budget = max(target, min(_MAX_SEED_COUNT, max(2 * trials, seed_count(mol, constrained=True))))
+        budget = max(target, min(MAX_SEED_COUNT, max(2 * trials, seed_count(mol, constrained=True))))
         used = attempt = generated = 0
         while kept.GetNumConformers() < target and used < budget:
             need = target - kept.GetNumConformers()
             batch_n = min(_REPLACEMENT_FACTOR * need, pool, budget - used)
-            hard_chirality = not point_stereo or attempt == 0
+            hard_chirality = not has_point_stereo or attempt == 0
             trial_prune = -1 if len(targets) > 1 else params.prune_rms
             trial = replace(params, seed=params.seed + attempt, prune_rms=trial_prune)
-            ids = generate(batch_n, trial, hard_chirality=hard_chirality)
+            ids = seed_coordinates(
+                mol, cons, batch_n, trial, enforce_chirality=hard_chirality, max_attempts=max_attempts
+            )
             used += batch_n
             attempt += 1
             generated += len(ids)
@@ -755,32 +758,39 @@ def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
                     ligand_stereo,
                 )
             ]
-            matches.sort(key=lambda cid: not _seed_geometry_matches(mol, cid, iso))
+            # Keep only enough seeds to fill `need`, geometry-matching ones first: a stable sort on
+            # "not matching" followed by a `need`-length prefix, without ranking seeds we will not use.
+            good, rest = [], []
+            for cid in matches:
+                if len(good) < need and _seed_geometry_matches(mol, cid, iso):
+                    good.append(cid)
+                else:
+                    rest.append(cid)
+            matches = good + rest
             for cid in matches:
                 kept.AddConformer(Chem.Conformer(mol.GetConformer(cid)), assignId=True)
                 if kept.GetNumConformers() == target:
                     break
         mol = kept
         ids = [conf.GetId() for conf in mol.GetConformers()]
-        logger.log(
-            logging.WARNING if len(ids) < target else logging.DEBUG,
+        logger.debug(
             "DG search returned %d candidates; %d/%d satisfied requested stereo selection",
             generated,
             len(ids),
             target,
         )
     if stereo_bonds:
-        mol, _metals = _metal.surrogate_all_metals(mol)  # UFF still receives the bondless surrogate graph
+        mol, _metals = surrogate_all_metals(mol)  # UFF still receives the bondless surrogate graph
     return mol, ids, target if needs_selection else None
 
 
 def require_seed_count(ids, target, iso=None):
-    """Reject public results that underfill the requested discrete stereo identity."""
+    """Raise `EmbeddingError` when the seeds underfill the requested metal hand, haptic face or ligand stereo."""
     if target is not None and len(ids) < target:
-        identity = f" for {iso}" if iso is not None else ""
-        raise RuntimeError(
-            f"embed: found {len(ids)}/{target} seeds with the requested stereo state{identity} after "
-            "the bounded DG seed budget; choose a compatible isomer or relax fix="
+        who = "embed" if iso is None else iso
+        raise EmbeddingError(
+            f"{who}: found {len(ids)}/{target} DG seeds with the requested metal and ligand stereo; try another isomer",
+            isomer=iso,
         )
 
 
@@ -800,13 +810,15 @@ def _reflection_is_free(mol, iso, cons, targets, stereo_bonds=None):
 
     Needs exactly one stereo target with a hand, no stated winding or haptic face, no other stereocentre
     or configured double bond (`_mirror_is_free`), no stereo-carrier donor bond, and no rigid coordinate
-    hold. Shared by seed selection, before relax, and hand correction, after it.
+    hold. A grafted chiral core's mirror is a different core, and a haptic face can be planar-chiral in a way
+    this tier cannot perceive (`pipeline.select_stereo` owns that). Shared by seed selection, before relax,
+    and hand correction, after it.
     """
     if len(targets) != 1:
         return False
     state, _vertices, haptic, winding = targets[0]
     if stereo_bonds is None:
-        stereo_bonds = _stereo_donor_bonds(mol, iso)
+        stereo_bonds = stereo_donor_bonds(mol, iso)
     return bool(
         state.hand
         and not winding
@@ -832,14 +844,14 @@ def _realised_hand(mol, iso, cid):
     Spectator metals are masked so `from_geometry` reads the selected centre only.
     """
     one = Chem.Mol(mol, False, int(cid))
-    for metal in _metal.metal_indices(one):
+    for metal in metal_indices(one):
         if metal != iso.metal:
             one.GetAtomWithIdx(metal).SetAtomicNum(0)
     pos = one.GetConformer().GetPositions()
     if any(np.linalg.norm(pos[d] - pos[iso.metal]) < _EPS for d in iso.donors):
         return ""
     try:
-        got = from_geometry(one)  # a single-conformer copy: `from_geometry` takes a Mol
+        got = from_geometry(one, warn=False)  # a single-conformer copy: `from_geometry` takes a Mol
     except (ValueError, IndexError):
         return ""  # a collapsed or otherwise unclassifiable sphere has no defensible hand
     return got.chirality if got.metal == iso.metal and got.geometry == iso.geometry else ""
@@ -862,22 +874,20 @@ class Conformers:
     # ids whose UFF endpoint did not converge, or which were restored because no endpoint passed the contract
     relax_failures: dict = field(default_factory=dict, kw_only=True)
     # last restrained-UFF endpoint reason by conformer id; retained when a later seed fails a different gate
-    uff_surrogates: dict = field(default_factory=dict, kw_only=True)  # atom -> (real Z, private UFF Z)
-    uff_retyped_bonds: set = field(default_factory=set, kw_only=True)  # private donor -> acceptor dative edges
+    uff: UFFRecord = field(default_factory=UFFRecord, kw_only=True)  # every relax's statuses and private typing
     # what reproduces this batch's seeds; None means search-free (minimize(), wrap()), so replacement is off
     params: EmbedParams | None = field(default=None, kw_only=True)
     # seed plus snapshots from the accepted restrained-UFF attempt; recorded only when explicitly requested
     trajectory: Chem.Mol | None = field(default=None, kw_only=True)
-    # memoized (isomer identity, its per-centre coordination-state prep); invalidated when `iso` is reassigned
-    _coord_state_prep: tuple = field(default=(None, None), init=False, repr=False, compare=False)
+    # {isomer identity: its per-centre coordination-state prep}; a plain init field so replace() and a fresh
+    # replacement Conformers can share one cache across every ladder rung and batch for the same isomer.
+    _coord_state_prep: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
 
     def _coordination_states(self, iso):
-        """Return `iso`'s per-centre coordination-state prep, cached while `iso`'s identity is unchanged."""
-        cached_iso, prep = self._coord_state_prep
-        if cached_iso is not iso:
-            prep = _coordination_state_prep(iso)
-            self._coord_state_prep = (iso, prep)
-        return prep
+        """Return `iso`'s per-centre coordination-state prep, cached by `iso`'s identity."""
+        if iso not in self._coord_state_prep:
+            self._coord_state_prep[iso] = _coordination_state_prep(iso)
+        return self._coord_state_prep[iso]
 
     def _restored_mol(self, cid=None):
         """Return tracked conformers, or one requested conformer, on the restored public graph."""
@@ -893,14 +903,14 @@ class Conformers:
             return mol
         self.iso.restore(mol)  # real element and formal charge, on our copy
         if self.iso.donor_bonds:
-            mol = _metal.connect_metal(mol, self.iso.donor_bonds)
+            mol = connect_metal(mol, self.iso.donor_bonds)
         missing = {
             donor
-            for donor, _metal_idx in _stereo_donor_bonds(mol, self.iso)
+            for donor, _metal_idx in stereo_donor_bonds(mol, self.iso)
             if mol.GetAtomWithIdx(donor).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
         }
         if missing:
-            _stereo.apply_point_stereo(mol, self.iso.stereo_label, missing)
+            apply_point_stereo(mol, self.iso.stereo_label, missing)
         return mol
 
     @property
@@ -935,7 +945,7 @@ class Conformers:
         misses = []
         for atoms, (lo, hi) in self.cons.fixed.items():
             actual = constraint_value(pos, atoms, self.cons.haptic, (lo, hi))
-            tol, unit = (FIX_DISTANCE_TOL, "A") if len(atoms) == _DIST_ATOMS else (FIX_ANGLE_TOL, "deg")
+            tol, unit = (FIX_DISTANCE_TOL, "A") if len(atoms) == DIST_ATOMS else (FIX_ANGLE_TOL, "deg")
             excess = abs(actual - lo) - tol if lo == hi else max(lo - actual, actual - hi)
             if not np.isfinite(actual):
                 excess = float("inf")
@@ -959,14 +969,16 @@ class Conformers:
             _excess, atoms, actual, lo, hi, tol, unit = max(
                 (miss for misses in failures.values() for miss in misses), key=lambda miss: miss[0]
             )
-            requested = f"{lo:.6f} +/- {tol:g}" if lo == hi else f"[{lo:.6f}, {hi:.6f}]"
+            requested = f"{lo:.3f} +/- {tol:g}" if lo == hi else f"{lo:.3f}-{hi:.3f}"
             kind = {2: "distance", 3: "angle", 4: "dihedral"}[len(atoms)]
+            graph = _real_graph(self._mol, self.iso)
+            names = "-".join(atom_label(graph, atom) for atom in atoms)
             logger.warning(
-                "%s: dropped %d conformer(s) missing numeric fix; worst %s %s requested %s %s, got %.6f %s",
+                "%s: dropped %d conformer(s) missing fix=; worst %s %s requested %s %s, got %.3f %s",
                 operation,
                 len(bad),
                 kind,
-                atoms,
+                names,
                 requested,
                 unit,
                 actual,
@@ -974,33 +986,41 @@ class Conformers:
             )
         return bad
 
+    # Failure kinds a caller explicitly requested: missing one raises rather than returning fewer conformers.
+    _required_kinds = frozenset(
+        {
+            "numeric_fix",
+            "metal_state",
+            "coordination_shape",
+            "seating_crossed",
+            "ligand_stereo",
+            "ligand_stereo_unassigned",
+        }
+    )
+
     def _required_failure(self, failures):
-        """Return failed core requests that require acceptance to restore the starting count."""
-        kinds = {failure.kind for failure in failures if isinstance(failure, Failure)}
-        required = []
-        if "numeric_fix" in kinds:
-            required.append("fix=")
-        if kinds & {"metal_state", "coordination_shape"}:
-            required.append("the requested metal state")
-        if kinds & {"ligand_stereo", "ligand_stereo_unassigned"}:
-            required.append("requested ligand stereo")
-        return tuple(required)
+        """Return the requested failure kinds among `failures`; any one makes acceptance raise when underfilled."""
+        return {failure.kind for failure in failures if isinstance(failure, Failure)} & self._required_kinds
 
     def _geometry_failure(self, cid, iso=None):
         """Return the first failed core publication contract, or ``None``."""
-        if self._fixed_geometry_misses(cid):
-            return Failure("numeric_fix", "missed numeric fix")
+        active = self.iso if iso is None else iso
+        if misses := self._fixed_geometry_misses(cid):
+            _excess, atoms, actual, _lo, _hi, _tol, unit = max(misses, key=lambda miss: miss[0])
+            graph = _real_graph(self._mol, active)
+            names = "-".join(atom_label(graph, atom) for atom in atoms)
+            return Failure("numeric_fix", f"fix= {names} not held ({actual:.3f} {unit})")
         # Seed selection and publication share ligand integrity; metal and stated pairs are already exempt.
-        if bonding := _bonding_failure(self._mol, cid, exclude=self.cons.frozen, constrained=self.cons.distances):
-            return Failure("bonding", f"heavy-atom bonding/clash failure ({bonding})")
+        if bonding := bonding_failure(self._mol, cid, exclude=self.cons.frozen, constrained=self.cons.distances):
+            return Failure("bonding", bonding.detail, atoms=bonding.atoms)
         pos = self._mol.GetConformer(int(cid)).GetPositions()
         for body in self.cons.shapes:
             for (i, j), (lo, hi) in self.cons.distances.items():
                 if i in body and j in body:
                     value = float(np.linalg.norm(pos[i] - pos[j]))
                     if value < lo - _SHAPE_TEAR_TOL or value > hi + _SHAPE_TEAR_TOL:
-                        return Failure("rigid_body", "torn rigid body")
-        active = self.iso if iso is None else iso
+                        graph = _real_graph(self._mol, active)
+                        return Failure("rigid_body", f"fixed core {atom_label(graph, i)}-{atom_label(graph, j)} torn")
         if reason := _coordination_state_failure(self._mol, cid, active, states=self._coordination_states(active)):
             return reason
         if active is not None:
@@ -1010,7 +1030,15 @@ class Conformers:
                 _donor_facing_failure(restored, intended_donors, self.cons.frozen)
             if reason := _ligand_stereo_failure(restored, active):
                 return reason
-        return _structural_failure(self._mol, cid, self.cons)
+        return _structural_failure(self._mol, cid, self.cons, active)
+
+    def _metal_state_failure(self):
+        """Return the `Failure` for a lost metal hand or haptic face, naming each stated centre."""
+        centres = ", ".join(
+            f"{Chem.GetPeriodicTable().GetElementSymbol(state.atomic_num)}{state.atom}"
+            for state, _vertices, _haptic, _winding in _stereo_targets(self.iso)
+        )
+        return Failure("metal_state", f"{centres} loses its requested hand or haptic face")
 
     def _relax_failures(self, donor_hands):
         """Return failed endpoint contracts without changing coordinates or optimizer status."""
@@ -1022,27 +1050,27 @@ class Conformers:
         for cid in self.ids:
             reason = self._geometry_failure(cid)
             if reason is None and not states.get(cid, True):
-                reason = Failure("metal_state", "requested metal hand or haptic winding was not retained")
-            hand_ok = all(
-                target is None or _metal.donor_chirality_sign(self._mol, cid, donor, references) == target
+                reason = self._metal_state_failure()
+            inverted = [
+                donor
                 for donor, (target, references) in donor_hands[cid].items()
-            )
-            if not hand_ok:
-                if reason is None:
-                    reason = Failure("donor_hand", "coordinated ligand hand changed")
+                if target is not None and donor_chirality_sign(self._mol, cid, donor, references) != target
+            ]
+            if reason is None and inverted:
+                reason = Failure("donor_hand", f"coordinated donor {atom_label(self._mol, inverted[0])} inverts")
             if reason is not None:
                 failures[cid] = reason
         return failures
 
     def _seed_donor_hands(self, conf_ids):
         """Record labile coordinated-donor hands before UFF, which does not read chiral tags."""
-        donors = [donor for donor, _metal_idx in _stereo_donor_bonds(self._mol, self.iso)]
+        donors = [donor for donor, _metal_idx in stereo_donor_bonds(self._mol, self.iso)]
         donor_bonds = self.iso.donor_bonds if self.iso is not None else []
         references = {donor: [metal for site, metal in donor_bonds if site == donor] for donor in donors}
         return {
             cid: {
                 donor: (
-                    _metal.donor_chirality_sign(self._mol, cid, donor, references[donor]),
+                    donor_chirality_sign(self._mol, cid, donor, references[donor]),
                     references[donor],
                 )
                 for donor in donors
@@ -1051,10 +1079,15 @@ class Conformers:
         }
 
     def _relax_constrained(self, stiffness, max_iters=MAX_ITERS, operation="minimize", _frames=None):
-        """Retry unresolved endpoints from their seeds, then restore any that never pass the contract."""
+        """Retry unresolved endpoints from their seeds, then restore any that never pass the contract.
+
+        Returns whether UFF could relax this system at all (``None`` only on a typing failure); it does not
+        return energies. `_rescore_restrained` is the one place that scores settled conformers, once, on the
+        caller's own objective, so a rung's escalated stiffness never leaks into a comparable public energy.
+        """
         relaxing = list(self.ids)
         if not relaxing:
-            return np.array([])
+            return True
         self.energies = {}
         self.relax_failures = {}
         seed_pos = {cid: self._mol.GetConformer(cid).GetPositions().copy() for cid in relaxing}
@@ -1068,14 +1101,14 @@ class Conformers:
         first = relaxing[0]
 
         rungs = (*FC_ESCALATION, *_HIGH_FC_ESCALATION)
+        # The ladder's view of `self.uff`: a shallow copy shares its statuses and typing, and keeps frames apart.
+        record = replace(self.uff, snapshots={} if _frames is not None else None)
         for mult in rungs:
             if not pending:
                 break
             current = pending
             for cid in current:
                 self._mol.GetConformer(cid).SetPositions(seed_pos[cid])
-            statuses = {}
-            snapshots = {} if _frames is not None else None
             try:
                 restrained_uff(
                     self._mol,
@@ -1083,10 +1116,7 @@ class Conformers:
                     stiffness=stiffness * mult,
                     max_iters=max_iters,
                     conf_ids=current,
-                    _snapshots=snapshots,
-                    _statuses=statuses,
-                    _surrogates=self.uff_surrogates,
-                    _retyped=self.uff_retyped_bonds,
+                    record=record,
                 )
             except UFFTypingError as err:
                 for cid in current:
@@ -1097,29 +1127,20 @@ class Conformers:
                 logger.warning(
                     "%s: UFF could not relax this system (%s); kept the starting geometries",
                     operation,
-                    _error_summary(err),
+                    error_summary(err),
                 )
                 force_field_error = err
                 break
 
             active = replace(self, ids=current)
-            active._correct_metal_hand(operation, _snapshots=snapshots)
+            active._correct_metal_hand(operation, snapshots=record.snapshots)
             failed = active._relax_failures(donor_hands)
             accepted = set(current).difference(failed)
-            # A converged force field that settled on another coordination shape or slot seating is in a
-            # different basin. Increasing the same objective's stiffness cannot change that basin; sample a
-            # fresh DG seed instead. Keep handedness and structural failures on the normal escalation ladder.
-            terminal_shape = {
-                cid
-                for cid, reason in failed.items()
-                if statuses.get(cid, 1) == 0 and _stable_coordination_failure(reason)
-            }
-            # A donor-hand change is a geometric endpoint failure and may recover; an opposite ligand
-            # stereoisomer is never chased by a stronger wall.
+            # A wrong basin waits for a fresh seed; a donor-hand change may recover on a stiffer rung.
             pending = [
                 cid
                 for cid, reason in failed.items()
-                if cid not in terminal_shape
+                if not _stable_coordination_failure(reason)
                 if mult != rungs[-1]
                 and (mult < FC_ESCALATION[-1] or _high_force_candidate(reason))
                 # A metal restraint that already tears an internal ligand bond cannot be repaired by
@@ -1134,10 +1155,12 @@ class Conformers:
             for cid in rejected:
                 self._mol.GetConformer(cid).SetPositions(seed_pos[cid])
             self.unrelaxed.extend(
-                cid for cid in current if cid not in pending and (cid in failed or statuses.get(cid, 1))
+                cid
+                for cid in current
+                if cid not in pending and (cid in failed or not max_iters or record.statuses.get(cid, 1))
             )
-            if first in accepted and snapshots is not None:
-                accepted_frames = snapshots.get(first, [])
+            if first in accepted and record.snapshots is not None:
+                accepted_frames = record.snapshots.get(first, [])
             if mult != FC_ESCALATION[0] and accepted:
                 escalated += len(accepted)
                 highest_mult = mult
@@ -1156,7 +1179,7 @@ class Conformers:
         self.relax_failures = dict(restored)
 
         if escalated:
-            logger.info(
+            logger.debug(
                 "%s: %d/%d conformer(s) needed restraint stiffness up to %gx",
                 operation,
                 escalated,
@@ -1164,26 +1187,14 @@ class Conformers:
                 highest_mult,
             )
         if restored and force_field_error is None:
-            counts = Counter(restored.values())
-            detail = ", ".join(f"{count}x {reason}" for reason, count in counts.items())
-            logger.warning(
-                "%s: rejected %d/%d UFF endpoints (%s); restored seeds before final acceptance",
+            logger.debug(
+                "%s: rejected %d/%d UFF results (%s); back to the seed",
                 operation,
                 len(restored),
                 len(relaxing),
-                detail,
+                _describe_groups(_group_failures(restored.values())),
             )
-        if force_field_error is not None:
-            return None
-        return restrained_uff(
-            self._mol,
-            self.cons,
-            stiffness=stiffness,
-            max_iters=0,
-            conf_ids=relaxing,
-            _surrogates=self.uff_surrogates,
-            _retyped=self.uff_retyped_bonds,
-        )
+        return None if force_field_error is not None else True
 
     def _rescore_restrained(self, stiffness):
         """Record comparable restrained-UFF single points for settled conformers."""
@@ -1197,8 +1208,7 @@ class Conformers:
             stiffness=stiffness,
             max_iters=0,
             conf_ids=settled,
-            _surrogates=self.uff_surrogates,
-            _retyped=self.uff_retyped_bonds,
+            record=self.uff,
         )
         self.energies = {i: float(v) for i, v in zip(settled, e, strict=True)}
 
@@ -1221,7 +1231,12 @@ class Conformers:
 
         Replacements keep the original ids. Each batch receives a constraint copy because embedding may add
         encounter bounds or move phantom indices. ``validator`` may add pipeline publication checks after the
-        core contract; it never controls how a replacement is generated or relaxed.
+        core contract; it never controls how a replacement is generated or relaxed. The search stops early
+        when every seed of one batch crossed to another donor-slot seating, or when two consecutive batches
+        are rejected in full for the same non-shape reason at the same atoms: a fresh seed cannot change a
+        structural basin a batch has already shown it lands in twice. A wrong labelled shape never stops
+        this way, only a fresh seed can rescue it, and its residual is a near-tie call a later seed can
+        still cross.
         Rank settled survivors by their endpoint scores; keep unscored fallbacks in generation order.
         """
         params = self.params if params is None else params
@@ -1229,6 +1244,7 @@ class Conformers:
             return list(failed)
         left = list(failed)
         source = self._mol if template is None else template
+        previous_signature = None
         for batch_index in range(_REPLACEMENT_ROUNDS):
             if not left:
                 break
@@ -1237,8 +1253,9 @@ class Conformers:
             cons = self.cons.copy()
             mol, ids, _target = seed_conformers(Chem.Mol(source), cons, self.iso, count, trial_params)
             if not ids:
+                previous_signature = None
                 continue
-            batch = Conformers(mol, ids, cons, self.iso, params=trial_params)
+            batch = Conformers(mol, ids, cons, self.iso, params=trial_params, _coord_state_prep=self._coord_state_prep)
             # A constrained replacement must use the same stiffness ladder as the original batch.  A single
             # base-force pass can reject a seed that a higher rung would satisfy, while silently making fresh
             # seeds weaker than the batch they replace.
@@ -1250,18 +1267,45 @@ class Conformers:
                 {("replacement", batch_index, cid): reason for cid, reason in batch.relax_failures.items()}
             )
             failures = batch._acceptance_failures(operation, validator=validator)
-            batch_rejected = {cid for rejected in failures.values() for cid in rejected}
-            if batch_rejected == set(batch.ids) and batch_rejected:
-                reasons = [reason for reason, rejected in failures.items() if rejected]
-                if (
-                    len(reasons) == 1
-                    and _stable_coordination_failure(reasons[0])
+            # Each rejected seed's ladder failure, else its acceptance one.
+            reasons = {cid: batch.relax_failures.get(cid) or r for r, cids in failures.items() for cid in cids}
+            if reasons:
+                logger.debug(
+                    "%s: reseed batch %d/%d, %d/%d rejected: %s",
+                    operation,
+                    batch_index + 1,
+                    _REPLACEMENT_ROUNDS,
+                    len(reasons),
+                    len(batch.ids),
+                    _describe_groups(_group_failures(reasons.values())),
+                )
+            batch_rejected = set(reasons)
+            fully_rejected = bool(batch_rejected) and batch_rejected == set(batch.ids)
+            if fully_rejected:
+                signature = {reason.key for reason in reasons.values()}
+                one_reason = len(signature) == 1
+                kind, atoms = next(iter(signature)) if one_reason else (None, ())
+                # The crossing is read by the acceptance gate on a restored seed, not on a ladder endpoint.
+                accepted = {r.key for r, cids in failures.items() if cids}
+                crossed_every_seed = (
+                    len(accepted) == 1
+                    and next(iter(accepted))[0] == "seating_crossed"
                     and any(_stable_coordination_failure(reason) for reason in self.relax_failures.values())
-                ):
+                )
+                # A wrong labelled shape is excluded here: only a fresh seed can rescue it (see
+                # _stable_coordination_failure), and its residual is a near-tie judgement call that a
+                # later batch's seed can still cross, unlike a structural tear at the same atoms.
+                repeated_reason = (
+                    one_reason and atoms and kind not in _STABLE_SHAPE_KINDS and signature == previous_signature
+                )
+                if crossed_every_seed or repeated_reason:
                     return left
-            batch._remove({cid for rejected in failures.values() for cid in rejected})
-            self.uff_surrogates.update(batch.uff_surrogates)
-            self.uff_retyped_bonds.update(batch.uff_retyped_bonds)
+                previous_signature = signature
+            else:
+                previous_signature = None
+            batch._remove(batch_rejected)
+            self.uff.surrogates.update(batch.uff.surrogates)
+            self.uff.retyped.update(batch.uff.retyped)
             scores = {
                 cid: energy
                 for cid, energy in batch.energies.items()
@@ -1284,7 +1328,7 @@ class Conformers:
                 left.remove(cid)
         return left
 
-    def _correct_metal_hand(self, operation="minimize", *, _snapshots=None):
+    def _correct_metal_hand(self, operation="minimize", *, snapshots=None):
         """Reflect free metal inversions and return conformers that remain in the wrong state.
 
         Distance and angle constraints cannot choose a mirror; a signed dihedral can. The hand is read after
@@ -1298,25 +1342,21 @@ class Conformers:
         wrong = [c for c, matches in states.items() if not matches]
         if not wrong:
             return []
-        hands = self._metal_hands()
         reflected = 0
-        # The mirror is free only where the metal centre is the one thing it inverts: no other stereocentre
-        # (`_mirror_is_free`), no grafted core (its contract is the caller's exact geometry, and a chiral
-        # core's mirror is a different core, so re-seeding re-grafts it instead), and no haptic face, which
-        # can be planar-chiral in a way this tier cannot perceive (`pipeline.select_stereo` owns that).
         if _reflection_is_free(self._mol, iso, self.cons, targets):
+            hands = self._metal_hands()
             target_hand = targets[0][0].hand
             reflectable = [cid for cid in wrong if hands[cid] and hands[cid] != target_hand]
             for cid in reflectable:
                 _reflect(self._mol, cid)
-                if _snapshots is not None:
-                    _snapshots[cid] = None  # Reflection is not a continuous UFF step.
+                if snapshots is not None:
+                    snapshots[cid] = None  # Reflection is not a continuous UFF step.
             reflected = len(reflectable)
-            if reflected and _snapshots is not None:
+            if reflected and snapshots is not None:
                 logger.warning("trajectory: metal-hand reflection discarded the discontinuous UFF path")
             states = self._metal_states()
             wrong = [cid for cid in wrong if not states[cid]]
-        logger.info(
+        logger.debug(
             "%s: metal-state correction: %d reflected, %d unresolved",
             operation,
             reflected,
@@ -1335,8 +1375,7 @@ class Conformers:
             if reason := self._geometry_failure(cid):
                 failures.setdefault(reason, []).append(cid)
             elif cid in wrong:
-                failure = Failure("metal_state", "requested metal hand or haptic winding was not retained")
-                failures.setdefault(failure, []).append(cid)
+                failures.setdefault(self._metal_state_failure(), []).append(cid)
             elif validator is not None and (reason := validator(self, cid)):
                 failures.setdefault(reason, []).append(cid)
         return failures
@@ -1355,17 +1394,17 @@ class Conformers:
         """Search bounded replacements for publication failures, then reject unresolved ids.
 
         Optimizer status is metadata: an unrelaxed conformer may survive when its restored seed still satisfies
-        the structural contract. Structurally invalid seeds and wrong metal states share the same fresh-seed
-        replacement loop. Internal replacement batches call `_acceptance_failures` directly and cannot recurse.
-        Embedding that rejects every relaxed candidate raises, even without a failed stereo or fix request.
+        the structural contract, and is then reported as one warning. Structurally invalid seeds and wrong metal
+        states share the same fresh-seed replacement loop. Internal replacement batches call
+        `_acceptance_failures` directly and cannot recurse. A requested identity left underfilled raises
+        `EmbeddingError`, as does an embed that rejects every candidate; fewer conformers otherwise warn.
         """
         target = len(self.ids)
         failures = self._acceptance_failures(operation, validator)
-        requirements = list(self._required_failure(failures))
+        required = self._required_failure(failures)
         failed = {cid for rejected in failures.values() for cid in rejected}
         replacement_params = self.params if params is None else params
-        replaced = bool(failed and allow_replacement and replacement_params is not None)
-        if replaced:
+        if failed and allow_replacement and replacement_params is not None:
             self._replace_failed(
                 failed,
                 stiffness,
@@ -1376,18 +1415,9 @@ class Conformers:
                 params=replacement_params,
             )
         if failed:
-            # A replacement only touches `failed` ids; every other one's status cannot have changed since
-            # the first pass, so keep its result rather than re-running the full gate over it again.
-            failures = {
-                reason: kept
-                for reason, rejected in failures.items()
-                if (kept := [c for c in rejected if c not in failed])
-            }
-            for reason, rejected in self._acceptance_failures(operation, validator, ids=failed).items():
-                failures.setdefault(reason, []).extend(rejected)
-            requirements.extend(
-                requirement for requirement in self._required_failure(failures) if requirement not in requirements
-            )
+            # A replacement only touches `failed` ids, and every other id passed the first gate.
+            failures = self._acceptance_failures(operation, validator, ids=failed)
+            required |= self._required_failure(failures)
             failed = {cid for rejected in failures.values() for cid in rejected}
             missed = [
                 cid
@@ -1397,26 +1427,35 @@ class Conformers:
             ]
             self._report_missed_fixes(missed, operation)
             self._remove(failed)
-        if not failures:
-            return {}
-
-        reason = ", ".join(f"{len(ids)}x {name}" for name, ids in failures.items())
-        attempt = " after bounded fresh-seed replacement" if replaced else ""
-        message = (
-            f"{operation}: could not produce {target} conformer(s); {reason} remained{attempt}; "
-            "the generated geometries did not satisfy the publication gate"
-        )
-        if self.relax_failures:
-            previous = Counter(str(failure) for failure in self.relax_failures.values())
-            rows = [f"{count}x {failure}" for failure, count in previous.items()]
-            detail = ", ".join(rows[:4])
-            if extra := rows[4:]:
-                detail += f", {len(extra)} more"
-            message += f"; restrained UFF endpoint failures: {detail}"
-        if len(self.ids) < target and (requirements or (operation == "embed" and not self.ids)):
-            requirement = " and ".join(requirements) or "the publication gate"
-            raise EmbeddingError(f"{message}; could not satisfy {requirement}")
-        logger.warning(message)
+        who = str(self.iso) if self.iso is not None else operation
+        if failures:
+            # One entry per rejected seed: its rejected UFF result, else its final gate reason.
+            groups = _group_failures(
+                [
+                    *self.relax_failures.values(),
+                    *(
+                        reason
+                        for reason, rejected in failures.items()
+                        for cid in rejected
+                        if cid not in self.relax_failures
+                    ),
+                ]
+            )
+            if len(self.ids) < target and (required or (operation == "embed" and not self.ids)):
+                raise EmbeddingError(
+                    f"{who}: {_headline(groups, self.iso, self.cons)}", failures=groups, isomer=self.iso
+                )
+            logger.warning(
+                "%s: kept %d/%d conformers; %s", who, len(self.ids), target, _headline(groups, self.iso, self.cons)
+            )
+        unrelaxed = [cid for cid in self.ids if cid in self.unrelaxed]
+        if unrelaxed and allow_replacement:  # a UFF typing failure has already warned that nothing relaxed
+            logger.warning(
+                "%s: %d/%d conformer(s) have no converged UFF geometry; see .unrelaxed",
+                who,
+                len(unrelaxed),
+                len(self.ids),
+            )
         return failures
 
     def _relax_once(self, stiffness, max_iters, operation="minimize", frames=None):
@@ -1425,7 +1464,6 @@ class Conformers:
             return None
         self.energies = {}
         if not self.cons.is_constrained:
-            statuses = {}
             try:
                 e = restrained_uff(
                     self._mol,
@@ -1433,26 +1471,21 @@ class Conformers:
                     stiffness=stiffness,
                     max_iters=max_iters,
                     conf_ids=self.ids,
-                    _statuses=statuses,
-                    _surrogates=self.uff_surrogates,
-                    _retyped=self.uff_retyped_bonds,
+                    record=self.uff,
                 )
             except UFFTypingError as err:
                 self.unrelaxed = list(self.ids)
                 logger.warning(
                     "%s: UFF could not relax this system (%s); kept the starting geometries",
                     operation,
-                    _error_summary(err),
+                    error_summary(err),
                 )
                 return None
             self.energies = {i: float(v) for i, v in zip(self.ids, e, strict=False)}
-            self.unrelaxed = [i for i in self.ids if statuses.get(i, 1) != 0]
+            self.unrelaxed = [i for i in self.ids if not max_iters or self.uff.statuses.get(i, 1) != 0]
             return e
         self.unrelaxed = []
-        e = self._relax_constrained(stiffness, max_iters, operation, frames)
-        if e is not None:
-            self.energies = {i: float(v) for i, v in zip(self.ids, e, strict=False)}
-        return e
+        return self._relax_constrained(stiffness, max_iters, operation, frames)
 
     def minimize(self, stiffness=BASE_STIFFNESS, max_iters=MAX_ITERS):
         """Relax every conformer in place with restrained UFF; return ``self``.
@@ -1471,7 +1504,7 @@ class Conformers:
             return self
         e = self._relax_once(stiffness, max_iters)
         self._accept_relaxed(stiffness, max_iters, allow_replacement=e is not None)
-        if self.cons.is_constrained and (e is not None or self.energies):
+        if self.cons.is_constrained and e is not None:
             # Rescue and hand re-seeding may relax different conformers at different stiffnesses. Rank them
             # only after one single-point pass on the caller's stated objective.
             self._rescore_restrained(stiffness)
@@ -1487,10 +1520,10 @@ class Conformers:
                 "measure() on an empty result: embed/minimize may have produced no conformers (check the log)"
             )
         idx = tuple(resolve_atom(self._mol, a) for a in atoms)
-        if len(idx) not in (_DIST_ATOMS, _ANGLE_ATOMS, _DIHEDRAL_ATOMS):
+        if len(idx) not in (DIST_ATOMS, ANGLE_ATOMS, DIHEDRAL_ATOMS):
             raise ValueError("measure() takes 2 (distance), 3 (angle) or 4 (dihedral) atoms")
         window = None
-        if len(idx) == _DIHEDRAL_ATOMS:
+        if len(idx) == DIHEDRAL_ATOMS:
             window = self.cons.dihedrals.get(min(idx, idx[::-1]))
         v = [constraint_value(self._mol.GetConformer(c).GetPositions(), idx, window=window) for c in self.ids]
         return {"mean": float(np.mean(v)), "min": float(np.min(v)), "max": float(np.max(v)), "n": len(v)}
@@ -1535,8 +1568,7 @@ class Conformers:
             ids=sel,
             energies={i: self.energies[i] for i in sel if i in self.energies},
             unrelaxed=[i for i in self.unrelaxed if i in sel],  # a slice must not silently lose these flags
-            uff_surrogates=dict(self.uff_surrogates),
-            uff_retyped_bonds=set(self.uff_retyped_bonds),
+            uff=deepcopy(self.uff),
             trajectory=Chem.Mol(self.trajectory) if self.trajectory is not None and sel == self.ids else None,
         )
 
@@ -1554,7 +1586,7 @@ def _check_bare_mol(mol):
     """Reject implicit hydrogens or a metal Mol that bypassed the Isomer surrogate."""
     if any(a.GetTotalNumHs() for a in mol.GetAtoms()):
         raise ValueError("embed() needs a Mol with explicit hydrogens; pass Chem.AddHs(mol)")
-    metals = _metal.metal_indices(mol)
+    metals = metal_indices(mol)
     if metals:
         raise ValueError(
             f"atom(s) {metals} are metal centres: a metal is embedded through a SURROGATE, because neither "
@@ -1638,29 +1670,28 @@ def prepare(spec, *, fix=None, constrain=None, external=None, params=None):
     iso = spec if isinstance(spec, Isomer) else None
     mol = Chem.Mol(iso.mol if iso is not None else spec)  # our own copy: never the caller's conformers
     has_geometry = mol.GetNumConformers() > 0
-    if iso is None and _metal.metal_index(mol) is not None and has_geometry:
-        centre = "all" if len(_metal.metal_indices(mol)) > 1 else None
+    if iso is None and metal_index(mol) is not None and has_geometry:
+        centre = "all" if len(metal_indices(mol)) > 1 else None
         iso = from_geometry(mol, center=centre)
         mol = Chem.Mol(iso.mol)
-    elif iso is None and _metal.metal_index(mol) is not None:
+    elif iso is None and metal_index(mol) is not None:
         raise ValueError(
             "a coordinate-free metal needs a selected coordination state; pass an Isomer from "
             "enumerate_isomers()/rx.metal(), or use the pipeline metal=<geometry> sugar"
         )
     cons, ref = resolve_core(mol, fix=fix, constrain=constrain, has_geometry=has_geometry)
-    donor_orientation = True if params is None else params.donor_orientation
-    conjugation = True if params is None else params.conjugation
+    params = EmbedParams() if params is None else params
     if iso is not None:
-        graft_ref = {**iso._graft_ref, **ref}
+        graft_ref = {**iso.graft_ref, **ref}
         cons = fold_substrate(
-            iso._constraints(cons, external, donor_orientation=donor_orientation, conjugation=conjugation),
+            compile_constraints(iso, cons, external, params=params),
             cons,
             graft_ref,
-            protect_arrangement=bool(iso._constrained_metals) and iso._protect_arrangement,
+            protect_arrangement=bool(iso.constrained_metals) and iso.protect_arrangement,
         )
         ref = graft_ref
     else:
-        cons = cons.copy(donor_orientation=donor_orientation, conjugation=conjugation)
+        cons = cons.copy(donor_orientation=params.donor_orientation, conjugation=params.conjugation)
     return mol, cons, iso, ref
 
 

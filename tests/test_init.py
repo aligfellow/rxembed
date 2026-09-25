@@ -47,7 +47,7 @@ def test_public_and_engine_surfaces():
         "EmbedParams",
     ):
         assert hasattr(core, name), name
-    assert rxembed.embed.__module__ == "rxembed.pipeline.api"
+    assert rxembed.embed.__module__ == "rxembed.pipeline.dispatch"
     assert core.embed.__module__ == "rxembed.embed"
     assert rxembed.EmbedParams is core.EmbedParams
 

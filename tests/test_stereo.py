@@ -428,7 +428,7 @@ def test_aromatic_eta1_donor_is_not_made_stereogenic_by_stale_hybridization():
 
 def test_coordination_locked_alkene_is_not_enumerated():
     mol, metals = _with_metals(_ALPHA_DIIMINE_NI)
-    assert stereo._coordination_locked_double_bonds(mol, metals), "the metal-closed imine was not detected"
+    assert stereo.coordination_locked_double_bonds(mol, metals), "the metal-closed imine was not detected"
     variants, _n, _total, _unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
     assert len(variants) == 2, "only the real point stereocentre should expand, not the locked imines"
 
@@ -436,14 +436,14 @@ def test_coordination_locked_alkene_is_not_enumerated():
 def test_coordination_locked_explicit_ez_is_not_kept_on_the_variant():
     mol, metals = _with_metals(r"C/C1=N/[NH]->[Ni+2](<-[Cl-])(<-[Cl-])<-1")
     (variant, _label), *_ = stereo.enumerate_unassigned(mol, exclude=metals)[0]
-    pair = next(iter(stereo._coordination_locked_double_bonds(mol, metals)))
+    pair = next(iter(stereo.coordination_locked_double_bonds(mol, metals)))
 
     assert variant.GetBondBetweenAtoms(*pair).GetStereo() == Chem.BondStereo.STEREONONE
 
 
 def test_eta2_alkene_is_not_coordination_locked():
     mol, metals = _with_metals(_ETA2_PT)
-    assert stereo._coordination_locked_double_bonds(mol, metals) == set()
+    assert stereo.coordination_locked_double_bonds(mol, metals) == set()
     assert set(_labels(mol, exclude=metals)) == {"C1=C2:E", "C1=C2:Z"}
 
 
@@ -461,14 +461,14 @@ def test_eta2_alkene_keeps_explicit_ez_after_metal_strip(smiles, expected):
 
 def test_pendant_alkene_remains_unlocked_by_metal():
     mol, metals = _with_metals("CC=CC[NH2]->[Ni+2](<-[O-]C(=O)C)<-[NH2]CC=CC")
-    assert stereo._coordination_locked_double_bonds(mol, metals) == set()
+    assert stereo.coordination_locked_double_bonds(mol, metals) == set()
 
 
 def test_flexible_metal_closed_alkene_keeps_ligand_side_ez():
     isomer = rx.metal(r"N1CC/C=C/CC[NH2]->[Pt+2](<-[Cl-])(<-[Cl-])<-1", "square_planar")[0]
     mol = rx.embed(isomer, n=1, seed=7).mol
     metals = metal_indices(mol)
-    locked = stereo._coordination_locked_double_bonds(mol, metals)
+    locked = stereo.coordination_locked_double_bonds(mol, metals)
 
     assert locked == set()
     pair = next(iter(stereo.bond_stereo(stereo.defined_stereo_label(mol, metals))))
@@ -550,7 +550,7 @@ def test_coordinate_free_donor_imine_in_a_large_chelate_keeps_ez():
 def test_monodentate_donor_imine_keeps_ez():
     mol, metals = _with_metals("CC=[NH]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
 
-    assert stereo._coordination_locked_double_bonds(mol, metals) == set()
+    assert stereo.coordination_locked_double_bonds(mol, metals) == set()
     assert _labels(mol, exclude=metals) == ["C1=N2:E", "C1=N2:Z"]
 
 

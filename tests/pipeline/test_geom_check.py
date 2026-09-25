@@ -5,13 +5,16 @@ from importlib.util import find_spec
 import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom, rdForceFieldHelpers, rdMolTransforms
+from rdkit.Chem import GetPeriodicTable, rdDistGeom, rdForceFieldHelpers, rdMolTransforms
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
 from rxembed import metal_distance as mdist
-from rxembed import metal_perceive as perceive
+from rxembed import metal_perceive
+from rxembed.constraints import Constraints
+from rxembed.metal_core import COORDINATION_METALS
 from rxembed.pipeline import geom_check as geom
+from rxembed.pipeline import metrics
 from tests.conftest import EXAMPLES_DIR
 
 _DFT = (
@@ -295,8 +298,6 @@ def test_frozen_core_skips_ground_state_checks():
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_gate_catches_collapsed_ester_fusion():
-    from rxembed.pipeline import metrics
-
     mol = _reference_conformer("CC(=O)OC")
     cc = next(
         a.GetIdx()
@@ -315,7 +316,7 @@ def test_gate_catches_collapsed_ester_fusion():
     assert set(fused[0].atoms) >= {o_term, o_est}
     # red-first: the three gates that were the only ones looking here all stay silent on that pair
     assert not [v for v in geom.clashes(mol, pos) if set(v.atoms) >= {o_term, o_est}], "clashes excludes a 1-3 pair"
-    assert metrics.bonding_ok(mol, 0), "bonding_ok's fusion floor sits below the fused O...O distance"
+    assert metrics.bonding_failure(mol, 0) is None, "bonding_failure's fusion floor sits below the fused O...O distance"
     formed, _broken = metrics.connectivity(mol, 0)
     assert {o_term, o_est} not in [set(p) for p in formed], "connectivity skips a topo-2 pair"
 
@@ -332,34 +333,28 @@ def test_tight_1_3_pair_is_not_fusion(smiles):
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_overbond_gate_accepts_clean_isomers():
-    import rxembed as rx
-
     seen = 0
     for iso in rx.metal("Cl[Pd](Cl)(N)N", "square_planar"):
         ens = rx.embed(iso, n=2, seed=1).minimize()
         for cid in ens.ids:
             seen += 1
-            assert not perceive.metal_overbond(ens.mol, ens.mol.GetConformer(cid).GetPositions(), iso.donors)
+            assert not metal_perceive.metal_overbond(ens.mol, ens.mol.GetConformer(cid).GetPositions(), iso.donors)
     assert seen, "no conformer was judged: the gate was never asked anything"
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_donor_sets_are_per_metal():
-    import rxembed as rx
-
     reference = rx.read_xyz(str(EXAMPLES_DIR / "mn-h2.xyz"), metal_charges={0: 2, 1: 1})
     isos = rx.metal(reference, "octahedral", center="Mn", fix=[1, 5, 63, 64, 65, 66])
     iso = next(candidate for candidate in isos if rx.cxsmiles(candidate) == rx.cxsmiles(reference))
     ens = rx.embed(iso, n=1, seed=1)
     assert ens.ids, "no conformer was judged: the gate was never asked anything"
     for cid in ens.ids:
-        assert not perceive.metal_overbond(ens.mol, ens.mol.GetConformer(cid).GetPositions(), iso.donors)
+        assert not metal_perceive.metal_overbond(ens.mol, ens.mol.GetConformer(cid).GetPositions(), iso.donors)
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_gate_catches_third_sphere_overbond():
-    import rxembed as rx
-
     smi = "CC[P]1(CC)CC[P](CC)(CC)->[Ni+2]<-12<-[O-]C(=O)C(c1ccccc1)[N-]->2c1ccccc1"
     iso = rx.metal(smi, "square_planar")[0]
     ens = rx.embed(iso, n=1, seed=1).minimize()
@@ -369,7 +364,7 @@ def test_gate_catches_third_sphere_overbond():
     c = next(i for i, h in hops.items() if h >= 3 and mol.GetAtomWithIdx(i).GetAtomicNum() > 1)
 
     clean = mol.GetConformer(ens.ids[0]).GetPositions().copy()
-    assert not perceive.metal_overbond(mol, clean, donors)
+    assert not metal_perceive.metal_overbond(mol, clean, donors)
 
     def crushed_to(distance):  # the clean M...c separation is embed-dependent, so aim at an absolute distance
         pos = clean.copy()
@@ -378,17 +373,17 @@ def test_gate_catches_third_sphere_overbond():
         return pos
 
     buried = crushed_to(1.2)
-    v = perceive.metal_overbond(mol, buried, donors)
+    v = metal_perceive.metal_overbond(mol, buried, donors)
     assert [x.kind for x in v] == ["metal_overbond"]
     assert c in v[0].atoms
 
     # perceiving the donors instead of declaring them is circular: the collapse itself makes the atom "a donor",
     # so it is judged by the donor floor (may it be this close?) not the non-donor one (may it be here at all?).
     near = crushed_to(1.75)  # a plausible BONDING length; isolates the circularity from the donor floor
-    assert perceive.metal_overbond(mol, near, donors), "the declared-donor gate must still see this collapse"
-    assert not perceive.metal_overbond(mol, near, None), "perceived-donor mode is expected to be circular"
+    assert metal_perceive.metal_overbond(mol, near, donors), "the declared-donor gate must still see this collapse"
+    assert not metal_perceive.metal_overbond(mol, near, None), "perceived-donor mode is expected to be circular"
     # ...but the circularity is bounded: past the donor floor even a perceived donor is judged. Wrong atom, not silence.
-    assert [x.kind for x in perceive.metal_overbond(mol, buried, None)] == ["metal_collapse"]
+    assert [x.kind for x in metal_perceive.metal_overbond(mol, buried, None)] == ["metal_collapse"]
 
 
 def test_overbond_tier_counts_bonded_donors():
@@ -398,11 +393,11 @@ def test_overbond_tier_counts_bonded_donors():
         [(0, 0, 0), (1.12, 1.68, 0), (-1.12, 1.68, 0), (0, 2.46, 0), (0, 3.96, 0)],
     )
     assert np.linalg.norm(pos[3] - pos[0]) == pytest.approx(2.460, abs=0.005)
-    assert not perceive.metal_overbond(ac, pos, [1, 2])
+    assert not metal_perceive.metal_overbond(ac, pos, [1, 2])
 
     ti, tpos = _bare_sphere(["Ti", "C", "C"], [(1, 2)], [(0, 0, 0), (2.15, 0, 0), (1.60, 1.99, 0)])
     assert np.linalg.norm(tpos[2] - tpos[0]) == pytest.approx(2.554, abs=0.01)
-    assert not perceive.metal_overbond(ti, tpos, [1])
+    assert not metal_perceive.metal_overbond(ti, tpos, [1])
 
     assert mdist.overbond_tier(ac, [1, 2], 3) == mdist.APEX  # bonded to both donors: a chelate bite, forced
     assert mdist.overbond_tier(ac, [1, 2], 4) == mdist.OUTER  # bonded to neither: third sphere
@@ -410,8 +405,6 @@ def test_overbond_tier_counts_bonded_donors():
 
 
 def test_second_sphere_floor_rejects_collapse_not_agostic():
-    from rxembed.constraints import Constraints
-
     col, pos = _bare_sphere(
         ["Pd", "N", "C", "C", "Cl", "Cl"],
         [(1, 2), (2, 3)],
@@ -420,7 +413,7 @@ def test_second_sphere_floor_rejects_collapse_not_agostic():
     cons = Constraints()
     mdist.nondonor_floors(col, 0, 46, [1, 4, 5], cons)
     assert np.linalg.norm(pos[2] - pos[0]) < cons.floors[(0, 2)], "the alpha-C is floored, not exempt"
-    assert perceive.metal_overbond(col, pos, [1, 4, 5])
+    assert metal_perceive.metal_overbond(col, pos, [1, 4, 5])
 
     ti, pos = _bare_sphere(
         ["Ti", "C", "C", "Cl", "Cl", "Cl"],
@@ -430,22 +423,16 @@ def test_second_sphere_floor_rejects_collapse_not_agostic():
     cons = Constraints()
     mdist.nondonor_floors(ti, 0, 22, [1, 3, 4, 5], cons)
     assert np.linalg.norm(pos[2] - pos[0]) > cons.floors[(0, 2)]
-    assert not perceive.metal_overbond(ti, pos, [1, 3, 4, 5])
+    assert not metal_perceive.metal_overbond(ti, pos, [1, 3, 4, 5])
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 @pytest.mark.parametrize(("name", "read_kw"), _DFT)
 def test_floors_accept_reference_geometries(name, read_kw):
-    from rdkit.Chem import GetPeriodicTable
-
-    from rxembed.constraints import Constraints
-    from rxembed.metal_core import TRANSITION_METALS
-    from rxembed.pipeline.perceive import read_xyz
-
     pt = GetPeriodicTable()
-    mol = read_xyz(str(EXAMPLES_DIR / f"{name}.xyz"), 0, **read_kw)
+    mol = rx.read_xyz(str(EXAMPLES_DIR / f"{name}.xyz"), 0, **read_kw)
     pos = mol.GetConformer().GetPositions()
-    metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS]
+    metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS]
     assert metals, f"{name} carries no transition metal: the fixture exercises no floor at all"
 
     for m in metals:
@@ -462,7 +449,7 @@ def test_floors_accept_reference_geometries(name, read_kw):
         for d in donors:
             rs = rm + pt.GetRcovalent(mol.GetAtomWithIdx(d).GetAtomicNum())
             assert float(np.linalg.norm(pos[d] - pos[m])) / rs > mdist.DONOR_COLLAPSE_RATIO
-        assert not perceive.metal_overbond(mol, pos, donors), "the gate rejects a real DFT geometry"
+        assert not metal_perceive.metal_overbond(mol, pos, donors), "the gate rejects a real DFT geometry"
 
 
 # --- a declared donor is a donor, whatever its element ------------------------------------------------------
@@ -480,7 +467,7 @@ def _ruthenium(d_ruh=1.701, d_rucl=2.233):
 def test_declared_hydride_passes_without_covalent_ruler():
     mol, pos = _ruthenium()
     donors = [1, 2, 3, 4]
-    assert 1 in perceive._spheres(mol, pos, donors)[0]
+    assert 1 in metal_perceive._spheres(mol, pos, donors)[0]
     assert not geom.hydrogens(mol, pos, donors=frozenset(donors))
     assert geom.check(mol, mol.GetConformer().GetId(), donors=donors).ok()
 
@@ -492,15 +479,15 @@ def test_undeclared_agostic_h_is_not_promoted_to_a_donor():
         [(0, 0, 0), (2.10, 0, 0), (1.85, 0, 0.9), (0, 2.341, 0), (0, -2.341, 0)],
     )
     donors = [1, 3, 4]
-    assert 2 not in perceive._spheres(mol, pos, donors)[0]
-    assert not perceive.metal_overbond(mol, pos, donors)
+    assert 2 not in metal_perceive._spheres(mol, pos, donors)[0]
+    assert not metal_perceive.metal_overbond(mol, pos, donors)
 
 
 @pytest.mark.parametrize("kind", ["hydride", "chloride"])
 def test_buried_donor_triggers_metal_collapse(kind):
     at = 1 if kind == "hydride" else 2
     mol, pos = _ruthenium(**{"d_ruh" if kind == "hydride" else "d_rucl": 0.100})
-    v = perceive.metal_overbond(mol, pos, [1, 2, 3, 4])
+    v = metal_perceive.metal_overbond(mol, pos, [1, 2, 3, 4])
     assert [x.kind for x in v] == ["metal_collapse"]
     assert v[0].atoms == (0, at)
     assert not geom.check(mol, mol.GetConformer().GetId(), donors=[1, 2, 3, 4]).ok()
@@ -514,8 +501,6 @@ _CHB = "C1CSC2=NCCN12.CC(=O)OC(C)=O"  # tetramisole's bicyclic thiazoline/imidaz
 
 def _seeded(smi, seed=1, pick=None):
     """Embed an NCI complex on its first (or `pick`-matched) discovered mode -> the ensembles to check."""
-    import rxembed as rx
-
     mol = Chem.AddHs(Chem.MolFromSmiles(smi))
     if pick is None:
         contact = next(iter(rx.nci_modes(mol).values()))

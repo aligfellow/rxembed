@@ -13,9 +13,8 @@ from rdkit import Chem
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
-from rxembed.metal_core import COORDINATION_METALS, _reject_boron_cages
+from rxembed.metal_core import COORDINATION_METALS, canonical_metal_graph, reject_boron_cages
 from rxembed.pipeline import perceive
-from rxembed.pipeline.perceive import read_xyz
 from tests.conftest import EXAMPLES_DIR
 
 _BIMP = str(EXAMPLES_DIR / "bimp.xyz")  # a metal-free TS with a stretched reacting core
@@ -27,17 +26,17 @@ needs_corpus = pytest.mark.skipif(not _CORPUS.is_dir(), reason="needs the local-
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_xyz_returns_bonded_molecule():
-    mol = read_xyz(_BIMP, 0)
+    mol = perceive.read_xyz(_BIMP, 0)
     assert mol.GetNumConformers() == 1
     assert mol.GetConformer().GetPositions().shape == (mol.GetNumAtoms(), 3)
     assert any(b.GetBondTypeAsDouble() > 1.0 for b in mol.GetBonds())
     with pytest.raises(ValueError, match=r"xyz2mol.*does not support"):
-        read_xyz(_BIMP, 0, bond_orders="xyz2mol", fallback=False)
+        perceive.read_xyz(_BIMP, 0, bond_orders="xyz2mol", fallback=False)
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_xyzgraph_metal_bonds_round_trip_as_dative(tmp_path):
-    source = read_xyz(str(EXAMPLES_DIR / "mnh.xyz"), 0)
+    source = perceive.read_xyz(str(EXAMPLES_DIR / "mnh.xyz"), 0)
     metals = {atom.GetIdx() for atom in source.GetAtoms() if atom.GetAtomicNum() in COORDINATION_METALS}
     coordination = [
         bond for bond in source.GetBonds() if (bond.GetBeginAtomIdx() in metals) != (bond.GetEndAtomIdx() in metals)
@@ -49,7 +48,7 @@ def test_xyzgraph_metal_bonds_round_trip_as_dative(tmp_path):
     embedded = rx.embed(rx.cxsmiles(source), n=1, seed=0xF00D)
     output = tmp_path / "mnh.xyz"
     Chem.MolToXYZFile(embedded.mol, str(output), confId=embedded.ids[0])
-    recovered = read_xyz(str(output), 0)
+    recovered = perceive.read_xyz(str(output), 0)
 
     assert rx.dative_smiles(recovered) == rx.dative_smiles(source)
     assert rx.cxsmiles(recovered) == rx.cxsmiles(source)
@@ -58,25 +57,25 @@ def test_xyzgraph_metal_bonds_round_trip_as_dative(tmp_path):
 def test_missing_xyzgraph_warns_and_names_each_fallback(monkeypatch, caplog, tmp_path):
     monkeypatch.setitem(sys.modules, "xyzgraph", None)
     caplog.set_level(logging.WARNING, logger="rxembed")
-    mol = read_xyz(str(EXAMPLES_DIR / "ru-co.xyz"), 0)
+    mol = perceive.read_xyz(str(EXAMPLES_DIR / "ru-co.xyz"), 0)
     assert any(a.GetSymbol() == "Ru" for a in mol.GetAtoms())
     assert "xyzgraph unavailable; using xyz2mol" in caplog.text
 
     caplog.clear()
     water = tmp_path / "water.xyz"
     water.write_text("3\nwater\nO 0 0 0\nH 0.96 0 0\nH -0.24 0.93 0\n")
-    mol = read_xyz(str(water), 0)
+    mol = perceive.read_xyz(str(water), 0)
     assert mol.GetNumBonds() == 2
     assert "xyzgraph unavailable; using RDKit" in caplog.text
 
     with pytest.raises(ValueError, match="multiple metals"):
-        read_xyz(str(EXAMPLES_DIR / "mn-h2.xyz"), 0)
+        perceive.read_xyz(str(EXAMPLES_DIR / "mn-h2.xyz"), 0)
 
-    read_xyz(str(EXAMPLES_DIR / "ru-co.xyz"), 0, bond_orders="xyz2mol")
+    perceive.read_xyz(str(EXAMPLES_DIR / "ru-co.xyz"), 0, bond_orders="xyz2mol")
 
     for argument in ("connectivity", "bond_orders"):
         with pytest.raises(ValueError, match=argument):
-            read_xyz(_BIMP, 0, **{argument: "typo"})
+            perceive.read_xyz(_BIMP, 0, **{argument: "typo"})
 
 
 def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog):
@@ -90,8 +89,8 @@ def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog)
     monkeypatch.setattr(perceive, "_from_xyzgraph", lambda *_args: fallback)
     caplog.set_level(logging.WARNING, logger="rxembed")
     with pytest.raises(ValueError, match="no assignment"):
-        read_xyz(_BIMP, 0, connectivity="xyz2mol", bond_orders="xyz2mol", fallback=False)
-    assert read_xyz(_BIMP, 0, connectivity="xyz2mol", bond_orders="xyz2mol") is fallback
+        perceive.read_xyz(_BIMP, 0, connectivity="xyz2mol", bond_orders="xyz2mol", fallback=False)
+    assert perceive.read_xyz(_BIMP, 0, connectivity="xyz2mol", bond_orders="xyz2mol") is fallback
     assert "xyz2mol failed (no assignment); using xyzgraph" in caplog.text
     assert fallback.GetProp("_rxembedConnectivity") == "xyzgraph"
     assert fallback.GetBoolProp("_rxembedPerceptionFallback")
@@ -107,7 +106,7 @@ def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog)
         conf.SetAtomPosition(i, xyz)
     mol.AddConformer(conf)
 
-    monkeypatch.setattr("rxembed.pipeline.xyz2mol_tmc.get_tmc_mol", fail)
+    monkeypatch.setattr(perceive, "get_tmc_mol", fail)
     with pytest.raises(ValueError, match="could not assign bond orders"):
         perceive._rank_orders(mol, 0)
 
@@ -119,7 +118,7 @@ def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog)
         return (changed.GetMol(),)
 
     caplog.clear()
-    monkeypatch.setattr("rxembed.pipeline.xyz2mol_tmc.get_tmc_mol", drop_a_bond)
+    monkeypatch.setattr(perceive, "get_tmc_mol", drop_a_bond)
     with pytest.raises(ValueError, match="changed connectivity"):
         perceive._rank_orders(mol, 0)
 
@@ -139,7 +138,7 @@ def test_failed_bond_order_and_connectivity_assignment_raise_together(monkeypatc
     monkeypatch.setattr(perceive, "_from_xyz2mol", fail)
 
     with pytest.raises(ValueError, match=r"xyzgraph connectivity.*xyz2mol connectivity also failed"):
-        read_xyz("unused.xyz", bond_orders="xyz2mol")
+        perceive.read_xyz("unused.xyz", bond_orders="xyz2mol")
 
 
 def test_failed_assignments_do_not_keep_a_selected_graph_with_the_wrong_charge(monkeypatch):
@@ -149,7 +148,7 @@ def test_failed_assignments_do_not_keep_a_selected_graph_with_the_wrong_charge(m
     monkeypatch.setattr(perceive, "_rank_orders", lambda *_args: selected)
 
     with pytest.raises(ValueError, match="perceived total charge 1 does not match charge=0"):
-        read_xyz("unused.xyz", charge=0, bond_orders="xyz2mol")
+        perceive.read_xyz("unused.xyz", charge=0, bond_orders="xyz2mol")
 
 
 def _closo_b6h6():
@@ -174,7 +173,7 @@ def test_boron_cage_is_rejected_before_valence_search(monkeypatch):
     monkeypatch.setattr(perceive, "_with_fallback", lambda *_args: (selected, "xyzgraph"))
 
     with pytest.raises(ValueError, match="two-centre donor model"):
-        read_xyz("unused.xyz", bond_orders="xyz2mol")
+        perceive.read_xyz("unused.xyz", bond_orders="xyz2mol")
 
 
 def test_five_boryl_groups_in_one_ligand_are_not_a_cage():
@@ -192,7 +191,7 @@ def test_five_boryl_groups_in_one_ligand_are_not_a_cage():
     mol = rw.GetMol()
     mol.UpdatePropertyCache(strict=False)
 
-    _reject_boron_cages(mol)  # must not raise: every boron is three-coordinate
+    reject_boron_cages(mol)  # must not raise: every boron is three-coordinate
 
 
 def test_unbonded_bridging_hydrogen_is_rejected_before_valence_search(monkeypatch):
@@ -210,7 +209,7 @@ def test_unbonded_bridging_hydrogen_is_rejected_before_valence_search(monkeypatc
     monkeypatch.setattr(perceive, "_with_fallback", lambda *_args: (selected, "xyzgraph"))
 
     with pytest.raises(ValueError, match="3-centre"):
-        read_xyz("unused.xyz", bond_orders="xyz2mol")
+        perceive.read_xyz("unused.xyz", bond_orders="xyz2mol")
 
 
 def test_invalid_selected_connectivity_falls_back_with_provenance(monkeypatch, caplog):
@@ -225,7 +224,7 @@ def test_invalid_selected_connectivity_falls_back_with_provenance(monkeypatch, c
     monkeypatch.setattr(perceive, "_from_xyz2mol", lambda *_args: fallback)
 
     with caplog.at_level(logging.WARNING, logger="rxembed"):
-        result = read_xyz("unused.xyz", bond_orders="xyz2mol")
+        result = perceive.read_xyz("unused.xyz", bond_orders="xyz2mol")
 
     assert result is fallback
     assert "using xyz2mol connectivity" in caplog.text
@@ -270,14 +269,14 @@ def test_default_xyzgraph_keeps_a_native_omitted_metal_donor_contact(monkeypatch
     monkeypatch.setattr(perceive, "_from_rdkit_connectivity", lambda *_args: graph(False))
 
     with caplog.at_level(logging.WARNING, logger="rxembed"):
-        result = read_xyz("unused.xyz", bond_orders="xyzgraph")
+        result = perceive.read_xyz("unused.xyz", bond_orders="xyzgraph")
 
     assert donor_edges(result) == raw
     assert result.GetBondBetweenAtoms(0, 4) is not None
     assert not result.HasProp("_rxembedConnectivityRemoved")
     assert result.GetProp("_rxembedConnectivityAdded") == ""
 
-    strict = read_xyz("unused.xyz", bond_orders="xyzgraph", fallback=False)
+    strict = perceive.read_xyz("unused.xyz", bond_orders="xyzgraph", fallback=False)
     assert donor_edges(strict) == raw
 
 
@@ -309,7 +308,7 @@ def test_default_xyzgraph_restores_consensus_internal_ligand_bonds_only(monkeypa
     monkeypatch.setattr(perceive, "_from_xyz2mol", lambda *_args: joint)
 
     with caplog.at_level(logging.WARNING, logger="rxembed"):
-        result = read_xyz("unused.xyz", bond_orders="xyzgraph")
+        result = perceive.read_xyz("unused.xyz", bond_orders="xyzgraph")
 
     assert result.GetBondBetweenAtoms(1, 2) is not None
     assert result.GetBondBetweenAtoms(0, 3) is None
@@ -328,7 +327,7 @@ def test_strict_bond_order_choice_does_not_change_connectivity(monkeypatch):
     monkeypatch.setattr(perceive, "_from_xyz2mol", lambda *_args: pytest.fail("changed connectivity"))
 
     with pytest.raises(ValueError, match="bad selected graph"):
-        read_xyz("unused.xyz", bond_orders="xyz2mol", fallback=False)
+        perceive.read_xyz("unused.xyz", bond_orders="xyz2mol", fallback=False)
 
 
 def test_connectivity_fallback_preserves_explicit_metal_charge_allocation(monkeypatch):
@@ -342,7 +341,7 @@ def test_connectivity_fallback_preserves_explicit_metal_charge_allocation(monkey
     monkeypatch.setattr(perceive, "_rank_orders", fail)
     monkeypatch.setattr(perceive, "_from_xyz2mol", lambda *_args: fallback)
 
-    result = read_xyz("unused.xyz", charge=0, metal_charges={0: 2, 1: 1})
+    result = perceive.read_xyz("unused.xyz", charge=0, metal_charges={0: 2, 1: 1})
 
     assert [result.GetAtomWithIdx(index).GetFormalCharge() for index in (0, 1)] == [2, 1]
 
@@ -362,7 +361,7 @@ def test_connectivity_fallback_preserves_explicit_metal_charge_allocation(monkey
 @needs_corpus
 def test_perceiver_pairs_read_complex(connectivity, bond_orders):
     path = _CORPUS / "CisPlatin.xyz"
-    mol = read_xyz(str(path), 0, connectivity=connectivity, bond_orders=bond_orders)
+    mol = perceive.read_xyz(str(path), 0, connectivity=connectivity, bond_orders=bond_orders)
     assert mol.GetNumAtoms() == 11
     assert mol.GetNumConformers() == 1
 
@@ -371,19 +370,19 @@ def test_perceiver_pairs_read_complex(connectivity, bond_orders):
 def test_xyzgraph_bond_orders_need_xyzgraph_connectivity():
     path = _CORPUS / "CisPlatin.xyz"
     with pytest.raises(ValueError, match="connectivity='xyzgraph'"):
-        read_xyz(str(path), 0, connectivity="xyz2mol", bond_orders="xyzgraph")
+        perceive.read_xyz(str(path), 0, connectivity="xyz2mol", bond_orders="xyzgraph")
 
 
 def test_bond_order_perception_does_not_accept_auto_mode():
     with pytest.raises(ValueError, match="bond_orders must be 'xyzgraph' or 'xyz2mol'"):
-        read_xyz("unused.xyz", bond_orders="auto")
+        perceive.read_xyz("unused.xyz", bond_orders="auto")
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_xyz2mol_bond_orders_preserve_xyzgraph_connectivity():
     path = str(EXAMPLES_DIR / "ru-co.xyz")
     before = perceive._from_xyzgraph(path, 0)
-    after = read_xyz(path, 0, connectivity="xyzgraph", bond_orders="xyz2mol", fallback=False)
+    after = perceive.read_xyz(path, 0, connectivity="xyzgraph", bond_orders="xyz2mol", fallback=False)
 
     def bonds(mol):
         return {frozenset((b.GetBeginAtomIdx(), b.GetEndAtomIdx())) for b in mol.GetBonds()}
@@ -393,12 +392,12 @@ def test_xyz2mol_bond_orders_preserve_xyzgraph_connectivity():
 
 def test_rdkit_connectivity_uses_native_bond_orders_for_an_organic_graph(caplog):
     with caplog.at_level(logging.WARNING, logger="rxembed"):
-        mol = read_xyz(_BIMP, 0, connectivity="rdkit", bond_orders="xyz2mol")
+        mol = perceive.read_xyz(_BIMP, 0, connectivity="rdkit", bond_orders="xyz2mol")
 
     assert any(bond.GetBondTypeAsDouble() > 1 for bond in mol.GetBonds())
     assert "xyz2mol bond-order assignment is metal-only; using RDKit" in caplog.text
     with pytest.raises(ValueError, match=r"xyz2mol.*does not support"):
-        read_xyz(_BIMP, 0, connectivity="rdkit", bond_orders="xyz2mol", fallback=False)
+        perceive.read_xyz(_BIMP, 0, connectivity="rdkit", bond_orders="xyz2mol", fallback=False)
 
 
 def test_strict_xyz2mol_orders_do_not_substitute_rdkit_for_an_unsupported_metal(monkeypatch):
@@ -406,7 +405,7 @@ def test_strict_xyz2mol_orders_do_not_substitute_rdkit_for_an_unsupported_metal(
     monkeypatch.setattr(perceive, "_with_fallback", lambda *_args: (selected, "rdkit"))
 
     with pytest.raises(ValueError, match=r"xyz2mol.*does not support"):
-        read_xyz("unused.xyz", connectivity="rdkit", bond_orders="xyz2mol", fallback=False)
+        perceive.read_xyz("unused.xyz", connectivity="rdkit", bond_orders="xyz2mol", fallback=False)
 
 
 def test_xyz2mol_orders_are_ranked_on_the_selected_connectivity(monkeypatch):
@@ -418,9 +417,9 @@ def test_xyz2mol_orders_are_ranked_on_the_selected_connectivity(monkeypatch):
         perceive, "_rank_orders", lambda mol, charge: ranked if (mol, charge) == (selected, 0) else None
     )
 
-    assert read_xyz("unused.xyz", connectivity="xyzgraph", bond_orders="xyz2mol") is ranked
+    assert perceive.read_xyz("unused.xyz", connectivity="xyzgraph", bond_orders="xyz2mol") is ranked
     monkeypatch.setattr(perceive, "_rank_orders", lambda *_args: pytest.fail("default changed bond-order backend"))
-    assert read_xyz("unused.xyz", connectivity="xyzgraph") is selected
+    assert perceive.read_xyz("unused.xyz", connectivity="xyzgraph") is selected
 
 
 def test_read_xyz_rejects_a_final_charge_different_from_the_request(monkeypatch):
@@ -428,7 +427,7 @@ def test_read_xyz_rejects_a_final_charge_different_from_the_request(monkeypatch)
     monkeypatch.setattr(perceive, "_with_fallback", lambda *_args: (selected, "xyzgraph"))
 
     with pytest.raises(ValueError, match="does not match charge=1; use bond_orders='xyz2mol'"):
-        read_xyz("unused.xyz", charge=1, bond_orders="xyzgraph")
+        perceive.read_xyz("unused.xyz", charge=1, bond_orders="xyzgraph")
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
@@ -437,11 +436,11 @@ def test_multimetal_xyz_requires_explicit_charge_allocation():
     options = {"bond_orders": "xyz2mol"}
 
     with pytest.raises(ValueError, match="cannot allocate oxidation states between multiple metals"):
-        read_xyz(path, charge=0, **options)
+        perceive.read_xyz(path, charge=0, **options)
     with pytest.raises(ValueError, match="metal_charges must name every metal atom index"):
-        read_xyz(path, charge=0, metal_charges={0: 2}, **options)
+        perceive.read_xyz(path, charge=0, metal_charges={0: 2}, **options)
 
-    mol = read_xyz(path, charge=0, metal_charges={0: 2, 1: 1}, **options)
+    mol = perceive.read_xyz(path, charge=0, metal_charges={0: 2, 1: 1}, **options)
     assert Chem.GetFormalCharge(mol) == 0
     assert [(mol.GetAtomWithIdx(i).GetSymbol(), mol.GetAtomWithIdx(i).GetFormalCharge()) for i in (0, 1)] == [
         ("Fe", 2),
@@ -470,7 +469,7 @@ def test_bond_order_ranking_keeps_metal_bonds_out_of_ligand_valence(monkeypatch)
         assert graph.GetAtomWithIdx(1).GetValence(Chem.ValenceType.EXPLICIT) == 4
         return (graph,)
 
-    monkeypatch.setattr("rxembed.pipeline.xyz2mol_tmc.get_tmc_mol", check_private_graph)
+    monkeypatch.setattr(perceive, "get_tmc_mol", check_private_graph)
     ranked = perceive._rank_orders(mol, 0)
 
     assert ranked.GetBondBetweenAtoms(0, 1).GetBondType() == Chem.BondType.DATIVE
@@ -496,7 +495,7 @@ def test_bond_order_ranking_does_not_promote_a_nonmetal_hydrogen_contact(monkeyp
         assert graph.GetAtomWithIdx(2).GetDegree() == 2
         return (graph,)
 
-    monkeypatch.setattr("rxembed.pipeline.xyz2mol_tmc.get_tmc_mol", check_private_graph)
+    monkeypatch.setattr(perceive, "get_tmc_mol", check_private_graph)
 
     perceive._rank_orders(mol, 0)
 
@@ -522,7 +521,7 @@ def test_bond_order_ranking_keeps_the_ligand_leg_of_a_hydride_bridge(monkeypatch
         assert graph.GetBondBetweenAtoms(0, 2) is None
         return (graph,)
 
-    monkeypatch.setattr("rxembed.pipeline.xyz2mol_tmc.get_tmc_mol", check_private_graph)
+    monkeypatch.setattr(perceive, "get_tmc_mol", check_private_graph)
 
     ranked = perceive._rank_orders(mol, 0)
 
@@ -532,7 +531,7 @@ def test_bond_order_ranking_keeps_the_ligand_leg_of_a_hydride_bridge(monkeypatch
 
 
 def test_symmetric_nonmetal_shared_hydrogen_uses_a_zero_order_contact(monkeypatch):
-    monkeypatch.setattr("rxembed.pipeline.xyz2mol_tmc.get_tmc_mol", lambda *_args, **kwargs: (kwargs["graph"][0],))
+    monkeypatch.setattr(perceive, "get_tmc_mol", lambda *_args, **kwargs: (kwargs["graph"][0],))
     outcomes = []
     for edges in (((1, 2), (3, 2)), ((3, 2), (1, 2))):
         rw = Chem.RWMol()
@@ -589,7 +588,7 @@ def test_connectivity_sources_preserve_an_open_eta3_face(monkeypatch):
         graph.add_edge(left, right, bond_order=1)
     monkeypatch.setitem(sys.modules, "xyzgraph", SimpleNamespace(build_graph=lambda *_args, **_kwargs: graph))
     monkeypatch.setattr(perceive, "_coordinates", lambda _path: Chem.Mol(source))
-    monkeypatch.setattr("rxembed.pipeline.xyz2mol_tmc.get_tmc_mol", lambda *_args, **_kwargs: (Chem.Mol(source),))
+    monkeypatch.setattr(perceive, "get_tmc_mol", lambda *_args, **_kwargs: (Chem.Mol(source),))
     assert edges(perceive._from_xyzgraph("unused.xyz", 0)) == expected
     assert edges(perceive._from_xyz2mol("unused.xyz", 0)) == expected
 
@@ -621,7 +620,7 @@ def test_read_xyz_drops_a_bridgehead_bond_the_connectivity_backend_mis_bonded(mo
     assert len(before) == 3  # the two real S donors plus the wrong P bond
     monkeypatch.setattr(perceive, "_with_fallback", lambda *_args: (selected, "xyzgraph"))
 
-    result = read_xyz("unused.xyz", charge=Chem.GetFormalCharge(selected))
+    result = perceive.read_xyz("unused.xyz", charge=Chem.GetFormalCharge(selected))
 
     after = sorted(n.GetSymbol() for n in result.GetAtomWithIdx(metal).GetNeighbors())
     assert after == ["S", "S"]
@@ -817,12 +816,10 @@ def test_hydride_transfer_like_ru_h_carbon_contact_is_kept():
 
 
 def test_smiles_input_keeps_a_bridgehead_bond_canonical_metal_graph_no_longer_drops():
-    """A user SMILES is not routed through `_drop_bridgehead_bonds`; `_canonical_metal_graph` keeps it."""
-    from rxembed import metal_core
-
+    """A user SMILES is not routed through `_drop_bridgehead_bonds`; `canonical_metal_graph` keeps it."""
     mol = rx.parse_smiles(_DTP_NI, remove_hs=False)
     metal, before = _metal_neighbours(mol)
 
-    out = metal_core._canonical_metal_graph(mol)
+    out = canonical_metal_graph(mol)
 
     assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before

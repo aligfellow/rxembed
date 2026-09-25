@@ -11,22 +11,23 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass, field
+from typing import override
 
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdForceFieldHelpers, rdMolTransforms
 
 from .constraints import (
-    _DIST_ATOMS,
+    DIST_ATOMS,
     FIX_ANGLE_TOL,
     FIX_DISTANCE_TOL,
-    _graft_owns,
-    _merge_pulls,
-    _periodic_window,
-    _stated_dihedral,
+    graft_owns,
+    merge_pulls,
+    periodic_window,
+    stated_dihedral,
 )
 from .metal_core import disconnect_metal
-from .utils import _CARBON_Z, _DISCONNECTED, _SP2_DEGREE, conjugated_quartets
+from .utils import CARBON_Z, DISCONNECTED, SP2_DEGREE, conjugated_quartets
 
 _PHANTOM_FLOOR = 0.30  # Å: a haptic centroid dummy may sit this close to any atom, living inside its own ring
 _RIGHT_ANGLE = 90.0  # deg: syn/anti split and the open end of a pyramidal improper
@@ -39,20 +40,21 @@ _FLOOR_INF = 1e3  # Å: practical infinity for a one-sided floor
 PIN_FC = 1e4  # kcal/mol/Å²: stated distances sit on the measured 500-1e5 metal-fidelity plateau
 RELEASABLE_FC_SCALE = 0.3  # NCI wall scale; measured p90 overshoot 0.014 Å
 CONTACT_PUSH = 320.0  # kcal/mol/Å at either wall; measured knee for contact centring
-ANGLE_FC = 30.0  # kcal/mol/deg²; flat measured fidelity, while 1000 broke 12% of windows
+ANGLE_FC = 30.0  # kcal/mol/deg²; flat measured fidelity, while a higher constant breaks some windows
 PI_STACK_FC = 2e3  # kcal/mol/Å²: softer than a stated distance because the seed already formed the stack
 TARGET_FC = 1e4  # kcal/mol/Å²: holds an M-L target to 0.004 Å against a measured 43 kcal/mol/Å pull
-_ANGLE_TARGET_FC = 0.001 * ANGLE_FC  # kcal/mol/deg²: common-shell benchmark, 19/25 fresh vs 15/25 with walls alone
+# kcal/mol/deg²: much softer than the angle wall, so it nudges without overriding it
+_ANGLE_TARGET_FC = 0.001 * ANGLE_FC
 FIX_DISTANCE_FC = 3e7  # kcal/mol/Å²: measured 1.557 -> 1.55760 Å against the reactive-pair LJ repulsion
 FIX_ANGLE_FC = 1e3  # kcal/mol/deg²: measured 123.456 -> 123.45543 degrees before the acceptance gate
 _COPLANAR_FC = 10.0  # kcal/mol/deg²: below 5 tears a diphosphine on a rigid diene
 _UMBRELLA_FC = 3.0  # kcal/mol/deg²: shortest M-L systems need 2-3 to retain the declared side of the plane
-# Planar crystals have p95 9.83°; 15° gives RMS 0.063r and is 43% of the 35.264° pyramid improper.
-_PLANAR_CAP = 15.0  # deg: keeps a held plane outside the pyramid basin
+# deg: wide enough for a real crystal plane's own spread, narrow enough to stay outside the pyramid basin
+_PLANAR_CAP = 15.0
 _STRAIGHT = 180.0
 _SP2_HOLD_FC = 10.0 / 3.0  # kcal/mol/deg²: three ordered terms share the measured total restraint strength
 _SP2_HOLD_WIN = 5.0  # deg around the seed improper: preserve existing curvature, never create it
-_CONJ_CAP = 20.0  # deg: inside the 30° conjugation gate, measured on BIMP, Takemoto and Schreiner
+_CONJ_CAP = 20.0  # deg: inside the 30° conjugation gate
 _UFF_SMALL_SP2_RINGS = (3, 4)  # RDKit UFF uses nonperiodic angle potentials for these ring sizes
 
 
@@ -110,23 +112,24 @@ class DGContext:
 class Mechanism:
     """A constraint field's two writers. Subclasses implement only the hooks their field needs."""
 
-    def _dg_windows(self, cons, ctx):
+    def dg_windows(self, cons, ctx):
         """WINDOW: contribute candidate ``(lo, hi)`` windows to ``ctx.pairs``."""
 
-    def _dg_relief(self, cons, ctx):
+    def dg_relief(self, cons, ctx):
         """RELIEVE: lower a matrix bound. Runs before COMMIT, so an explicit window always wins."""
 
-    def _dg_post(self, cons, ctx):
+    def dg_post(self, cons, ctx):
         """POST: read the committed matrix and tighten it."""
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    def uff_terms(self, ff, cons, conf, stiffness):
         """FF: add terms for this field at the requested stiffness rung."""
 
 
 class Frozen(Mechanism):
     """Pin atoms at their embedded coordinates with zero degrees of freedom; FF-only."""
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
         for idx in cons.frozen:
             ff.AddFixedPoint(idx)
 
@@ -134,10 +137,12 @@ class Frozen(Mechanism):
 class Distance(Mechanism):
     """Write distance windows to DG and FF; Haptic replaces derived centroid radii during relaxation."""
 
-    def _dg_windows(self, cons, ctx):
+    @override
+    def dg_windows(self, cons, ctx):
         ctx.pairs.update(cons.distances)  # override only the constrained pairs; RDKit keeps the rest
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
         releasable, _ = cons.contacts
         seed_radii = {tuple(sorted((dummy, atom))) for dummy, face in cons.haptic.items() for atom in face}
         for (i, j), (lo, hi) in cons.distances.items():
@@ -156,16 +161,17 @@ class Distance(Mechanism):
 class Pull(Mechanism):
     """Bias a modelled distance or angle toward its preferred value; FF-only."""
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
-        for atoms, target in _merge_pulls({}, cons.pulls).items():
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
+        for atoms, target in merge_pulls({}, cons.pulls).items():
             if atoms in cons.fixed or atoms[::-1] in cons.fixed:
                 continue
-            if len(atoms) == _DIST_ATOMS:
+            if len(atoms) == DIST_ATOMS:
                 ff.AddDistanceConstraint(*atoms, target, target, TARGET_FC)
             else:
                 ff.UFFAddAngleConstraint(*atoms, False, target, target, _ANGLE_TARGET_FC)
         for atoms, (lo, hi) in cons.fixed.items():
-            if len(atoms) == _DIST_ATOMS and lo == hi:  # scalar distance fix; ranges use the strict wall above
+            if len(atoms) == DIST_ATOMS and lo == hi:  # scalar distance fix; ranges use the strict wall above
                 ff.AddDistanceConstraint(*atoms, lo, hi, stiffness * FIX_DISTANCE_FC)
         # A contact has no UFF bond keeping it inside its window, so bias it to the midpoint without storing
         # that derived target a second time.
@@ -182,7 +188,8 @@ class Pull(Mechanism):
 class Floor(Mechanism):
     """Apply one-sided FF distance walls and relieve false metal-surrogate DG floors."""
 
-    def _dg_relief(self, cons, ctx):
+    @override
+    def dg_relief(self, cons, ctx):
         # Never relieve onto an atom inside a rigid body: it has 6 dof not 3n, every internal distance is
         # already stated, and lowering a floor there only lets the DG fold the body inward.
         rigid = set().union(*cons.shapes) if cons.shapes else set()
@@ -195,7 +202,8 @@ class Floor(Mechanism):
             if floor < ctx.bm[b][a] <= ctx.bm[a][b]:  # only ever relax, and only if genuinely too high
                 ctx.bm[b][a] = floor
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
         for (i, j), floor in cons.floors.items():
             # Explicit holds override the automatic wall; seed-only encounter windows do not.
             if (i, j) in cons.fixed or (i, j) in cons.contacts[0]:
@@ -210,22 +218,24 @@ class Angle(Mechanism):
     disjoint intersection keeps RDKit's backbone bounds.
     """
 
-    def _dg_windows(self, cons, ctx):
+    @override
+    def dg_windows(self, cons, ctx):
         for (i, j, k), (lo, hi) in cons.angles.items():
             a, b = min(i, k), max(i, k)  # sorted, as `add_distance` stores them
             if (a, b) in ctx.pairs:  # an explicit distance window already owns this pair
                 continue
             dij, djk = ctx.leg(i, j), ctx.leg(j, k)
             # Scalar fixed-angle seed padding can extend beyond the physical domain used by UFF.
-            ang_lo = _law_of_cosines(dij, djk, max(0.0, lo))
-            ang_hi = _law_of_cosines(dij, djk, min(_STRAIGHT, hi))
-            if ctx.topo[a][b] < _DISCONNECTED:
+            ang_lo = law_of_cosines(dij, djk, max(0.0, lo))
+            ang_hi = law_of_cosines(dij, djk, min(_STRAIGHT, hi))
+            if ctx.topo[a][b] < DISCONNECTED:
                 lo_hi = (max(ang_lo, ctx.bm[b][a]), min(ang_hi, ctx.bm[a][b]))
                 ctx.pairs[(a, b)] = lo_hi if lo_hi[0] <= lo_hi[1] else (ctx.bm[b][a], ctx.bm[a][b])
             else:
                 ctx.pairs[(a, b)] = (ang_lo, ang_hi)
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
         _, releasable = cons.contacts
         for atoms, window in cons.angles.items():
             i, j, k = atoms
@@ -244,7 +254,8 @@ class Angle(Mechanism):
 class Dihedral(Mechanism):
     """Write periodic dihedral windows to UFF; distance geometry cannot encode their signed hand."""
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
         _, releasable = cons.contacts
         for atoms, window in cons.dihedrals.items():
             used_lo, used_hi, fc = _angular_wall(atoms, window, cons, stiffness, releasable)
@@ -258,9 +269,10 @@ class Coplanar(Mechanism):
     Without a stated M-D-X angle, only the Cartesian FF torsion applies.
     """
 
-    def _dg_post(self, cons, ctx):
+    @override
+    def dg_post(self, cons, ctx):
         for i, j, k, w, anchor, cap in cons.coplanar:
-            if _stated_dihedral(cons, i, j, k, w):  # the same override owns the seed and the FF
+            if stated_dihedral(cons, i, j, k, w):  # the same override owns the seed and the FF
                 continue
             if anchor is None:  # the graph proves a plane but not which periodic well
                 continue
@@ -280,13 +292,14 @@ class Coplanar(Mechanism):
             elif not anti and ctx.bm[b][a] <= edge < ctx.bm[a][b]:  # syn: ceiling at the cap edge
                 ctx.bm[a][b] = edge
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
         if not cons.coplanar:
             return
         for i, j, k, w, anchor, cap in cons.coplanar:
-            if _graft_owns((i, j, k, w), cons.frozen, cons.haptic):
+            if graft_owns((i, j, k, w), cons.frozen, cons.haptic):
                 continue
-            if _stated_dihedral(cons, i, j, k, w):
+            if stated_dihedral(cons, i, j, k, w):
                 continue
             phi = rdMolTransforms.GetDihedralDeg(conf, i, j, k, w)
             lo, hi = _coplanar_window(phi, cap, anchor)
@@ -296,7 +309,8 @@ class Coplanar(Mechanism):
 class Plane(Mechanism):
     """Hold a parallel pi-stack by cross-ring distances; explicit and angle-derived windows win."""
 
-    def _dg_windows(self, cons, ctx):
+    @override
+    def dg_windows(self, cons, ctx):
         for ring_a, ring_b, sep in cons.planes:  # cross-ring d = sqrt(sep^2 + in-plane^2)
             for u, au in enumerate(ring_a):
                 for v, bv in enumerate(ring_b):
@@ -304,7 +318,8 @@ class Plane(Mechanism):
                     d = math.hypot(sep, offset)
                     ctx.pairs.setdefault((min(au, bv), max(au, bv)), (d - _PLANE_PAD, d + _PLANE_PAD))
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
         pos = conf.GetPositions()  # hold the stack as embedded; the seed already realised the separation
         for ring_a, ring_b, _sep in cons.planes:
             for a, b in itertools.product(ring_a, ring_b):
@@ -313,15 +328,17 @@ class Plane(Mechanism):
 
 
 class Haptic(Mechanism):
-    """Seat the DG helper inside its face and restrain it to the moving centroid during UFF.
+    """Seat the DG helper inside its haptic face, then hold it at the moving centroid during UFF.
 
-    Native zero-distance springs implement E = K/2 |p - mean(r)|² through
-    sum_i |p-r_i|²/n - sum_i<j |r_i-r_j|²/n². The complete sum is nonnegative: the negative terms cancel
-    internal face strain, leaving no radius or planarity target. This finite penalty is not an exact
-    dependent coordinate; publication measures the real centroid independently.
+    A zero-distance spring on every dummy-to-face-atom pair, plus a negative spring on every face-atom pair,
+    implements E = K/2 |p - mean(r)|² through sum_i |p-r_i|²/n - sum_i<j |r_i-r_j|²/n². The full sum stays
+    nonnegative: the negative terms cancel the face's own internal strain, leaving no separate radius or
+    planarity target. This is a finite penalty, not an exact dependent coordinate; publication measures the
+    real centroid independently.
     """
 
-    def _dg_relief(self, cons, ctx):
+    @override
+    def dg_relief(self, cons, ctx):
         n = len(ctx.bm)
         for p in cons.phantoms:
             for x in range(n):
@@ -330,7 +347,8 @@ class Haptic(Mechanism):
                     continue
                 ctx.bm[b][a] = min(ctx.bm[b][a], _PHANTOM_FLOOR)  # bm[b][a] is the lower bound; only ever lower
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
         for dummy, face in cons.haptic.items():
             n = len(face)
             force = stiffness * PIN_FC
@@ -350,7 +368,8 @@ class TrigonalAngle(Mechanism):
     a different potential and are untouched. Stated geometry and existing pair floors remain authoritative.
     """
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
         mol = conf.GetOwningMol()
         for atom in mol.GetAtoms():
             if atom.GetHybridization() != Chem.HybridizationType.SP2:
@@ -365,7 +384,7 @@ class TrigonalAngle(Mechanism):
                     or (b, centre, a) in cons.angles
                     or (a, b) in cons.distances
                     or (a, b) in cons.floors
-                    or _graft_owns((a, centre, b), cons.frozen)
+                    or graft_owns((a, centre, b), cons.frozen)
                 ):
                     continue
                 params = rdForceFieldHelpers.GetUFFAngleBendParams(mol, a, centre, b)
@@ -379,15 +398,16 @@ class TrigonalAngle(Mechanism):
 
 
 class Sp2Planar(Mechanism):
-    """Preserve each organic sp2 carbon's seed improper; never target flat.
+    """Hold each organic sp2 carbon at its seed improper; never pull it flat.
 
-    UFF puckers a planar conjugated carbon from 0.003 to 0.20 Å. A seed-centred window stops added pucker
-    without inventing curvature. A coordinated carbon's improper is excluded because its coordination state
-    owns that geometry. Three ordered torsions are needed because RDKit exposes no permutation-invariant
-    improper restraint.
+    UFF puckers a planar conjugated carbon by up to 0.2 Å. A window centred on the seed value stops that
+    pucker without inventing curvature the seed did not have. A coordinated carbon is excluded because its
+    coordination state already owns that geometry. Three ordered torsions are needed because RDKit exposes no
+    permutation-invariant improper restraint.
     """
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
         if not cons.conjugation:
             return
         mol = conf.GetOwningMol()
@@ -395,19 +415,19 @@ class Sp2Planar(Mechanism):
         stated = {frozenset(atoms) for atoms in cons.dihedrals}
         for atom in mol.GetAtoms():
             centre = atom.GetIdx()
-            if atom.GetAtomicNum() != _CARBON_Z or atom.GetHybridization() != Chem.HybridizationType.SP2:
+            if atom.GetAtomicNum() != CARBON_Z or atom.GetHybridization() != Chem.HybridizationType.SP2:
                 continue
             nbrs = [n.GetIdx() for n in atom.GetNeighbors()]
-            if len(nbrs) != _SP2_DEGREE:
+            if len(nbrs) != SP2_DEGREE:
                 continue
-            if _graft_owns((centre, *nbrs), cons.frozen, cons.haptic):
+            if graft_owns((centre, *nbrs), cons.frozen, cons.haptic):
                 continue
             if centre in coordinated or frozenset((centre, *nbrs)) in stated:
                 continue
             a, b, c = nbrs
             for key in ((a, b, c, centre), (b, a, c, centre), (c, a, b, centre)):
                 phi = rdMolTransforms.GetDihedralDeg(conf, *key)
-                lo, hi = _periodic_window((phi - _SP2_HOLD_WIN, phi + _SP2_HOLD_WIN))
+                lo, hi = periodic_window((phi - _SP2_HOLD_WIN, phi + _SP2_HOLD_WIN))
                 ff.UFFAddTorsionConstraint(*key, False, lo, hi, _SP2_HOLD_FC)
 
 
@@ -420,7 +440,7 @@ def _coordination_owned_carbons(mol, cons):
             continue
         site = right if left in cons.metals else left
         sites.update(cons.haptic.get(site, (site,)))
-    return {atom for atom in sites if atom < mol.GetNumAtoms() and mol.GetAtomWithIdx(atom).GetAtomicNum() == _CARBON_Z}
+    return {atom for atom in sites if atom < mol.GetNumAtoms() and mol.GetAtomWithIdx(atom).GetAtomicNum() == CARBON_Z}
 
 
 class ConjugationCap(Mechanism):
@@ -431,14 +451,15 @@ class ConjugationCap(Mechanism):
     window, while an ordinary ligand amide or enamine still receives the same cleanup as a metal-free one.
     """
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
         if not cons.conjugation:
             return
         mol = conf.GetOwningMol()
         flex = _coordination_owned_carbons(mol, cons)
         for a, c, x, s in conjugated_quartets(mol):
             key = (a, c, x, s)
-            if {a, c, x} & flex or _stated_dihedral(cons, *key) or _graft_owns(key, cons.frozen):
+            if {a, c, x} & flex or stated_dihedral(cons, *key) or graft_owns(key, cons.frozen):
                 continue
             phi = rdMolTransforms.GetDihedralDeg(conf, *key)
             lo, hi = _coplanar_window(phi, _CONJ_CAP)
@@ -446,18 +467,22 @@ class ConjugationCap(Mechanism):
 
 
 class Umbrella(Mechanism):
-    """Keep a selected metal pyramid or tetrahedral point on its seeded side with native FF impropers.
+    """Hold a metal pyramid or tetrahedral point on its seeded side with soft FF impropers.
 
-    The D-M-D walls alone flatten a pyramid to 117.5° or pucker a plane to 112°. A pyramid uses its record's
-    ideal improper and seed hand; a plane uses ±`_PLANAR_CAP`. Zero holds only point handedness, with no force
-    on its seeded half-circle. Average the six torsion axes so carrier order cannot change the penalty.
-    These soft UFF walls do not guarantee stereo; publication still checks the final geometry. They are absent
-    from DG and downstream real-energy optimization. D-M-D angle targets crushed a side-on imine to 1.42 Å.
+    D-M-D angle walls alone let a pyramid flatten to 117.5 degrees or a plane pucker to 112: this term
+    restores the missing out-of-plane force. A pyramid targets its record's ideal improper and seed hand; a
+    plane targets ±`_PLANAR_CAP`. A zero target holds only handedness, with no force on the seeded
+    half-circle. The six torsion axes are averaged so carrier order cannot change the penalty.
+
+    Soft: these walls do not guarantee the final stereo, so publication still checks the final geometry. They
+    run only inside restrained UFF, never in DG or a real-energy step. A D-M-D angle target alone, with no
+    umbrella term, can crush a side-on imine to 1.42 Å.
     """
 
-    def _ff_terms(self, ff, cons, conf, stiffness):
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
         for key, ideal in cons.umbrellas.items():
-            if _graft_owns(key, cons.frozen, cons.haptic) or _stated_dihedral(cons, *key, improper=True):
+            if graft_owns(key, cons.frozen, cons.haptic) or stated_dihedral(cons, *key, improper=True):
                 continue
             if isinstance(ideal, tuple):
                 anchor, weight = ideal
@@ -502,42 +527,45 @@ MECHANISM_ORDER = (
 )
 
 
-def _law_of_cosines(dij, djk, theta_deg):
+def law_of_cosines(dij, djk, theta_deg):
+    """Return the side opposite angle `theta_deg` (degrees) between sides `dij` and `djk`."""
     return math.sqrt(dij**2 + djk**2 - 2 * dij * djk * math.cos(math.radians(theta_deg)))
 
 
-def _triangle_distances(left, right, angles):
+def _cosine_rule_sq(a, b, cosine):
+    """Return the squared side opposite an angle of the given cosine between sides `a` and `b`."""
+    return a * a + b * b - 2 * a * b * cosine
+
+
+def triangle_distances(left, right, angles):
     """Enclose the opposite distance for nonnegative side intervals and angles in degrees."""
-
-    def square(a, b, cosine):
-        return max(0.0, a * a + b * b - 2 * a * b * cosine)
-
     cosine = math.cos(math.radians(angles[0]))
     # This convex quadratic attains its minimum on an edge of the side-length rectangle.
-    lower = [square(a, min(max(a * cosine, right[0]), right[1]), cosine) for a in left]
-    lower += [square(min(max(b * cosine, left[0]), left[1]), b, cosine) for b in right]
+    lower = [max(0.0, _cosine_rule_sq(a, min(max(a * cosine, right[0]), right[1]), cosine)) for a in left]
+    lower += [max(0.0, _cosine_rule_sq(min(max(b * cosine, left[0]), left[1]), b, cosine)) for b in right]
     cosine = math.cos(math.radians(angles[1]))
-    upper = [square(a, b, cosine) for a, b in itertools.product(left, right)]
+    upper = [max(0.0, _cosine_rule_sq(a, b, cosine)) for a, b in itertools.product(left, right)]
     return math.sqrt(min(lower)), math.sqrt(max(upper))
 
 
-def _triangle_angles(left, right, span):
+def opposite_angle(a, b, d):
+    """Return the angle in radians between sides `a` and `b` of a triangle whose third side is `d`."""
+    return math.acos(max(-1.0, min(1.0, (a * a + b * b - d * d) / (2 * a * b))))
+
+
+def triangle_angles(left, right, span):
     """Enclose the angle between two positive side intervals, in radians, or return None without support."""
     if span[0] > left[1] + right[1] or span[1] < max(0.0, left[0] - right[1], right[0] - left[1]):
         return None
-
-    def angle(a, b, d):
-        return math.acos(max(-1.0, min(1.0, (a * a + b * b - d * d) / (2 * a * b))))
-
-    lower = min(angle(a, b, span[0]) for a, b in itertools.product(left, right))
-    upper = [angle(a, b, span[1]) for a, b in itertools.product(left, right)]
+    lower = min(opposite_angle(a, b, span[0]) for a, b in itertools.product(left, right))
+    upper = [opposite_angle(a, b, span[1]) for a, b in itertools.product(left, right)]
     # Cosine has no nondegenerate interior stationary point. Its edge minimum has a²=b²-d²;
     # corner clipping also covers every supported collinear boundary.
     for variable, fixed in ((left, right), (right, left)):
         for b in fixed:
             a = math.sqrt(max(0.0, b * b - span[1] * span[1]))
             if variable[0] <= a <= variable[1]:
-                upper.append(angle(a, b, span[1]))
+                upper.append(opposite_angle(a, b, span[1]))
     return lower, max(upper)
 
 
@@ -558,7 +586,7 @@ def _coplanar_bound(bm, atoms, window, anchor, cap):
     if any(not 0 < lo <= hi or not math.isfinite(hi) for lo, hi in legs):
         return None
     ij, jk, kw, jw = legs
-    beta = _triangle_angles(jk, jw, kw)
+    beta = triangle_angles(jk, jw, kw)
     if beta is None:
         return None
     anti = anchor == _STRAIGHT
@@ -570,16 +598,12 @@ def _coplanar_bound(bm, atoms, window, anchor, cap):
     # Anti maximizes cosine, syn minimizes it. Any stationary point along either edge is the opposite
     # extremum: its sine coefficient is nonpositive for anti and nonnegative for syn.
     cosine = max(-1.0, min(1.0, max(cosines) if anti else min(cosines)))
-
-    def square(a, b):
-        return a * a + b * b - 2 * a * b * cosine
-
     if anti:
         # The convex distance quadratic attains its minimum on an edge, possibly between its corners.
-        values = [square(a, min(max(a * cosine, jw[0]), jw[1])) for a in ij]
-        values += [square(min(max(b * cosine, ij[0]), ij[1]), b) for b in jw]
+        values = [_cosine_rule_sq(a, min(max(a * cosine, jw[0]), jw[1]), cosine) for a in ij]
+        values += [_cosine_rule_sq(min(max(b * cosine, ij[0]), ij[1]), b, cosine) for b in jw]
         return math.sqrt(max(0.0, min(values)))
-    return math.sqrt(max(0.0, *(square(a, b) for a, b in itertools.product(ij, jw))))
+    return math.sqrt(max(0.0, *(_cosine_rule_sq(a, b, cosine) for a, b in itertools.product(ij, jw))))
 
 
 def _coplanar_window(phi, cap, anchor=None):

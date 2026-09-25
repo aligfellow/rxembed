@@ -14,6 +14,8 @@ override single knobs and `config` is an escape hatch. Needs `openconf`; `availa
 
 from __future__ import annotations
 
+import dataclasses
+import importlib.util
 import logging
 
 from rdkit import Chem
@@ -22,12 +24,8 @@ logger = logging.getLogger("rxembed")
 
 
 def available() -> bool:
-    """Return True when the optional openconf backend is importable."""
-    try:
-        import openconf  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    """Return True when the optional openconf backend is installed."""
+    return importlib.util.find_spec("openconf") is not None
 
 
 def _config(preset, seed, max_out, low_mode, config, constrained, **openconf_kw):
@@ -36,8 +34,6 @@ def _config(preset, seed, max_out, low_mode, config, constrained, **openconf_kw)
     ``openconf_kw`` are arbitrary ``ConformerConfig`` fields (from ``mc(**kwargs)``) applied verbatim; an
     unknown field raises the standard ``dataclasses.replace`` TypeError, naming it.
     """
-    import dataclasses
-
     try:
         from openconf.config import preset_config
     except ImportError as exc:

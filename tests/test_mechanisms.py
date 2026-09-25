@@ -70,8 +70,8 @@ def test_angle_projection_keeps_fixed_collinear_geometry(anchor):
     mol = Chem.MolFromSmiles("C.C.C")
     cons = compose(Constraints(distances={(0, 1): (1.0, 1.0), (1, 2): (2.0, 2.0)}, fixed={(0, 1, 2): (anchor, anchor)}))
     ctx = mech_mod.DGContext(mol, np.triu(np.full((3, 3), 10.0), 1))
-    mech_mod.Distance()._dg_windows(cons, ctx)
-    mech_mod.Angle()._dg_windows(cons, ctx)
+    mech_mod.Distance().dg_windows(cons, ctx)
+    mech_mod.Angle().dg_windows(cons, ctx)
 
     lo, hi = ctx.pairs[(0, 2)]
     assert lo <= (1.0 if anchor == 0.0 else 3.0) <= hi
@@ -107,7 +107,7 @@ def test_coplanar_projection_preserves_full_distance_windows(anchor, order):
         assert lo - 1e-12 <= np.linalg.norm(points[a] - points[b]) <= hi + 1e-12
     a, b = sorted((atoms[0], atoms[3]))
     before = (ctx.bm[b, a], ctx.bm[a, b])
-    mech_mod.Coplanar()._dg_post(cons, ctx)
+    mech_mod.Coplanar().dg_post(cons, ctx)
     assert (ctx.bm[b, a], ctx.bm[a, b]) != before, "the coplanar cap must actually tighten this pair"
     distance = np.linalg.norm(points[0] - points[3])
     assert ctx.bm[b, a] - 1e-12 <= distance <= ctx.bm[a, b] + 1e-12
@@ -120,12 +120,12 @@ def test_coplanar_post_uses_committed_intervals_not_pending_midpoints():
         matrix[b, a] = matrix[a, b] = length
     cons = Constraints(angles={(0, 1, 2): (90.0, 90.0)}, coplanar=[(0, 1, 2, 3, 180.0, 0.0)])
     ctx = mech_mod.DGContext(mol, matrix, pairs={(1, 3): (1.0, 3.0)})
-    mech_mod.Coplanar()._dg_post(cons, ctx)
+    mech_mod.Coplanar().dg_post(cons, ctx)
     assert ctx.bm[3, 0] == pytest.approx(math.sqrt(8 + 4 * math.sqrt(2)))
 
 
 def test_coplanar_interval_extrema_include_interior_edge_points():
-    angles = mech_mod._triangle_angles((1.0, 3.0), (2.0, 2.0), (1.0, 1.0))
+    angles = mech_mod.triangle_angles((1.0, 3.0), (2.0, 2.0), (1.0, 1.0))
     assert angles == pytest.approx((0.0, math.pi / 6))
     matrix = np.triu(np.full((4, 4), 10.0), 1)
     for a, b, length in [(1, 2, 2.0), (1, 3, 2.0), (2, 3, 4 * math.sin(math.radians(10)))]:
@@ -153,9 +153,9 @@ def test_coplanar_projection_abstains_outside_its_geometric_domain(window, ancho
     assert mech_mod._coplanar_bound(matrix, (0, 1, 2, 3), window, anchor, cap) is None
 
 
-def _ff_terms(mech, cons, mol, fc=1.0):
+def uff_terms(mech, cons, mol, fc=1.0):
     ff = SpyFF()
-    mech._ff_terms(ff, cons, mol.GetConformer(0), fc)
+    mech.uff_terms(ff, cons, mol.GetConformer(0), fc)
     return ff
 
 
@@ -174,11 +174,11 @@ _FIELD_DRIVEN = [m for m in mech_mod.MECHANISM_ORDER if type(m).__name__ not in 
 @pytest.mark.parametrize("mech", _FIELD_DRIVEN, ids=lambda m: type(m).__name__)
 def test_mechanism_is_silent_on_empty_constraints(mech):
     mol = _mol()
-    assert _ff_terms(mech, Constraints(), mol).calls == [], f"{type(mech).__name__} wrote an FF term unasked"
+    assert uff_terms(mech, Constraints(), mol).calls == [], f"{type(mech).__name__} wrote an FF term unasked"
 
     ctx = _ctx(mol)
     before = ctx.bm.copy()
-    for hook in (mech._dg_windows, mech._dg_relief, mech._dg_post):
+    for hook in (mech.dg_windows, mech.dg_relief, mech.dg_post):
         hook(Constraints(), ctx)
     assert ctx.pairs == {}, f"{type(mech).__name__} proposed a window off an empty struct"
     assert np.array_equal(ctx.bm, before), f"{type(mech).__name__} edited the matrix off an empty struct"
@@ -188,7 +188,7 @@ def test_mechanism_is_silent_on_empty_constraints(mech):
 def test_ff_repair_uses_molecule_state(name):
     mech = next(m for m in mech_mod.MECHANISM_ORDER if type(m).__name__ == name)
     mol = _mol()
-    assert _ff_terms(mech, Constraints(), mol).calls, f"{name} must fire on a bare struct"
+    assert uff_terms(mech, Constraints(), mol).calls, f"{name} must fire on a bare struct"
 
 
 def test_sp2_planar_excludes_only_coordination_owned_carbon():
@@ -203,7 +203,7 @@ def test_sp2_planar_excludes_only_coordination_owned_carbon():
     mechanism = mech_mod.Sp2Planar()
 
     def calls(cons):
-        return _ff_terms(mechanism, cons, mol).calls
+        return uff_terms(mechanism, cons, mol).calls
 
     bare = calls(Constraints())
     torsions = [args[:4] for name, args, _kwargs in bare if name == "UFFAddTorsionConstraint" and args[3] == centre]
@@ -230,9 +230,9 @@ def test_stated_improper_owns_its_carbon_but_a_proper_torsion_does_not():
     mechanism = mech_mod.Sp2Planar()
     a, b, c = neighbors
     for key in ((a, b, c, centre), (centre, b, a, c), (c, a, centre, b)):
-        assert not _ff_terms(mechanism, Constraints(dihedrals={key: (-10.0, 10.0)}), mol).calls
+        assert not uff_terms(mechanism, Constraints(dihedrals={key: (-10.0, 10.0)}), mol).calls
 
-    calls = _ff_terms(mechanism, Constraints(dihedrals={(0, 1, 2, 3): (-10.0, 10.0)}), mol).calls
+    calls = uff_terms(mechanism, Constraints(dihedrals={(0, 1, 2, 3): (-10.0, 10.0)}), mol).calls
     assert len(calls) == 3
 
 
@@ -248,13 +248,13 @@ def test_trigonal_angle_repair_defers_to_stated_geometry(owner):
         "graft": Constraints(frozen={a, centre, b}),
     }[owner]
 
-    calls = _ff_terms(mech_mod.TrigonalAngle(), cons, mol).calls
+    calls = uff_terms(mech_mod.TrigonalAngle(), cons, mol).calls
     assert calls
     assert not any(args[:3] == (a, centre, b) for _name, args, _kwargs in calls)
 
 
 def test_trigonal_angle_repair_leaves_native_small_ring_angles_alone():
-    assert not _ff_terms(mech_mod.TrigonalAngle(), Constraints(), _mol("O=C1CC1")).calls
+    assert not uff_terms(mech_mod.TrigonalAngle(), Constraints(), _mol("O=C1CC1")).calls
 
 
 @pytest.mark.parametrize("smiles", ["C=C", "NC=O"])
@@ -268,7 +268,7 @@ def test_trigonal_angle_repair_penalizes_collapsed_geometry(smiles):
     conf.SetAtomPosition(hydrogens[1], origin + np.array((-0.866, 0.5, 0)))
     ff = rdForceFieldHelpers.CreateEmptyForceFieldForMol(mol)
 
-    mech_mod.TrigonalAngle()._ff_terms(ff, Constraints(), mol.GetConformer(), 1.0)
+    mech_mod.TrigonalAngle().uff_terms(ff, Constraints(), mol.GetConformer(), 1.0)
     ff.Initialize()
 
     assert ff.CalcEnergy() > 0
@@ -282,7 +282,7 @@ def test_trigonal_angle_repair_preserves_unstrained_native_energy_and_gradient(s
     ff.Initialize()
     energy, gradient = ff.CalcEnergy(), ff.CalcGrad()
 
-    mech_mod.TrigonalAngle()._ff_terms(ff, Constraints(), mol.GetConformer(), 1.0)
+    mech_mod.TrigonalAngle().uff_terms(ff, Constraints(), mol.GetConformer(), 1.0)
     ff.Initialize()
 
     assert ff.CalcEnergy() == pytest.approx(energy, abs=1e-12)
@@ -295,10 +295,10 @@ def test_conjugation_cap_excludes_only_a_coordinated_pi_carbon():
     metal = next(atom.GetIdx() for atom in mol.GetAtoms() if atom.GetIdx() not in {a, c, x, s})
     mechanism = mech_mod.ConjugationCap()
 
-    assert _ff_terms(mechanism, Constraints(metals={metal}, distances={(metal, s): (1.4, 1.6)}), mol).calls
-    assert not _ff_terms(mechanism, Constraints(metals={metal}, distances={(metal, c): (1.4, 1.6)}), mol).calls
+    assert uff_terms(mechanism, Constraints(metals={metal}, distances={(metal, s): (1.4, 1.6)}), mol).calls
+    assert not uff_terms(mechanism, Constraints(metals={metal}, distances={(metal, c): (1.4, 1.6)}), mol).calls
     contact = (min(metal, c), max(metal, c))
-    assert _ff_terms(
+    assert uff_terms(
         mechanism,
         Constraints(metals={metal}, distances={contact: (1.0, 2.0)}, contacts=(frozenset({contact}), frozenset())),
         mol,
@@ -309,8 +309,8 @@ def test_conjugation_cleanup_switch_is_uff_only():
     mol = _mol()
     mechanism = mech_mod.ConjugationCap()
 
-    assert _ff_terms(mechanism, Constraints(), mol).calls
-    assert not _ff_terms(mechanism, Constraints(conjugation=False), mol).calls
+    assert uff_terms(mechanism, Constraints(), mol).calls
+    assert not uff_terms(mechanism, Constraints(conjugation=False), mol).calls
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -345,10 +345,10 @@ def test_distance_writes_dg_and_ff():
     cons = Constraints(distances={(0, 3): (2.0, 2.4)})
 
     ctx = _ctx(mol)
-    mech_mod.Distance()._dg_windows(cons, ctx)
+    mech_mod.Distance().dg_windows(cons, ctx)
     assert ctx.pairs[(0, 3)] == (2.0, 2.4)
 
-    ff = _ff_terms(mech_mod.Distance(), cons, mol)
+    ff = uff_terms(mech_mod.Distance(), cons, mol)
     assert ff.kinds() == ["AddDistanceConstraint"]
     _name, args, _kw = ff.calls[0]
     assert args[:4] == (0, 3, 2.0, 2.4)
@@ -358,12 +358,12 @@ def test_haptic_radius_is_a_seed_prior_unless_explicitly_fixed():
     mol = _mol()
     cons = Constraints(distances={(0, 3): (0.6, 0.8), (1, 3): (0.6, 0.8), (2, 3): (1.9, 2.1)}, haptic={3: (0, 1)})
     ctx = _ctx(mol)
-    mech_mod.Distance()._dg_windows(cons, ctx)
+    mech_mod.Distance().dg_windows(cons, ctx)
     assert ctx.pairs == cons.distances
 
     for fixed in ({}, {(0, 3): (0.6, 0.8)}):
         cons.fixed = fixed
-        calls = _ff_terms(mech_mod.Distance(), cons, mol).calls
+        calls = uff_terms(mech_mod.Distance(), cons, mol).calls
         assert {args[:2] for _name, args, _kw in calls} == {(2, 3)} | set(fixed)
 
 
@@ -379,7 +379,7 @@ def test_haptic_penalty_moves_the_centroid_without_straining_its_face(size, stif
 
     for members in (tuple(range(size)), tuple(reversed(range(size)))):
         ff = rdForceFieldHelpers.CreateEmptyForceFieldForMol(mol)
-        mech_mod.Haptic()._ff_terms(ff, Constraints(haptic={size: members}), mol.GetConformer(), stiffness)
+        mech_mod.Haptic().uff_terms(ff, Constraints(haptic={size: members}), mol.GetConformer(), stiffness)
         ff.Initialize()
         for offset in (np.zeros(3), np.array((0.3, -0.2, 0.4))):
             positions = np.vstack((face, face.mean(axis=0) + offset)).ravel().tolist()
@@ -397,8 +397,8 @@ def test_overlapping_haptic_centroids_respect_frozen_members(frozen):
     mol.AddConformer(conf)
     cons = Constraints(haptic={4: (0, 1, 2), 5: (1, 2, 3)}, frozen=frozen)
     ff = rdForceFieldHelpers.CreateEmptyForceFieldForMol(mol)
-    mech_mod.Frozen()._ff_terms(ff, cons, mol.GetConformer(), 100.0)
-    mech_mod.Haptic()._ff_terms(ff, cons, mol.GetConformer(), 100.0)
+    mech_mod.Frozen().uff_terms(ff, cons, mol.GetConformer(), 100.0)
+    mech_mod.Haptic().uff_terms(ff, cons, mol.GetConformer(), 100.0)
     ff.Initialize()
 
     assert ff.Minimize(maxIts=200) == 0
@@ -411,11 +411,11 @@ def test_overlapping_haptic_centroids_respect_frozen_members(frozen):
 
 def test_pull_collapses_window_to_spring():
     mol = _mol()
-    ff = _ff_terms(mech_mod.Pull(), Constraints(pulls={(0, 3): 2.1}), mol)
+    ff = uff_terms(mech_mod.Pull(), Constraints(pulls={(0, 3): 2.1}), mol)
     _name, args, _kw = ff.calls[0]
     assert args[2] == args[3] == 2.1
 
-    fixed = _ff_terms(
+    fixed = uff_terms(
         mech_mod.Pull(),
         Constraints(fixed={(0, 3): (2.1, 2.1)}),
         mol,
@@ -426,7 +426,7 @@ def test_pull_collapses_window_to_spring():
 
 def test_reversed_distance_preference_suppresses_contact_midpoint_force():
     cons = Constraints(distances={(0, 3): (2.0, 4.0)}, pulls={(3, 0): 2.5}, contacts=(frozenset({(0, 3)}), frozenset()))
-    calls = _ff_terms(mech_mod.Pull(), cons, _mol()).calls
+    calls = uff_terms(mech_mod.Pull(), cons, _mol()).calls
     assert len(calls) == 1
     assert calls[0][1][2:4] == (2.5, 2.5)
 
@@ -441,8 +441,8 @@ def test_native_angle_preference_pulls_inside_the_window_without_escalation():
     energies = []
     for stiffness in (1.0, 100.0):
         ff = rdForceFieldHelpers.CreateEmptyForceFieldForMol(mol)
-        mech_mod.Angle()._ff_terms(ff, cons, mol.GetConformer(), stiffness)
-        mech_mod.Pull()._ff_terms(ff, cons, mol.GetConformer(), stiffness)
+        mech_mod.Angle().uff_terms(ff, cons, mol.GetConformer(), stiffness)
+        mech_mod.Pull().uff_terms(ff, cons, mol.GetConformer(), stiffness)
         ff.Initialize()
         energy = ff.CalcEnergy()
         assert energy > 0
@@ -454,16 +454,16 @@ def test_native_angle_preference_pulls_inside_the_window_without_escalation():
         assert rdMolTransforms.GetAngleDeg(mol.GetConformer(), *key) == pytest.approx(120.0, abs=1e-3)
         mol.GetConformer().SetPositions(conf.GetPositions())
     assert energies[0] == pytest.approx(energies[1])
-    calls = _ff_terms(mech_mod.Pull(), cons, mol).calls
+    calls = uff_terms(mech_mod.Pull(), cons, mol).calls
     assert len(calls) == 1
     for fixed in (key, key[::-1]):
         cons.fixed = {fixed: (100.0, 110.0)}
-        assert not _ff_terms(mech_mod.Pull(), cons, mol).calls
+        assert not uff_terms(mech_mod.Pull(), cons, mol).calls
 
 
 def test_floor_is_one_sided():
     mol = _mol()
-    ff = _ff_terms(mech_mod.Floor(), Constraints(floors={(0, 3): 2.6}), mol)
+    ff = uff_terms(mech_mod.Floor(), Constraints(floors={(0, 3): 2.6}), mol)
     _name, args, _kw = ff.calls[0]
     assert args[2] == 2.6
     assert args[3] >= 1e3, f"a floor's upper bound must stand in for infinity, got {args[3]}"
@@ -482,22 +482,22 @@ def test_later_distance_overrides_only_an_explicitly_owned_floor(authority):
     )
     cons = compose(base, stated)
     ctx = _ctx(mol)
-    mech_mod.Distance()._dg_windows(cons, ctx)
-    mech_mod.Floor()._dg_relief(cons, ctx)
+    mech_mod.Distance().dg_windows(cons, ctx)
+    mech_mod.Floor().dg_relief(cons, ctx)
 
     assert ctx.pairs[pair] == window
-    ff = _ff_terms(mech_mod.Floor(), cons, mol)
+    ff = uff_terms(mech_mod.Floor(), cons, mol)
     expected = [(*pair, 2.6), (*other, 2.7)] if authority == "automatic" else [(*other, 2.7)]
     assert [args[:3] for _name, args, _kw in ff.calls] == expected
     assert base.floors[pair] == 2.6, "overriding a pair must not mutate the reusable structural model"
     if authority == "contact":
-        released = _ff_terms(mech_mod.Floor(), cons.relaxed(), mol)
+        released = uff_terms(mech_mod.Floor(), cons.relaxed(), mol)
         assert [args[:3] for _name, args, _kw in released.calls] == [(*pair, 2.6), (*other, 2.7)]
 
 
 def test_frozen_pins_points_rather_than_restraining_them():
     mol = _mol()
-    ff = _ff_terms(mech_mod.Frozen(), Constraints(frozen={0, 1, 2}), mol)
+    ff = uff_terms(mech_mod.Frozen(), Constraints(frozen={0, 1, 2}), mol)
     assert ff.kinds() == ["AddFixedPoint"]
     assert sorted(a[0] for _n, a, _k in ff.calls) == [0, 1, 2]
 
@@ -507,15 +507,15 @@ def test_angle_writes_dg_and_ff_terms():
     cons = Constraints(angles={(0, 1, 3): (100.0, 120.0)})
 
     ctx = _ctx(mol)
-    mech_mod.Angle()._dg_windows(cons, ctx)
+    mech_mod.Angle().dg_windows(cons, ctx)
     assert (0, 3) in ctx.pairs, "an angle must state its end-atom diagonal in the matrix"
 
-    ff = _ff_terms(mech_mod.Angle(), cons, mol)
+    ff = uff_terms(mech_mod.Angle(), cons, mol)
     assert ff.kinds() == ["UFFAddAngleConstraint"]
     _name, args, _kw = ff.calls[0]
     assert args[:3] == (0, 1, 3)
 
-    fixed = _ff_terms(
+    fixed = uff_terms(
         mech_mod.Angle(),
         Constraints(angles={(0, 1, 3): (108.0, 112.0)}, fixed={(0, 1, 3): (110.0, 110.0)}),
         mol,
@@ -527,9 +527,9 @@ def test_angle_writes_dg_and_ff_terms():
 def test_angle_force_is_not_scaled_by_ladder():
     mol = _mol()
     cons = Constraints(angles={(0, 1, 3): (100.0, 120.0)})
-    assert _ff_terms(mech_mod.Angle(), cons, mol, fc=1.0).calls[0][1][-1] == mech_mod.ANGLE_FC
-    assert _ff_terms(mech_mod.Angle(), cons, mol, fc=0.1).calls[0][1][-1] == pytest.approx(0.1 * mech_mod.ANGLE_FC)
-    assert _ff_terms(mech_mod.Angle(), cons, mol, fc=100.0).calls[0][1][-1] == mech_mod.ANGLE_FC, (
+    assert uff_terms(mech_mod.Angle(), cons, mol, fc=1.0).calls[0][1][-1] == mech_mod.ANGLE_FC
+    assert uff_terms(mech_mod.Angle(), cons, mol, fc=0.1).calls[0][1][-1] == pytest.approx(0.1 * mech_mod.ANGLE_FC)
+    assert uff_terms(mech_mod.Angle(), cons, mol, fc=100.0).calls[0][1][-1] == mech_mod.ANGLE_FC, (
         "the ladder must not be able to escalate the angle wall"
     )
 
@@ -537,7 +537,7 @@ def test_angle_force_is_not_scaled_by_ladder():
 def test_dihedral_writes_periodic_uff_term():
     mol = _mol("CCCC")
     cons = Constraints(dihedrals={(0, 1, 2, 3): (170.0, 190.0)})
-    ff = _ff_terms(mech_mod.Dihedral(), cons, mol)
+    ff = uff_terms(mech_mod.Dihedral(), cons, mol)
     assert ff.kinds() == ["UFFAddTorsionConstraint"]
     assert ff.calls[0][1][:7] == (0, 1, 2, 3, False, 170.0, 190.0)
 
@@ -556,7 +556,7 @@ def test_point_umbrella_leaves_every_same_hand_geometry_unbiased(smiles, height)
     for carriers in itertools.permutations(range(1, mol.GetNumAtoms())):
         key = carriers if len(carriers) == 4 else (*carriers, 0)
         ff = rdForceFieldHelpers.CreateEmptyForceFieldForMol(mol)
-        mech_mod.Umbrella()._ff_terms(ff, Constraints(umbrellas={key: 0.0}), mol.GetConformer(), 1.0)
+        mech_mod.Umbrella().uff_terms(ff, Constraints(umbrellas={key: 0.0}), mol.GetConformer(), 1.0)
         ff.Initialize()
 
         assert ff.CalcEnergy() == pytest.approx(0.0, abs=1e-10), key
@@ -573,7 +573,7 @@ def test_planar_umbrella_preserves_both_sides_of_its_periodic_cap(seed_phi):
     conf = mol.GetConformer()
     rdMolTransforms.SetDihedralDeg(conf, *key, seed_phi)
     ff = rdForceFieldHelpers.CreateEmptyForceFieldForMol(mol)
-    mech_mod.Umbrella()._ff_terms(ff, Constraints(umbrellas={key: None}), conf, 1.0)
+    mech_mod.Umbrella().uff_terms(ff, Constraints(umbrellas={key: None}), conf, 1.0)
     ff.Initialize()
     centre = 0.0 if abs(seed_phi) < 90.0 else 180.0
     for offset in (-20.0, -14.0, 0.0, 14.0, 20.0):
@@ -596,7 +596,7 @@ def test_point_umbrella_defers_to_stated_dihedral_independent_of_carrier_order()
     mol = _mol("C(F)(Cl)(Br)I")
     for key in itertools.permutations((1, 2, 3, 4)):
         cons = Constraints(umbrellas={key: 0.0}, dihedrals={(1, 2, 3, 4): (10.0, 30.0)})
-        assert not _ff_terms(mech_mod.Umbrella(), cons, mol).calls, key
+        assert not uff_terms(mech_mod.Umbrella(), cons, mol).calls, key
 
 
 def test_weighted_planar_umbrella_scales_energy_and_gradient():
@@ -607,7 +607,7 @@ def test_weighted_planar_umbrella_scales_energy_and_gradient():
     for weight in (0.25, 0.5):
         ff = rdForceFieldHelpers.CreateEmptyForceFieldForMol(mol)
         cons = Constraints(umbrellas={(0, 1, 2, 3): (180.0, weight)})
-        mech_mod.Umbrella()._ff_terms(ff, cons, conf, 1.0)
+        mech_mod.Umbrella().uff_terms(ff, cons, conf, 1.0)
         ff.Initialize()
         results.append((ff.CalcEnergy(), np.array(ff.CalcGrad())))
     assert results[0][0] > 0.0
@@ -621,11 +621,11 @@ def test_umbrella_force_matches_support_overrides_and_not_shared_axes(ideal):
     for key in itertools.permutations((0, 1, 2, 3)):
         independent = (4, key[1], key[2], 5)
         cons = Constraints(umbrellas={key: ideal}, dihedrals={independent: (10.0, 30.0)})
-        assert _ff_terms(mech_mod.Umbrella(), cons, mol).calls
-        assert _ff_terms(mech_mod.Umbrella(), cons.copy(frozen=set(key[:3])), mol).calls
-        assert not _ff_terms(mech_mod.Umbrella(), cons.copy(frozen=set(key)), mol).calls
+        assert uff_terms(mech_mod.Umbrella(), cons, mol).calls
+        assert uff_terms(mech_mod.Umbrella(), cons.copy(frozen=set(key[:3])), mol).calls
+        assert not uff_terms(mech_mod.Umbrella(), cons.copy(frozen=set(key)), mol).calls
         cons.dihedrals = {(1, 0, 3, 2): (10.0, 30.0)}
-        assert not _ff_terms(mech_mod.Umbrella(), cons, mol).calls
+        assert not uff_terms(mech_mod.Umbrella(), cons, mol).calls
 
 
 @pytest.mark.parametrize("ideal", [None, 30.0, 0.0, (180.0, 0.25)])
@@ -637,12 +637,12 @@ def test_composed_numeric_fix_overrides_the_same_umbrella_support(ideal):
         for active in (cons, cons.relaxed()):
             assert active.fixed[key] == (20.0, 20.0)
             assert active.umbrellas == base.umbrellas
-            assert bool(_ff_terms(mech_mod.Umbrella(), active, mol).calls) != suppressed
+            assert bool(uff_terms(mech_mod.Umbrella(), active, mol).calls) != suppressed
     key = (1, 0, 3, 2)
     soft = Constraints(dihedrals={key: (10.0, 30.0)}, contacts=(frozenset(), frozenset({key})))
     point = compose(Constraints(umbrellas={(0, 1, 2, 3): 0.0}), soft)
-    assert not _ff_terms(mech_mod.Umbrella(), point, mol).calls
-    assert _ff_terms(mech_mod.Umbrella(), point.relaxed(), mol).calls
+    assert not uff_terms(mech_mod.Umbrella(), point, mol).calls
+    assert uff_terms(mech_mod.Umbrella(), point.relaxed(), mol).calls
 
 
 def test_releasable_contact_uses_softer_wall():
@@ -651,7 +651,7 @@ def test_releasable_contact_uses_softer_wall():
         distances={(0, 3): (2.0, 2.4), (1, 4): (2.0, 2.4)},
         contacts=(frozenset({(0, 3)}), frozenset()),
     )
-    emitted = {tuple(a[:2]): a[-1] for _n, a, _kw in _ff_terms(mech_mod.Distance(), cons, mol).calls}
+    emitted = {tuple(a[:2]): a[-1] for _n, a, _kw in uff_terms(mech_mod.Distance(), cons, mol).calls}
     assert emitted[(1, 4)] == pytest.approx(mech_mod.PIN_FC), "a structural window is held at PIN"
     softened = mech_mod.PIN_FC * mech_mod.RELEASABLE_FC_SCALE
     assert emitted[(0, 3)] == pytest.approx(softened), "a releasable one is softened"
@@ -663,11 +663,11 @@ def test_plane_holds_a_pi_stack_by_cross_ring_distances():
     cons = Constraints(planes=[(ra, rb, 3.6)])
 
     ctx = _ctx(mol)
-    mech_mod.Plane()._dg_windows(cons, ctx)
+    mech_mod.Plane().dg_windows(cons, ctx)
     assert ctx.pairs, "a stack must state cross-ring windows in the matrix"
     assert all(i in ra and j in rb for i, j in ctx.pairs), "a stack window must span the two rings"
 
-    ff = _ff_terms(mech_mod.Plane(), cons, mol)
+    ff = uff_terms(mech_mod.Plane(), cons, mol)
     assert ff.kinds() == ["AddDistanceConstraint"]
 
 
@@ -706,7 +706,7 @@ def test_distance_walls_scale_without_strengthening_target_pulls():
     emitted: dict[str, dict[float, float]] = {}
     for fc in (1.0, 100.0):
         for mech in mech_mod.MECHANISM_ORDER:
-            for name, args, _kw in _ff_terms(mech, cons, mol, fc=fc).calls:
+            for name, args, _kw in uff_terms(mech, cons, mol, fc=fc).calls:
                 if name.endswith("Constraint"):
                     emitted.setdefault(type(mech).__name__, {})[fc] = args[-1]
 

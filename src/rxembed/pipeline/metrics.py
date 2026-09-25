@@ -2,7 +2,7 @@
 
 Two checks, kept apart because they answer differently for a metal:
 
-* ``bonding_ok``: are the bond lengths sane? Covalent-radius cutoffs; metals are skipped (a dative
+* ``bonding_failure``: are the bond lengths sane? Covalent-radius cutoffs; metals are skipped (a dative
   distance is not a covalent one) and so is any pair the user gave a length for (that length is the
   request, not a broken bond). Owned by ``rxembed.relax``, which also uses it to gate its own relax;
   re-exported here so both sanity checks read side by side.
@@ -19,9 +19,11 @@ from rdkit import Chem
 from rdkit.Chem import GetPeriodicTable
 
 from rxembed.metal_core import metal_indices
-from rxembed.relax import bonding_ok
+from rxembed.metal_distance import APEX, NEAR, NEAR_REPORT_RATIO, OUTER_REPORT_MARGIN, overbond_tier
+from rxembed.relax import bonding_failure
+from rxembed.utils import atom_label
 
-__all__ = ["bonding_ok", "connectivity", "coordination_changed", "describe"]
+__all__ = ["bonding_failure", "connectivity", "coordination_changed", "describe"]
 
 _PT = GetPeriodicTable()
 _BREAK_RATIO = 1.5  # a bond is broken only past this multiple of its covalent-radius sum: a dissociation
@@ -56,6 +58,12 @@ def _perceive(mol, conf_id, charge=0, elements=None):
     return {frozenset(e) for e in graph.edges()}
 
 
+def _covalent_ratio(mol, pos, z, i, j):
+    """Return the i-j separation as a multiple of its covalent-radius sum, reading atomic numbers from `z` first."""
+    r = sum(_PT.GetRcovalent(z.get(k, mol.GetAtomWithIdx(k).GetAtomicNum())) for k in (i, j))
+    return float(np.linalg.norm(pos[i] - pos[j])) / r if r else float("inf")
+
+
 def connectivity(mol, conf_id, *, exclude=frozenset(), metals=frozenset(), charge=0, elements=None):
     """Re-perceive the graph from the geometry and diff it against the intended one: ``(formed, broken)``.
 
@@ -64,7 +72,7 @@ def connectivity(mol, conf_id, *, exclude=frozenset(), metals=frozenset(), charg
     answers that question instead); and pairs wholly inside ``exclude``, a TS's partial bonds being held to
     the reference by design. A core atom's bond to a free atom is still checked.
 
-    Unlike ``bonding_ok`` this sees hydrogen: a proton transfer is the most common silent change.
+    Unlike ``bonding_failure`` this sees hydrogen: a proton transfer is the most common silent change.
     """
     # A ZERO bond is an explicit non-covalent annotation (for example the H in an O-H~O bridge),
     # not a connectivity edge for the geometry perceiver to preserve.
@@ -79,28 +87,24 @@ def connectivity(mol, conf_id, *, exclude=frozenset(), metals=frozenset(), charg
     topo = Chem.GetDistanceMatrix(mol)
     z = elements or {}
 
-    def ratio(i, j):  # the pair's separation as a multiple of its covalent-radius sum
-        r = sum(_PT.GetRcovalent(z.get(k, mol.GetAtomWithIdx(k).GetAtomicNum())) for k in (i, j))
-        return float(np.linalg.norm(pos[i] - pos[j])) / r if r else float("inf")
-
     def judged(pair):  # a pair this check has an opinion about at all
         return not (pair & metals) and not (pair <= exclude)
 
     # Require distance evidence before interpreting a heuristic perception mismatch as a reaction.
-    def real_new(p):  # a new bond: far enough apart in the graph to be one, and actually at bonding distance
+    formed = []
+    for p in got - want:  # a new bond: far enough apart in the graph to be one, and actually at bonding distance
         i, j = sorted(p)
         hydrogens = [k for k in p if mol.GetAtomWithIdx(k).GetAtomicNum() == 1]
         one_terminal_h = len(hydrogens) == 1 and mol.GetAtomWithIdx(hydrogens[0]).GetDegree() == 1
         separated = topo[i][j] >= _MIN_TOPO or (topo[i][j] == 2 and one_terminal_h)  # noqa: PLR2004  1-3 angle
-        return judged(p) and separated and ratio(i, j) < _FORM_RATIO
-
-    def real_lost(p):  # a lost bond: genuinely dissociated, not merely strained or oddly perceived
+        if judged(p) and separated and _covalent_ratio(mol, pos, z, i, j) < _FORM_RATIO:
+            formed.append((i, j))
+    broken = []
+    for p in want - got:  # a lost bond: genuinely dissociated, not merely strained or oddly perceived
         i, j = sorted(p)
-        return judged(p) and ratio(i, j) > _BREAK_RATIO
-
-    formed = sorted(tuple(sorted(p)) for p in got - want if real_new(p))
-    broken = sorted(tuple(sorted(p)) for p in want - got if real_lost(p))
-    return formed, broken
+        if judged(p) and _covalent_ratio(mol, pos, z, i, j) > _BREAK_RATIO:
+            broken.append((i, j))
+    return sorted(formed), sorted(broken)
 
 
 def coordination_changed(mol, conf_id, metal, donors, factor=1.3, elements=None, exclude=frozenset(), constrained=()):
@@ -112,14 +116,6 @@ def coordination_changed(mol, conf_id, metal, donors, factor=1.3, elements=None,
     wholly inside ``exclude`` is a reacting core and is not judged; a donor's window in ``constrained``
     outranks the generic cutoff.
     """
-    from rxembed.metal_distance import (
-        APEX,
-        NEAR,
-        NEAR_REPORT_RATIO,
-        OUTER_REPORT_MARGIN,
-        overbond_tier,
-    )
-
     pos = mol.GetConformer(conf_id).GetPositions()
     z = elements or {}
     zm = z.get(metal, mol.GetAtomWithIdx(metal).GetAtomicNum())
@@ -157,6 +153,6 @@ def coordination_changed(mol, conf_id, metal, donors, factor=1.3, elements=None,
 
 def describe(mol, formed, broken):
     """Render a connectivity diff as chemistry (``C12-N17 formed``), never as bare indices."""
-    sym = lambda i: f"{mol.GetAtomWithIdx(i).GetSymbol()}{i}"  # noqa: E731
-    bits = [f"{sym(i)}-{sym(j)} formed" for i, j in formed] + [f"{sym(i)}-{sym(j)} broken" for i, j in broken]
+    bits = [f"{atom_label(mol, i)}-{atom_label(mol, j)} formed" for i, j in formed]
+    bits += [f"{atom_label(mol, i)}-{atom_label(mol, j)} broken" for i, j in broken]
     return ", ".join(bits)

@@ -7,10 +7,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdMolTransforms
+from rdkit.Chem import rdDistGeom, rdMolTransforms
 
 import rxembed as rx
 from rxembed import metal_core as metal
+from rxembed.pipeline import ensemble as ensemble_module
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.calculators import Calculator
 from rxembed.utils import Violation
@@ -45,8 +46,8 @@ def test_structurally_valid_nonconverged_result_stays_flagged(monkeypatch):
     ens = rx.embed("CCCC", n=1, seed=1)
     failed = ens.ids[0]
 
-    def nonconverged(mol, _cons, *, _statuses, **_kwargs):
-        _statuses.update({conf.GetId(): 1 for conf in mol.GetConformers()})
+    def nonconverged(mol, _cons, *, record, **_kwargs):
+        record.statuses.update({conf.GetId(): 1 for conf in mol.GetConformers()})
         return np.zeros(mol.GetNumConformers())
 
     monkeypatch.setattr(core_embed, "restrained_uff", nonconverged)
@@ -57,9 +58,36 @@ def test_structurally_valid_nonconverged_result_stays_flagged(monkeypatch):
     assert failed not in ens.discarded
 
 
-def test_optional_connectivity_gate_does_not_break_base_minimize(monkeypatch):
-    import rxembed.pipeline.ensemble as ensemble_module
+def test_minimize_energy_window_only_sees_conformers_after_the_rescore_pass(monkeypatch):
+    """The 250 kcal/mol window can only drop what `_rescore_restrained` has actually scored.
 
+    `_relax_constrained` no longer scores its own endpoints; every settled conformer's public energy comes
+    from one `_rescore_restrained` single point. That pass must run before the window filter, or a bad
+    result would silently skip it because it was never in `self.energies` yet.
+    """
+    import importlib
+
+    core_embed = importlib.import_module("rxembed.embed")
+    iso = rx.metal(_EN_PDBRCL, "square_planar")[0]
+    ens = rx.embed(iso, n=2, seed=1)
+    good, bad = ens.ids
+    real_uff = core_embed.restrained_uff
+
+    def marked_uff(mol, cons, *, stiffness, max_iters, conf_ids=None, **kw):
+        result = real_uff(mol, cons, stiffness=stiffness, max_iters=max_iters, conf_ids=conf_ids, **kw)
+        if max_iters == 0 and conf_ids is not None:
+            result = np.array([300.0 if int(cid) == bad else float(v) for cid, v in zip(conf_ids, result, strict=True)])
+        return result
+
+    monkeypatch.setattr(core_embed, "restrained_uff", marked_uff)
+    ens.minimize()
+
+    assert good in ens.ids
+    assert bad not in ens.ids
+    assert bad in ens.discarded
+
+
+def test_optional_connectivity_gate_does_not_break_base_minimize(monkeypatch):
     ens = rx.embed("CCCC", n=1, seed=1)
     monkeypatch.setattr(
         ensemble_module.Ensemble,
@@ -71,11 +99,9 @@ def test_optional_connectivity_gate_does_not_break_base_minimize(monkeypatch):
 
 
 def test_changed_connectivity_is_not_published(monkeypatch):
-    import rxembed.pipeline.ensemble as ensemble_module
-
     ens = rx.embed("CCCC", n=1, seed=1)
     failed = ens.ids[0]
-    monkeypatch.setattr(ensemble_module._metrics, "connectivity", lambda *args, **kwargs: ([(0, 3)], []))
+    monkeypatch.setattr(ensemble_module, "connectivity", lambda *args, **kwargs: ([(0, 3)], []))
 
     ens.minimize()
 
@@ -84,11 +110,9 @@ def test_changed_connectivity_is_not_published(monkeypatch):
 
 
 def test_ligand_distance_constraint_does_not_exempt_a_graph_change(monkeypatch):
-    import rxembed.pipeline.ensemble as ensemble_module
-
     ens = rx.embed("CC", n=1, seed=1)
     ens.cons.distances[(0, 1)] = (1.4, 1.6)
-    monkeypatch.setattr(ensemble_module._metrics, "connectivity", lambda *args, **kwargs: ([(0, 1)], []))
+    monkeypatch.setattr(ensemble_module, "connectivity", lambda *args, **kwargs: ([(0, 1)], []))
 
     assert ens._scan_connectivity()
 
@@ -152,8 +176,6 @@ def test_metal_physical_gate_keeps_explicit_geometry_diagnostic(authority):
 
 
 def test_cleanup_ablations_filter_only_their_own_workflow_diagnostics(monkeypatch):
-    import rxembed.pipeline.ensemble as ensemble_module
-
     iso = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", "SPL")[0]
     ens = rx.embed(iso, n=1, params=rx.EmbedParams(seed=42, donor_orientation=False, conjugation=False))
     report = geom.GeometryReport(
@@ -162,24 +184,22 @@ def test_cleanup_ablations_filter_only_their_own_workflow_diagnostics(monkeypatc
             Violation("conjugation", (0, 1, 2, 3), value=90.0, limit=30.0),
         ]
     )
-    monkeypatch.setattr(ensemble_module._geometry, "check", lambda *_args, **_kwargs: report)
+    monkeypatch.setattr(ensemble_module.geom_check, "check", lambda *_args, **_kwargs: report)
 
     assert ens._workflow_failure(ens, ens.ids[0]) is None
 
 
-def test_donor_orientation_violation_warns_without_failing_the_workflow_gate(monkeypatch, caplog):
-    import rxembed.pipeline.ensemble as ensemble_module
-
+def test_donor_orientation_violation_logs_without_failing_the_workflow_gate(monkeypatch, caplog):
     iso = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", "SPL")[0]
     ens = rx.embed(iso, n=1, seed=42)
     detail = "N0 (sp3) M-D-X to C1: 99.5 deg < census floor 104 deg; inspect donor geometry and restraints"
     report = geom.GeometryReport([Violation("donor_orientation", (0, 1, 2), value=99.5, limit=104.0, detail=detail)])
-    monkeypatch.setattr(ensemble_module._geometry, "check", lambda *_args, **_kwargs: report)
+    monkeypatch.setattr(ensemble_module.geom_check, "check", lambda *_args, **_kwargs: report)
 
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
+    with caplog.at_level(logging.DEBUG, logger="rxembed"):
         failure = ens._workflow_failure(ens, ens.ids[0])
     assert failure is None, "a donor-orientation floor violation must not fail the workflow gate"
-    assert f"donor orientation: {detail}" in caplog.text
+    assert [record.levelno for record in caplog.records if detail in record.getMessage()] == [logging.DEBUG]
 
 
 def test_metal_embed_replaces_a_puckered_ligand_without_changing_the_isomer(monkeypatch):
@@ -226,10 +246,8 @@ def test_workflow_gate_restores_only_the_conformer_being_checked(monkeypatch):
 
 
 def test_wrong_requested_stereo_fails_if_replacement_cannot_restore_count(monkeypatch):
-    import rxembed.pipeline.ensemble as ensemble_module
-
     ens = rx.embed("CCCC", n=1, seed=1)
-    ens._stereo = ("preserve", ())
+    ens.stereo_filter = ("preserve", ())
     monkeypatch.setattr(
         ensemble_module.Ensemble,
         "_workflow_failure",
@@ -289,7 +307,7 @@ def test_explicitly_fixed_spectator_ferrocene_stays_rigid():
         _MN_H2, 0, metal_charges={0: 2, 1: 1}
     )  # find the spectator from the MOLECULE, so a missing record fails loudly
     fe = next(
-        a.GetIdx() for a in ref.GetAtoms() if a.GetAtomicNum() in metal.TRANSITION_METALS and a.GetSymbol() != "Mn"
+        a.GetIdx() for a in ref.GetAtoms() if a.GetAtomicNum() in metal.COORDINATION_METALS and a.GetSymbol() != "Mn"
     )
     shape = {fe, *(n.GetIdx() for n in ref.GetAtomWithIdx(fe).GetNeighbors())}
 
@@ -334,19 +352,17 @@ def test_search_disconnects_then_minimize_reconnects_metal():
 
 @pytest.mark.parametrize("smiles", [_EN_PDBRCL, "[Pd+2]"], ids=["coordinated", "vacant"])
 def test_search_rebuilds_the_selected_surrogate_graph(monkeypatch, smiles):
-    import rxembed.pipeline.ensemble as ensemble_module
-
     iso = rx.metal(smiles, "square_planar")[0]
     ens = rx.embed(iso, n=1, seed=1).minimize()
     assert ens._mol.GetAtomWithIdx(iso.metal).GetAtomicNum() != metal.SURROGATE
     seen = []
 
-    monkeypatch.setattr(ensemble_module._mc, "available", lambda: True)
+    monkeypatch.setattr(ensemble_module.search, "available", lambda: True)
 
     def inspect(mol, *_args, **_kwargs):
         seen.append(mol.GetAtomWithIdx(iso.metal).GetAtomicNum())
 
-    monkeypatch.setattr(ensemble_module._mc, "search", inspect)
+    monkeypatch.setattr(ensemble_module.search, "search", inspect)
     ens.mc()
 
     assert seen == [metal.SURROGATE]
@@ -550,7 +566,7 @@ def test_uff_surrogate_cleanup_is_reported_as_an_approximate_objective():
     selenium = next(atom.GetIdx() for atom in ens.mol.GetAtoms() if atom.GetSymbol() == "Se")
 
     assert ens.energies
-    assert ens.uff_surrogates == {selenium: (34, 16)}
+    assert ens.uff.surrogates == {selenium: (34, 16)}
     assert ens.energy_kind == "uff-surrogate"
     assert ens[0].energy_kind == "uff-surrogate"
 
@@ -559,21 +575,20 @@ def test_slice_preserves_ensemble_state():
     ens = rx.embed("CCCCO", n=4, params=rx.EmbedParams(seed=1, knowledge=False)).minimize()
     flagged = ens.ids[0]
     ens.unrelaxed = [flagged]
-    ens.uff_surrogates = {3: (34, 16)}
-    ens.uff_retyped_bonds = {(1, 2)}
+    ens.uff.surrogates = {3: (34, 16)}
+    ens.uff.retyped = {(1, 2)}
     assert ens.energy_kind == "ff"
     child = ens[0]
     assert child.energy_kind == "ff"
     assert child.params == rx.EmbedParams(seed=1, knowledge=False)
     assert child._mol is not ens._mol
     assert child.unrelaxed is not ens.unrelaxed
-    assert child.uff_surrogates is not ens.uff_surrogates
+    assert child.uff is not ens.uff
     assert child._stage == ens._stage == "minimized"
     assert child.unrelaxed == [flagged]
-    assert child.uff_surrogates == ens.uff_surrogates
-    assert child.uff_retyped_bonds == ens.uff_retyped_bonds
+    assert child.uff == ens.uff
     assert ens.lowest(2).energy_kind == "ff"
-    assert ens.lowest(2).uff_surrogates == ens.uff_surrogates
+    assert ens.lowest(2).uff.surrogates == ens.uff.surrogates
     aligned = ens.align()
     assert aligned.energy_kind == "ff"
     assert (aligned.params.knowledge, aligned.params.prune_rms) == (False, None)
@@ -650,3 +665,42 @@ def test_optimize_rejects_numeric_fix_drift():
     ens = rx.embed("[O-].ClCCCCBr", fix={(2, 0): 1.557}, n=1, seed=1, stereo="free")
     with pytest.raises(RuntimeError, match="moved every numeric fix"):
         ens.optimize(MovingCalculator())
+
+
+def test_wrap_labels_its_computed_force_field_single_point():
+    mol = rx.embed("CCO", n=1, seed=1).mol
+    ens = rx.wrap(mol, minimized=True)
+
+    assert ens.energies
+    assert ens.energy_kind == "ff"
+
+
+# --- encounter bounds: a probe geometry decides a discrete question, so it must not read process history ---
+
+
+def _two_fragments():
+    return Chem.AddHs(Chem.MolFromSmiles("OC(=O)CCCc1ccccc1.NCCCCN"))
+
+
+def _burn_global_rng(n=64):
+    """Consume RDKit global randomness, standing in for whatever ran before us in a real session."""
+    for _ in range(n):
+        m = Chem.AddHs(Chem.MolFromSmiles("CCCCO"))
+        rdDistGeom.EmbedMolecule(m, rdDistGeom.ETKDGv3())  # deliberately unseeded
+
+
+def test_encounter_bounds_ignore_global_rng():
+    mol = _two_fragments()
+    assert len(Chem.GetMolFrags(mol)) >= 2, "fixture must be multi-fragment to exercise the encounter bounds"
+    before = ensemble_module.encounter_bounds(mol)
+    assert before, "no inter-fragment bound was produced: the fixture is not exercising the code"
+    _burn_global_rng()
+    assert ensemble_module.encounter_bounds(mol) == before
+
+
+def test_probe_seed_is_forwarded(monkeypatch):
+    seen = []
+    real = ensemble_module.probe_conformer
+    monkeypatch.setattr(ensemble_module, "probe_conformer", lambda m, s: (seen.append(s), real(m, s))[1])
+    ensemble_module.encounter_bounds(_two_fragments(), seed=4321)
+    assert seen == [4321]

@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 
 import numpy as np
 from rdkit import Chem, rdBase
-from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers, rdMolTransforms
-from rdkit.Chem import rdtrajectory as _rdtrajectory
+from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers, rdMolTransforms, rdtrajectory
 
-from . import mechanisms as _mech
-from .constraints import _DIHEDRAL_ATOMS
+from .constraints import DIHEDRAL_ATOMS
+from .mechanisms import MECHANISM_ORDER
 from .metal_core import COORDINATION_METALS, materialise_phantoms, strip_phantoms
-from .utils import _CARBON_Z
+from .utils import CARBON_Z, Violation, atom_label
 
 FF_SURROGATE = 3  # Bondless Li avoids the singular CN>=3 UFF angle term while retaining a soft vdW sphere.
 UFF_GHOST = 54  # Untypeable Xe gives a haptic centroid no UFF terms inside its ring.
@@ -49,31 +49,27 @@ class UFFOptimizationError(RuntimeError):
 
 def _raise_uff_typing_error(mol, atoms):
     """Raise UFFTypingError naming the untypeable atoms and the one remedy: a different relaxation backend."""
-    names = ", ".join(f"{mol.GetAtomWithIdx(i).GetSymbol()}{i}" for i in atoms) or "unknown"
+    names = ", ".join(atom_label(mol, i) for i in atoms) or "unknown"
     raise UFFTypingError(f"UFF has unsupported atom types ({names}); use a different relaxation backend")
 
 
-def _error_summary(error):
+def error_summary(error):
     """Return the useful line from a multiline RDKit force-field error."""
     noise = ("Pre-condition Violation", "Violation occurred", "Failed Expression", "RDKIT:", "BOOST:")
     lines = [line.strip() for line in str(error).splitlines() if line.strip()]
     return next((line for line in lines if not line.startswith(noise)), lines[-1] if lines else "unknown error")
 
 
-def bonding_ok(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset(), constrained=()):
-    """Return whether heavy-atom bonds and clashes match the stated graph.
+def bonding_failure(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset(), constrained=()):
+    """Return the first heavy-atom bond or clash violation as a `Violation`, or ``None``.
 
     Frozen-core, metal and explicitly constrained pairs are exempt because covalent radii do not define their
-    intended distances. The exemption is per pair, so broken free-periphery bonds still fail.
+    intended distances. The exemption is per pair, so broken free-periphery bonds still fail. `atoms` names the
+    pair, `()` for the whole-conformer non-finite case.
     """
-    return _bonding_failure(mol, conf_id, bond_tol, clash_tol, exclude, constrained) is None
-
-
-def _bonding_failure(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset(), constrained=()):
-    """Return the first heavy-atom bond or clash violation, or ``None``."""
     pos = mol.GetConformer(conf_id).GetPositions()
     if not np.all(np.isfinite(pos)):
-        return "non-finite coordinates"
+        return Violation("nonfinite", (), value=float("nan"), limit=0.0, detail="non-finite coordinates")
     heavy = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
     metals = {i for i in heavy if mol.GetAtomWithIdx(i).GetAtomicNum() in COORDINATION_METALS}
     exclude = set(exclude)
@@ -90,12 +86,23 @@ def _bonding_failure(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozense
             cut = rcov[i] + rcov[j]
             if frozenset((i, j)) in bonded:
                 if d > bond_tol * cut or d < clash_tol * cut:  # bonded pair stretched/broken OR crushed
-                    relation = "above" if d > bond_tol * cut else "below"
-                    limit = bond_tol * cut if relation == "above" else clash_tol * cut
-                    return f"bond {i}-{j} {d:.3f} A {relation} {limit:.3f} A"
+                    stretched = d > bond_tol * cut
+                    limit = bond_tol * cut if stretched else clash_tol * cut
+                    change = "stretched" if stretched else "squeezed"
+                    detail = f"bond {atom_label(mol, i)}-{atom_label(mol, j)} {change} to {d:.2f} A"
+                    return Violation("bond", (i, j), value=d, limit=limit, detail=detail)
             elif d < clash_tol * cut:  # non-bonded pair fused/clashing
-                return f"clash {i}-{j} {d:.3f} A below {clash_tol * cut:.3f} A"
+                detail = f"{atom_label(mol, i)}...{atom_label(mol, j)} clash at {d:.2f} A"
+                return Violation("clash", (i, j), value=d, limit=clash_tol * cut, detail=detail)
     return None
+
+
+def _valence_pressure(mol, idx):
+    """Rank an atom for a dative retype by valence violation, excess valence, then degree."""
+    atom = mol.GetAtomWithIdx(idx)
+    default = max(_PT.GetDefaultValence(atom.GetAtomicNum()), 0)
+    excess = atom.GetValence(Chem.ValenceType.EXPLICIT) - default
+    return atom.HasValenceViolation(), excess, atom.GetDegree()
 
 
 def _uff_core_graphs(mol, frozen):
@@ -110,15 +117,9 @@ def _uff_core_graphs(mol, frozen):
         if b.GetBeginAtomIdx() in frozen and b.GetEndAtomIdx() in frozen and b.GetBondType() != Chem.BondType.DATIVE
     ]
 
-    def pressure(i):
-        atom = mol.GetAtomWithIdx(i)
-        default = max(_PT.GetDefaultValence(atom.GetAtomicNum()), 0)
-        excess = atom.GetValence(Chem.ValenceType.EXPLICIT) - default
-        return atom.HasValenceViolation(), excess, atom.GetDegree()
-
     directed = []
     for i, j in bonds:
-        start, end = sorted((i, j), key=pressure, reverse=True)
+        start, end = sorted((i, j), key=lambda idx: _valence_pressure(mol, idx), reverse=True)
         if mol.GetAtomWithIdx(start).HasValenceViolation():
             directed.append((start, end))
 
@@ -130,8 +131,8 @@ def _uff_core_graphs(mol, frozen):
         by_start.setdefault(edge[0], []).append(edge)
     combined = []
     for start, edges in by_start.items():
-        needed = max(1, int(pressure(start)[1]))
-        combined.extend(sorted(edges, key=lambda edge: pressure(edge[1]))[:needed])
+        needed = max(1, int(_valence_pressure(mol, start)[1]))
+        combined.extend(sorted(edges, key=lambda edge: _valence_pressure(mol, edge[1]))[:needed])
     if len(combined) > 1:
         choices.append(combined)
     for chosen in choices:
@@ -155,31 +156,33 @@ def _uff_core_graphs(mol, frozen):
         yield out, tuple(chosen)
 
 
-def ff_energies(mol, minimize=True, max_iters=MAX_ITERS, _statuses=None):
-    """FF energies (MMFF94s where typeable, else UFF); optimise in place first when ``minimize``."""
+def _force_field(mol, props, conf_id):
+    """Build MMFF94s from its molecule properties, or UFF when `props` is ``None``."""
+    if props is not None:
+        return rdForceFieldHelpers.MMFFGetMoleculeForceField(mol, props, confId=conf_id)
+    return rdForceFieldHelpers.UFFGetMoleculeForceField(mol, confId=conf_id)
+
+
+def ff_energies(mol, minimize=True, max_iters=MAX_ITERS, statuses=None):
+    """FF energies (MMFF94s where typeable, else UFF); optimise in place first when ``minimize``.
+
+    ``statuses``, when given, receives each conformer's optimizer status by id.
+    """
     use_mmff = rdForceFieldHelpers.MMFFHasAllMoleculeParams(mol)
     if not use_mmff and not _uff_typeable(mol, ()):
         _raise_uff_typing_error(mol, _uff_missing_atoms(mol, ()))
     props = rdForceFieldHelpers.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s") if use_mmff else None
-
-    def ff(c):
-        return (
-            rdForceFieldHelpers.MMFFGetMoleculeForceField(mol, props, confId=c)
-            if use_mmff
-            else rdForceFieldHelpers.UFFGetMoleculeForceField(mol, confId=c)
-        )
-
     if minimize:
-        statuses = {} if _statuses is None else _statuses
-        objective = ff(-1)
+        recorded = {} if statuses is None else statuses
+        objective = _force_field(mol, props, -1)
         res = rdForceFieldHelpers.OptimizeMoleculeConfs(mol, objective, numThreads=0, maxIters=max_iters)
-        statuses.update(
+        recorded.update(
             {conf.GetId(): int(status) for conf, (status, _energy) in zip(mol.GetConformers(), res, strict=True)}
         )
-        _warn_unconverged(statuses, max_iters, (conf.GetId() for conf in mol.GetConformers()))
+        _warn_unconverged(recorded, max_iters, (conf.GetId() for conf in mol.GetConformers()))
         # Refresh endpoint distances on the original field, retaining its initial nonbonded contribution list.
         return np.array([objective.CalcEnergy(tuple(c.GetPositions().ravel())) for c in mol.GetConformers()])
-    return np.array([ff(c.GetId()).CalcEnergy() for c in mol.GetConformers()])
+    return np.array([_force_field(mol, props, c.GetId()).CalcEnergy() for c in mol.GetConformers()])
 
 
 def _ff_surrogate(mol, metals, phantoms=()):
@@ -302,7 +305,7 @@ def _uff_surrogate_graph(mol, cons):
                 for neighbor in atom.GetNeighbors()
             ):
                 return None
-            surrogate_z = _CARBON_Z
+            surrogate_z = CARBON_Z
         if surrogate_z is None:
             return None
         atom.SetAtomicNum(surrogate_z)
@@ -364,7 +367,7 @@ def _seat_fixed_dihedrals(confs, fixed, frozen):
     """Rotate connected fixed dihedrals near target without disturbing a rigid graft."""
     frozen = sorted(frozen)
     for atoms, (lo, hi) in fixed.items():
-        if len(atoms) != _DIHEDRAL_ATOMS:
+        if len(atoms) != DIHEDRAL_ATOMS:
             continue
         i, j, k, w = atoms
         for conf in confs:
@@ -377,19 +380,27 @@ def _seat_fixed_dihedrals(confs, fixed, frozen):
                 conf.SetPositions(before)  # a coordinate graft is stricter than a numeric torsion
 
 
-def _report_uff_typing(mol, retyped, replacements, previous_retyped, previous_surrogates):
-    """Report private typing changes once per relaxation workflow."""
+@dataclass
+class UFFRecord:
+    """Collect what `restrained_uff` reports besides energies, across every call given the same record.
+
+    A caller that passes a record owns the non-convergence warning; without one, `restrained_uff` warns.
+    """
+
+    statuses: dict = field(default_factory=dict)  # conformer id -> status of its last minimisation, 0 converged
+    snapshots: dict | None = None  # conformer id -> frames of its last minimisation; recorded only in a dict
+    surrogates: dict = field(default_factory=dict)  # atom -> (real Z, private UFF Z) element substitution
+    retyped: set = field(default_factory=set)  # private donor -> acceptor dative bond edges
+
+
+def _report_uff_typing(mol, retyped, replacements, record):
+    """Report private typing changes at WARNING the first time `record` sees them, then at DEBUG."""
     if retyped:
-        first_report = previous_retyped is None or not set(retyped) <= previous_retyped
-        names = ", ".join(
-            f"{mol.GetAtomWithIdx(start).GetSymbol()}{start}->{mol.GetAtomWithIdx(end).GetSymbol()}{end}"
-            for start, end in retyped
-        )
+        first_report = not set(retyped) <= record.retyped
+        names = ", ".join(f"{atom_label(mol, start)}->{atom_label(mol, end)}" for start, end in retyped)
         (logger.warning if first_report else logger.debug)("UFF: private fixed-core dative typing for %s", names)
     if replacements:
-        first_report = previous_surrogates is None or any(
-            previous_surrogates.get(idx) != pair for idx, pair in replacements.items()
-        )
+        first_report = any(record.surrogates.get(idx) != pair for idx, pair in replacements.items())
         names = ", ".join(
             f"{_PT.GetElementSymbol(real_z)}{idx}->{_PT.GetElementSymbol(surrogate_z)}"
             for idx, (real_z, surrogate_z) in sorted(replacements.items())
@@ -406,10 +417,7 @@ def restrained_uff(
     stiffness=1.0,
     max_iters=MAX_ITERS,
     conf_ids=None,
-    _snapshots=None,
-    _statuses=None,
-    _surrogates=None,
-    _retyped=None,
+    record=None,
 ):
     """Minimise conformers with frozen atoms and flat-bottomed constraint terms.
 
@@ -418,18 +426,21 @@ def restrained_uff(
     is not a multiplier over the whole objective. Metal and haptic typing changes only a private graph;
     relaxed real-atom coordinates return to ``mol``. Any exception restores every selected conformer to its
     coordinates before torsion seating or minimisation.
+
+    ``record``, a `UFFRecord`, receives each minimised conformer's optimizer status and frames and the private
+    typing changes; a single point records no status.
     """
     frozen = set(cons.frozen)
     confs = list(mol.GetConformers()) if conf_ids is None else [mol.GetConformer(int(i)) for i in conf_ids]
-    statuses = {} if _statuses is None else _statuses
+    out = UFFRecord() if record is None else record
     original = {conf.GetId(): conf.GetPositions().copy() for conf in confs}
     energies = []
     try:
         _seat_fixed_dihedrals(confs, cons.fixed if max_iters else {}, frozen)
         work = materialise_phantoms(mol, cons.haptic)
         work = _ff_surrogate(work, cons.metals, cons.phantoms)
-        target, effective_cons, retyped, replacements = _select_uff_graph(work, cons, frozen)
-        _report_uff_typing(mol, retyped, replacements, _retyped, _surrogates)
+        target, effective_cons, dative_edges, replacements = _select_uff_graph(work, cons, frozen)
+        _report_uff_typing(mol, dative_edges, replacements, out)
         for conf in confs:
             cid = conf.GetId()
             stage = "force-field construction"
@@ -440,16 +451,16 @@ def restrained_uff(
                     )
                 stage = "constraint setup"
                 with rdBase.BlockLogs():
-                    for mechanism in _mech.MECHANISM_ORDER:
-                        mechanism._ff_terms(ff, effective_cons, target.GetConformer(cid), stiffness)
+                    for mechanism in MECHANISM_ORDER:
+                        mechanism.uff_terms(ff, effective_cons, target.GetConformer(cid), stiffness)
                 ff.Initialize()
                 stage = "minimization"
-                if _snapshots is None:
+                if out.snapshots is None:
                     status = ff.Minimize(maxIts=max_iters)
                 else:
-                    status, snapshots = ff.MinimizeTrajectory(1, maxIts=max_iters)
-                    trajectory = _rdtrajectory.Trajectory(3, target.GetNumAtoms(), snapshots)
-                    _snapshots[cid] = [
+                    status, frames = ff.MinimizeTrajectory(1, maxIts=max_iters)
+                    trajectory = rdtrajectory.Trajectory(3, target.GetNumAtoms(), frames)
+                    out.snapshots[cid] = [
                         np.array(
                             [
                                 [snapshot.GetPoint3D(i).x, snapshot.GetPoint3D(i).y, snapshot.GetPoint3D(i).z]
@@ -459,12 +470,12 @@ def restrained_uff(
                         for snapshot in (trajectory.GetSnapshot(i) for i in range(len(trajectory)))
                     ]
                 if max_iters:  # A single point has no optimizer convergence status.
-                    statuses[cid] = int(status)
+                    out.statuses[cid] = int(status)
                 # Explicit coordinates clear native distance caches left by a rejected line-search trial.
                 energy = ff.CalcEnergy(ff.Positions())
             except RuntimeError as error:
                 error_type = UFFTypingError if stage == "force-field construction" else UFFOptimizationError
-                raise error_type(f"UFF {stage} failed: {_error_summary(error)}") from error
+                raise error_type(f"UFF {stage} failed: {error_summary(error)}") from error
             energies.append(energy)
             if target is not mol:  # copy only real atoms off the metal/phantom/fixed-core FF graph
                 conf.SetPositions(target.GetConformer(cid).GetPositions()[: mol.GetNumAtoms()])
@@ -472,12 +483,10 @@ def restrained_uff(
         for cid, positions in original.items():
             mol.GetConformer(cid).SetPositions(positions)
         raise
-    if _surrogates is not None:
-        _surrogates.update(replacements)
-    if _retyped is not None:
-        _retyped.update(retyped)
-    if _statuses is None:
-        _warn_unconverged(statuses, max_iters, (conf.GetId() for conf in confs))
+    out.surrogates.update(replacements)
+    out.retyped.update(dative_edges)
+    if record is None:
+        _warn_unconverged(out.statuses, max_iters, (conf.GetId() for conf in confs))
     return np.array(energies)
 
 

@@ -5,12 +5,11 @@ from importlib.util import find_spec
 import numpy as np
 import pytest
 
+import rxembed as rx
 from rxembed.pipeline import search
 
 
 def test_missing_mc_backend_preserves_ensemble(monkeypatch):
-    import rxembed as rx
-
     monkeypatch.setattr(search, "available", lambda: False)
     ens = rx.embed("CCCCCCO", n=3, seed=1).minimize()
     before = (list(ens.ids), dict(ens.energies), ens.energy_kind, ens._stage)
@@ -25,8 +24,6 @@ def test_missing_mc_backend_preserves_ensemble(monkeypatch):
 
 
 def test_failed_search_clears_stale_energies(monkeypatch):
-    import rxembed as rx
-
     def fail(*args, **kwargs):
         raise RuntimeError("failed")
 
@@ -72,8 +69,6 @@ def test_constrained_search_rejects_low_mode(caplog):
     ],
 )
 def test_mc_preserves_only_constrained_seeds(spec, seeds_survive):
-    import rxembed as rx
-
     ens = rx.embed("CCCCCCO", n=4, seed=1, **spec)
     seeds = set(ens.ids)
     ens.mc(preset="ensemble", seed=1, max_out=8)
@@ -85,8 +80,6 @@ def test_mc_preserves_only_constrained_seeds(spec, seeds_survive):
 
 @pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
 def test_prune_deduplicates_search_results():
-    import rxembed as rx
-
     ens = rx.embed("CCCCCCO", n=6, seed=1).mc(preset="rapid", seed=1, max_out=20)
     searched = ens.n
     ens.prune(max_rmsd=1.5)
@@ -96,8 +89,6 @@ def test_prune_deduplicates_search_results():
 
 @pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
 def test_explore_pools_released_grip_and_clears_provenance():
-    import rxembed as rx
-
     es = rx.embed("CC(=O)O.n1ccccc1", contacts="auto", n=6)
     ens = es[0] if isinstance(es, rx.EnsembleSet) else es
     assert any(ens.cons.contacts), "the seeded grip must be recorded as releasable before explore"

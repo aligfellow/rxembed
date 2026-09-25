@@ -14,9 +14,9 @@ import numpy as np
 from rdkit import Chem
 
 _PT = Chem.GetPeriodicTable()
-_CARBON_Z = 6
-_SP2_DEGREE = 3  # a planar sp2 centre has exactly three neighbours
-_DISCONNECTED = 1e6  # RDKit's topological distance for atoms in different fragments (it returns ~1e8)
+CARBON_Z = 6
+SP2_DEGREE = 3  # a planar sp2 centre has exactly three neighbours
+DISCONNECTED = 1e6  # RDKit's topological distance for atoms in different fragments (it returns ~1e8)
 _TETRAHEDRAL_DEGREE = 4  # the only degree at which a CW/CCW tag has a bond-order parity: see `bond_removal_mirrors`
 _MIRRORED = {  # the two tetrahedral tags; no other ChiralType is a parity over the bond order
     Chem.ChiralType.CHI_TETRAHEDRAL_CW: Chem.ChiralType.CHI_TETRAHEDRAL_CCW,
@@ -24,7 +24,7 @@ _MIRRORED = {  # the two tetrahedral tags; no other ChiralType is a parity over 
 }
 
 
-def _cip_cache_key(mol, centers=()):
+def cip_cache_key(mol, centers=()):
     """Return a hashable key for `mol`'s chemical content, plus an optional labelled-centre tuple.
 
     A wrong key here silently hands back another molecule's cached answer, so it must cover every field two
@@ -129,7 +129,7 @@ def conjugated_quartets(mol, exclude=frozenset()):
         if b.GetBondType() != Chem.BondType.SINGLE or b.IsInRing():
             continue
         for x_atom, c_atom in ((b.GetBeginAtom(), b.GetEndAtom()), (b.GetEndAtom(), b.GetBeginAtom())):
-            if x_atom.GetAtomicNum() not in (7, 8) or c_atom.GetAtomicNum() != _CARBON_Z:
+            if x_atom.GetAtomicNum() not in (7, 8) or c_atom.GetAtomicNum() != CARBON_Z:
                 continue
             if x_atom.GetIdx() in exclude or c_atom.GetIdx() in exclude:
                 continue
@@ -149,18 +149,19 @@ def conjugated_quartets(mol, exclude=frozenset()):
             yield dbl[0].GetIdx(), c_atom.GetIdx(), x_atom.GetIdx(), subs[0].GetIdx()
 
 
-def _positions(mol_or_pos, conf_id: int = -1) -> np.ndarray:
-    """(N, 3) coordinates from a Mol conformer or a pass-through array."""
+def as_positions(mol_or_pos, conf_id: int = -1) -> np.ndarray:
+    """Return (N, 3) coordinates from a Mol conformer, passing an array through unchanged."""
     if isinstance(mol_or_pos, np.ndarray):
         return mol_or_pos
     return mol_or_pos.GetConformer(conf_id).GetPositions()
 
 
-def _rcov(z: int) -> float:
-    return _PT.GetRcovalent(z)
+def atom_label(mol, idx):
+    """Return an atom's element symbol followed by its index, as messages print it: ``'C12'``."""
+    return f"{mol.GetAtomWithIdx(int(idx)).GetSymbol()}{int(idx)}"
 
 
-def _lone_pair(atom, metals):
+def lone_pair_electrons(atom, metals):
     """Return `atom`'s nonbonding valence: outer electrons minus formal charge minus bonded valence.
 
     A bond to a metal is stripped from the bonded-valence term first (`Bond.GetValenceContrib`, zero
@@ -175,7 +176,8 @@ def _lone_pair(atom, metals):
     return _PT.GetNOuterElecs(atom.GetAtomicNum()) - atom.GetFormalCharge() - (atom.GetTotalValence() - to_metal)
 
 
-def _angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+def bond_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    """Return the a-b-c angle in degrees, or NaN when a leg has zero length."""
     u, w = a - b, c - b
     scale = np.linalg.norm(u) * np.linalg.norm(w)
     if scale == 0.0:
@@ -184,8 +186,8 @@ def _angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
 
 
-def _dihedral(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
-    """Signed dihedral p0-p1-p2-p3 in degrees."""
+def dihedral_angle(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
+    """Return the signed dihedral p0-p1-p2-p3 in degrees, or NaN when it is undefined."""
     b0, b1, b2 = p0 - p1, p2 - p1, p3 - p2
     axis = np.linalg.norm(b1)
     if axis == 0.0:

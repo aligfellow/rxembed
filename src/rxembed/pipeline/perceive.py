@@ -12,14 +12,20 @@ import logging
 
 import numpy as np
 from rdkit import Chem, rdBase
+from rdkit.Chem import rdDetermineBonds
+from rdkit.Geometry import Point3D
 
 from rxembed.metal_core import (
     COORDINATION_METALS,
-    _reject_boron_cages,
     metal_indices,
+    reject_boron_cages,
 )
 from rxembed.stereo import stereo_from_3d
-from rxembed.utils import _lone_pair, _rcov, flat_ranks, hydrogen_neighbor_order, remove_bond
+from rxembed.utils import flat_ranks, hydrogen_neighbor_order, lone_pair_electrons, remove_bond
+
+from .xyz2mol_tmc import SEEDED_STRUCTURAL_CHARGES, TRANSITION_METALS_NUM, get_tmc_mol
+
+_PT = Chem.GetPeriodicTable()
 
 _AROMATIC_BO_TOL = 0.25  # |bond_order - 1.5| within this reads as aromatic
 # Measured threshold: a real bridge's two legs (DEDPUX, SIJQIL, MOCQIE) split 1.007-1.034; an ordinary H-bond's
@@ -56,7 +62,7 @@ def read_xyz(path, charge=0, connectivity="xyzgraph", bond_orders="xyzgraph", me
             "build_graph and cannot be given another perceiver's bonds. Use bond_orders='xyz2mol'."
         )
     mol, perceived_by = _with_fallback(path, charge, connectivity, fallback)
-    _reject_boron_cages(mol)  # before xyz2mol forces multi-centre B-H/B-B into valence-two orders
+    reject_boron_cages(mol)  # before xyz2mol forces multi-centre B-H/B-B into valence-two orders
     added = ()
     if fallback and perceived_by == "xyzgraph" and metal_indices(mol):
         try:
@@ -111,14 +117,14 @@ def _reject_unbonded_bridging_hydrogens(mol):
     M-H-M) with zero neighbours instead of choosing one leg; it then survives as a free hydride and
     xyz2mol forces a nonsense two-centre graph around it, surfacing as a confusing failure five stages
     later. Geometry- and graph-derived only (no element list, no atom count), so this also catches a
-    bridge `_reject_boron_cages`'s cage-vertex rule cannot: a single B-H-B pair, or a non-boron bridge. A
+    bridge `reject_boron_cages`'s cage-vertex rule cannot: a single B-H-B pair, or a non-boron bridge. A
     dropped terminal hydrogen sits near one heavy atom, not two; a free hydride counterion sits outside
     the covalent-radius reach of anything.
     """
     if mol.GetNumConformers() == 0:
         return
     pos = mol.GetConformer().GetPositions()
-    r_h = _rcov(1)
+    r_h = _PT.GetRcovalent(1)
     bridges = []
     for atom in mol.GetAtoms():
         if atom.GetAtomicNum() != 1 or atom.GetDegree() != 0:
@@ -129,7 +135,7 @@ def _reject_unbonded_bridging_hydrogens(mol):
             if other.GetIdx() == h or other.GetAtomicNum() == 1:
                 continue
             distance = float(np.linalg.norm(pos[h] - pos[other.GetIdx()]))
-            if distance <= _BRIDGE_H_FACTOR * (r_h + _rcov(other.GetAtomicNum())):
+            if distance <= _BRIDGE_H_FACTOR * (r_h + _PT.GetRcovalent(other.GetAtomicNum())):
                 near.append((other.GetIdx(), distance))
         if len(near) >= 2:  # noqa: PLR2004  two or more heavy neighbours makes this a bridging H
             bridges.append((h, near))
@@ -185,7 +191,7 @@ def _trigonal_donors_qualify(rw, x, donors, metals, rings):
     xi = x.GetIdx()
     for d in donors:
         atom = rw.GetAtomWithIdx(d)
-        if atom.GetAtomicNum() in _TRIGONAL_NONDONOR_Z or _lone_pair(atom, metals) <= 0:
+        if atom.GetAtomicNum() in _TRIGONAL_NONDONOR_Z or lone_pair_electrons(atom, metals) <= 0:
             return False
         if any(xi in ring and d in ring for ring in rings):
             return False
@@ -200,7 +206,7 @@ def _prune_donorless_bridgeheads(rw, metals):
     neighbours. X has no donor orbital, and the bond is graph-provably wrong, exactly when: two or more of
     X's own neighbours are themselves bonded to that same metal (the real donors) and are not bonded to
     each other; X carries four or more sigma bonds to non-metal atoms (Class A); and X has no lone pair
-    (`_lone_pair`) -- not a per-element list, so it holds for any main-group bridgehead.
+    (`lone_pair_electrons`) -- not a per-element list, so it holds for any main-group bridgehead.
 
     Class B extends the same X-has-no-lone-pair test to a TRIGONAL bridgehead (exactly three sigma bonds
     to non-metal atoms: a carboxylate, amidinate, or dithiocarbamate C, or an N-B-N B). A geometric test
@@ -236,7 +242,7 @@ def _prune_donorless_bridgeheads(rw, metals):
             trigonal = sigma_to_nonmetal == _TRIGONAL_SIGMA
             if sigma_to_nonmetal < _BRIDGEHEAD_SIGMA_MIN and not trigonal:
                 continue
-            if _lone_pair(x, metals) > 0:
+            if lone_pair_electrons(x, metals) > 0:
                 continue
             if trigonal and not _trigonal_donors_qualify(rw, x, donors, metals, rings):
                 continue
@@ -319,15 +325,11 @@ def _assign_bond_orders(mol, path, charge, connectivity, requested, allow_fallba
 
 def _has_xyz2mol_metal(mol):
     """Return whether xyz2mol_tmc supports a metal present in this graph."""
-    from .xyz2mol_tmc import TRANSITION_METALS_NUM
-
     return any(atom.GetAtomicNum() in TRANSITION_METALS_NUM for atom in mol.GetAtoms())
 
 
 def _from_xyz2mol(path, charge):
     """Read connectivity and bond orders from the vendored perceiver."""
-    from .xyz2mol_tmc import get_tmc_mol
-
     before = _coordinates(path)
     with rdBase.BlockLogs():
         out = get_tmc_mol(path, charge)[0]
@@ -338,12 +340,10 @@ def _from_xyz2mol(path, charge):
 def _from_xyzgraph(path, charge):
     """Read connectivity and bond orders from xyzgraph, as a Mol with a conformer."""
     import xyzgraph
-    from rdkit.Chem import BondType, Conformer
-    from rdkit.Geometry import Point3D
 
     # Never quick=True: it skips bond-order and charge perception and returns all-single bonds.
     graph = xyzgraph.build_graph(path, charge=charge, kekule=True)
-    orders = {1: BondType.SINGLE, 2: BondType.DOUBLE, 3: BondType.TRIPLE}
+    orders = {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE, 3: Chem.BondType.TRIPLE}
     rw, idx = Chem.RWMol(), {}
     for node, data in sorted(graph.nodes(data=True)):
         atom = Chem.Atom(int(data["atomic_number"]))
@@ -355,19 +355,19 @@ def _from_xyzgraph(path, charge):
         v_metal = rw.GetAtomWithIdx(idx[v]).GetAtomicNum() in COORDINATION_METALS
         if u_metal != v_metal:
             donor, metal = (v, u) if u_metal else (u, v)
-            rw.AddBond(idx[donor], idx[metal], BondType.DATIVE)
+            rw.AddBond(idx[donor], idx[metal], Chem.BondType.DATIVE)
             continue
         order = data.get("bond_order", 1.0)
         if abs(order - 1.5) < _AROMATIC_BO_TOL:  # aromatic, only if kekulization fell through
-            bond = rw.GetBondWithIdx(rw.AddBond(idx[u], idx[v], BondType.AROMATIC) - 1)
+            bond = rw.GetBondWithIdx(rw.AddBond(idx[u], idx[v], Chem.BondType.AROMATIC) - 1)
             bond.SetIsAromatic(True)
             bond.GetBeginAtom().SetIsAromatic(True)
             bond.GetEndAtom().SetIsAromatic(True)
         else:
-            rw.AddBond(idx[u], idx[v], orders.get(round(order), BondType.SINGLE))
+            rw.AddBond(idx[u], idx[v], orders.get(round(order), Chem.BondType.SINGLE))
 
     mol = rw.GetMol()
-    conf = Conformer(mol.GetNumAtoms())
+    conf = Chem.Conformer(mol.GetNumAtoms())
     for node, data in graph.nodes(data=True):
         x, y, z = data["position"]
         conf.SetAtomPosition(idx[node], Point3D(float(x), float(y), float(z)))
@@ -385,8 +385,6 @@ def _from_xyzgraph(path, charge):
 def _from_rdkit_connectivity(path, charge):
     """Read connectivity with RDKit's native connect-the-dots algorithm."""
     mol = _coordinates(path)
-    from rdkit.Chem import rdDetermineBonds
-
     rdDetermineBonds.DetermineConnectivity(mol, charge=charge, useVdw=False)
     mol.UpdatePropertyCache(strict=False)
     Chem.FastFindRings(mol)
@@ -438,9 +436,6 @@ def _coordinates(path):
 def _from_rdkit(path, charge):
     """Read an organic molecule with RDKit's bond perceiver."""
     mol = _coordinates(path)
-
-    from rdkit.Chem import rdDetermineBonds
-
     try:
         rdDetermineBonds.DetermineBonds(mol, charge=charge)
     except ValueError as exc:
@@ -461,8 +456,6 @@ def _with_fallback(path, charge, backend, allow_fallback=True):
         return primary(path, charge), backend
     except (ImportError, OSError, RuntimeError, ValueError) as first:
         if backend == "xyzgraph":
-            from .xyz2mol_tmc import TRANSITION_METALS_NUM
-
             raw = _coordinates(path)
             has_metal = any(a.GetAtomicNum() in TRANSITION_METALS_NUM for a in raw.GetAtoms())
             fallback, name = (_from_xyz2mol, "xyz2mol") if has_metal else (_from_rdkit, "rdkit")
@@ -492,36 +485,30 @@ def _assert_same_atoms(before, after):
         raise ValueError(f"xyz2mol changed the {len(want)} input atoms, their order, or their coordinates")
 
 
-def _rank_orders(mol, charge):  # noqa: C901 - one linear graph-normalization pass
-    """Re-assign bond orders and charges without changing connectivity.
+def _rdkit_bond_orders(mol, charge):
+    """Assign bond orders with RDKit on a graph that has no metal xyz2mol's search supports."""
+    out = Chem.Mol(mol)
+    try:
+        rdDetermineBonds.DetermineBondOrders(out, charge=charge)
+    except (RuntimeError, ValueError) as exc:
+        raise ValueError(f"RDKit could not assign bond orders on the selected organic connectivity: {exc}") from exc
+    logger.warning("read_xyz: xyz2mol bond-order assignment is metal-only; using RDKit for this graph")
+    out.SetProp("_rxembedBondOrders", "rdkit")
+    return out
 
-    Bonds flatten to single and charges clear (`xyz2mol_tmc`'s three structural charges are re-applied for its
-    calibrated search); a metal-free structure delegates to RDKit. `TRANSITION_METALS_NUM` is narrower than
-    `metal_core.COORDINATION_METALS`: it omits the lanthanides and actinides that calibrated search has no
-    charge model for. xyz2mol allows hydrogen exactly one valence, so a hydrogen bridging a metal or shared
-    between two nonmetal legs (proton transfer) has its longer contact removed before the search, restored as
-    dative after.
+
+def _bridging_hydrogen_contacts(mol):
+    """Return ``(hydrogen, partner, bond type)`` for each hydrogen leg xyz2mol cannot hold.
+
+    xyz2mol allows hydrogen exactly one valence, so a hydrogen bridging a metal or shared between two nonmetal
+    legs (proton transfer) keeps only its first leg by `hydrogen_neighbor_order`. Each other leg comes back
+    after the search as a dative bond to a metal or a zero-order contact to a nonmetal.
     """
-    from .xyz2mol_tmc import SEEDED_STRUCTURAL_CHARGES, TRANSITION_METALS_NUM, get_tmc_mol
-
-    if not _has_xyz2mol_metal(mol):
-        from rdkit.Chem import rdDetermineBonds
-
-        out = Chem.Mol(mol)
-        try:
-            rdDetermineBonds.DetermineBondOrders(out, charge=charge)
-            logger.warning("read_xyz: xyz2mol bond-order assignment is metal-only; using RDKit for this graph")
-            out.SetProp("_rxembedBondOrders", "rdkit")
-            return out
-        except (RuntimeError, ValueError) as exc:
-            raise ValueError(f"RDKit could not assign bond orders on the selected organic connectivity: {exc}") from exc
-
-    flat = Chem.RWMol(mol)
     pos = mol.GetConformer().GetPositions()
-    donated = []  # (hydrogen, acceptor, type) contacts removed before the search, re-added after
     ranked = Chem.Mol(mol)
     ranked.UpdatePropertyCache(strict=False)
     ranks = flat_ranks(ranked)
+    contacts = []
     for atom in mol.GetAtoms():
         if atom.GetAtomicNum() != 1 or atom.GetDegree() <= 1:
             continue
@@ -547,14 +534,23 @@ def _rank_orders(mol, charge):  # noqa: C901 - one linear graph-normalization pa
         if not metal_bound and not shared:
             continue
         for other in ordered[1:]:
-            flat.RemoveBond(h, other)
             contact = (
                 Chem.BondType.DATIVE
                 if mol.GetAtomWithIdx(other).GetAtomicNum() in TRANSITION_METALS_NUM
                 else Chem.BondType.ZERO
             )
-            donated.append((h, other, contact))
+            contacts.append((h, other, contact))
+    return contacts
 
+
+def _flatten_for_xyz2mol(mol, contacts):
+    """Return the graph xyz2mol searches: `contacts` cut, M-L dative, other bonds single, charges cleared.
+
+    `xyz2mol_tmc`'s three structural charges are re-applied for its calibrated search.
+    """
+    flat = Chem.RWMol(mol)
+    for h, other, _contact in contacts:
+        flat.RemoveBond(h, other)
     for bond in list(flat.GetBonds()):
         begin, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
         begin_metal = flat.GetAtomWithIdx(begin).GetAtomicNum() in TRANSITION_METALS_NUM
@@ -577,10 +573,23 @@ def _rank_orders(mol, charge):  # noqa: C901 - one linear graph-normalization pa
             continue  # preserve a multi-metal backend's oxidation-state allocation
         heavy = sum(1 for n in atom.GetNeighbors() if n.GetAtomicNum() not in TRANSITION_METALS_NUM)
         atom.SetFormalCharge(SEEDED_STRUCTURAL_CHARGES.get((atom.GetAtomicNum(), heavy), 0))
-
     graph = flat.GetMol()
     graph.UpdatePropertyCache(strict=False)
     Chem.FastFindRings(graph)
+    return graph
+
+
+def _rank_orders(mol, charge):
+    """Re-assign bond orders and charges without changing connectivity.
+
+    A metal-free structure delegates to RDKit. `TRANSITION_METALS_NUM` is narrower than
+    `metal_core.COORDINATION_METALS`: it omits the lanthanides and actinides that calibrated search has no
+    charge model for.
+    """
+    if not _has_xyz2mol_metal(mol):
+        return _rdkit_bond_orders(mol, charge)
+    contacts = _bridging_hydrogen_contacts(mol)
+    graph = _flatten_for_xyz2mol(mol, contacts)
     coords = graph.GetConformer().GetPositions().tolist()
     try:
         with rdBase.BlockLogs():
@@ -588,7 +597,7 @@ def _rank_orders(mol, charge):  # noqa: C901 - one linear graph-normalization pa
         # Atom-for-atom, in order: the contacts below are restored by input atom index.
         _assert_same_atoms(mol, out)
         rw = Chem.RWMol(out)
-        for h, other, bond_type in donated:
+        for h, other, bond_type in contacts:
             if rw.GetBondBetweenAtoms(h, other) is None:
                 rw.AddBond(h, other, bond_type)
         rw.UpdatePropertyCache(strict=False)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pytest
 from rdkit import Chem
@@ -10,7 +12,8 @@ from rdkit.Geometry import Point3D
 
 import rxembed as rx
 from rxembed import metal_perceive as coord
-from rxembed.metal_donor_orient import _FOLD_WINDOW, _stripped_hybridisation
+from rxembed.metal_donor_orient import FOLD_WINDOW, stripped_hybridisation
+from rxembed.metal_polyhedron import POLYHEDRA, describe
 from rxembed.pipeline import geom_check as geom
 
 _FE_C, _C_O, _FE_H = 1.80, 1.13, 1.55  # Å: the recorded FeH2(CO)4 bond lengths
@@ -79,7 +82,7 @@ def _donor_at(smi, angle_deg, donor_num=7, pick=None):
     w /= np.linalg.norm(w)
     t = np.radians(angle_deg)
     pos[pd] = pos[n] + 2.1 * (np.cos(t) * u + np.sin(t) * w)
-    assert geom._angle(pos[pd], pos[n], pos[c]) == pytest.approx(angle_deg, abs=0.5)
+    assert geom.bond_angle(pos[pd], pos[n], pos[c]) == pytest.approx(angle_deg, abs=0.5)
     return _place(out, pos), pos, n
 
 
@@ -133,7 +136,7 @@ def test_donor_angle_warning_does_not_claim_an_enclosed_carbon_has_inverted():
     (violation,) = coord.donor_orientation(mol, pos, donors=[0])
     assert violation.atoms == (4, 0, 1)
     assert violation.value == pytest.approx(99.4623222)
-    assert violation.limit == _FOLD_WINDOW[("C", Chem.HybridizationType.SP3)][0]
+    assert violation.limit == FOLD_WINDOW[("C", Chem.HybridizationType.SP3)][0]
     assert "census floor" in violation.detail
     assert "inspect" in violation.detail
     assert "folded" not in violation.detail
@@ -162,8 +165,8 @@ def test_element_key_splits_the_carbonyl_from_the_nitrile():
 
 def test_uncalibrated_class_is_reported_but_never_gated():
     out, pos, o = _donor_at("COC", 60.0, donor_num=8)  # dimethyl ether
-    assert _stripped_hybridisation(out)[o] == Chem.HybridizationType.SP3, "the ether O must type as sp3"
-    assert ("O", Chem.HybridizationType.SP3) not in _FOLD_WINDOW, "O sp3 (n=2) must have NO threshold at all"
+    assert stripped_hybridisation(out)[o] == Chem.HybridizationType.SP3, "the ether O must type as sp3"
+    assert ("O", Chem.HybridizationType.SP3) not in FOLD_WINDOW, "O sp3 (n=2) must have NO threshold at all"
     assert not coord.donor_orientation(out, pos, [o]), "an UNCALIBRATED class must never be gated"
     rep = coord.donor_fold(out, donors=[o])
     assert o in rep.unknown, "...and it must be REPORTED as unknown, not silently dropped"
@@ -182,8 +185,7 @@ def test_gate_fires_on_the_fold_direction_only():
 
 
 def test_kappa1_carboxylate_is_metric_only():
-    anionic = lambda a: a.GetAtomicNum() == 8 and a.GetFormalCharge() == -1  # noqa: E731
-    out, pos, o = _donor_at("CC(=O)[O-]", 100.0, pick=anionic)
+    out, pos, o = _donor_at("CC(=O)[O-]", 100.0, pick=lambda a: a.GetAtomicNum() == 8 and a.GetFormalCharge() == -1)
     assert not coord.donor_orientation(out, pos, [o]), "100° is inside the census window; must NOT be flagged"
 
 
@@ -293,3 +295,154 @@ def test_xh_bond_length_window_is_element_aware():
         pos[h_p] = pos[p] + unit * length
         _place(m, pos)
         assert bool(any(v.kind == "hydrogen" for v in geom.hydrogens(m, c.GetPositions()))) is flags, f"P-H {length}"
+
+
+# --- perception: the shape invariant ------------------------------------------------------------------
+
+
+def _ideal_sphere(dirs, r):
+    """A bare Mol whose atom 0 is a metal and 1..N its vertices at radius `r` along `dirs`."""
+    rw = Chem.RWMol()
+    for _ in range(len(dirs) + 1):
+        rw.AddAtom(Chem.Atom(6))
+    mol = rw.GetMol()
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    conf.SetAtomPosition(0, Point3D(0.0, 0.0, 0.0))
+    for i, d in enumerate(dirs):
+        u = np.array(d, float)
+        conf.SetAtomPosition(i + 1, Point3D(*(u / np.linalg.norm(u) * r)))
+    mol.AddConformer(conf, assignId=True)
+    return mol
+
+
+def _classify(dirs, r):
+    return coord.classify_geometry(_ideal_sphere(dirs, r), 0, list(range(1, len(dirs) + 1)))
+
+
+def _bailar(degrees):
+    """The octahedron's own vertices with one C3 face rotated by `degrees` about the body diagonal.
+
+    0° leaves the octahedron, 60° reaches the trigonal prism. Built from the record's own `vertex_dirs` so the
+    probe cannot drift away from the shape it is distorting.
+    """
+    dirs = np.array(POLYHEDRA["octahedral"].vertex_dirs, float)
+    axis = np.array([1.0, 1.0, 1.0]) / np.sqrt(3.0)
+    face = [i for i, d in enumerate(dirs) if d @ axis > 0]
+    t = np.radians(degrees)
+    k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+    rot = np.eye(3) + np.sin(t) * k + (1 - np.cos(t)) * (k @ k)  # Rodrigues
+    dirs[face] = dirs[face] @ rot.T
+    return dirs
+
+
+def _tilted_square(tilt_deg):
+    """A square plane with an alternating `tilt_deg` out-of-plane bow: the tetrahedral distortion of Ni/Pd(II)."""
+    t = np.radians(tilt_deg)
+    return [
+        (np.cos(t) * np.cos(phi), np.cos(t) * np.sin(phi), np.sin(t) * (1 if k % 2 == 0 else -1))
+        for k, phi in enumerate((0.0, np.pi / 2, np.pi, 3 * np.pi / 2))
+    ]
+
+
+@pytest.mark.parametrize("name", sorted(POLYHEDRA))
+def test_all_records_round_trip(name):
+    got = _classify(POLYHEDRA[name].vertex_dirs, 2.1)
+    assert got == name, f"{describe(name)} re-perceives as {got}"
+
+
+def test_unbound_metal_has_no_coordination_geometry():
+    mol = Chem.MolFromSmiles("[Hg]")
+    mol.AddConformer(Chem.Conformer(1))
+
+    assert coord.classify_geometry(mol, 0, []) is None
+
+
+def test_short_bonded_pyramid_is_not_flatness_excluded():
+    dirs = POLYHEDRA["trigonal_pyramidal"].vertex_dirs
+    assert _classify(dirs, 1.4) == "trigonal_pyramidal"
+
+
+def _shallow_pyramid(frac):
+    """The CN3 pyramid record with its elevation scaled by `frac`: shallower than the ideal, still tilted."""
+    dirs = np.array(POLYHEDRA["trigonal_pyramidal"].vertex_dirs, float)
+    dirs[:, 2] *= frac
+    return dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
+
+
+def test_shallow_pyramid_reads_as_the_nearer_ideal():
+    """A pyramid shallow enough to read flat by `COPLANAR_TOL` must still read as the shape it best fits.
+
+    A flatness pre-filter used to drop `trigonal_pyramidal` from the ranking whenever the sphere's raw plane
+    RMS cleared the absolute tolerance (the M[N(SiMe3)2]3 case), leaving `trigonal_planar` as the only
+    candidate even though the pyramid fits four times closer.
+    """
+    dirs = _shallow_pyramid(0.8)
+    assert coord._plane_rms(np.zeros(3), dirs * 2.0) < coord.COPLANAR_TOL, "fixture premise: reads flat"
+    assert _classify(dirs, 2.0) == "trigonal_pyramidal"
+
+
+def test_bowed_square_plane_reads_square_planar():
+    assert _classify(_tilted_square(8), 2.3) == "square_planar"
+
+
+def test_bis_chelate_zinc_tetrahedron_reads_tetrahedral():
+    iso = rx.metal("CC1=[O]->[Zn+2](Cl)(Cl)<-[O-]1", "tetrahedral").select(index=0)
+    mol = iso.restore(rx.embed(iso, n=2, seed=7).minimize().mol)
+    assert [i.geometry for i in rx.metal(mol)] == ["tetrahedral"]
+
+
+@pytest.mark.parametrize(
+    ("twist", "expected"),
+    [(0.0, "octahedral"), (60.0, "trigonal_prismatic")],
+    ids=["octahedral", "trigonal-prismatic"],
+)
+def test_bailar_twist_endpoints(twist, expected, caplog):
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        got = coord.classify_geometry(_ideal_sphere(_bailar(twist), 2.1), 0, list(range(1, 7)))
+    assert got == expected
+    assert not [r for r in caplog.records if "no shape fits" in r.message], caplog.text
+
+
+def test_hexagonal_plane_is_not_forced_into_a_three_dimensional_cn6_shape():
+    directions = [(np.cos(angle), np.sin(angle), 0.0) for angle in np.arange(6) * np.pi / 3]
+
+    assert _classify(directions, 2.1) == "hexagonal_planar"
+
+
+def test_poor_shape_returns_record_and_warns(caplog):
+    squashed = np.array([(np.cos(t) * 0.5, np.sin(t) * 0.5, 0.87) for t in np.radians([0, 60, 120, 180, 240, 300])])
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        got = coord.classify_geometry(_ideal_sphere(squashed, 2.1), 0, list(range(1, 7)))
+    assert got is not None, "a poor fit is still the nearest record, reported loudly"
+    assert [r for r in caplog.records if "no shape fits" in r.message], caplog.text
+
+
+def test_poor_shape_can_be_checked_silently(caplog):
+    squashed = np.array([(np.cos(t) * 0.5, np.sin(t) * 0.5, 0.87) for t in np.radians([0, 60, 120, 180, 240, 300])])
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        coord.classify_geometry(_ideal_sphere(squashed, 2.1), 0, list(range(1, 7)), warn=False)
+    assert not [r for r in caplog.records if "no shape fits" in r.message], caplog.text
+
+
+def test_near_tie_keeps_the_argmin_and_names_the_runner_up(caplog):
+    """A CN5 witness almost equidistant between trigonal_bipyramidal and square_pyramidal (residual gap
+    ~3e-5, far inside `_FIT_MARGIN`) still returns one name, the argmin, and logs the runner-up with the
+    `geometry=` remedy rather than silently picking either. The acceptance gate is what accepts a requested
+    shape this close to the argmin (`shape_reading`, rule B); `classify_geometry` itself always names the one
+    nearest reading.
+    """
+    sp = np.array(POLYHEDRA["square_pyramidal"].vertex_dirs, float)
+    tbp = np.array(POLYHEDRA["trigonal_bipyramidal"].vertex_dirs, float)
+    dirs = 0.662 * sp + 0.338 * tbp
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        got = coord.classify_geometry(_ideal_sphere(dirs, 2.1), 0, list(range(1, 6)))
+    assert got == "trigonal_bipyramidal"
+    assert [r for r in caplog.records if "near-tie" in r.message and "pass geometry='SPY'" in r.message], caplog.text
+
+
+def test_cn_defaults_are_the_common_shapes():
+    assert coord.geometry_for(3) == "trigonal_planar"
+    assert coord.geometry_for(3, has_apical=True) == "trigonal_planar"
+    assert coord.geometry_for(4) == "square_planar"
+    assert coord.geometry_for(4, has_apical=True) == "tetrahedral"
+    assert coord.geometry_for(5, has_apical=True) == "trigonal_bipyramidal"

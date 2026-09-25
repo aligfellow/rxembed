@@ -55,10 +55,8 @@ best.dump("best.xyz")              # three conformers in one multi-frame XYZ
 If the request creates several choices, such as every metal isomer, it returns an `EnsembleSet` and applies
 chainable methods to each member. `stereo="separate"` returns a list of those sets.
 
-For embedding diagnostics, call `rx.set_verbose("DEBUG")` before `rx.embed(...)`. Each native DG call reports
-its rejected-attempt counters and returned conformer count; subsequent requested-stereo selection reports how
-many candidates it kept. Native DG minimization counters are not UFF cleanup failures, and a rejected attempt
-does not prove chemical infeasibility. Successful searches can also include rejected attempts.
+By default rxembed prints only outcomes: an error, or a warning when the result differs from the request.
+[Messages and Errors](#messages-and-errors) explains them; `rx.set_verbose("DEBUG")` also shows every retry.
 
 ### EmbedParams
 
@@ -208,7 +206,9 @@ shorter than the required donor separation. Embedding can still fail when the fu
 angles is inconsistent, and successful arrangements should be checked with an appropriate energy method.
 
 Use `rx.metal` when you want to inspect and select the isomer yourself. The `metal="SPL"` shortcut embeds every
-enumerated isomer; `n` applies separately to each one.
+enumerated isomer; `n` applies separately to each one. It returns every isomer that embedded: an isomer that
+cannot be built logs one warning line and stays in `all_confs.errors`, and the call raises only when none
+embeds. A single selected isomer, such as `trans` above, raises its own `EmbeddingError`.
 
 If `fix` includes several atoms in the coordination sphere, pass it to `rx.metal` before selection:
 
@@ -378,7 +378,7 @@ optimized = best.optimize("gfn2")
 - `minimize()` uses restrained UFF. If native UFF typing fails or assigns an impossible multicoordinate angle
   objective, a private surrogate graph may clean up the geometry while radius-corrected bond holds preserve the
   public element's scale. Such results expose `energy_kind="uff-surrogate"`, element substitutions in
-  `uff_surrogates`, and fixed-core bond substitutions in `uff_retyped_bonds`. `score("ff")` remains an exact
+  `uff.surrogates`, and fixed-core bond substitutions in `uff.retyped`. `score("ff")` remains an exact
   public-graph MMFF94s/UFF single point and raises when that graph is not typeable.
 - xTB scoring and optimization need the xTB executable.
 
@@ -401,6 +401,53 @@ from xtb_ase import XTB
 
 ranked = rx.embed("O", n=1).score(rx.ASE(XTB()))
 ```
+
+## Messages and Errors
+
+`rx.embed` builds a metal complex in four steps. Distance geometry (DG) makes rough 3D seeds from a table of
+allowed atom-atom distances. Restrained UFF cleans each seed while restraints hold the metal polyhedron. A gate
+then checks the result: ligand bonds intact, no overlapping atoms, the requested polyhedron and donor sites, the
+requested hand (Λ/Δ) and ligand R/S, and any `fix=` values. When the gate fails, rxembed retries, first with
+stiffer restraints, then with up to three fresh batches of seeds.
+
+At the default level you see only outcomes:
+
+- `EmbeddingError`: rxembed could not build what you asked for. It is raised when no conformer passed the gate
+  after every retry, or when fewer than `n` passed and a rejected one missed part of the request: the polyhedron
+  or donor sites, the hand (Λ/Δ), a ligand R/S, or a `fix=` value. Fewer than `n` for any other reason, such as a
+  strained bond, is a warning instead. The message is one sentence: the isomer as `summary()` prints it, the most
+  common reason with its count, and one remedy, for example `Fe0 TBP cis [H1 C6 P2 P3 N5] -  -: Fe0 relaxes from
+  TBP (0.211) to SPY (0.159) in 13/13 rejected seeds; try geometry= or another isomer`. `err.failures` counts
+  every rejected seed by failure kind and site, and `err.isomer` is the isomer.
+- A request that expands into several candidates (`metal=`, undefined stereocentres, `contacts="auto"`, an
+  ambiguous `coordinate=`) returns every candidate that embedded, as an `EnsembleSet` whenever one failed. Each
+  one that could not be built logs one warning line, the error's sentence, and stays in `result.errors`. With
+  `stereo="separate"`, a configuration that failed stays in the list as an empty set holding its own `errors`.
+  The call raises only when none embeds.
+- A warning says the result differs from the request or an input changed: fewer conformers than `n`
+  (`kept 3/4 conformers; ...`), conformers without a converged UFF geometry (`ens.unrelaxed`), a `read_xyz`
+  perception change, a dropped constraint, or a model choice you may want to override, such as a near-tie
+  between two shapes (pass `geometry=`).
+
+The reasons use element symbols and 0-based atom indices:
+
+- `Zn0 relaxes from SPY (0.366) to TBP (0.351)`: the donors relaxed into another polyhedron. The numbers are
+  shape misfits, 0 being ideal. Five-coordinate metals swap between these two easily (Berry pseudorotation).
+- `Fe0 distorts far from OCT (0.75)`: the sphere fits no shape well enough to name it.
+- `Zn0 donors swap sites (another isomer)`: the polyhedron holds, but UFF moved donors to other sites.
+- `bond C9-C10 squeezed to 0.87 A`, `stretched to 2.33 A` or `C4...C9 clash at 0.90 A`: the ligand is strained
+  in this arrangement.
+- `N3 reads R, not S` or `N3 no longer reads S`: a ligand stereocentre, often a coordinated amine N, inverted or
+  lost its configuration.
+- `found 0/1 DG seeds with the requested metal and ligand stereo`: no seed had the requested hand together with
+  the ligand R/S. With fixed ligand stereocentres some hands cannot exist.
+
+`rx.set_verbose()` adds progress lines. `rx.set_verbose("DEBUG")` also shows every retry, grouped by failure and
+site: rejected UFF results, stiffness escalation, each replacement batch, and each native DG call's
+rejected-attempt counters. A retry is bookkeeping, not a result, and a rejected attempt does not prove chemical
+infeasibility. After a successful embed, `ens.relax_failures` records each rejected UFF result by conformer id,
+replacement batches included, and `ens.unrelaxed` lists the conformers returned without a converged UFF
+geometry.
 
 ## Embedding Engine
 
@@ -425,7 +472,7 @@ Current limitations:
 |---|---|
 | metals | rxembed presents a bondless carbon surrogate to ETKDG and lithium to UFF. M–L targets use the fitted model unless `lengths="input"` is requested. The final metal state is validated |
 | coordinate `fix` | ETKDG biases the fixed core, then rxembed restores its coordinates exactly |
-| `n=N` | requests N seeds. Failed required structures are retried; the call raises if the requested metal, stereo, or fixed-core count cannot be produced |
+| `n=N` | requests N seeds. Failed required structures are retried; an isomer whose requested metal, stereo, or fixed-core count cannot be produced raises `EmbeddingError`, or is skipped with a warning when the call expands into several candidates |
 | g-xTB solvent | `E_gxtb(gas) + [E_gfn2(solv) − E_gfn2(gas)]`, never a silent gas-phase energy |
 | haptic axial pose | `rx.metal` selects face and winding, not continuous rotation about the metal-centroid axis. ETKDG may sample it; `mc()` freezes each starting pose |
 | `mc()` pose freeze | soft, with about 0.1 Å drift. State a persistent constraint as a distance, angle, or dihedral that relax also reads |

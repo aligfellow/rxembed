@@ -15,9 +15,9 @@ from collections import Counter
 from rdkit import Chem
 from rdkit.Chem import rdMolHash
 
-import rxembed.metal_core as _metal
-import rxembed.metal_stereo as _metal_stereo
-import rxembed.stereo as _ligand_stereo
+from rxembed.metal_core import canonical_metal_graph, haptic_sites, metal_indices
+from rxembed.metal_stereo import donor_classes, face_has_orientation
+from rxembed.stereo import atrop_code, axis_stereo, bond_stereo, clear_atrop, clear_ez, point_stereo, stereo_from_3d
 
 _XYZ_KEYS = (("planar", "ring"), ("helical", "atoms"))
 _NATIVE = ("point", "ez", "axial")
@@ -94,17 +94,17 @@ def _mode(kind, spec):
 
 def _independent_summary(mol, summary):
     """Drop planar labels for haptic faces whose ligand graph has no orientation."""
-    metals = set(_metal.metal_indices(mol))
+    metals = set(metal_indices(mol))
     if not metals or not summary.get("planar"):
         return summary
     out = dict(summary)
     oriented = {}
     for metal in metals:
         donors = [atom.GetIdx() for atom in mol.GetAtomWithIdx(metal).GetNeighbors()]
-        ranks = _metal_stereo.donor_classes(mol, donors)
-        for face in _metal._haptic_sites(mol, donors):
+        ranks = donor_classes(mol, donors)
+        for face in haptic_sites(mol, donors):
             if len(face) > 1:
-                oriented[frozenset(face)] = _metal_stereo.face_has_orientation(mol, face, ranks)
+                oriented[frozenset(face)] = face_has_orientation(mol, face, ranks)
     out["planar"] = [entry for entry in summary["planar"] if oriented.get(frozenset(entry.get("ring", ())), True)]
     return out
 
@@ -125,7 +125,7 @@ def _native_hash(mol):
     for bond in source.GetBonds():
         if bond.GetStereo() not in _ATROP_TAGS:
             continue
-        hand = _ligand_stereo._atrop_code(source, bond)
+        hand = atrop_code(source, bond)
         if hand not in {"M", "P"}:
             raise ValueError(f"could not assign M/P to atropisomer bond {bond.GetIdx()}")
         axes.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), hand))
@@ -135,7 +135,7 @@ def _native_hash(mol):
         marker_isotopes = (next(available), next(available))
     except StopIteration as exc:
         raise ValueError("no two isotope values remain for internal atropisomer markers") from exc
-    _ligand_stereo._clear_atrop(source)
+    clear_atrop(source)
     graph = Chem.RWMol(source)
     for left, right, hand in axes:
         graph.RemoveBond(left, right)
@@ -153,9 +153,9 @@ def _native_hash(mol):
 
 def _native_signature(mol):
     """Return one exact native stereo graph key plus diagnostic hand counts."""
-    graph = _metal._canonical_metal_graph(mol)
-    label = _ligand_stereo.stereo_from_3d(graph, exclude=_metal.metal_indices(graph), apply=True)
-    points = _ligand_stereo.point_stereo(label)
+    graph = canonical_metal_graph(mol)
+    label = stereo_from_3d(graph, exclude=metal_indices(graph), apply=True)
+    points = point_stereo(label)
     for atom in graph.GetAtoms():
         if atom.GetIdx() not in points:
             atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
@@ -163,8 +163,8 @@ def _native_signature(mol):
                 atom.ClearProp("_CIPCode")
     hands = {
         "point": tuple(points.values()),
-        "ez": tuple(_ligand_stereo.bond_stereo(label).values()),
-        "axial": tuple(_ligand_stereo.axis_stereo(label).values()),
+        "ez": tuple(bond_stereo(label).values()),
+        "axial": tuple(axis_stereo(label).values()),
     }
     return {_NATIVE_KEY: _native_hash(graph)} | {kind: Counter(values) for kind, values in hands.items() if values}
 
@@ -207,7 +207,7 @@ def _clear_native(mol, kind, marker_isotopes):
             if atom.HasProp("_CIPCode"):
                 atom.ClearProp("_CIPCode")
     elif kind == "ez":
-        _ligand_stereo._clear_ez(mol)
+        clear_ez(mol)
     else:
         mol = _clear_atrop_markers(mol, marker_isotopes)
     return mol
@@ -299,13 +299,10 @@ def signature(mol, conf_id=-1, charge=0, native=True):
     RDKit supplies graph-canonical identities for point, E/Z, and stated atrop stereo. xyzgraph supplies only
     planar and helical labels, whose representative atoms and multiplicity are not stable across perception.
     Pass ``native=False`` to skip the point/E-Z/axial half when a caller only ever reads planar/helical
-    (e.g. a metal `Isomer`'s stereo_ref, whose native keys `_attach_stereo` discards).
+    (e.g. a metal `Isomer`'s stereo_ref, which `dispatch._stereo_filter` reads only for planar/helical).
     """
     try:
         import xyzgraph
-    except ImportError as exc:
-        raise ImportError("signature needs xyzgraph; pip install 'rxembed[workflow]'") from exc
-    try:
         from xyzgraph.stereo import annotate_stereo
     except ImportError as exc:
         raise ImportError("signature needs xyzgraph; pip install 'rxembed[workflow]'") from exc
@@ -356,8 +353,3 @@ def mismatch(sig, ref, spec="preserve"):
                 found = unexpected
                 return f"{kind} expected {'/'.join(sorted(expected))}, found {'/'.join(sorted(found))}"
     return None
-
-
-def satisfies_spec(sig, ref, spec="preserve"):
-    """Return whether fingerprint ``sig`` satisfies the chirality ``spec`` against reference ``ref``."""
-    return mismatch(sig, ref, spec) is None

@@ -23,35 +23,31 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Numerics import rdAlignment
 
-# metals excluded from every ground-state check (dative, not vdW):
 from rxembed.constraints import constraint_value, within_window
-from rxembed.embed import SHAPE_PROP
 from rxembed.metal_core import COORDINATION_METALS, metal_indices
-from rxembed.metal_perceive import (
-    _coordinating_carbons,
-    _coordination_pairs,
-    _eta2_pi_atoms,
-    donor_orientation,
-    metal_overbond,
-)
+from rxembed.metal_perceive import SHAPE_PROP, coordinating_atoms, donor_orientation, metal_overbond
 from rxembed.utils import (
-    _CARBON_Z,
-    _PT,
-    _SP2_DEGREE,
+    CARBON_Z,
+    SP2_DEGREE,
     Violation,
-    _angle,
-    _dihedral,
-    _positions,
-    _rcov,
+    as_positions,
     assign_stereo_from_3d,
+    atom_label,
+    bond_angle,
     conjugated_quartets,
+    dihedral_angle,
 )
 
+_PT = Chem.GetPeriodicTable()
 _FLEX_CONJ = 60.0  # deg: the wider conjugation-dihedral window a metal-coordinated / side-on π atom gets (vs 30)
 _XH_TOL = 0.2  # Å slack over an X-H covalent-radius sum (P-H/Si-H/S-H run longer than the flat C-H ceiling)
 # A non-bonded 1-3 pair has fused when its separation drops to the covalent sum: a ring closed by the relax,
 # not the graph. Bonded 1-3 pairs are excluded, being legitimately this close.
 _FUSE_RATIO = 1.0
+_SIDEON_SYM = 0.5  # A: max |d(M,a) - d(M,b)| for a pi pair to count as symmetric side-on (else donor + backbone)
+# Absolute, not a covalent-sum ratio like the `coordinating_atoms` shell: no ratio keeps GODNOD's eta2 C=S (1.233x) and
+# rejects COJKAO's Pd...S=O (1.226x); 2.6 A separates them by 0.27 A.
+_SIDEON_MAX = 2.6  # A: both eta2 atoms must bind within this; beyond it a pi atom is backbone, not a donor.
 
 
 # --- the result -------------------------------------------------------------
@@ -105,7 +101,9 @@ def bond_lengths(mol, pos, lo: float = 0.7, hi: float = 1.3, exclude=frozenset()
         if i in exclude or j in exclude:
             continue
         d = float(np.linalg.norm(pos[i] - pos[j]))
-        ideal = _rcov(mol.GetAtomWithIdx(i).GetAtomicNum()) + _rcov(mol.GetAtomWithIdx(j).GetAtomicNum())
+        ideal = _PT.GetRcovalent(mol.GetAtomWithIdx(i).GetAtomicNum()) + _PT.GetRcovalent(
+            mol.GetAtomWithIdx(j).GetAtomicNum()
+        )
         if d < lo * ideal:
             out.append(
                 Violation(
@@ -223,7 +221,7 @@ def clashes(
             if z[i] == 1 and z[j] == 1:
                 limit, why = hh_floor, "H...H clash"
             elif z[i] == 1 or z[j] == 1:
-                limit, why = xh_cov * (_rcov(z[i]) + _rcov(z[j])), "H buried in heavy atom"
+                limit, why = xh_cov * (_PT.GetRcovalent(z[i]) + _PT.GetRcovalent(z[j])), "H buried in heavy atom"
             else:
                 limit, why = heavy_vdw * (_PT.GetRvdw(z[i]) + _PT.GetRvdw(z[j])), "heavy-atom steric overlap"
             if d < limit:
@@ -236,7 +234,7 @@ def over_compression(mol, pos, exclude=frozenset(), ratio: float = _FUSE_RATIO) 
 
     A 1-3 pair is normally held apart by its bridging angle, so ``clashes`` excludes it and
     ``metrics.connectivity`` never reports it. But a hard relax can fold that angle until the terminals
-    fuse: a coordinated ester's O-C-O collapsing ~122->56° fuses its O to 1.27 Å, below ``bonding_ok``'s
+    fuse: a coordinated ester's O-C-O collapsing ~122->56° fuses its O to 1.27 Å, below ``bonding_failure``'s
     ~0.9 Å fusion floor. The discriminator against a genuine small ring (epoxide, cyclopropane) is the
     graph, not the angle: a bonded pair never enters this test.
     """
@@ -251,14 +249,14 @@ def over_compression(mol, pos, exclude=frozenset(), ratio: float = _FUSE_RATIO) 
                 a, c = nbrs[u], nbrs[w]
                 if mol.GetBondBetweenAtoms(a, c) is not None:  # a genuine small ring: the two terminals ARE bonded
                     continue
-                r_sum = _rcov(mol.GetAtomWithIdx(a).GetAtomicNum()) + _rcov(mol.GetAtomWithIdx(c).GetAtomicNum())
+                r_sum = _PT.GetRcovalent(mol.GetAtomWithIdx(a).GetAtomicNum()) + _PT.GetRcovalent(
+                    mol.GetAtomWithIdx(c).GetAtomicNum()
+                )
                 floor = ratio * r_sum
                 d = float(np.linalg.norm(pos[a] - pos[c]))
                 if d < floor:
-                    ang = _angle(pos[a], pos[mid], pos[c])
-                    a_s = f"{mol.GetAtomWithIdx(a).GetSymbol()}{a}"
-                    c_s = f"{mol.GetAtomWithIdx(c).GetSymbol()}{c}"
-                    m_s = f"{mol.GetAtomWithIdx(mid).GetSymbol()}{mid}"
+                    ang = bond_angle(pos[a], pos[mid], pos[c])
+                    a_s, c_s, m_s = atom_label(mol, a), atom_label(mol, c), atom_label(mol, mid)
                     out.append(
                         Violation(
                             kind="fusion",
@@ -283,12 +281,12 @@ def planarity(mol, pos, oop: float = 0.15, ring_rms: float = 0.10, exclude=froze
     """
     out = []
     for atom in mol.GetAtoms():
-        if atom.GetAtomicNum() != _CARBON_Z or atom.GetHybridization() != Chem.HybridizationType.SP2:
+        if atom.GetAtomicNum() != CARBON_Z or atom.GetHybridization() != Chem.HybridizationType.SP2:
             continue
         if atom.GetIdx() in exclude:
             continue
         nbrs = [n.GetIdx() for n in atom.GetNeighbors()]
-        if len(nbrs) != _SP2_DEGREE:
+        if len(nbrs) != SP2_DEGREE:
             continue
         off = _plane_offset(pos[atom.GetIdx()], pos[nbrs])
         if off > oop:
@@ -338,7 +336,7 @@ def conjugation(mol, pos, tol_deg: float = 30.0, exclude=frozenset(), flex=froze
     out = []
     for a, c, x, s in conjugated_quartets(mol, exclude):
         limit = _FLEX_CONJ if (c in flex or x in flex or a in flex) else tol_deg  # side-on η² twists further
-        dih = abs(_dihedral(pos[a], pos[c], pos[x], pos[s]))
+        dih = abs(dihedral_angle(pos[a], pos[c], pos[x], pos[s]))
         dev = min(dih, abs(180.0 - dih))
         if dev > limit:
             out.append(
@@ -356,7 +354,7 @@ def conjugation(mol, pos, tol_deg: float = 30.0, exclude=frozenset(), flex=froze
 def frozen_core(mol, pos, frozen, reference, tol: float = 0.05) -> list[Violation]:
     """Frozen atoms held to ``reference`` within ``tol`` Å after Kabsch superposition."""
     frozen = list(frozen)
-    ref = _positions(reference)
+    ref = as_positions(reference)
     ssd, _ = rdAlignment.GetAlignmentTransform(ref[frozen], pos[frozen])
     rmsd = (ssd / len(frozen)) ** 0.5
     if rmsd > tol:
@@ -432,7 +430,7 @@ def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=No
     """
     if isinstance(reference, str):
         reference = Chem.MolFromXYZFile(reference)  # coords only; atom order must match `mol`
-    pos = _positions(mol, conf_id)
+    pos = as_positions(mol, conf_id)
     if not np.all(np.isfinite(pos)):
         return GeometryReport(
             [
@@ -475,6 +473,58 @@ def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=No
 # --- small private utilities -------------------------------------------------
 
 _EPS = 1e-9  # numerical floor for a degenerate cross-product / near-zero norm
+
+
+def _eta2_pi_atoms(mol, pos) -> set[int]:
+    """Return atoms in a genuine side-on η² unit: a π-bonded pair binding one metal symmetrically.
+
+    A side-on π ligand binds *through* its π bond, so the metal sits above the bond and legitimately pulls the
+    sp2 atoms a little out of plane, a real feature rather than broken geometry, so these atoms get a wider
+    planarity/conjugation window.
+
+    The signal is a pi-bonded pair both near the metal and at roughly equal metal distance: side-on is symmetric.
+    Equal-distance rejects a false positive the flat 1.3x shell lets through: an alpha-diimine's imine C drifts
+    inside the shell behind its sigma-donor N, but that N/C pair is lopsided, not side-on.
+    """
+    metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS]
+    out: set[int] = set()
+    for a, b in _coordination_pairs(mol, pos):
+        bond = mol.GetBondBetweenAtoms(a, b)
+        if bond is None or bond.GetBondTypeAsDouble() < 2:  # noqa: PLR2004  double/triple needed for side-on pi
+            continue
+        for m in metals:  # symmetric binding: both atoms at ~equal distance from the same metal
+            da, db = float(np.linalg.norm(pos[m] - pos[a])), float(np.linalg.norm(pos[m] - pos[b]))
+            if abs(da - db) <= _SIDEON_SYM and max(da, db) <= _SIDEON_MAX:
+                out.update((a, b))
+                break
+    return out
+
+
+def _coordinating_carbons(mol, pos) -> set[int]:
+    """Return carbons in a metal's coordination shell, which get the wider planarity window.
+
+    A carbanion / carbene / eta2 carbon legitimately pyramidalises out of the flat sp2 plane RDKit assigns it,
+    so judging it by the strict sp2 rule reports a defect that is not one.
+    """
+    metals = (a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS)
+    return {
+        i for m in metals for i in coordinating_atoms(mol, pos, m) if mol.GetAtomWithIdx(i).GetAtomicNum() == CARBON_Z
+    }
+
+
+def _coordination_pairs(mol, pos) -> set[tuple[int, int]]:
+    """Return donor-donor index pairs of each metal (a heavy atom in the `coordinating_atoms` shell).
+
+    These are 1-3 pairs through the metal: cis coordination partners at the bite distance, not a steric
+    clash. The metal-donor bonds are stripped on the rxembed surrogate, so donors are found geometrically.
+    """
+    out: set[tuple[int, int]] = set()
+    for m in (a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS):
+        donors = sorted(coordinating_atoms(mol, pos, m))
+        for x in range(len(donors)):
+            for y in range(x + 1, len(donors)):
+                out.add((donors[x], donors[y]))
+    return out
 
 
 def _plane_offset(center: np.ndarray, neighbors: np.ndarray) -> float:

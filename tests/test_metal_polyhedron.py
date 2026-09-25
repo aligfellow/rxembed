@@ -12,13 +12,11 @@ from rdkit.Chem import rdMolTransforms
 from rdkit.Geometry import Point3D
 
 from rxembed.constraints import FIX_ANGLE_TOL
-from rxembed.metal_core import _plane_rms, n_sites, rank_shapes
+from rxembed.metal_perceive import _plane_rms, rank_shapes
 from rxembed.metal_polyhedron import (
     _ALIASES,
     POLYHEDRA,
     _fit_trace,
-    _seat_by_alignment,
-    _vertex_angle,
     canonical_slots,
     describe,
     geometries_for_cn,
@@ -27,7 +25,9 @@ from rxembed.metal_polyhedron import (
     point_group,
     relaxed_shell,
     resolve_geometry,
+    seat_by_alignment,
     seat_properly,
+    vertex_angle,
     vertex_dirs,
 )
 
@@ -37,7 +37,6 @@ from rxembed.metal_polyhedron import (
 def test_records_resolve_and_match_vertex_count():
     for name, p in POLYHEDRA.items():
         assert resolve_geometry(p.code) == name, f"{p.code} does not resolve to {name}"
-        assert n_sites(name) == p.cn == len(p.vertex_dirs), f"{name}: cn {p.cn} is not its vertex count"
         assert name in [q.name for q in geometries_for_cn(p.cn)]
 
         v = np.array(p.vertex_dirs, float)
@@ -57,7 +56,6 @@ def test_aliases_are_unique_and_case_insensitive():
 
     for spelling in ("OCT", "oct", " Oct ", "octahedral", "OCTAHEDRAL"):
         assert resolve_geometry(spelling) == "octahedral"
-        assert n_sites(spelling) == 6
 
     assert describe("SPL") == "square_planar (SPL, CN 4)"
     assert describe("3-coordinate") == "3-coordinate"  # the from_geometry pseudo-name is not invented into a record
@@ -71,7 +69,7 @@ def test_angle_rows_match_vertex_geometry():
         if p.angles is None:  # CN7 / CN8: no hand-authored rows, `resolved_angles` derives them
             continue
         for i, j, a in p.angles:
-            assert abs(a - _vertex_angle(p.vertex_dirs[i], p.vertex_dirs[j])) <= 0.5, f"{name} row {(i, j, a)}"
+            assert abs(a - vertex_angle(p.vertex_dirs[i], p.vertex_dirs[j])) <= 0.5, f"{name} row {(i, j, a)}"
 
 
 def test_only_flat_based_pyramid_gets_umbrella():
@@ -204,7 +202,7 @@ def test_seating_finds_distorted_antiprism_optimum():
     for trial, optimum in enumerate(optima):
         observed = directions[rng.permutation(len(directions))] + rng.randn(len(directions), 3) * 0.05
         observed /= np.linalg.norm(observed, axis=1, keepdims=True)
-        order = _seat_by_alignment(observed, directions)
+        order = seat_by_alignment(observed, directions)
         score = float(np.linalg.svd(observed[list(order)].T @ directions, compute_uv=False).sum())
         assert score == pytest.approx(optimum, abs=1e-12), f"trial {trial}: {score:.6f} vs {optimum:.6f}"
 
@@ -222,7 +220,7 @@ def test_seating_searches_the_exact_bounded_orbit_pool():
     )
     ideal = np.array(vertex_dirs("octahedral"), float)
 
-    order = _seat_by_alignment(observed, ideal)
+    order = seat_by_alignment(observed, ideal)
 
     assert tuple(order) == (0, 5, 1, 4, 2, 3)
     assert _fit_trace(observed[order].T @ ideal) == pytest.approx(4.956143442072902, abs=1e-12)
@@ -242,7 +240,7 @@ def test_seating_reuses_template_assignments_but_refits_each_geometry(monkeypatc
     monkeypatch.setattr(poly, "_proper_orbit_permutations", counted)
     ideal = np.array(vertex_dirs("octahedral"), float)
     for observed in (ideal, ideal[[0, 2, 1, 3, 5, 4]]):
-        order = _seat_by_alignment(observed, ideal)
+        order = seat_by_alignment(observed, ideal)
         assert _fit_trace(observed[order].T @ ideal) == pytest.approx(6.0)
     assert len(calls) == 1
 
@@ -250,7 +248,7 @@ def test_seating_reuses_template_assignments_but_refits_each_geometry(monkeypatc
 # --- the convex-hull edge test, for the metal_slots chelate edge rule --------------------------------
 
 
-_HULL_EDGE_COUNTS = {  # counted by hand against a supporting-plane definition; see metal_slots._chelate_edge_links
+_HULL_EDGE_COUNTS = {  # counted by hand against a supporting-plane definition; see metal_slots.chelate_edge_links
     "OCT": 12,
     "TPR": 9,
     "CTP": 13,
@@ -277,7 +275,7 @@ def test_hull_edges_exclude_every_trans_pair():
         trans = {
             frozenset((i, j))
             for i, j in itertools.combinations(range(len(dirs)), 2)
-            if _vertex_angle(dirs[i], dirs[j]) == 180
+            if vertex_angle(dirs[i], dirs[j]) == 180
         }
         assert not (trans & edges), f"{name}: a 180 deg (trans) pair counted as a hull edge"
 
@@ -380,7 +378,5 @@ def test_square_pyramid_apex_fan_keeps_its_base_planar():
     plane_rms = _plane_rms(base.mean(axis=0), base)
     assert plane_rms < 1e-6, "the basal face folded instead of staying planar"
 
-    radius = 2.1  # an ordinary M-L distance (Angstrom); the reading depends only on direction, not scale
-    rms = _plane_rms(np.zeros(3), rays * radius)
-    ranked = rank_shapes(rays, rms, radius)
+    ranked = rank_shapes(rays)
     assert ranked[0][1] == "square_pyramidal", ranked[:2]

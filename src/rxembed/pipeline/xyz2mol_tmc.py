@@ -27,12 +27,12 @@ from rdkit.Chem import (
 )
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
-from rxembed.metal_core import _haptic_sites
-from rxembed.utils import _lone_pair, flat_ranks
+from rxembed.metal_core import haptic_sites
+from rxembed.utils import flat_ranks, lone_pair_electrons
 
 from .xyz2mol_local import AC2mol, chiral_stereo_check, read_xyz_file, xyz2AC_obabel
 
-# Narrower than metal_core.TRANSITION_METALS, which includes the f-block. The two are not
+# Narrower than metal_core.COORDINATION_METALS, which includes the f-block. The two are not
 # interchangeable; changing this list changes which atoms are disconnected as metals.
 # fmt: off
 TRANSITION_METALS: list[str] = [
@@ -230,7 +230,7 @@ def get_proposed_ligand_charge(ligand_mol, cutoff=-10):
 
 # A tetra-coordinate N or B, or a tri-coordinate O, reads no other way than a formal charge; a period-2
 # "fewer than four valence electrons, more sigma bonds than that" formula would also charge a five-bonded
-# TS carbon, so this stays a literal table. Shared with perceive._rank_orders, which re-applies it after
+# TS carbon, so this stays a literal table. Shared with perceive._flatten_for_xyz2mol, which re-applies it after
 # clearing charges for its own bond-order search.
 SEEDED_STRUCTURAL_CHARGES = {(7, 4): 1, (8, 3): 1, (5, 4): -1}
 
@@ -416,10 +416,10 @@ def lig_checks(lig_mol, coordinating_atoms, resonate=True):
 
         # Lewis bookkeeping (pairless-donor count below): read only the old pi-seeded face rule, not the site
         # pair rule, so grouping a bonded donor pair into one site never changes this reader's charge decision.
-        haptic = {atom for site in _haptic_sites(res_mol, coord_canon, pairs=False) if len(site) > 1 for atom in site}
+        haptic = {atom for site in haptic_sites(res_mol, coord_canon, pairs=False) if len(site) > 1 for atom in site}
         # A sigma site needs a lone pair; multicentre sites remain ranked fallbacks above (no metal bond
-        # on this ligand fragment, so _lone_pair's metal exclusion is a no-op here).
-        pairless = sum(_lone_pair(res_mol.GetAtomWithIdx(index), ()) < 2 for index in coord_canon - haptic)
+        # on this ligand fragment, so lone_pair_electrons' metal exclusion is a no-op here).
+        pairless = sum(lone_pair_electrons(res_mol.GetAtomWithIdx(index), ()) < 2 for index in coord_canon - haptic)
 
         # back to the caller's numbering (the enumeration ran on the blind-canonical one)
         yield (

@@ -14,8 +14,8 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import GetPeriodicTable
 
-from .metal_core import _ETA2, COORDINATION_METALS, VACANT, _frag_map, _haptic_sites, ligand_degree, ligand_valence
-from .utils import _CARBON_Z
+from .metal_core import COORDINATION_METALS, ETA2, VACANT, frag_map, haptic_sites, ligand_degree, ligand_valence
+from .utils import CARBON_Z
 
 _PT = GetPeriodicTable()
 
@@ -23,7 +23,7 @@ _PT = GetPeriodicTable()
 _OVERBOND_MARGIN = 0.55  # Å over the covalent sum: a model clearance above the 0.45 reporting boundary.
 _VDW_FLOOR_SCALE = 0.90  # x (r_vdw(M) + r_vdw(X)): extra OUTER clearance, not the surrogate's native vdW.
 _FLOOR_REACH = 5  # bonds from the metal, counted through the donors: the surrogate disconnects it topologically
-_INPUT_HALF_WIDTH = 0.1  # Å: lower/upper room around explicitly requested input lengths
+INPUT_HALF_WIDTH = 0.1  # Å: lower/upper room around explicitly requested input lengths
 
 # --- the anti-overbond tiers (`overbond_tier`) --------------------------------------------------------
 # Second-sphere clearance is smaller than OUTER clearance to admit beta-agostic geometry. An atom bonded to
@@ -36,7 +36,7 @@ OUTER_REPORT_MARGIN = 0.45  # Å over the covalent sum, for a third-sphere non-d
 # triple bond (Pyykkö Mn≡C = 0.82 x the sum; the tightest measured, back-bonded Mn-CO, 0.814). Below 0.70 the
 # nuclei interpenetrate: this catches a donor buried in the metal, not merely a short one.
 DONOR_COLLAPSE_RATIO = 0.70
-_APEX_DONORS = 2  # bonded to >= this many donors of this metal -> a geometrically forced bite apex: never floored
+APEX_DONORS = 2  # bonded to >= this many donors of this metal -> a geometrically forced bite apex: never floored
 APEX, NEAR, OUTER = "apex", "near", "outer"
 
 _SOFT_DATIVE_DONORS = frozenset({15, 33, 51})  # P/As/Sb, whose covalent radius over-states the dative M-bond.
@@ -45,10 +45,7 @@ _SOFT_DONOR_FRAC = 0.82  # x donor covalent radius, neutral non-haptic pnictogen
 
 
 # --- the M-donor bond length -------------------------------------------------------------------------
-# A fitted periodic model plus the guards a naive fit lacks. A formal charge is a Lewis artefact that splits
-# acac's equivalent oxygens, so charge is delocalised over symmetry classes first. Known residual: nothing
-# here reads bond order, so an anionic O still runs short. Terminal multiple bonds are keyed on ligand valence
-# instead (`_LIGAND_FREE_CONTRACTION`).
+# A fitted periodic model plus the guards a naive fit lacks; `ml_distance` lists them.
 
 
 _PHYS_COEF = (0.29574, 0.95161, 0.91467, -0.10418, 0.00875, -0.12581, 0.03590)
@@ -123,14 +120,10 @@ def delocalised_charges(mol):
     return out
 
 
-def _hapticity(mol, d, donor_set, sites=None):
-    """Return the shared haptic-site size for ``d``, or 0 for a sigma donor.
-
-    ``sites`` reuses an already-grouped `_haptic_sites` call instead of regrouping the whole donor set.
-    """
-    sites = _haptic_sites(mol, donor_set) if sites is None else sites
-    site = next(site for site in sites if d in site)
-    return len(site) if len(site) >= _ETA2 else 0
+def _hapticity(mol, d, donor_set):
+    """Return the shared haptic-site size for ``d``, or 0 for a sigma donor."""
+    site = next(site for site in haptic_sites(mol, donor_set) if d in site)
+    return len(site) if len(site) >= ETA2 else 0
 
 
 def ml_distance(mol, metal, d, real_z, donor_set, charges=None, *, hyb, eta=None):
@@ -148,7 +141,8 @@ def ml_distance(mol, metal, d, real_z, donor_set, charges=None, *, hyb, eta=None
     * a terminal, non-haptic sp donor binds `_SP_CONTRACTION` shorter (s-character plus pi back-donation).
 
     `eta` reuses a caller-precomputed hapticity (`_hapticity`) instead of regrouping `donor_set` per donor;
-    M-L grows monotonically with it, so it enters the fit linearly as the donor-island size.
+    M-L grows monotonically with it, so it enters the fit linearly as the donor-island size. Nothing here reads
+    bond order, so an anionic O donor still runs short.
     """
     a = mol.GetAtomWithIdx(d)
     z_d = a.GetAtomicNum()
@@ -186,12 +180,12 @@ def ml_distance(mol, metal, d, real_z, donor_set, charges=None, *, hyb, eta=None
             base -= intercept + slope * g
         elif eta == 0 and hyb.get(d) is Chem.HybridizationType.SP and ligand_degree(a) == 1:
             base -= _SP_CONTRACTION
-    if z_d == 1 and any(n.GetAtomicNum() == _CARBON_Z for n in a.GetNeighbors()):  # agostic C-H...M, not a hydride
+    if z_d == 1 and any(n.GetAtomicNum() == CARBON_Z for n in a.GetNeighbors()):  # agostic C-H...M, not a hydride
         return base + _AGOSTIC_ELONGATION
     return base
 
 
-def ff_terms(mol, cons, spheres, *, frozen=(), fragments=None, topology=None, sites=None):
+def ff_terms(mol, cons, spheres, *, frozen=(), fragments=None, topology=None):
     """Set up the force field for every metal in `spheres`: the one place this happens.
 
     Fills three `Constraints` fields: `metals` (a bondless Li surrogate with weak native vdW and no bonded
@@ -202,8 +196,7 @@ def ff_terms(mol, cons, spheres, *, frozen=(), fragments=None, topology=None, si
     ligand force field pick compatible radial distances.
 
     `spheres` is `{metal index: (real_z, [donor indices])}` for every metal, including a spectator that is
-    not the one being enumerated. `sites` reuses an already-grouped `_haptic_sites` call; pass it only when
-    `spheres` holds one metal, since it goes to every sphere's floors unchanged.
+    not the one being enumerated.
     """
     shape_held = set().union(*cons.shapes) if cons.shapes else set()  # metals whose sphere is an all-pairs body
     frozen = set(cons.frozen) | set(frozen)
@@ -213,7 +206,7 @@ def ff_terms(mol, cons, spheres, *, frozen=(), fragments=None, topology=None, si
             continue
         cons.metals.add(m)
         if m not in shape_held:  # a radial shell: pull independent donors off their walls
-            fragments = _frag_map(mol) if fragments is None else fragments
+            fragments = frag_map(mol) if fragments is None else fragments
             by_fragment = {}
             for donor in real:
                 by_fragment.setdefault(fragments.get(donor), []).append(donor)
@@ -235,16 +228,15 @@ def ff_terms(mol, cons, spheres, *, frozen=(), fragments=None, topology=None, si
                     continue
                 lo, hi = cons.distances[key]
                 cons.pulls[key] = 0.5 * (lo + hi)
-        nondonor_floors(mol, m, real_z, real, cons, topology=topology, sites=sites)
+        nondonor_floors(mol, m, real_z, real, cons, topology=topology)
 
 
-def overbond_tier(mol, donors, i, sites=None):
+def overbond_tier(mol, donors, i):
     """Anti-overbond tier of non-donor atom `i` against a metal whose donor set is `donors`.
 
     The one place the second-sphere rule is written; `nondonor_floors` (force field), `coordination.metal_overbond`
     (gate) and `metrics.coordination_changed` (connectivity check) all key off this, so the three cannot drift.
-    See the tier ratios at the top of this module. `sites` is accepted for call-signature compatibility with
-    callers that precompute `_haptic_sites`; unused here.
+    See the tier ratios at the top of this module.
 
     * `APEX`: bonded to 2 or more donors, a chelate bite apex or eta-n backbone. Forced, never floored.
     * `NEAR`: bonded to exactly 1 donor, the second sphere. Floored, but loosely enough to admit a real
@@ -252,7 +244,7 @@ def overbond_tier(mol, donors, i, sites=None):
     * `OUTER`: bonded to no donor, the third sphere and beyond. Only a collapse puts it this close.
     """
     attached = {int(d) for d in donors if mol.GetBondBetweenAtoms(int(i), int(d)) is not None}
-    if len(attached) >= _APEX_DONORS:
+    if len(attached) >= APEX_DONORS:
         return APEX
     return NEAR if attached else OUTER
 
@@ -273,7 +265,7 @@ def _tier_floor(z, tier, r_m, real_z):
     return max(r_sum + _OVERBOND_MARGIN, _VDW_FLOOR_SCALE * (_PT.GetRvdw(real_z) + _PT.GetRvdw(z)))
 
 
-def nondonor_floors(mol, metal, real_z, donors, cons, *, topology=None, sites=None):
+def nondonor_floors(mol, metal, real_z, donors, cons, *, topology=None):
     """Record the minimum M...X for every at-risk non-donor heavy atom: the metal's steric identity.
 
     `OUTER` gets `_VDW_FLOOR_SCALE` vdW clearance; `NEAR` (1,3 through its donor, position fixed by the
@@ -281,13 +273,11 @@ def nondonor_floors(mol, metal, real_z, donors, cons, *, topology=None, sites=No
     a real beta-agostic contact; `APEX` (>= 2 donors) cannot move and is not floored.
 
     Reach is measured through the donors, not the metal: the FF surrogate strips the M-donor bonds, so the
-    metal's own topological distance to its ligands is otherwise infinite. `sites` reuses an already-grouped
-    `_haptic_sites` call, shared with every `overbond_tier` call this makes.
+    metal's own topological distance to its ligands is otherwise infinite.
     """
     real = [d for d in donors if d != VACANT]
     if not real:
         return
-    sites = _haptic_sites(mol, real) if sites is None else sites
     topo = Chem.GetDistanceMatrix(mol) if topology is None else topology
     r_m = _PT.GetRcovalent(real_z)
     committed = {metal, *real}
@@ -304,7 +294,7 @@ def nondonor_floors(mol, metal, real_z, donors, cons, *, topology=None, sites=No
         hops = 1 + min(topo[d][i] for d in real)  # M -> donor -> ... -> X
         if hops > _FLOOR_REACH:
             continue
-        tier = overbond_tier(mol, real, i, sites=sites)
+        tier = overbond_tier(mol, real, i)
         if tier == APEX:  # a bite apex cannot move: its distance is already fixed by the two M-donor windows, so
             continue  # the FF needs no wall here; the DG still relieves it below, RDKit flooring it regardless
         key = (min(metal, i), max(metal, i))
@@ -319,5 +309,5 @@ def nondonor_floors(mol, metal, real_z, donors, cons, *, topology=None, sites=No
         if i in committed:
             continue
         z = mol.GetAtomWithIdx(i).GetAtomicNum()
-        floor = _tier_floor(z, overbond_tier(mol, real, i, sites=sites), r_m, real_z)
+        floor = _tier_floor(z, overbond_tier(mol, real, i), r_m, real_z)
         cons.dg_floors[(min(metal, i), max(metal, i))] = floor

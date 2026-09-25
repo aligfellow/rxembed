@@ -16,23 +16,26 @@ from rdkit.Chem.rdMolTransforms import GetAngleDeg
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
-from rxembed import metal_constraints as _metal_constraints
-from rxembed import metal_core as _metal
-from rxembed import stereo as _stereo
+from rxembed import metal_constraints, metal_core, stereo
+from rxembed.bounds import EmbedParams, bounds_matrix
 from rxembed.constraints import FIX_ANGLE_TOL, Constraints
-from rxembed.embed import _coordination_state_ok
+from rxembed.embed import _coordination_state_failure
 from rxembed.metal_constraints import (
+    CoordinationSphere,
     _add_ligand_ez,
     _add_umbrella,
     _bite_window_and_reach,
+    compile_constraints,
+    compile_context,
     coordination,
 )
-from rxembed.metal_core import VACANT, HapticSite, MetalState, _bounds_matrix, classify_geometry, metal_indices
-from rxembed.metal_donor_orient import _COPLANAR_CAP
+from rxembed.metal_core import VACANT, HapticSite, MetalState, metal_indices
+from rxembed.metal_donor_orient import COPLANAR_CAP
 from rxembed.metal_enumeration import enumerate_isomers
 from rxembed.metal_isomer import Isomer
-from rxembed.metal_polyhedron import CHELATE_SPAN_ANGLE, POLYHEDRA, _vertex_angle, point_group, vertex_dirs
-from rxembed.metal_slots import _CHELATE_BITE, _SPAN_TOL, _chelate_bite_window
+from rxembed.metal_perceive import classify_geometry
+from rxembed.metal_polyhedron import CHELATE_SPAN_ANGLE, POLYHEDRA, point_group, vertex_angle, vertex_dirs
+from rxembed.metal_slots import _CHELATE_BITE, SPAN_TOL, chelate_bite_window
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.ensemble import Ensemble
 from rxembed.relax import _ff_surrogate
@@ -50,7 +53,7 @@ _TRIDENTATE_CD = "[NH2]1CC[NH]2CC[NH2]->[Cd+2](<-[Cl-])(<-[Cl-])<-1<-2"
 def _realised(ens, iso, cid, i, j):
     """The vertex i-metal-vertex j angle realised in conformer `cid`."""
     pos = ens.mol.GetConformer(cid).GetPositions()
-    return _vertex_angle(pos[iso.vertices[i]] - pos[iso.metal], pos[iso.vertices[j]] - pos[iso.metal])
+    return vertex_angle(pos[iso.vertices[i]] - pos[iso.metal], pos[iso.vertices[j]] - pos[iso.metal])
 
 
 def _two_centre_ensemble(primary, secondary):
@@ -69,7 +72,7 @@ def _two_centre_ensemble(primary, secondary):
             unit = np.asarray(direction, dtype=float)
             conf.SetAtomPosition(donor, Point3D(*(origin + 2.0 * unit / np.linalg.norm(unit))))
     mol.AddConformer(conf)
-    iso = Isomer._from_state(mol, states)
+    iso = Isomer.from_state(mol, states)
     return Ensemble(mol, [0], iso=iso), iso
 
 
@@ -127,7 +130,9 @@ def test_flattened_pyramid_is_rejected():
         conf.SetAtomPosition(iso.metal, Point3D(*np.mean([pos[v] for v in verts], axis=0)))
     failures = ens._acceptance_failures()
     assert len(failures) == 1
-    assert str(next(iter(failures))).startswith("coordination state")
+    failure = next(iter(failures))
+    assert failure.kind == "coordination_shape"
+    assert str(failure).endswith("donors fall into a plane")
     assert next(iter(failures.values())) == ens.ids
 
 
@@ -138,7 +143,7 @@ def test_secondary_planar_centre_is_checked():
     pos = conf.GetPositions()
     donor = secondary.vertices[0]
     conf.SetAtomPosition(donor, Point3D(*(pos[donor] + np.array([0.0, 0.0, 2.0]))))
-    assert not _coordination_state_ok(ens._mol, 0, iso), "the puckered secondary square plane passed the final gate"
+    assert _coordination_state_failure(ens._mol, 0, iso) is not None, "the puckered secondary plane passed the gate"
 
 
 def test_secondary_nonplanar_centre_flattening_is_rejected():
@@ -147,7 +152,7 @@ def test_secondary_nonplanar_centre_flattening_is_rejected():
     conf = ens._mol.GetConformer()
     pos = conf.GetPositions()
     conf.SetAtomPosition(secondary.atom, Point3D(*np.mean(pos[list(secondary.vertices)], axis=0)))
-    assert not _coordination_state_ok(ens._mol, 0, iso)
+    assert _coordination_state_failure(ens._mol, 0, iso) is not None
 
 
 def test_one_haptic_site_does_not_define_a_nonplanar_state():
@@ -155,13 +160,13 @@ def test_one_haptic_site_does_not_define_a_nonplanar_state():
     secondary = iso.centres[1]
     face = HapticSite(tuple(secondary.vertices))
     sparse = secondary._replace(vertices=(face, None, None, None))
-    iso = Isomer._from_state(iso.mol, (iso.centres[0], sparse))
-    assert _coordination_state_ok(ens._mol, 0, iso)
+    iso = Isomer.from_state(iso.mol, (iso.centres[0], sparse))
+    assert _coordination_state_failure(ens._mol, 0, iso) is None
 
 
 def test_planar_donor_keeps_rdkit_native_substituent_floor_during_relax():
     iso = rx.metal("[Pd+2](<-[n]1ccccc1)(<-[n]1ccccc1)(<-[Cl-])<-[Cl-]", "square_planar")[0]
-    bounds = _bounds_matrix(iso.mol)
+    bounds = bounds_matrix(iso.mol)
     ens = rx.embed(iso, n=1, seed=42)
     pos = ens.mol.GetConformer(ens.ids[0]).GetPositions()
 
@@ -177,7 +182,7 @@ def test_donor_orientation_walls_cannot_collapse_two_protons_together():
     iso = rx.metal("[NH2](c1ccccc1)->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]", "square_planar")[0]
     donor = next(atom for atom in iso.mol.GetAtoms() if atom.GetAtomicNum() == 7)
     protons = sorted(neighbor.GetIdx() for neighbor in donor.GetNeighbors() if neighbor.GetAtomicNum() == 1)
-    floor = float(_bounds_matrix(iso.mol)[protons[1], protons[0]])
+    floor = float(bounds_matrix(iso.mol)[protons[1], protons[0]])
 
     assert iso.cons.floors[tuple(protons)] == pytest.approx(floor)
     ens = rx.embed(iso, n=1, seed=42)
@@ -292,7 +297,7 @@ def test_held_opposed_bites_retain_a_valid_shared_angle_witness():
     # windows (metal_polyhedron.relaxed_shell), not from one shared `180 - bite`. Mutating back to that
     # per-bite formula breaks this witness on these elongated (O/S kappa2-corrected) legs.
     iso = Isomer(Chem.MolFromSmiles("[Ag+]12(<-[O-]C[O-]->1)<-NCCN->2"), "square_planar", {0: 1, 1: 3, 2: 4, 3: 7})
-    cons = coordination(iso.mol, iso.metal, iso.vertices, iso.geometry, 47, haptic={})
+    cons = coordination(CoordinationSphere(iso.mol, iso.metal, 47, tuple(iso.vertices), {}, POLYHEDRA[iso.geometry]))
     windows = {frozenset((a, b)): value for (a, m, b), value in cons.angles.items() if m == iso.metal}
     left, right = windows[frozenset((1, 3))], windows[frozenset((4, 7))]
     # b1, b2: the closest-approaching point in each bite's own window (minimising |b1 - b2|), not a shared value.
@@ -366,7 +371,7 @@ def test_tridentate_fan_compiles_shared_targets_and_survives_cleanup():
     assert len(targets) == 10
     for spectator in (8, 9):
         lo, hi = iso.cons.angles[3, iso.metal, spectator]
-        assert (lo + hi) / 2 == pytest.approx(91.502, abs=1e-3)
+        assert (lo + hi) / 2 == pytest.approx(84.505, abs=1e-3)
         for donor in (0, 6):
             assert targets[donor, iso.metal, spectator] == pytest.approx(88.441, abs=1e-3)
     for key, value in targets.items():
@@ -385,7 +390,7 @@ def test_public_planar_bite_compilation_respects_late_target_owners(opposed):
     assert any(len(key) == 3 for key in original.pulls)
     trans = (iso.vertices[0], iso.metal, iso.vertices[2])
     for external in (Constraints(pulls={trans: 110.0}), Constraints(fixed={trans: (180.0, 180.0)})):
-        cons = iso._constraints(external)
+        cons = compile_constraints(iso, external)
         assert not any(len(key) == 3 for key in cons.pulls)
     assert iso.cons == original
 
@@ -442,7 +447,7 @@ def test_chelate_bite_uses_backbone_not_ideal():
     assert inter, "the fixture must also state an inter-ligand pair, or the contrast is untested"
     pads = {(max(0.0, a - 8.0), min(180.0, a + 8.0)) for a in ideal}  # ±8° about a tabulated angle, clamped
     for k, window in inter.items():
-        # A wide intra-chelate bite (the native reach, `_seated_bites`) can pull `relaxed_shell`'s corner
+        # A wide intra-chelate bite (the native reach, `seated_bites`) can pull `relaxed_shell`'s corner
         # images further than the plain pad, and every already-compiled row only widens for that (`coordination`
         # never narrows one), so an inter-ligand row need only contain its pad, not equal it.
         assert any(window[0] <= lo and window[1] >= hi for lo, hi in pads), (
@@ -451,13 +456,13 @@ def test_chelate_bite_uses_backbone_not_ideal():
 
     # the window comes from the RING, so a pair with no shared backbone gets none at all
     cl = [d for d in iso.donors if iso.mol.GetAtomWithIdx(d).GetSymbol() == "Cl"]
-    assert _chelate_bite_window(iso.mol, cl[0], cl[1]) is None
+    assert chelate_bite_window(iso.mol, cl[0], cl[1]) is None
 
 
 def test_chelate_bite_window_intersects_a_partial_rdkit_reach_window():
-    """`_bite_window_and_reach` (the native-reach triangle, moved here from `metal_slots._chelate_bite_window`)
+    """`_bite_window_and_reach` (the native-reach triangle, moved here from `metal_slots.chelate_bite_window`)
     intersects the ring-size census with the backbone reach triangle for `window`, and reports the wider
-    triangle back as `reach` for `_bounded_bites`'s gap box. Both sites are one atom (a sigma pair), so `row`
+    triangle back as `reach` for `bounded_bites`'s gap box. Both sites are one atom (a sigma pair), so `row`
     (only read for a haptic-ended pair) is a placeholder.
     """
     mol = Chem.MolFromSmiles("NCCN")
@@ -466,8 +471,8 @@ def test_chelate_bite_window_intersects_a_partial_rdkit_reach_window():
     def span(angle):
         return math.sqrt(8.0 - 8.0 * math.cos(math.radians(angle)))
 
-    matrix[3, 0] = span(80.0) + _SPAN_TOL
-    matrix[0, 3] = span(100.0) - _SPAN_TOL
+    matrix[3, 0] = span(80.0) + SPAN_TOL
+    matrix[0, 3] = span(100.0) - SPAN_TOL
 
     window, reach = _bite_window_and_reach(mol, (0,), (3,), (0, 3), matrix, (2.0, 2.0), (0.0, 180.0))
 
@@ -518,7 +523,35 @@ def test_tris_pyrazolyl_borate_zinc_chloride_keeps_its_boron_nitrogen_bonds():
         assert ratio < 1.05, f"{ligand.GetAtomWithIdx(i).GetSymbol()}-{ligand.GetAtomWithIdx(j).GetSymbol()} {ratio}"
 
 
-# --- a haptic bite reads the native ligand reach, same as a sigma bite (metal_constraints._seated_bites) ------
+def test_capped_tp_tungsten_tricarbonyl_holds_carbonyl_off_the_spectator_pyrazolyl_nitrogen(tmp_path):
+    """A Tp tungsten tricarbonyl's spectator N-W-C rows narrow toward the bite, but never past the angle
+    where a carbonyl carbon and a pyrazolyl nitrogen on different ligands would close inside their own
+    van der Waals contact floor (MADROZ).
+    """
+    cx = (
+        "CC#[N]->[W+2]12(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[n]3c(C)cc(C)n3[BH-](n3c(C)cc(C)[n]->13)"
+        "n1c(C)cc(C)[n]->21 |atomProp:2.atomNote.s6:3.atomNote.COC-delta:4.atomNote.s1:6.atomNote.s4:"
+        "8.atomNote.s5:10.atomNote.s0:24.atomNote.s2:31.atomNote.s3|"
+    )
+    iso = rx.metal(cx)[0]
+    ensemble = rx.embed(iso, n=1, seed=42, threads=1)
+    pytest.importorskip("xyzgraph")
+    path = tmp_path / "madroz.xyz"
+    Chem.MolToXYZFile(ensemble.mol, str(path), confId=ensemble.ids[0])
+    fresh = rx.read_xyz(str(path), charge=1, connectivity="xyzgraph", bond_orders="xyz2mol")
+
+    def edges(mol):
+        return {
+            tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx())))
+            for b in mol.GetBonds()
+            if b.GetBondType() != Chem.BondType.ZERO
+        }
+
+    formed = edges(metal_core.canonical_metal_graph(fresh)) - edges(ensemble.mol)
+    assert not formed, formed
+
+
+# --- a haptic bite reads the native ligand reach, same as a sigma bite (metal_constraints.seated_bites) ------
 
 
 def _worst_ligand_bond_ratio(mol, positions, ref_positions=None):
@@ -576,7 +609,7 @@ def test_norbornadiene_nickel_dicarbonyl_keeps_its_carbon_bonds():
 def test_cis_diene_faces_keep_a_cis_window_on_platinum(smiles):
     """Compile only: every cis diene isomer's face-face row must have an upper bound below `CHELATE_SPAN_ANGLE`,
     or a real embed can force the two coordinated faces toward `PtCl2`'s trans vertices and tear the ring
-    finding room. This pins the span source: RDKit's smoothed DG bounds matrix (`metal_core._bounds_matrix`)
+    finding room. This pins the span source: RDKit's smoothed DG bounds matrix (`bounds.bounds_matrix`)
     leaves this row unbounded for both, from a vdW floor on the wide-reach diene (a floppy 6-carbon tether) and
     from cyclooctatetraene's planar aromatic-ring template (section 2, cause A) -- 98.7-180 and 161.4-180 deg.
 
@@ -591,7 +624,7 @@ def test_cis_diene_faces_keep_a_cis_window_on_platinum(smiles):
         faces = list(iso.haptic)
         assert len(faces) == 2
         slots = {donor: k for k, donor in enumerate(iso.vertices) if donor != VACANT}
-        ideal = _vertex_angle(dirs[slots[faces[0]]], dirs[slots[faces[1]]])
+        ideal = vertex_angle(dirs[slots[faces[0]]], dirs[slots[faces[1]]])
         if ideal >= CHELATE_SPAN_ANGLE:
             continue  # the trans arrangement: not this test's concern
         checked += 1
@@ -633,7 +666,7 @@ def test_tethered_norbornadiene_molybdenum_keeps_its_crystal_carbon_bonds():
 @pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
 def test_cyclooctatetraene_iridium_face_row_holds_its_crystal_bite():
     """OMANUL: a tub-shaped cyclooctatetraene's two eta2,eta2 faces on Ir. This pins the span source: RDKit's
-    smoothed DG bounds matrix (`metal_core._bounds_matrix`) reads the ring as a planar aromatic octagon
+    smoothed DG bounds matrix (`bounds.bounds_matrix`) reads the ring as a planar aromatic octagon
     (section 2, cause A) and bounds the compiled row to 100.5-117.3 deg, excluding the crystal's 87.9 deg
     centroid-centroid angle; the native ligand reach does not carry that ring-template preference.
     """
@@ -683,7 +716,7 @@ def test_coordination_constraints_are_invariant_under_proper_rotation(geometry, 
     metal, donors = 0, tuple(range(1, coordination_number + 1))
 
     def sphere_angles(vertices):
-        cons = coordination(mol, metal, vertices, geometry, 26, haptic={})
+        cons = coordination(CoordinationSphere(mol, metal, 26, vertices, {}, POLYHEDRA[geometry]))
         return {(min(a, b), max(a, b)): window for (a, centre, b), window in cons.angles.items() if centre == metal}
 
     expected = sphere_angles(donors)
@@ -694,7 +727,7 @@ def test_coordination_constraints_are_invariant_under_proper_rotation(geometry, 
 def test_directly_bonded_donors_use_their_distance_triangle():
     """A bonded donor pair with a third donor neighbour on each side keeps its native distance triangle.
 
-    ZUDWUQ's encircling cyclo-As6 ring on Ni: the pair rule (`metal_core._haptic_sites`) only merges a
+    ZUDWUQ's encircling cyclo-As6 ring on Ni: the pair rule (`metal_core.haptic_sites`) only merges a
     bonded donor pair with no third donor neighbour, so each As keeps its own donor slot here and its two
     ring bonds get a native distance row instead of an independent M-centred angle.
     """
@@ -719,7 +752,7 @@ def test_retained_haptic_distances_are_measured_but_angles_use_the_polyhedron():
     left, right = cons.haptic
     angle = (left, iso.metal, right)
     rays = [positions[list(cons.haptic[site])].mean(axis=0) - positions[iso.metal] for site in (left, right)]
-    measured = _vertex_angle(*rays)
+    measured = vertex_angle(*rays)
     assert measured < 165
     assert cons.angles.get(angle, cons.angles.get(angle[::-1])) == (172.0, 180.0)
     for site, ray in zip((left, right), rays, strict=True):
@@ -747,9 +780,16 @@ def test_three_centre_hydrogen_bridge_keeps_its_measured_xh_span():
         conf.SetAtomPosition(atom, Point3D(*point))
     mol.AddConformer(conf)
 
-    cons = coordination(
-        mol, metal, (boron, bridge, nitrogen), "trigonal_planar", 26, haptic={}, source=mol, lengths="input"
+    sphere = CoordinationSphere(
+        mol,
+        metal,
+        26,
+        (boron, bridge, nitrogen),
+        {},
+        POLYHEDRA["trigonal_planar"],
+        pos=mol.GetConformer().GetPositions(),
     )
+    cons = coordination(sphere)
 
     distance = np.linalg.norm(np.array((2.1, 0, 0)) - np.array((1.4, 1.15, 0)))
     assert cons.distances[(boron, bridge)] == pytest.approx((distance - 0.1, distance + 0.1))
@@ -850,7 +890,7 @@ def test_independent_tetrahedral_bite_centres_are_jointly_realizable(smiles):
     donors = (1, 4, 5, 9)
     expected = None
     for vertices in itertools.permutations(donors):
-        cons = coordination(mol, 0, vertices, "tetrahedral", 30, haptic={})
+        cons = coordination(CoordinationSphere(mol, 0, 30, vertices, {}, POLYHEDRA["tetrahedral"]))
         angles = {tuple(sorted((a, b))): window for (a, metal, b), window in cons.angles.items() if metal == 0}
         if expected is None:
             expected = angles
@@ -874,12 +914,14 @@ def test_independent_tetrahedral_bite_centres_are_jointly_realizable(smiles):
         assert spectrum[1] > 0, "the witness must not collapse into a plane"
     order = list(reversed(range(mol.GetNumAtoms())))
     renamed = coordination(
-        Chem.RenumberAtoms(mol, order),
-        order.index(0),
-        tuple(order.index(i) for i in donors),
-        "tetrahedral",
-        30,
-        haptic={},
+        CoordinationSphere(
+            Chem.RenumberAtoms(mol, order),
+            order.index(0),
+            30,
+            tuple(order.index(i) for i in donors),
+            {},
+            POLYHEDRA["tetrahedral"],
+        )
     )
     assert {
         tuple(sorted((order[a], order[b]))): window
@@ -965,24 +1007,19 @@ def test_late_graft_and_numeric_bite_disable_independent_target_preferences():
 
 
 def test_unnamed_spectator_donor_bond_disables_independent_bite_targets():
-    from rxembed.metal_constraints import compile_constraints, compile_context
-
     iso = rx.metal("C=[N]1Cc2cccc[n]2->[Cu+]<-12<-[N](Cc1cccc[n]->21)=C", "tetrahedral")[0]
-    assert iso._constraints(context=compile_context(iso._graph)) == iso.cons
-    spectator = iso._graph.GetNumAtoms()
-    mol = Chem.CombineMols(iso._graph, Chem.MolFromSmiles("[C]"))
+    assert compile_constraints(iso, context=compile_context(iso.graph)) == iso.cons
+    spectator = iso.graph.GetNumAtoms()
+    mol = Chem.CombineMols(iso.graph, Chem.MolFromSmiles("[C]"))
     Chem.GetSymmSSSR(mol)
     unnamed = MetalState(spectator, 26, 0, "", ())
-    cons = compile_constraints(
+    cons = Isomer.from_state(
         mol,
         (*iso.centres, unnamed),
-        length_mol=iso._length_mol,
-        base=Constraints(),
-        constrained_metals=iso._constrained_metals,
-        lengths="model",
+        [*iso.donor_bonds, (2, spectator)],
+        constrained_metals=iso.constrained_metals,
         stereo_label=iso.stereo_label,
-        donor_bonds=[*iso.donor_bonds, (2, spectator)],
-    )
+    ).cons
     frag = _frag_of(iso.mol)
     cross = next(k for k in iso.cons.angles if k[1] == iso.metal and frag[k[0]] != frag[k[2]])
     assert cons.angles[cross] != iso.cons.angles[cross]
@@ -1050,7 +1087,7 @@ def test_input_coordinates_do_not_disable_haptic_chelate_donor_folds():
         rw.AddBond(left, right, Chem.BondType.DOUBLE)
         faces.append((left, right))
     # Two independent monodentate donors, not bonded to each other: a bonded N,N pair is now one haptic
-    # site under the pair rule (`metal_core._haptic_sites`), which would drop their per-donor fold term.
+    # site under the pair rule (`metal_core.haptic_sites`), which would drop their per-donor fold term.
     donors = (rw.AddAtom(Chem.Atom("N")), rw.AddAtom(Chem.Atom("N")))
     substituents = []
     for donor in donors:
@@ -1118,7 +1155,7 @@ def test_planar_shell_force_covers_every_donor_and_is_index_invariant(geometry):
         _add_umbrella(cons, metal, slots, poly)
         assert sum(value[1] for value in cons.umbrellas.values()) == pytest.approx(1.0)
         ff = rdForceFieldHelpers.CreateEmptyForceFieldForMol(mol)
-        Umbrella()._ff_terms(ff, cons, mol.GetConformer(), 1.0)
+        Umbrella().uff_terms(ff, cons, mol.GetConformer(), 1.0)
         ff.Initialize()
         return mol, ff
 
@@ -1192,14 +1229,14 @@ def test_coordinated_nh_imine_uses_requested_ez_donor_plane():
     source = Chem.AddHs(Chem.MolFromSmiles("CC=[NH]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]"))
     for order in (list(range(source.GetNumAtoms())), list(reversed(range(source.GetNumAtoms())))):
         isomers = enumerate_isomers(Chem.RenumberAtoms(source, order), "square_planar")
-        assert {_stereo.bond_stereo(iso.stereo_label).popitem()[1] for iso in isomers} == {"E", "Z"}
+        assert {stereo.bond_stereo(iso.stereo_label).popitem()[1] for iso in isomers} == {"E", "Z"}
         for iso in isomers:
-            targets = _stereo.metal_referenced_ez(iso.mol, iso.stereo_label, iso.donor_bonds)
+            targets = stereo.metal_referenced_ez(iso.mol, iso.stereo_label, iso.donor_bonds)
             ((_, (donor, carbon, metal, _ref, _ligand_ref, wanted)),) = targets.items()
             restored = Chem.Mol(iso.mol)
             iso.restore(restored)
-            restored = _metal.connect_metal(restored, iso.donor_bonds)
-            assert _stereo.metal_referenced_ez(restored, iso.stereo_label, iso.donor_bonds) == targets
+            restored = metal_core.connect_metal(restored, iso.donor_bonds)
+            assert stereo.metal_referenced_ez(restored, iso.stereo_label, iso.donor_bonds) == targets
             rows = iso.cons.coplanar
             ((_, _, _, _ref, anchor, _cap),) = [row for row in rows if row[0] == metal]
             assert anchor == (180.0 if wanted == "E" else 0.0)
@@ -1209,10 +1246,10 @@ def test_coordinated_nh_imine_uses_requested_ez_donor_plane():
 def test_coordinated_nh_imine_ez_survives_donor_orientation_ablation():
     source = Chem.AddHs(Chem.MolFromSmiles("CC=[NH]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]"))
     isomer = enumerate_isomers(source, "square_planar")[0]
-    targets = _stereo.metal_referenced_ez(isomer.mol, isomer.stereo_label, isomer.donor_bonds)
+    targets = stereo.metal_referenced_ez(isomer.mol, isomer.stereo_label, isomer.donor_bonds)
     assert targets
 
-    cons = isomer._constraints(donor_orientation=False)
+    cons = compile_constraints(isomer, params=EmbedParams(donor_orientation=False))
     ((_, (_, _, metal, _ref, _ligand_ref, wanted)),) = targets.items()
     rows = [row for row in cons.coplanar if row[0] == metal]
     assert rows
@@ -1222,8 +1259,8 @@ def test_coordinated_nh_imine_ez_survives_donor_orientation_ablation():
 def test_n_substituted_imine_keeps_ordinary_ligand_ez():
     iso = rx.metal(r"C/C=N(/C)->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]", "square_planar")[0]
 
-    assert _stereo.bond_stereo(iso.stereo_label)
-    assert not _stereo.metal_referenced_ez(iso.mol, iso.stereo_label, iso.donor_bonds)
+    assert stereo.bond_stereo(iso.stereo_label)
+    assert not stereo.metal_referenced_ez(iso.mol, iso.stereo_label, iso.donor_bonds)
 
 
 def test_ligand_ez_uses_rdkit_reference_geometry_not_absolute_cip():
@@ -1231,24 +1268,24 @@ def test_ligand_ez_uses_rdkit_reference_geometry_not_absolute_cip():
     bond = next(bond for bond in mol.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE)
     bond.SetStereoAtoms(0, 5)
     bond.SetStereo(Chem.BondStereo.STEREOE)
-    label = _stereo.defined_stereo_label(mol)
+    label = stereo.defined_stereo_label(mol)
     assert label.endswith(":Z"), "the regression requires raw-trans references whose absolute CIP label is Z"
 
     cons = Constraints()
     _add_ligand_ez(cons, mol, label, ())
 
-    assert cons.coplanar == [(0, 1, 3, 5, 180.0, _COPLANAR_CAP)]
+    assert cons.coplanar == [(0, 1, 3, 5, 180.0, COPLANAR_CAP)]
 
 
 def test_eta2_alkene_keeps_stated_ez_during_relaxation():
     iso = rx.metal(r"C/[CH]1=[CH](\F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1", "square_planar")[0]
-    pair = next(iter(_stereo.bond_stereo(iso.stereo_label)))
+    pair = next(iter(stereo.bond_stereo(iso.stereo_label)))
     rows = [row for row in iso.cons.coplanar if frozenset(row[1:3]) == pair]
 
     assert len(rows) == 1
     tag = iso.mol.GetBondBetweenAtoms(*pair).GetStereo()
     cis = tag in {Chem.BondStereo.STEREOCIS, Chem.BondStereo.STEREOZ}
-    assert rows[0][4:] == (0.0 if cis else 180.0, _COPLANAR_CAP)
+    assert rows[0][4:] == (0.0 if cis else 180.0, COPLANAR_CAP)
 
 
 def test_fully_occupied_planar_chelate_gets_one_shape_level_plane_hold():
@@ -1355,16 +1392,16 @@ def test_coordinate_composes_with_fix_constrain_and_contacts():
 
 
 def test_coordinate_relieves_the_phantom_floor_it_creates(monkeypatch):
-    from rxembed import bounds as _b
+    from rxembed import bounds
 
-    tols, real = [], _b._bounds
+    tols, real = [], bounds._bounds
 
     def spy(mol, cons, params=None):
         bm, tol = real(mol, cons, params)
         tols.append(tol)
         return bm, tol
 
-    monkeypatch.setattr(_b, "_bounds", spy)
+    monkeypatch.setattr(bounds, "_bounds", spy)
     iso = rx.metal("N->[Pt](Cl)Cl.CC(C)=O", "square_planar").select(index=0)  # one vacant site + free acetone
     o = next(a.GetIdx() for a in iso.mol.GetAtoms() if a.GetSymbol() == "O")
     ens = rx.embed(iso, coordinate=o, n=1)
@@ -1448,18 +1485,37 @@ def test_constraint_compilation_classifies_donors_once(lengths, monkeypatch):
     reference = rx.embed(iso, n=1, seed=42, threads=1).mol
     iso = rx.metal(reference, lengths=lengths)[0]
     expected = iso.cons
-    classify = metal_donor_orient._stripped_hybridisation
+    classify = metal_donor_orient.stripped_hybridisation
     calls = []
 
     def counted(mol):
         calls.append(mol)
         return classify(mol)
 
-    monkeypatch.setattr(metal_constraints, "_stripped_hybridisation", counted)
-    monkeypatch.setattr(metal_donor_orient, "_stripped_hybridisation", counted)
+    monkeypatch.setattr(metal_constraints, "stripped_hybridisation", counted)
+    monkeypatch.setattr(metal_donor_orient, "stripped_hybridisation", counted)
 
     assert iso.cons == expected
     assert len(calls) == 1, "one coordination build must share its ligand classification across donors"
+
+
+@pytest.mark.parametrize("face", ["centred-arene", "slipped-arene", "open-allyl"])
+def test_haptic_centroid_target_matches_measured_geometry(face):
+    if face == "open-allyl":
+        mol = Chem.MolFromSmiles("C=CC")
+        positions = np.array([[-1.2, 0.0, 0.0], [0.0, 0.7, 0.0], [1.2, 0.0, 0.0]])
+    else:
+        mol = Chem.MolFromSmiles("c1ccccc1")
+        angles = np.arange(6) * np.pi / 3
+        positions = 1.4 * np.column_stack((np.cos(angles), np.sin(angles), np.zeros(6)))
+    metal = np.array([0.0 if face == "centred-arene" else 1.2, 0.0, 1.5])
+    conf = Chem.Conformer(len(positions))
+    conf.SetPositions(positions)
+    mol.AddConformer(conf)
+    radius = metal_constraints._site_radius(mol, tuple(range(len(positions))), positions=positions)
+    lengths = np.linalg.norm(positions - metal, axis=1)
+    actual = np.linalg.norm(metal - positions.mean(axis=0))
+    assert metal_constraints._site_height(radius, lengths) == pytest.approx(actual)
 
 
 def test_input_haptic_centroid_uses_the_input_distance_width():
@@ -1543,25 +1599,9 @@ def test_input_lengths_do_not_impose_observed_non_donor_contacts():
     mol.AddConformer(conf)
 
     measured = coordination(
-        mol,
-        2,
-        (1, -1),
-        "linear",
-        25,
-        haptic={},
-        source=mol,
-        lengths="input",
+        CoordinationSphere(mol, 2, 25, (1, -1), {}, POLYHEDRA["linear"], pos=mol.GetConformer().GetPositions())
     )
-    alternate = coordination(
-        mol,
-        2,
-        (1, -1),
-        "linear",
-        25,
-        haptic={},
-        source=mol,
-        lengths="model",
-    )
+    alternate = coordination(CoordinationSphere(mol, 2, 25, (1, -1), {}, POLYHEDRA["linear"]))
     assert measured.floors == alternate.floors
 
 
@@ -1577,12 +1617,12 @@ def test_length_source_logged_once(caplog):
 
 def test_screen_constraints_skip_force_field_contacts(monkeypatch):
     iso = rx.metal("Cl[Pt](Cl)(N)N", "square_planar")[0]
-    context = _metal_constraints.compile_context(iso._graph)
+    context = compile_context(iso.graph)
 
     def fail(*_args, **_kwargs):
         raise AssertionError("screen compilation must not build force-field contacts")
 
-    monkeypatch.setattr(_metal_constraints, "ff_terms", fail)
-    screened = iso._constraints(force_field=False, context=context)
+    monkeypatch.setattr(metal_constraints, "ff_terms", fail)
+    screened = compile_constraints(iso, force_field=False, context=context)
 
     assert screened.distances

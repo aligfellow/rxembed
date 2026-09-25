@@ -8,7 +8,7 @@ from rdkit import Chem
 
 import rxembed as rx
 from rxembed import metal_slots as slots
-from rxembed.metal_polyhedron import CHELATE_SPAN_ANGLE, _vertex_angle, hull_edges, vertex_dirs
+from rxembed.metal_polyhedron import CHELATE_SPAN_ANGLE, hull_edges, vertex_angle, vertex_dirs
 
 
 def test_square_pyramidal_150_degree_pair_is_trans():
@@ -57,7 +57,7 @@ def test_narrow_drops_only_the_orderings_placing_the_pair_on_a_wide_vertex_pair(
     pruned = slots.distinct_vertex_orderings(mol, donors, geometry, narrow=narrow)
 
     expected = [
-        order for order in unpruned if _vertex_angle(dirs[order.index(0)], dirs[order.index(1)]) < CHELATE_SPAN_ANGLE
+        order for order in unpruned if vertex_angle(dirs[order.index(0)], dirs[order.index(1)]) < CHELATE_SPAN_ANGLE
     ]
     assert pruned == expected
     assert len(pruned) < len(unpruned), f"{geometry}: narrow pair is never wide here"
@@ -96,7 +96,7 @@ def test_explicit_perms_bypass_narrow_and_linked():
     geometry = "trigonal_bipyramidal"
     dirs = vertex_dirs(geometry)
     unpruned = slots.distinct_vertex_orderings(mol, donors, geometry)
-    bad = next(o for o in unpruned if _vertex_angle(dirs[o.index(0)], dirs[o.index(1)]) >= CHELATE_SPAN_ANGLE)
+    bad = next(o for o in unpruned if vertex_angle(dirs[o.index(0)], dirs[o.index(1)]) >= CHELATE_SPAN_ANGLE)
     narrow = frozenset({frozenset((0, 1))})
 
     assert bad not in slots.distinct_vertex_orderings(mol, donors, geometry, narrow=narrow)
@@ -109,7 +109,7 @@ def _drop_forbidden_orderings(perms, dirs, narrow, linked=frozenset()):
     Two rules share this one filter, each mapping its constrained donor pairs to a forbidden set of vertex
     pairs: `narrow` (a same-ligand pair too short to reach a wide, >= CHELATE_SPAN_ANGLE, vertex pair) is
     forbidden on the wide vertex pairs; `linked` (`metal_enumeration._isomers_for_geometry`'s chelate-backbone
-    or direct-bond pairs, see `_chelate_edge_links`) is forbidden on the non-edge (`hull_edges`) vertex pairs.
+    or direct-bond pairs, see `chelate_edge_links`) is forbidden on the non-edge (`hull_edges`) vertex pairs.
     A donor pair in both takes the union: it is dropped by whichever vertex-pair check it lands on. Both sets
     are computed once per geometry, and either has already proven no completion can survive its screen. Empty
     `narrow` and `linked` pass `perms` through unwrapped, so the common untethered/unpruned case pays nothing.
@@ -183,14 +183,14 @@ def test_tethered_cn10_prune_enumerates_far_fewer_than_the_full_orbit_sweep(monk
 
     Regression for the brute-force sweep this replaces: `isomer_permutations('bicapped_square_antiprismatic')`
     alone iterates 10! = 3,628,800 raw permutations before any filtering. A decadentate chelate chain gives 9
-    same-ligand backbone-linked donor pairs (`_chelate_edge_links`), which the backtracking prune should reject
+    same-ligand backbone-linked donor pairs (`chelate_edge_links`), which the backtracking prune should reject
     long before most of that sweep is ever built. The `isomer_permutations` trap catches a reversion to the old
     sweep-then-filter call directly (mirroring `test_high_coordination_cap_precedes_permutation_generation`);
     the explored count separately catches a prune that runs but no longer rejects a dead branch early.
     """
     mol, donors = _decadentate_chain_mol()
     geometry = "bicapped_square_antiprismatic"
-    linked = slots._chelate_edge_links(mol, donors)
+    linked = slots.chelate_edge_links(mol, donors)
     assert linked, "the chain must supply at least one backbone link for this test to exercise the prune"
 
     monkeypatch.setattr(
@@ -270,7 +270,7 @@ def test_chelate_bite_is_independent_of_equal_shortest_path_order():
             rw.AddAtom(Chem.Atom(6))
         for edge in edges:
             rw.AddBond(*edge, Chem.BondType.SINGLE)
-        values.append(slots._chelate_bite_window(rw.GetMol(), 0, 2, donors=(0, 1, 2)))
+        values.append(slots.chelate_bite_window(rw.GetMol(), 0, 2, donors=(0, 1, 2)))
 
     assert values == [(58.0, 81.0)] * 2
 
@@ -284,7 +284,7 @@ def test_chelate_edge_links_covers_a_bite_window_pair_and_a_bonded_pair():
     mol = rw.GetMol()
     mol.UpdatePropertyCache(strict=False)
 
-    assert slots._chelate_edge_links(mol, [0, 3, 6]) == frozenset({frozenset((0, 1)), frozenset((1, 2))})
+    assert slots.chelate_edge_links(mol, [0, 3, 6]) == frozenset({frozenset((0, 1)), frozenset((1, 2))})
 
     rw2 = Chem.RWMol()
     n1, n2 = rw2.AddAtom(Chem.Atom(7)), rw2.AddAtom(Chem.Atom(7))
@@ -292,7 +292,7 @@ def test_chelate_edge_links_covers_a_bite_window_pair_and_a_bonded_pair():
     mol2 = rw2.GetMol()
     mol2.UpdatePropertyCache(strict=False)
 
-    assert slots._chelate_edge_links(mol2, [n1, n2]) == frozenset({frozenset((0, 1))})
+    assert slots.chelate_edge_links(mol2, [n1, n2]) == frozenset({frozenset((0, 1))})
 
 
 def test_chelate_edge_links_through_donor_exclusion_drops_the_redundant_outer_link():
@@ -310,7 +310,7 @@ def test_chelate_edge_links_through_donor_exclusion_drops_the_redundant_outer_li
     mol.UpdatePropertyCache(strict=False)
     padded = [atoms[0], atoms[2], atoms[4]]
 
-    with_exclusion = slots._chelate_edge_links(mol, padded)
+    with_exclusion = slots.chelate_edge_links(mol, padded)
     assert with_exclusion == frozenset({frozenset((0, 1)), frozenset((1, 2))})
 
     # The measured effect on enumeration: forbidding a-b too (what the edge rule would do without the

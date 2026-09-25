@@ -19,11 +19,12 @@ import logging
 import os
 from copy import deepcopy
 from dataclasses import dataclass, field, fields, replace
+from functools import partial
 
 import numpy as np
 from rdkit import Chem
 
-from .utils import _angle, _dihedral
+from .utils import atom_label, bond_angle, dihedral_angle
 
 _STRAIGHT = 180.0  # degrees: angle ceiling and one half-turn of a periodic dihedral
 
@@ -92,7 +93,7 @@ class Constraints:
             pulls={
                 key: value
                 for key, value in self.pulls.items()
-                if len(key) != _ANGLE_ATOMS or not {key, key[::-1]} & angular or {key, key[::-1]} & self.fixed.keys()
+                if len(key) != ANGLE_ATOMS or not {key, key[::-1]} & angular or {key, key[::-1]} & self.fixed.keys()
             },
             contacts=(frozenset(), frozenset()),
         )
@@ -107,7 +108,7 @@ class Constraints:
         return s - set(self.phantoms)  # a haptic centroid dummy is transient embed scaffolding, never a real atom
 
 
-def _graft_owns(atoms, frozen, haptic=None):
+def graft_owns(atoms, frozen, haptic=None):
     """Return whether every real atom defining a term belongs to the coordinate graft."""
     real = set()
     haptic = haptic or {}
@@ -116,18 +117,24 @@ def _graft_owns(atoms, frozen, haptic=None):
     return real.issubset(frozen)
 
 
+def canonical_key(key):
+    """Return an atom-index key in whichever direction sorts first, so a path and its reverse compare equal."""
+    key = tuple(key)
+    return min(key, key[::-1])
+
+
 def _central_bond(atoms):
     """Return the bond that owns a torsional degree of freedom."""
     return frozenset(atoms[1:3])
 
 
-def _stated_dihedral(cons, *atoms, improper=False):
+def stated_dihedral(cons, *atoms, improper=False):
     """Match a stated torsion by axis, or an improper by its four represented points."""
     owner = frozenset if improper else _central_bond
     return any(owner(key) == owner(atoms) for key in cons.dihedrals)
 
 
-def _structural_dihedral_owned(cons, atoms):
+def structural_dihedral_owned(cons, atoms):
     """Protect torsional axes and umbrella support from soft replacement.
 
     A shell improper does not own a ligand rotation merely sharing its numerical torsion axis.
@@ -137,7 +144,7 @@ def _structural_dihedral_owned(cons, atoms):
     axis = _central_bond(atoms)
     return (
         any(_central_bond(key) == axis for key in (*cons.dihedrals, *cons.coplanar))
-        or any(len(key) == _DIHEDRAL_ATOMS and _central_bond(key) == axis for key in cons.fixed)
+        or any(len(key) == DIHEDRAL_ATOMS and _central_bond(key) == axis for key in cons.fixed)
         or any(ideal != 0.0 and frozenset(key) == frozenset(atoms) for key, ideal in cons.umbrellas.items())
     )
 
@@ -156,19 +163,15 @@ def _merge_relief(a, b):  # a relief is permission to lower, so the fullest (low
     return out
 
 
-def _merge_exclusive(name):
-    """Build a dict merge that refuses a key collision, for fields where two claims cannot be reconciled."""
-
-    def merge(a, b):
-        clash = {k for k in b if k in a and a[k] != b[k]}
-        if clash:
-            raise ValueError(f"compose: conflicting {name} on {sorted(clash)}; two sources claim one key")
-        return {**a, **b}
-
-    return merge
+def _merge_exclusive(name, a, b):
+    """Merge two dicts, refusing a key collision, for fields where two claims cannot be reconciled."""
+    clash = {k for k in b if k in a and a[k] != b[k]}
+    if clash:
+        raise ValueError(f"compose: conflicting {name} on {sorted(clash)}; two sources claim one key")
+    return {**a, **b}
 
 
-def _periodic_window(window):
+def periodic_window(window):
     """Return an equivalent dihedral interval centred in (-180, 180], choosing +180 at the boundary."""
     lo, hi = window
     middle = 0.5 * (lo + hi)
@@ -179,24 +182,20 @@ def _periodic_window(window):
     return lo + shift, hi + shift
 
 
-def _merge_fixed(a, b):
-    """Merge strict records after normalising equivalent periodic dihedral spellings."""
-
-    def norm(d):
-        return {k: _periodic_window(v) if len(k) == _DIHEDRAL_ATOMS else v for k, v in d.items()}
-
-    return _merge_exclusive("fixed")(norm(a), norm(b))
+def _periodic_keys(d):
+    """Return a copy of a fixed record with every dihedral window centred by `periodic_window`."""
+    return {k: periodic_window(v) if len(k) == DIHEDRAL_ATOMS else v for k, v in d.items()}
 
 
-def _merge_pulls(a, b):
+def merge_pulls(a, b):
     """Merge distance targets and canonical angle targets, rejecting conflicting preferences."""
     out = {}
     for terms in (a, b):
         for atoms, value in terms.items():
             key = atoms
-            if len(key) not in (_DIST_ATOMS, _ANGLE_ATOMS):
+            if len(key) not in (DIST_ATOMS, ANGLE_ATOMS):
                 raise ValueError(f"pull {key}: expected a distance pair or angle triple")
-            if len(key) == _ANGLE_ATOMS:
+            if len(key) == ANGLE_ATOMS:
                 key = min(key, key[::-1])
                 if not (np.isfinite(value) and 0 <= value <= _STRAIGHT):
                     raise ValueError(f"pull {key}: expected a finite angle between 0 and 180 degrees")
@@ -214,15 +213,16 @@ _MERGE = {  # field -> how two sources combine. See `compose`.
     "coplanar": lambda a, b: [*a, *b],
     "frozen": lambda a, b: a | b,
     "contacts": lambda a, b: (a[0] | b[0], a[1] | b[1]),
-    "fixed": _merge_fixed,
+    # equivalent periodic dihedral spellings of one fixed value compare equal
+    "fixed": lambda a, b: _merge_exclusive("fixed", _periodic_keys(a), _periodic_keys(b)),
     "metals": lambda a, b: a | b,
-    "pulls": _merge_pulls,
+    "pulls": merge_pulls,
     "floors": _merge_floor,
     "dg_floors": _merge_relief,
     "shapes": lambda a, b: [*a, *(set(s) for s in b)],
     "phantoms": lambda a, b: a | b,
-    "haptic": _merge_exclusive("haptic"),  # a shared key = two faces claiming one reserved index = corruption
-    "umbrellas": _merge_exclusive("umbrellas"),
+    "haptic": partial(_merge_exclusive, "haptic"),  # a shared key = two faces claiming one reserved index = corruption
+    "umbrellas": partial(_merge_exclusive, "umbrellas"),
     "donor_orientation": lambda a, b: a and b,
     "conjugation": lambda a, b: a and b,
 }
@@ -246,10 +246,10 @@ def compose(*parts: Constraints) -> Constraints:
         for name, merge in _MERGE.items():
             setattr(out, name, merge(getattr(out, name), getattr(part, name)))
     for key, value in out.fixed.items():
-        if len(key) == _DIST_ATOMS:
+        if len(key) == DIST_ATOMS:
             out.distances[key] = _seed_window(value, _FIX_PAD)
             out.pulls.pop(key, None)
-        elif len(key) == _ANGLE_ATOMS:
+        elif len(key) == ANGLE_ATOMS:
             out.angles.pop(key[::-1], None)
             out.angles[key] = _seed_window(value, _FIX_ANG_PAD)
             out.pulls.pop(key, None)
@@ -260,35 +260,32 @@ def compose(*parts: Constraints) -> Constraints:
     return out
 
 
+def _angular_owner(key):
+    """Return the degree of freedom an angle or dihedral key claims: its angle, or its central bond."""
+    return ("dihedral", _central_bond(key)) if len(key) == DIHEDRAL_ATOMS else ("angle", canonical_key(key))
+
+
 def compose_soft(base: Constraints, soft: Constraints) -> Constraints:
     """Compose incoming soft terms without replacing a structural term or another soft owner."""
     base_d, base_a = base.contacts
-
-    def canonical(key):
-        key = tuple(key)
-        return min(key, key[::-1])
-
-    def angular_owner(key):
-        return ("dihedral", _central_bond(key)) if len(key) == _DIHEDRAL_ATOMS else ("angle", canonical(key))
-
-    base_soft_d = {canonical(key) for key in base_d}
-    structural_d = {canonical(key) for key in base.distances} - base_soft_d
-    structural_d |= {canonical(key) for key in base.fixed if len(key) == _DIST_ATOMS}
-    base_soft_a = {angular_owner(key) for key in base_a}
+    base_soft_d = {canonical_key(key) for key in base_d}
+    structural_d = {canonical_key(key) for key in base.distances} - base_soft_d
+    structural_d |= {canonical_key(key) for key in base.fixed if len(key) == DIST_ATOMS}
+    base_soft_a = {_angular_owner(key) for key in base_a}
     incoming_a = [*soft.angles, *soft.dihedrals]
-    structural_a = {angular_owner(key) for key in base.angles} - base_soft_a
-    structural_a |= {angular_owner(key) for key in base.fixed if len(key) == _ANGLE_ATOMS}
-    overlap = {key for key in soft.distances if canonical(key) in base_soft_d} | {
-        key for key in incoming_a if angular_owner(key) in base_soft_a
+    structural_a = {_angular_owner(key) for key in base.angles} - base_soft_a
+    structural_a |= {_angular_owner(key) for key in base.fixed if len(key) == ANGLE_ATOMS}
+    overlap = {key for key in soft.distances if canonical_key(key) in base_soft_d} | {
+        key for key in incoming_a if _angular_owner(key) in base_soft_a
     }
     if overlap:
         raise ValueError(
             f"soft constraints overlap at {sorted(overlap)}; state each degree of freedom once with either "
             "constrain= or contacts="
         )
-    distances = {key: value for key, value in soft.distances.items() if canonical(key) not in structural_d}
-    angles = {key: value for key, value in soft.angles.items() if angular_owner(key) not in structural_a}
-    dihedrals = {key: value for key, value in soft.dihedrals.items() if not _structural_dihedral_owned(base, key)}
+    distances = {key: value for key, value in soft.distances.items() if canonical_key(key) not in structural_d}
+    angles = {key: value for key, value in soft.angles.items() if _angular_owner(key) not in structural_a}
+    dihedrals = {key: value for key, value in soft.dihedrals.items() if not structural_dihedral_owned(base, key)}
     d_soft, a_soft = soft.contacts
     return compose(
         base,
@@ -300,9 +297,9 @@ def compose_soft(base: Constraints, soft: Constraints) -> Constraints:
                 key: value
                 for key, value in soft.pulls.items()
                 if (
-                    canonical(key) not in structural_d
-                    if len(key) == _DIST_ATOMS
-                    else angular_owner(key) not in structural_a
+                    canonical_key(key) not in structural_d
+                    if len(key) == DIST_ATOMS
+                    else _angular_owner(key) not in structural_a
                 )
             },
             contacts=(frozenset(d_soft & distances.keys()), frozenset(a_soft & (angles.keys() | dihedrals.keys()))),
@@ -346,33 +343,33 @@ _CON_PAD = 0.1  # constrain distance half-window when a scalar target is given
 _CON_ANG_PAD = 5.0  # constrain angular half-window
 _SHAPE_PAD = 0.05  # graft pairwise-shape half-window (a rigid hold; the exact graft does the real work)
 _MIN_SHAPE_ATOMS = 3  # below this a core has only a distance to pin, not an orientable 3-D shape
-_DIST_ATOMS = 2  # a distance key names two atoms
-_ANGLE_ATOMS = 3  # an angle key names three atoms
-_DIHEDRAL_ATOMS = 4  # a dihedral key names four atoms
+DIST_ATOMS = 2  # a distance key names two atoms
+ANGLE_ATOMS = 3  # an angle key names three atoms
+DIHEDRAL_ATOMS = 4  # a dihedral key names four atoms
+
+
+def _site_point(positions, haptic, atom):
+    """Return an atom's position, or its haptic face centroid, or None when either is out of range."""
+    if 0 <= atom < len(positions):
+        return positions[atom]
+    face = haptic.get(atom)
+    if not face or any(index < 0 or index >= len(positions) for index in face):
+        return None
+    return np.mean(positions[list(face)], axis=0)
 
 
 def constraint_value(positions, atoms, haptic=None, window=None):
     """Measure one distance, angle or dihedral, resolving haptic centroids when present."""
-    haptic = haptic or {}
-
-    def point(atom):
-        if 0 <= atom < len(positions):
-            return positions[atom]
-        face = haptic.get(atom)
-        if not face or any(index < 0 or index >= len(positions) for index in face):
-            return None
-        return np.mean(positions[list(face)], axis=0)
-
-    points = [point(atom) for atom in atoms]
+    points = [_site_point(positions, haptic or {}, atom) for atom in atoms]
     if any(value is None for value in points):
         return None
-    if len(atoms) == _DIST_ATOMS:
+    if len(atoms) == DIST_ATOMS:
         return float(np.linalg.norm(points[0] - points[1]))
-    if len(atoms) == _ANGLE_ATOMS:
-        return _angle(*points)
-    if len(atoms) != _DIHEDRAL_ATOMS:
+    if len(atoms) == ANGLE_ATOMS:
+        return bond_angle(*points)
+    if len(atoms) != DIHEDRAL_ATOMS:
         raise ValueError("a geometric term needs 2, 3 or 4 atoms")
-    value = _dihedral(*points)
+    value = dihedral_angle(*points)
     if window is not None:
         middle = 0.5 * sum(window)
         value = middle + (value - middle + _STRAIGHT) % (2 * _STRAIGHT) - _STRAIGHT
@@ -427,7 +424,7 @@ def _window(val, pad, key=None, angle=False, dihedral=False):
     """
     if isinstance(val, (tuple, list, np.ndarray)):
         given = [float(v) for v in val]
-        if len(given) != _DIST_ATOMS:
+        if len(given) != DIST_ATOMS:
             raise ValueError(
                 f"a distance/angle/dihedral value must be a scalar target or a (lo, hi) window; got {val!r} "
                 f"(a coordinate belongs under an int key: fix={{i: (x, y, z)}})"
@@ -448,11 +445,12 @@ def _window(val, pad, key=None, angle=False, dihedral=False):
             f"constraint {key!r}: {val!r} is not a valid {label}; give a scalar target or an ordered (lo, hi) window"
         )
     if dihedral:
-        return _periodic_window((lo, hi))
+        return periodic_window((lo, hi))
     return max(0.0, lo), hi if top is None else min(top, hi)
 
 
-def _is_index(x):
+def is_index(x):
+    """Return whether `x` is an integer atom index; a bool is not one."""
     return isinstance(x, (int, np.integer)) and not isinstance(x, bool)
 
 
@@ -466,21 +464,21 @@ def _index_tuple(key):
                 f"(0-based, xyz/graph order); resolve your SMARTS first, e.g. "
                 f"i = mol.GetSubstructMatch(Chem.MolFromSmarts('[F-]'))[0], then key by i"
             )
-        if not _is_index(a):
+        if not is_index(a):
             raise ValueError(f"constraint key {key!r} must be integer atom indices, got {type(a).__name__}")
     out = tuple(int(a) for a in key)
     if len(set(out)) != len(out):  # (i, i) is the (i, j) typo: it writes the bounds-matrix diagonal and no-ops
         raise ValueError(f"constraint key {key!r} names the same atom twice; geometric coordinates need distinct atoms")
-    if len(out) == _ANGLE_ATOMS and out[0] > out[2]:
+    if len(out) == ANGLE_ATOMS and out[0] > out[2]:
         out = (out[2], out[1], out[0])
-    elif len(out) == _DIHEDRAL_ATOMS and out > out[::-1]:
+    elif len(out) == DIHEDRAL_ATOMS and out > out[::-1]:
         out = out[::-1]
     return out
 
 
 def _is_plane_key(key):
     """Return True for a π-stack key: a 2-tuple of ring atom-groups (lists/tuples/None), not two indices."""
-    if not (isinstance(key, tuple) and len(key) == _DIST_ATOMS):
+    if not (isinstance(key, tuple) and len(key) == DIST_ATOMS):
         return False
     return all(isinstance(e, (list, tuple)) or e is None for e in key)
 
@@ -503,7 +501,7 @@ def _resolve_ring(mol, ring):
     atoms = tuple(ring)
     if len(atoms) < 3:  # noqa: PLR2004
         raise ValueError(f"constrain plane needs at least 3 atoms per ring; got {atoms}")
-    if any(not _is_index(atom) for atom in atoms):
+    if any(not is_index(atom) for atom in atoms):
         raise ValueError(f"constrain plane ring atoms must be integer indices; got {atoms}")
     atoms = tuple(int(atom) for atom in atoms)
     if len(set(atoms)) != len(atoms):
@@ -531,15 +529,15 @@ def _apply_fix(mol, fix, cons, coord_fix, has_geometry):
         raise ValueError(
             f"fix= takes a list of atom indices (own-coords graft) or a dict "
             f"({{i: (x,y,z)}} coords / {{(i,j): d}} numbers); got {type(fix).__name__} {fix!r}"
-            + (f"; did you mean fix=[{fix}]?" if _is_index(fix) else "")
+            + (f"; did you mean fix=[{fix}]?" if is_index(fix) else "")
         )
     if isinstance(fix, dict):
         for key, val in fix.items():
-            if _is_index(key):  # int key -> a coordinate pin (graft)
+            if is_index(key):  # int key -> a coordinate pin (graft)
                 coord_fix[int(key)] = _as_coord(val)
             else:  # tuple key -> a scalar target or explicit allowed range
                 idx = _index_tuple(key)
-                if len(idx) == _DIST_ATOMS:
+                if len(idx) == DIST_ATOMS:
                     pair = (min(idx), max(idx))
                     requested = _window(val, 0.0, key)
                     if pair in cons.fixed and cons.fixed[pair] != requested:
@@ -547,14 +545,14 @@ def _apply_fix(mol, fix, cons, coord_fix, has_geometry):
                     add_distance(cons.distances, *idx, *_seed_window(requested, _FIX_PAD))
                     cons.fixed[pair] = requested
                     written.add(pair)
-                elif len(idx) == _ANGLE_ATOMS:
+                elif len(idx) == ANGLE_ATOMS:
                     requested = _window(val, 0.0, key, angle=True)
                     if idx in cons.fixed and cons.fixed[idx] != requested:
                         raise ValueError(f"fix= gives conflicting values for angle {idx}")
                     cons.angles[idx] = _seed_window(requested, _FIX_ANG_PAD)
                     cons.fixed[idx] = requested
                     written.add(idx)
-                elif len(idx) == _DIHEDRAL_ATOMS:
+                elif len(idx) == DIHEDRAL_ATOMS:
                     requested = _window(val, 0.0, key, dihedral=True)
                     if idx in cons.fixed and cons.fixed[idx] != requested:
                         raise ValueError(f"fix= gives conflicting values for dihedral {idx}")
@@ -573,7 +571,7 @@ def _apply_fix(mol, fix, cons, coord_fix, has_geometry):
         )
     positions = mol.GetConformer().GetPositions()
     for a in fix:
-        if isinstance(a, str) or not _is_index(a):
+        if isinstance(a, str) or not is_index(a):
             raise ValueError(
                 f"fix=[...] takes atom indices; got {a!r}. Resolve SMARTS yourself first "
                 f"(fix=/constrain= are index-driven)."
@@ -616,13 +614,13 @@ def _apply_constrain(mol, constrain, cons):
             cons.planes.append((ra, rb, separation))
             continue
         idx = _index_tuple(key)
-        if len(idx) == _DIST_ATOMS:
+        if len(idx) == DIST_ATOMS:
             add_distance(cons.distances, *idx, *_window(val, _CON_PAD, key))
             d_soft.add((min(idx), max(idx)))
-        elif len(idx) == _ANGLE_ATOMS:
+        elif len(idx) == ANGLE_ATOMS:
             cons.angles[idx] = _window(val, _CON_ANG_PAD, key, angle=True)
             angular_soft.add(idx)
-        elif len(idx) == _DIHEDRAL_ATOMS:
+        elif len(idx) == DIHEDRAL_ATOMS:
             cons.dihedrals[idx] = _window(val, _CON_ANG_PAD, key, dihedral=True)
             angular_soft.add(idx)
         else:
@@ -761,11 +759,11 @@ def _drop_determined_by_graft(cons, coord_fix, keys):
     and, worse, would seed the embed against a distance the graft then contradicts. Restore the shape
     window (a distance) or drop it (an angle/dihedral), loudly, so the user is not left thinking it applied.
     """
-    dropped = {key for key in keys if _graft_owns(key, coord_fix)}
+    dropped = {key for key in keys if graft_owns(key, coord_fix)}
     for key in sorted(dropped):
-        if len(key) == _DIST_ATOMS:
+        if len(key) == DIST_ATOMS:
             add_pairwise_shape(cons, key, coord_fix, _SHAPE_PAD)  # back to what the graft implies
-        elif len(key) == _ANGLE_ATOMS:
+        elif len(key) == ANGLE_ATOMS:
             cons.angles.pop(key, None)
         else:
             cons.dihedrals.pop(key, None)
@@ -783,7 +781,7 @@ def _warn_underdetermined(cons, coord_fix, n_fix_d):
     which comes out bent rather than the linear TS the user meant. A richer network (more than 3 atoms, or
     any coords or angles) is left alone as a deliberate distance web. Advisory, not fatal.
     """
-    if coord_fix or cons.angles or cons.dihedrals or n_fix_d < _DIST_ATOMS:
+    if coord_fix or cons.angles or cons.dihedrals or n_fix_d < DIST_ATOMS:
         return
     keys = list(cons.distances)
     atoms = {a for k in keys for a in k}
@@ -807,33 +805,30 @@ def _echo(mol, cons, coord_fix):
     d_soft, angular_soft = cons.contacts
     a_soft, t_soft = angular_soft & cons.angles.keys(), angular_soft & cons.dihedrals.keys()
 
-    def s(i):
-        return f"{mol.GetAtomWithIdx(int(i)).GetSymbol()}{int(i)}"
-
     parts = []
     if coord_fix:
-        parts.append(f"graft {', '.join(s(i) for i in sorted(coord_fix))}")
+        parts.append(f"graft {', '.join(atom_label(mol, i) for i in sorted(coord_fix))}")
     for atoms, (lo, hi) in cons.fixed.items():
-        tol, unit = (FIX_DISTANCE_TOL, "A") if len(atoms) == _DIST_ATOMS else (FIX_ANGLE_TOL, "deg")
+        tol, unit = (FIX_DISTANCE_TOL, "A") if len(atoms) == DIST_ATOMS else (FIX_ANGLE_TOL, "deg")
         requested = f"{lo:.6f}+/-{tol:g}" if lo == hi else f"[{lo:.6f},{hi:.6f}]"
         name = {2: "d", 3: "angle", 4: "dihedral"}[len(atoms)]
-        parts.append(f"fix {name}({','.join(s(i) for i in atoms)})->{requested}{unit}")
+        parts.append(f"fix {name}({','.join(atom_label(mol, i) for i in atoms)})->{requested}{unit}")
     for (i, j), (lo, hi) in cons.distances.items():
         if (i, j) in cons.fixed or (i, j) in d_soft or (i in cons.frozen and j in cons.frozen):
             continue  # already logged canonically, soft (below), or implied by the coordinate graft
-        parts.append(f"fix d({s(i)},{s(j)})->{lo:.2f}-{hi:.2f}A")
+        parts.append(f"fix d({atom_label(mol, i)},{atom_label(mol, j)})->{lo:.2f}-{hi:.2f}A")
     for name, windows, soft in (("angle", cons.angles, a_soft), ("dihedral", cons.dihedrals, t_soft)):
         for atoms, (lo, hi) in windows.items():
             if atoms in cons.fixed or atoms in soft:
                 continue
-            parts.append(f"fix {name}({','.join(s(i) for i in atoms)})->{lo:.1f}-{hi:.1f}deg")
+            parts.append(f"fix {name}({','.join(atom_label(mol, i) for i in atoms)})->{lo:.1f}-{hi:.1f}deg")
     for i, j in d_soft:
         lo, hi = cons.distances[(i, j)]
-        parts.append(f"soft d({s(i)},{s(j)})->{lo:.2f}-{hi:.2f}A")
+        parts.append(f"soft d({atom_label(mol, i)},{atom_label(mol, j)})->{lo:.2f}-{hi:.2f}A")
     for name, windows, soft in (("angle", cons.angles, a_soft), ("dihedral", cons.dihedrals, t_soft)):
         for atoms in soft:
             lo, hi = windows[atoms]
-            parts.append(f"soft {name}({','.join(s(i) for i in atoms)})->{lo:.1f}-{hi:.1f}deg")
+            parts.append(f"soft {name}({','.join(atom_label(mol, i) for i in atoms)})->{lo:.1f}-{hi:.1f}deg")
     for ra, rb, sep in cons.planes:
         parts.append(f"stack {len(ra)}x{len(rb)} ring @ {sep:.1f}A")
     for part in parts:

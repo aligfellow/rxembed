@@ -13,7 +13,6 @@ from rxembed.pipeline.stereo_check import (
     _independent_summary,
     _native_signature,
     mismatch,
-    satisfies_spec,
     signature,
 )
 from tests.metal_fixtures import ferrocene
@@ -31,7 +30,7 @@ def _reference_conformer(smiles, seed=1, optimize=True):
     return mol
 
 
-# --- satisfies_spec: the four modes, on one inverted element ----------------------------------------------
+# --- mismatch: the four modes, on one inverted element ----------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -40,21 +39,21 @@ def _reference_conformer(smiles, seed=1, optimize=True):
     ids=["preserve", "free", "invert", "all"],
 )
 def test_stereo_modes_accept_expected_hands(mode, kept, flipped):
-    assert satisfies_spec(_PLANAR, _PLANAR, mode) is kept
-    assert satisfies_spec(_FLIPPED_PLANAR, _PLANAR, mode) is flipped
+    assert (mismatch(_PLANAR, _PLANAR, mode) is None) is kept
+    assert (mismatch(_FLIPPED_PLANAR, _PLANAR, mode) is None) is flipped
 
 
 def test_preserve_holds_only_nongraph_stereo():
     left = _native_signature(_reference_conformer("C[C@H](N)C(=O)O", optimize=False))
     right = _native_signature(_reference_conformer("C[C@@H](N)C(=O)O", optimize=False))
 
-    assert satisfies_spec(right, left, "preserve")
-    assert not satisfies_spec(right, left, "all")
+    assert mismatch(right, left, "preserve") is None
+    assert mismatch(right, left, "all") is not None
 
 
 def test_native_stereo_normalizes_metal_notation_before_comparing():
     raw = ferrocene()
-    canonical = metal_core._canonical_metal_graph(raw)
+    canonical = metal_core.canonical_metal_graph(raw)
 
     assert _native_signature(raw) == _native_signature(canonical)
 
@@ -68,14 +67,14 @@ def test_graph_mismatch_is_not_reported_as_axial_stereo():
 
 def test_preserve_ignores_fingerprint_multiplicity():
     for sig in ({}, {"planar": Counter({"Rₚ": 1})}, {"planar": Counter({"Rₚ": 2})}):
-        assert satisfies_spec(sig, _PLANAR, "preserve")
+        assert mismatch(sig, _PLANAR, "preserve") is None
 
 
 def test_preserve_accepts_a_reference_with_both_planar_hands():
     both = {"planar": Counter({"Rₚ": 1, "Sₚ": 1})}
 
-    assert satisfies_spec(both, both, "preserve")
-    assert not satisfies_spec(both, _PLANAR, "preserve")
+    assert mismatch(both, both, "preserve") is None
+    assert mismatch(both, _PLANAR, "preserve") is not None
 
 
 def test_symmetric_native_hands_remain_attached_to_the_whole_graph():
@@ -84,8 +83,8 @@ def test_symmetric_native_hands_remain_attached_to_the_whole_graph():
     reference, perceived = _native_signature(left), _native_signature(right)
 
     assert reference["point"] == perceived["point"]  # the old orbit-count representation collided here
-    assert not satisfies_spec(perceived, reference, "all")
-    assert satisfies_spec(perceived, reference, {"point": "free", "default": "free"})
+    assert mismatch(perceived, reference, "all") is not None
+    assert mismatch(perceived, reference, {"point": "free", "default": "free"}) is None
     reordered = Chem.RenumberAtoms(left, list(reversed(range(left.GetNumAtoms()))))
     assert _native_signature(reordered) == reference
 
@@ -103,28 +102,28 @@ def test_all_reference_kinds_must_pass():
     left = _native_signature(_reference_conformer("C[C@H](N)C(=O)O", optimize=False))
     right = _native_signature(_reference_conformer("C[C@@H](N)C(=O)O", optimize=False))
     ref = {**_PLANAR, **left}
-    assert not satisfies_spec({**_FLIPPED_PLANAR, **left}, ref, "all")
-    assert not satisfies_spec({**_PLANAR, **right}, ref, "all")
+    assert mismatch({**_FLIPPED_PLANAR, **left}, ref, "all") is not None
+    assert mismatch({**_PLANAR, **right}, ref, "all") is not None
 
     sig = {**_FLIPPED_PLANAR, **right}
-    assert not satisfies_spec(sig, ref, {"planar": "free", "point": "preserve"})
-    assert satisfies_spec(sig, ref, {"planar": "free", "default": "free"})
+    assert mismatch(sig, ref, {"planar": "free", "point": "preserve"}) is not None
+    assert mismatch(sig, ref, {"planar": "free", "default": "free"}) is None
 
 
 def test_native_ez_can_be_inverted_without_holding_other_kinds():
     trans = _native_signature(_reference_conformer("F/C=C/F", optimize=False))
     cis = _native_signature(_reference_conformer("F/C=C\\F", optimize=False))
 
-    assert not satisfies_spec(cis, trans, {"ez": "preserve", "default": "free"})
-    assert satisfies_spec(cis, trans, {"ez": "invert", "default": "free"})
+    assert mismatch(cis, trans, {"ez": "preserve", "default": "free"}) is not None
+    assert mismatch(cis, trans, {"ez": "invert", "default": "free"}) is None
 
 
 def test_native_point_can_be_inverted_without_holding_other_kinds():
     right = _native_signature(_reference_conformer("C[C@H](N)C(=O)O", optimize=False))
     left = _native_signature(_reference_conformer("C[C@@H](N)C(=O)O", optimize=False))
 
-    assert satisfies_spec(left, right, {"point": "invert", "default": "free"})
-    assert not satisfies_spec(left, right, {"point": "preserve", "default": "free"})
+    assert mismatch(left, right, {"point": "invert", "default": "free"}) is None
+    assert mismatch(left, right, {"point": "preserve", "default": "free"}) is not None
 
 
 # --- signature: read the handedness back out of the coordinates -------------------------------------------
@@ -137,7 +136,7 @@ def test_two_enantiomers_get_opposite_point_labels():
     assert set(left.get("point", ())), f"no point label read from the R conformer: {left}"
     assert set(right.get("point", ())), f"no point label read from the S conformer: {right}"
     assert set(left["point"]) != set(right["point"])
-    assert not satisfies_spec(right, left, "all")  # ...and the gate sees the inversion
+    assert mismatch(right, left, "all") is not None  # ...and the gate sees the inversion
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
@@ -156,8 +155,8 @@ def test_native_atrop_identity_survives_atom_order_and_detects_a_mirror():
         conf.SetAtomPosition(atom, (-point.x, point.y, point.z))
     observed = signature(mirrored)
     assert observed.get("axial")
-    assert not satisfies_spec(observed, reference)
-    assert satisfies_spec(observed, reference, {"axial": "invert", "default": "free"})
+    assert mismatch(observed, reference) is not None
+    assert mismatch(observed, reference, {"axial": "invert", "default": "free"}) is None
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
@@ -215,8 +214,8 @@ def test_atrop_markers_do_not_overflow_at_the_rdkit_isotope_limit():
     mirrored.GetConformer().SetPositions(positions)
     observed = _native_signature(mirrored)
 
-    assert satisfies_spec(observed, reference, {"axial": "free", "default": "free"})
-    assert satisfies_spec(observed, reference, {"axial": "invert", "default": "free"})
+    assert mismatch(observed, reference, {"axial": "free", "default": "free"}) is None
+    assert mismatch(observed, reference, {"axial": "invert", "default": "free"}) is None
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
@@ -238,7 +237,7 @@ def test_mirror_symmetric_haptic_face_does_not_gain_planar_chirality_from_the_me
     mol = ferrocene()
     metal = metal_core.metal_indices(mol)[0]
     donors = [atom.GetIdx() for atom in mol.GetAtomWithIdx(metal).GetNeighbors()]
-    face = next(site for site in metal_core._haptic_sites(mol, donors) if len(site) > 1)
+    face = next(site for site in metal_core.haptic_sites(mol, donors) if len(site) > 1)
     summary = {"planar": [{"label": "Sₚ", "ring": list(face)}]}
 
     assert _independent_summary(mol, summary)["planar"] == []

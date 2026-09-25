@@ -8,6 +8,7 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom, rdForceFieldHelpers, rdMolTransforms
 from rdkit.Geometry import Point3D
 
+import rxembed as rx
 from rxembed.pipeline import metrics
 
 # every check here re-perceives the graph with xyzgraph
@@ -96,7 +97,7 @@ def test_reperception_finds_transferred_proton():
     formed, broken = metrics.connectivity(m, conf.GetId())
     assert {o, h} in [set(p) for p in formed]
     assert {n, h} in [set(p) for p in broken]
-    assert metrics.bonding_ok(m, conf.GetId()), "bonding_ok is heavy-atom-only: it CANNOT see this"
+    assert metrics.bonding_failure(m, conf.GetId()) is None, "bonding_failure is heavy-atom-only: it CANNOT see this"
 
 
 def test_zero_bond_is_not_a_connectivity_edge():
@@ -128,8 +129,6 @@ def test_reperception_finds_a_terminal_hydrogen_collapsed_across_an_angle():
 
 
 def test_connectivity_ignores_metal_pairs():
-    import rxembed as rx
-
     iso = rx.metal("Cl[Pd](Cl)(N)N", "square_planar")[0]
     ens = rx.embed(iso, n=2, seed=1).minimize()
     assert ens.ids, "no conformer survived: the covalent diff was never asked about a metal pair"
@@ -141,8 +140,6 @@ def test_connectivity_ignores_metal_pairs():
 
 
 def test_metal_donor_departure_is_reported():
-    import rxembed as rx
-
     iso = rx.metal("Cl[Pd](Cl)(N)N", "square_planar")[0]
     ens = rx.embed(iso, n=1, seed=1).minimize()
     cid = ens.ids[0]

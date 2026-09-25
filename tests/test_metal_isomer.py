@@ -13,7 +13,7 @@ from rxembed import metal_core, stereo
 from rxembed import metal_isomer as isomer
 from rxembed import metal_polyhedron as poly
 from rxembed import metal_slots as slots
-from rxembed.metal_core import VACANT
+from rxembed.metal_core import VACANT, MetalState
 from rxembed.pipeline import geom_check
 from tests.metal_fixtures import ferrocene
 
@@ -124,7 +124,7 @@ def test_summary_details_show_site_relations_and_non_equivalent_donors(capsys):
 def test_select_accepts_geometry_code_or_name():
     isomers = rx.metal(_MA2B2, "square_planar")
     first = isomers[0]
-    assert isomers.select(arrangement=isomer.arrangement(first)).vertices == first.vertices
+    assert isomers.select(arrangement=first.arrangement).vertices == first.vertices
     assert isomers.select(index=0).vertices == first.vertices
     with pytest.raises(ValueError, match="matched"):
         isomers.select(arrangement="does not exist")
@@ -140,7 +140,7 @@ def test_isomer_repr_is_the_compact_summary_row():
 
 
 def test_shape_only_summary_lists_every_restored_metal(capsys):
-    candidate = isomer.from_surrogate(Chem.MolFromSmiles("[C].[C]"), [(0, 26, 2), (1, 25, 0)], [])
+    candidate = isomer.Isomer.from_state(Chem.MolFromSmiles("[C].[C]"), (MetalState(0, 26, 2), MetalState(1, 25, 0)))
     candidates = isomer.IsomerSet([candidate])
     assert candidates.filter() == [candidate]
     assert candidates.select() is candidate
@@ -194,12 +194,12 @@ def test_isomer_source_and_metal_are_mutually_exclusive():
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_coordinate_input_reports_generated_seeds(tmp_path, caplog):
+def test_coordinate_input_reports_its_kept_conformers(tmp_path, caplog):
     xyz = tmp_path / "pd.xyz"
     rx.embed(rx.metal(_MA2B2, "square_planar")[0], n=1, seed=1).dump(str(xyz))
     with caplog.at_level("INFO", logger="rxembed"):
         rx.embed(str(xyz), n=1)
-    assert any("1 seeds" in record.message for record in caplog.records)
+    assert any("kept 1 conformer(s)" in record.message for record in caplog.records)
     assert not any("input geometry)" in record.message for record in caplog.records)
     with caplog.at_level("INFO", logger="rxembed"):
         rx.embed("OC(=O)CCCCc1ccccc1", constrain={(1, 9): (2.6, 3.0)}, n=2, seed=1)
@@ -282,7 +282,7 @@ def _seating_is_real(candidate, positions):
         )
         for i in range(len(directions))
         for j in range(i + 1, len(directions))
-        if poly._vertex_angle(directions[i], directions[j]) > slots.TRANS_ANGLE
+        if poly.vertex_angle(directions[i], directions[j]) > slots.TRANS_ANGLE
     ]
 
 
@@ -321,7 +321,7 @@ def test_from_geometry_uses_measured_stereo_for_site_identity():
 def test_retained_imine_chelate_does_not_add_independent_ez():
     candidate = rx.metal(r"C/C=C/C/N1=C(/F)C(/Cl)=N(/Br)->[Ni+2](<-[Cl-])(<-[I-])<-1", "SPL")[0]
     source = rx.embed(candidate, n=1, seed=7, threads=1).mol
-    locked = stereo._coordination_locked_double_bonds(source, {candidate.metal})
+    locked = stereo.coordination_locked_double_bonds(source, {candidate.metal})
     assert locked
     pendant = stereo.bond_stereo(candidate.stereo_label)
     assert pendant
@@ -427,6 +427,6 @@ def test_derived_shape_uses_polyhedron():
     directions = poly.vertex_dirs(geometry)
     for i in range(len(directions)):
         for j in range(i + 1, len(directions)):
-            expected = poly._vertex_angle(directions[i], directions[j])
+            expected = poly.vertex_angle(directions[i], directions[j])
             actual = _angle(positions, retained.vertices[i], retained.metal, retained.vertices[j])
             assert actual == pytest.approx(expected, abs=1.0)

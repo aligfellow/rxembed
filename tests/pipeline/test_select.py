@@ -7,12 +7,11 @@ import pytest
 from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 
+import rxembed as rx
 from rxembed.pipeline import select
 
 
 def _ens(smiles, n=6, **kw):
-    import rxembed as rx
-
     return rx.embed(smiles, n=n, seed=1, **kw).minimize()
 
 
@@ -54,8 +53,6 @@ def test_butanol_dihedral_latent_excludes_the_methyl_and_hydroxyl_rotors():
     ids=["conformer", "relative", "contact"],
 )
 def test_active_features_define_mode_kind(smiles, kw, kinds, mode):
-    import rxembed as rx
-
     ens = _ens(smiles, **kw)
     ens = ens[0] if isinstance(ens, rx.EnsembleSet) else ens
     assert select.active_feature_kinds(ens.mol, ens.ids) == kinds
@@ -64,8 +61,6 @@ def test_active_features_define_mode_kind(smiles, kw, kinds, mode):
 
 @pytest.mark.skipif(find_spec("prism_pruner") is None or find_spec("sklearn") is None, reason="needs rxembed[workflow]")
 def test_metal_latent_suppresses_other_blocks():
-    import rxembed as rx
-
     ens = rx.embed(rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0], n=3, seed=1).minimize()
     assert select.active_feature_kinds(ens.mol, ens.ids) == ["dihedral", "metal"]
     assert select.mode_kind(ens.mol, ens.ids) == "ligand arrangement"
@@ -92,8 +87,8 @@ def test_metal_latent_uses_declared_sphere():
     stretched.SetAtomPosition(donors[0], (5.0, 0.0, 0.0))
     stretched_cid = mol.AddConformer(stretched, assignId=True)
 
-    assert select._metal_donors(mol, [cid]) == (metal, donors)
-    assert select._metal_donors(mol, [stretched_cid, cid]) == (metal, donors), (
+    assert select.metal_donors(mol, [cid]) == (metal, donors)
+    assert select.metal_donors(mol, [stretched_cid, cid]) == (metal, donors), (
         "reordering conformers changed the descriptor's declared donor columns"
     )
     assert select._metal_features(mol, [cid]).shape == (1, 1), (
@@ -110,7 +105,7 @@ def test_only_bondless_metal_uses_geometric_sphere():
     for atom, xyz in enumerate(((0.0, 0.0, 0.0), (3.0, 0.0, 0.0), (-3.0, 0.0, 0.0))):
         conf.SetAtomPosition(atom, xyz)
     cid = mol.AddConformer(conf, assignId=True)
-    assert select._metal_donors(mol, [cid]) == (metal, donors)
+    assert select.metal_donors(mol, [cid]) == (metal, donors)
 
     rw = Chem.RWMol(mol)
     other_metal = rw.AddAtom(Chem.Atom(26))
@@ -120,7 +115,7 @@ def test_only_bondless_metal_uses_geometric_sphere():
     bonded_conf.SetAtomPosition(other_metal, (2.5, 2.5, 0.0))
     bonded.RemoveAllConformers()
     bonded_cid = bonded.AddConformer(bonded_conf, assignId=True)
-    assert select._metal_donors(bonded, [bonded_cid]) == (metal, []), (
+    assert select.metal_donors(bonded, [bonded_cid]) == (metal, []), (
         "an M-M bond is a declared graph, not permission to guess nearby ligand donors"
     )
 
