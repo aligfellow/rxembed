@@ -163,7 +163,7 @@ def donor_chirality_sign(mol, cid, donor, references=()):
     return int(np.sign(v)) if abs(v) > 1e-6 else None  # noqa: PLR2004  a near-planar centre has no hand
 
 
-_HAND_TAG = {  # `donor_chirality_sign` -> the tag naming that hand in the atom's current bond order
+HAND_TAG = {  # `donor_chirality_sign` -> the tag naming that hand in the atom's current bond order
     -1: Chem.ChiralType.CHI_TETRAHEDRAL_CW,
     +1: Chem.ChiralType.CHI_TETRAHEDRAL_CCW,
 }
@@ -189,7 +189,7 @@ def _retag(mol, hands, ambiguous):
             continue
         decided = carried
         if d in ambiguous and mol.GetNumConformers():
-            decided = _HAND_TAG.get(donor_chirality_sign(mol, -1, d), carried)
+            decided = HAND_TAG.get(donor_chirality_sign(mol, -1, d), carried)
         atom.SetChiralTag(decided)
 
 

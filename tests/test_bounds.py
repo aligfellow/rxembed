@@ -34,6 +34,14 @@ def _matrix(mol):
     return rdDistGeom.GetMoleculeBoundsMatrix(mol)
 
 
+def _random_start():
+    """Return a native KDG object with random starting coordinates, RDKit's own fallback for a hard search."""
+    native = rdDistGeom.KDG()
+    native.useLegacyImplementation = False
+    native.useRandomCoords = True
+    return native
+
+
 # ---------------------------------------------------------------------------------------------------------
 # embed_parameters: native model and reproducible sampling defaults
 # ---------------------------------------------------------------------------------------------------------
@@ -606,8 +614,15 @@ def test_matrix_is_edited_not_replaced():
         (lambda: bnd._bounds(_graph("C[S-]"), Constraints(distances={(0, 1): (1.7, 1.9)})), "UFFTYPER"),
         (
             # the hydride's own construction warns too; `partial` builds it at collection time, so only the
-            # seeding call itself is under test
-            partial(bnd.seed_coordinates, _graph("[H-].CC"), Constraints(), 1, bnd.EmbedParams(seed=42)),
+            # seeding call itself is under test. This fragment only embeds with a random start, so ask for
+            # one through a native object, same as any other caller of an unconstrained multi-fragment input.
+            partial(
+                bnd.seed_coordinates,
+                _graph("[H-].CC"),
+                Constraints(),
+                1,
+                bnd.EmbedParams(seed=42, native=_random_start()),
+            ),
             "not removing hydrogen atom without neighbors",
         ),
     ],
@@ -726,12 +741,11 @@ def test_seed_coordinates_can_delegate_chirality_to_a_later_accept_gate(monkeypa
         max_attempts=30,
     )
 
-    assert seen == [(False, 30)] * 2
+    assert seen == [(False, 30)]
 
 
 @pytest.mark.parametrize("knowledge", [True, False])
-@pytest.mark.parametrize("rejections", [0, 1, 2])
-def test_native_recovery_preserves_bounds_and_stereo(monkeypatch, knowledge, rejections):
+def test_native_embed_preserves_bounds_and_stereo(monkeypatch, knowledge):
     native = rdDistGeom.EmbedMultipleConfs
     mol = _graph("F[C@H](Cl)Br")
     cons = Constraints(distances={(0, 1): (1.3, 1.5)})
@@ -761,18 +775,17 @@ def test_native_recovery_preserves_bounds_and_stereo(monkeypatch, knowledge, rej
                 params.useExpTorsionAnglePrefs,
             )
         )
-        return [] if len(stages) <= rejections else native(candidate, n, params)
+        return native(candidate, n, params)
 
     monkeypatch.setattr(bnd, "_feasible_bounds", matrix)
     monkeypatch.setattr(rdDistGeom.EmbedParameters, "SetBoundsMat", handoff)
     monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", embed)
     ids = bnd.seed_coordinates(mol, cons, 1, bnd.EmbedParams(seed=42, threads=1, knowledge=knowledge), max_attempts=30)
 
-    expected = [(False, False, knowledge, False), (False, True, knowledge, False)]
-    assert stages == expected[: rejections + 1]
+    assert stages == [(False, False, knowledge, False)]
     assert len(matrices) == 1
     assert cons.distances == {(0, 1): (1.3, 1.5)}
-    assert bool(ids) == (rejections < len(expected))
+    assert ids
     for cid in ids:
         positions = mol.GetConformer(cid).GetPositions()
         assert 1.3 <= np.linalg.norm(positions[0] - positions[1]) <= 1.5
@@ -781,19 +794,12 @@ def test_native_recovery_preserves_bounds_and_stereo(monkeypatch, knowledge, rej
         assert measured.GetAtomWithIdx(1).GetChiralTag() == mol.GetAtomWithIdx(1).GetChiralTag()
 
 
-def test_native_failure_counts_are_reported_before_each_fallback(monkeypatch, caplog):
+def test_native_failure_counts_are_reported_once_with_a_random_start_remedy(monkeypatch, caplog):
     counts = [0] * (max(map(int, rdDistGeom.EmbedFailureCauses.names.values())) + 1)
-    causes = iter(
-        [
-            rdDistGeom.EmbedFailureCauses.INITIAL_COORDS,
-            rdDistGeom.EmbedFailureCauses.LINEAR_DOUBLE_BOND,
-        ]
-    )
+    counts[int(rdDistGeom.EmbedFailureCauses.INITIAL_COORDS)] = 2
 
     def reject(_mol, _n, params):
         assert params.trackFailures
-        counts[:] = [0] * len(counts)
-        counts[int(next(causes))] = 2
         return []
 
     monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", reject)
@@ -802,11 +808,10 @@ def test_native_failure_counts_are_reported_before_each_fallback(monkeypatch, ca
         assert not bnd.seed_coordinates(_graph("CC"), Constraints(), 1, bnd.EmbedParams(seed=42))
 
     messages = [record.message for record in caplog.records if record.name == "rxembed.bounds"]
-    assert len(messages) == 2
+    assert len(messages) == 1
     assert "random=False" in messages[0]
     assert "{'INITIAL_COORDS': 2}" in messages[0]
-    assert "random=True" in messages[1]
-    assert "{'LINEAR_DOUBLE_BOND': 2}" in messages[1]
+    assert "EmbedParams(native=...), useRandomCoords=True" in messages[0]
 
 
 def test_native_failure_tracking_does_not_change_seed_coordinates(monkeypatch):

@@ -7,6 +7,7 @@ connectivity, but only the latter two rank bond orders.
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import logging
 
@@ -49,8 +50,10 @@ def read_xyz(path, charge=0, connectivity="xyzgraph", bond_orders="xyzgraph", me
     metal-free TS keeps xyzgraph's orders instead of failing); RDKit connectivity never adds or removes a metal-donor
     contact. ``metal_charges`` names a formal charge per metal index for a multi-metal XYZ whose total does not
     determine the split; every metal must be named. Sanitisation is lenient (rings yes, valence checks no); perceiver
-    choices land on the returned Mol's ``_rxembed*`` properties. A bridgehead M-X bond a reader mis-perceived
-    (`_drop_bridgehead_bonds`) is dropped here, once, since only a coordinate-derived graph can carry that fault.
+    choices land on the returned Mol's ``_rxembed*`` properties; ``_rxembedChargeRescue`` says how a metal read
+    past its valence electrons was read instead (`_assign_bond_orders`), empty when none was. A bridgehead M-X
+    bond a reader mis-perceived (`_drop_bridgehead_bonds`) is dropped here, once, since only a coordinate-derived
+    graph can carry that fault.
     """
     if connectivity not in _CONNECTIVITY:
         raise ValueError(f"connectivity must be 'rdkit', 'xyzgraph', or 'xyz2mol', got {connectivity!r}")
@@ -98,10 +101,15 @@ def read_xyz(path, charge=0, connectivity="xyzgraph", bond_orders="xyzgraph", me
     if perceived_charge != charge:
         remedy = "use bond_orders='xyz2mol'" if bond_orders == "xyzgraph" else "check charge= and the input graph"
         raise ValueError(f"perceived total charge {perceived_charge} does not match charge={charge}; {remedy}")
+    rescue = mol.GetProp("_rxembedChargeRescue") if mol.HasProp("_rxembedChargeRescue") else ""
+    if rescue:
+        logger.warning("read_xyz: %s", rescue)
     mol.SetProp("_rxembedConnectivity", perceived_by)
     mol.SetProp("_rxembedBondOrders", order_by)
     mol.SetProp("_rxembedConnectivityAdded", ",".join(f"{i}-{j}" for i, j in added))
+    mol.SetProp("_rxembedChargeRescue", rescue)
     mol.SetBoolProp("_rxembedPerceptionFallback", used_fallback or order_by != bond_orders)
+    _warn_if_charge_looks_missing(mol, charge)
     try:
         with rdBase.BlockLogs():
             stereo_from_3d(mol, metal_indices(mol), apply=True)
@@ -289,7 +297,14 @@ def _apply_metal_charges(mol, charges):
 
 
 def _assign_bond_orders(mol, path, charge, connectivity, requested, allow_fallback):
-    """Apply the requested bond-order backend without silently changing a strict choice."""
+    """Apply the requested bond-order backend without silently changing a strict choice.
+
+    When xyz2mol finds no closed-shell reading on the selected graph or on its own connectivity, the last
+    resort keeps the selected graph and takes the reading with fewer radical electrons: xyz2mol's, with a
+    metal's charge past its valence electrons moved onto anionic donors as radicals, or xyzgraph's own
+    charges when they reach the total and keep every metal within its valence electrons. On a tie xyz2mol's
+    is taken.
+    """
     if requested != "xyz2mol" or connectivity == "xyz2mol":
         return mol, connectivity, connectivity, False
     if not _has_xyz2mol_metal(mol):
@@ -309,18 +324,67 @@ def _assign_bond_orders(mol, path, charge, connectivity, requested, allow_fallba
         try:
             joint = _from_xyz2mol(path, charge)
         except (ImportError, OSError, RuntimeError, ValueError) as second:
-            raise ValueError(
-                f"{connectivity} connectivity has no valid bond-order assignment ({first}); "
-                f"xyz2mol connectivity also failed ({second})"
-            ) from second
+            readings = []
+            with contextlib.suppress(ValueError):
+                readings.append((_rank_orders(mol, charge, radicals=True), "xyz2mol"))
+            metals = _metal_charges(mol)
+            if (
+                connectivity == "xyzgraph"
+                and Chem.GetFormalCharge(mol) == charge
+                and all(q <= n for _s, q, n in metals)
+            ):
+                own = Chem.Mol(mol)
+                kept = ", ".join(f"{symbol}{q:+d}" for symbol, q, _limit in metals)
+                own.SetProp(
+                    "_rxembedChargeRescue",
+                    f"xyz2mol found no closed-shell reading at charge={charge}; kept xyzgraph's {kept}",
+                )
+                readings.append((own, "xyzgraph"))
+            if not readings:
+                raise ValueError(
+                    f"xyz2mol found no bond orders on the {connectivity} graph ({first}); "
+                    f"xyz2mol connectivity also failed ({second})"
+                ) from second
+            reading, order_by = min(
+                readings, key=lambda item: sum(a.GetNumRadicalElectrons() for a in item[0].GetAtoms())
+            )
+            return reading, connectivity, order_by, order_by != requested
         logger.warning(
-            "read_xyz: %s connectivity has no valid bond-order assignment (%s); using xyz2mol connectivity",
+            "read_xyz: xyz2mol found no bond orders on the %s graph (%s); using xyz2mol connectivity",
             connectivity,
             first,
         )
         return joint, "xyz2mol", "xyz2mol", True
     actual = ranked.GetProp("_rxembedBondOrders") if ranked.HasProp("_rxembedBondOrders") else "xyz2mol"
     return ranked, connectivity, actual, actual != requested
+
+
+def _warn_if_charge_looks_missing(mol, charge):
+    """Warn when a metal read at charge=0 is over its valence electrons, negative, or odd-electron.
+
+    An ion read without its charge gets the default charge=0, and the metal absorbs the missing total; these
+    three readings are what that usually looks like. The warning never changes the reading or infers a total.
+    """
+    if charge != 0:
+        return
+    suspect = []
+    for symbol, q, limit in _metal_charges(mol):
+        if q > limit:
+            suspect.append(f"{symbol}{q:+d} is over its {limit} valence electrons")
+        elif q < 0:
+            suspect.append(f"{symbol}{q:+d} is negative")
+        elif (limit - q) % 2:
+            suspect.append(f"{symbol}{q:+d} has an odd electron count")
+    if suspect:
+        logger.warning("read_xyz: at charge=0, %s; pass charge= for a charged complex", ", ".join(suspect))
+
+
+def _metal_charges(mol):
+    """Return ``(symbol, formal charge, valence electrons)`` for each metal atom."""
+    return [
+        (atom.GetSymbol(), atom.GetFormalCharge(), _PT.GetNOuterElecs(atom.GetAtomicNum()))
+        for atom in (mol.GetAtomWithIdx(index) for index in metal_indices(mol))
+    ]
 
 
 def _has_xyz2mol_metal(mol):
@@ -337,12 +401,45 @@ def _from_xyz2mol(path, charge):
     return out
 
 
+def _right_angle_ring_chords(graph):
+    """Return xyzgraph's nonmetal, non-H bonds that sit opposite an angle of 90 degrees or more in a three-ring.
+
+    Every side of a real three-ring is a bond, so each angle is acute: an angle at k of 90 degrees or more
+    makes the i-j side at least the hypotenuse of the two bonds meeting at k, so i-j is a 1,3 contact across a
+    larger ring, not a bond. xyzgraph 1.6.14's strict three-ring check misses this (its limit is 110 degrees
+    plus 2 degrees per unit of mean Z above carbon). This is geometric, not chemical, so a genuine partial bond
+    in a transition state (for example a cyclopropyl-cation ring-opening TS) could be dropped the same way;
+    metal and H rings are excluded from this guard and stay untouched.
+    """
+    nodes = {
+        n: np.asarray(data["position"], float)
+        for n, data in graph.nodes(data=True)
+        if data["atomic_number"] != 1 and data["atomic_number"] not in COORDINATION_METALS
+    }
+    chords = set()
+    for i, j in graph.edges:
+        if i not in nodes or j not in nodes:
+            continue
+        for k in set(graph[i]) & set(graph[j]) & nodes.keys():
+            u, v = nodes[i] - nodes[k], nodes[j] - nodes[k]
+            if u @ v <= 0.0:  # cos(angle at k) <= 0
+                chords.add((min(i, j), max(i, j)))
+    return sorted(chords)
+
+
 def _from_xyzgraph(path, charge):
     """Read connectivity and bond orders from xyzgraph, as a Mol with a conformer."""
     import xyzgraph
 
     # Never quick=True: it skips bond-order and charge perception and returns all-single bonds.
     graph = xyzgraph.build_graph(path, charge=charge, kekule=True)
+    if phantom := _right_angle_ring_chords(graph):
+        # ponytail: drop this guard once the installed xyzgraph caps the strict three-ring angle at 90 deg.
+        logger.warning(
+            "read_xyz: dropped cross-ring contact(s) %s (a three-ring angle >= 90 deg)",
+            ", ".join(f"{i}-{j}" for i, j in phantom),
+        )
+        graph = xyzgraph.build_graph(path, charge=charge, kekule=True, unbond=phantom)
     orders = {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE, 3: Chem.BondType.TRIPLE}
     rw, idx = Chem.RWMol(), {}
     for node, data in sorted(graph.nodes(data=True)):
@@ -579,12 +676,12 @@ def _flatten_for_xyz2mol(mol, contacts):
     return graph
 
 
-def _rank_orders(mol, charge):
+def _rank_orders(mol, charge, radicals=False):
     """Re-assign bond orders and charges without changing connectivity.
 
     A metal-free structure delegates to RDKit. `TRANSITION_METALS_NUM` is narrower than
     `metal_core.COORDINATION_METALS`: it omits the lanthanides and actinides that calibrated search has no
-    charge model for.
+    charge model for. ``radicals`` is passed to `get_tmc_mol`.
     """
     if not _has_xyz2mol_metal(mol):
         return _rdkit_bond_orders(mol, charge)
@@ -593,7 +690,7 @@ def _rank_orders(mol, charge):
     coords = graph.GetConformer().GetPositions().tolist()
     try:
         with rdBase.BlockLogs():
-            out = get_tmc_mol(None, charge, graph=(graph, coords))[0]
+            out = get_tmc_mol(None, charge, graph=(graph, coords), radicals=radicals)[0]
         # Atom-for-atom, in order: the contacts below are restored by input atom index.
         _assert_same_atoms(mol, out)
         rw = Chem.RWMol(out)

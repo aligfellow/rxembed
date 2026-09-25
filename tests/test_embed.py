@@ -26,6 +26,7 @@ from rxembed.metal_polyhedron import POLYHEDRA
 from rxembed.metal_smiles import cxsmiles, parse_smiles
 from rxembed.relax import UFFOptimizationError, UFFRecord, UFFTypingError, bonding_failure, restrained_uff
 from rxembed.stereo import axis_stereo, bond_stereo, point_stereo, stereo_from_3d
+from tests.metal_fixtures import ONE_ARM_BOUND_PT
 
 emb = importlib.import_module("rxembed.embed")  # the engine implementation module, not the public facade
 
@@ -97,7 +98,12 @@ def test_embed_fix_chains_minimize_and_dump(tmp_path):
 def test_numeric_fix_delivers_a_linear_three_centre_core():
     mol = _mol("[F-].CCl")  # F(0), C(1), Cl(2)
     fix = {(0, 1): 2.0, (1, 2): 2.2, (0, 1, 2): 178.0}
-    confs = embed(mol, fix=fix, n=1, params=bnd.EmbedParams(seed=0xF00D, prune_rms=-1)).minimize()
+    # Two disconnected fragments tied only by the fix: DG's own eigen-embedding step needs a random start to
+    # place them into the constrained arrangement at all, so ask for one explicitly (no default retry).
+    native = rdDistGeom.KDG()
+    native.useLegacyImplementation = False
+    native.useRandomCoords = True
+    confs = embed(mol, fix=fix, n=1, params=bnd.EmbedParams(seed=0xF00D, prune_rms=-1, native=native)).minimize()
     assert confs
     for cid in confs.ids:
         conf = confs.mol.GetConformer(int(cid))
@@ -1599,6 +1605,23 @@ def test_relax_gate_rejects_inverted_ligand_point_stereo(monkeypatch):
     monkeypatch.setattr(emb, "_coordination_state_failure", lambda *_args, **_kwargs: None)
 
     assert str(conformers._geometry_failure(conformers.ids[0])) == f"{symbol}{atom} reads {found}, not {expected}"
+
+
+def test_relax_gate_offers_locked_hand_enumeration_for_a_bound_amine(monkeypatch):
+    """A bound amine's hand is the input arrangement's, so losing it names the option that enumerates both."""
+    isomer = _isomer(ONE_ARM_BOUND_PT)
+    conformers = embed(isomer, n=1, seed=7)
+    wanted = point_stereo(isomer.stereo_label)
+    monkeypatch.setattr(emb, "stereo_from_3d", lambda *_args, **_kwargs: f"N4:{'S' if wanted[4] == 'R' else 'R'}")
+    monkeypatch.setattr(emb, "_coordination_state_failure", lambda *_args, **_kwargs: None)
+
+    failure = conformers._geometry_failure(conformers.ids[0])
+
+    assert failure.kind == "locked_stereo"
+    assert emb.remedy(failure.kind, isomer, conformers.cons) == (
+        "try rx.metal(..., stereo={'locked': 'racemic'}) or another isomer"
+    )
+    assert conformers._required_failure({failure: [0]}) == {"locked_stereo"}
 
 
 def test_relax_gate_distinguishes_unassigned_ligand_stereo(monkeypatch):

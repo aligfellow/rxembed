@@ -1,5 +1,6 @@
 """Test XYZ graph perception and backend fallback behavior."""
 
+import csv
 import itertools
 import logging
 import sys
@@ -15,7 +16,7 @@ from rdkit.Geometry import Point3D
 import rxembed as rx
 from rxembed.metal_core import COORDINATION_METALS, canonical_metal_graph, reject_boron_cages
 from rxembed.pipeline import perceive
-from tests.conftest import EXAMPLES_DIR
+from tests.conftest import EXAMPLES_DIR, TMQMG_DIR
 
 _BIMP = str(EXAMPLES_DIR / "bimp.xyz")  # a metal-free TS with a stretched reacting core
 
@@ -127,18 +128,84 @@ def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog)
         perceive._rank_orders(mol, 0)
 
 
-def test_failed_bond_order_and_connectivity_assignment_raise_together(monkeypatch):
-    selected = Chem.MolFromSmiles("[Cl-]->[Fe+2]<-[Cl-]")
+@pytest.mark.parametrize(("smiles", "kept"), [("[Cl-]->[Fe+2]<-[Cl-]", True), ("[Cl-]->[Fe+3]<-[Cl-]", False)])
+def test_iron_dichloride_keeps_xyzgraph_charges_only_when_both_xyz2mol_readings_fail_and_they_fit(
+    monkeypatch, caplog, smiles, kept
+):
+    selected = Chem.MolFromSmiles(smiles)
 
-    def fail(*_args):
+    def fail(*_args, **_kwargs):
         raise ValueError("no assignment")
 
     monkeypatch.setattr(perceive, "_with_fallback", lambda *_args: (selected, "xyzgraph"))
     monkeypatch.setattr(perceive, "_rank_orders", fail)
     monkeypatch.setattr(perceive, "_from_xyz2mol", fail)
 
-    with pytest.raises(ValueError, match=r"xyzgraph connectivity.*xyz2mol connectivity also failed"):
-        perceive.read_xyz("unused.xyz", bond_orders="xyz2mol")
+    if not kept:  # Fe+3 and two Cl- total +1, not the requested 0
+        with pytest.raises(ValueError, match=r"xyz2mol found no bond orders on the xyzgraph graph.*also failed"):
+            perceive.read_xyz("unused.xyz", bond_orders="xyz2mol")
+        return
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        mol = perceive.read_xyz("unused.xyz", bond_orders="xyz2mol")
+    assert [a.GetFormalCharge() for a in mol.GetAtoms()] == [-1, 2, -1]
+    assert mol.GetProp("_rxembedBondOrders") == "xyzgraph"
+    assert mol.GetBoolProp("_rxembedPerceptionFallback")
+    assert mol.GetProp("_rxembedChargeRescue").endswith("kept xyzgraph's Fe+2")
+    assert "kept xyzgraph's Fe+2" in caplog.text
+
+
+def _write_complex(tmp_path, name, atoms, order):
+    """Write `atoms` as an .xyz with its lines in `order`."""
+    rows = [atoms[i] for i in order]
+    path = tmp_path / f"{name}-{''.join(map(str, order))}.xyz"
+    path.write_text(f"{len(rows)}\n{name}\n" + "".join(f"{s} {x:.4f} {y:.4f} {z:.4f}\n" for s, x, y, z in rows))
+    return str(path)
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+@pytest.mark.parametrize(
+    ("atoms", "metal", "radical"),
+    [
+        # HgI3: a neutral doublet, so the unpaired electron sits on an iodine next to d10 Hg(II).
+        ([("Hg", 0, 0, 0), ("I", 2.7, 0, 0), ("I", -1.35, 2.338, 0), ("I", -1.35, -2.338, 0)], "Hg+2", "I"),
+        # [VO2Cl2]- read without its charge, as PIVPOB's dioxo V(V) was: V+6 at charge=0 gives an oxo O radical.
+        (
+            [
+                ("V", 0, 0, 0),
+                ("O", 0.924, 0.924, 0.924),
+                ("O", 0.924, -0.924, -0.924),
+                ("Cl", -1.270, 1.270, -1.270),
+                ("Cl", -1.270, -1.270, 1.270),
+            ],
+            "V+5",
+            "O",
+        ),
+    ],
+    ids=["mercury_triiodide", "dioxovanadium_dichloride"],
+)
+def test_metal_past_its_valence_at_charge_zero_is_read_at_its_cap_with_a_donor_radical(
+    tmp_path, caplog, atoms, metal, radical
+):
+    smiles = set()
+    for order in (list(range(len(atoms))), list(reversed(range(len(atoms))))):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="rxembed"):
+            mol = perceive.read_xyz(_write_complex(tmp_path, radical, atoms, order), 0, bond_orders="xyz2mol")
+
+        centre = next(a for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS)
+        assert f"{centre.GetSymbol()}{centre.GetFormalCharge():+d}" == metal
+        assert [(a.GetSymbol(), a.GetNumRadicalElectrons()) for a in mol.GetAtoms() if a.GetNumRadicalElectrons()] == [
+            (radical, 1)
+        ]
+        assert Chem.GetFormalCharge(mol) == 0
+        assert mol.GetProp("_rxembedBondOrders") == "xyz2mol"
+        assert not mol.GetBoolProp("_rxembedPerceptionFallback")
+        note = mol.GetProp("_rxembedChargeRescue")
+        assert f"read {metal} with a radical on {radical}" in note
+        assert note.endswith("check charge=")
+        assert f"read_xyz: {note}" in caplog.text
+        smiles.add(Chem.MolToSmiles(mol))
+    assert len(smiles) == 1
 
 
 def test_failed_assignments_do_not_keep_a_selected_graph_with_the_wrong_charge(monkeypatch):
@@ -344,6 +411,33 @@ def test_connectivity_fallback_preserves_explicit_metal_charge_allocation(monkey
     result = perceive.read_xyz("unused.xyz", charge=0, metal_charges={0: 2, 1: 1})
 
     assert [result.GetAtomWithIdx(index).GetFormalCharge() for index in (0, 1)] == [2, 1]
+
+
+@pytest.mark.parametrize(
+    ("smiles", "charge", "warning"),
+    [
+        ("N->[Cu](<-N)(<-N)<-N", 0, "Cu+0 has an odd electron count"),  # [Cu(NH3)4]2+ without its charge
+        ("[I-]->[Hg+3](<-[I-])<-[I-]", 0, "Hg+3 is over its 2 valence electrons"),  # xyzgraph's HgI3
+        ("C[N+](C)(C)C.[O+]#[C-]->[Co-](<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]", 0, "Co-1 is negative"),
+        ("[Cl-]->[Zn+2]<-[Cl-]", 0, None),  # d10 Zn(II): nothing suggests a missing charge
+        ("N->[Cu+2](<-N)(<-N)<-N", 2, None),  # the charge was given
+    ],
+    ids=["tetraammine_copper", "mercury_triiodide", "tetracarbonylcobaltate", "zinc_dichloride", "copper_two_plus"],
+)
+def test_metal_read_at_charge_zero_warns_when_its_reading_suggests_a_missing_charge(
+    monkeypatch, caplog, smiles, charge, warning
+):
+    selected = Chem.MolFromSmiles(smiles)
+    monkeypatch.setattr(perceive, "_with_fallback", lambda *_args: (selected, "xyzgraph"))
+
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        mol = perceive.read_xyz("unused.xyz", charge=charge)
+
+    assert Chem.GetFormalCharge(mol) == charge
+    hints = [record.getMessage() for record in caplog.records if "pass charge=" in record.getMessage()]
+    assert hints == (
+        [] if warning is None else [f"read_xyz: at charge=0, {warning}; pass charge= for a charged complex"]
+    )
 
 
 # --- choosing a perceiver -------------------------------------------------------------------------
@@ -823,3 +917,23 @@ def test_smiles_input_keeps_a_bridgehead_bond_canonical_metal_graph_no_longer_dr
     out = canonical_metal_graph(mol)
 
     assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
+def test_read_drops_a_triazolate_cross_ring_contact():
+    """DEPZOR: each Fe-bound 1,2,4-triazolate has two ring carbons 2.095 A apart, just inside xyzgraph's C-C
+    cutoff. xyzgraph 1.6.14 bonds that contact anyway, since its strict three-ring check only rejects an
+    obtuse apex above 110 deg (mean-Z adjusted) and this one is 101.8 deg; a real three-ring cannot have an
+    obtuse apex at all, so `_right_angle_ring_chords` drops the bond and xyzgraph rebuilds without it.
+    """
+    charges = {
+        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
+    }
+    mol = rx.read_xyz(str(TMQMG_DIR / "xyz" / "DEPZOR.xyz"), charge=charges["DEPZOR"], bond_orders="xyz2mol")
+
+    assert mol.GetBondBetweenAtoms(0, 15) is None
+    assert mol.GetBondBetweenAtoms(34, 49) is None
+    rx.cxsmiles(mol)  # must not raise: no spurious point stereo on the freed ring carbons
+    for idx in (0, 15, 34, 49):
+        assert mol.GetAtomWithIdx(idx).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED

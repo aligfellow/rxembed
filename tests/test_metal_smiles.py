@@ -26,6 +26,7 @@ from rxembed.metal_stereo import donor_classes, eta2_signatures, face_winding, r
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.perceive import _drop_bridgehead_bonds, read_xyz
 from tests.conftest import EXAMPLES_DIR
+from tests.metal_fixtures import one_arm_bound_pt
 
 _MN_H2 = str(EXAMPLES_DIR / "mn-h2.xyz")  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
 _MNH = str(EXAMPLES_DIR / "mnh.xyz")  # the corresponding Mn hydride minimum
@@ -559,6 +560,19 @@ def test_dative_smiles_rejects_unreadable_graph():
         rw.AddBond(c, h, Chem.BondType.SINGLE)
     with pytest.raises(ValueError, match="round-tripping SMILES"):
         metal_smiles.dative_smiles(rw.GetMol())
+
+
+def test_writer_round_trips_a_hydroxycarbene_whose_oh_fixes_ez():
+    """ASINUO carries a hydroxycarbene O-H that fixes the C=O+ bond's E/Z: its only substituent is the
+    carbene carbon, so RDKit's own SMILES parser keeps it explicit rather than folding it into an implicit
+    H count. The round-trip check used to model that rule instead of asking RDKit, and modelled it wrong.
+    """
+    smi = "[H]/[O+]=[C-](/C)->[Cr](<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]"
+    isomers = rx.metal(smi, "octahedral")
+    texts = [rx.cxsmiles(iso) for iso in isomers]
+    assert texts
+    for text in texts:
+        assert rx.cxsmiles(rx.metal(text)[0]) == text
 
 
 def test_dative_writer_does_not_invent_point_stereo_on_a_degree_five_atom():
@@ -1118,6 +1132,20 @@ def test_tagged_chiral_amine_donor_stays_in_the_smiles_core():
     for text in hands.values():
         realised = rx.embed(rx.metal(text)[0], n=1, seed=2).minimize().mol
         assert rx.cxsmiles(realised) == text
+
+
+def test_isomer_writes_the_bound_amine_hand_it_states_against_its_coordinates():
+    """stereo='invert' states the mirror of a bound N's measured hand; the CX keeps it, not the coordinates' one."""
+    mol = one_arm_bound_pt()
+    [iso] = rx.metal(mol, stereo={"N13": "invert"})
+
+    written = rx.cxsmiles(iso)
+    back = rx.parse_smiles(written)
+
+    assert written != rx.cxsmiles(mol)
+    assert sorted(stereo.point_stereo(stereo.defined_stereo_label(back, metal_indices(back))).values()) == sorted(
+        stereo.point_stereo(iso.stereo_label).values()
+    )
 
 
 def test_coupled_chelated_amine_hands_write_together():

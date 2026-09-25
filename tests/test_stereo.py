@@ -14,6 +14,7 @@ import rxembed as rx
 from rxembed import stereo
 from rxembed.metal_core import metal_indices
 from rxembed.metal_smiles import parse_smiles
+from tests.metal_fixtures import ONE_ARM_BOUND_PT
 
 _CHIRAL_P_PD = "C[P](CC)(c1ccccc1)[Pd](Cl)(Cl)Cl"
 # an alpha-diimine-style chelate: both imine C=N sit in the 5-membered ring the metal closes
@@ -342,6 +343,30 @@ def test_chelated_amine_donor_enumerates_both_configurations():
 
     assert {label for _variant, label in variants} == {"N1:R", "N1:S"}
     assert (n_unassigned, total, unresolved) == (1, 2, 0)
+
+
+def test_bound_amine_and_alkyl_are_coordination_locked_but_phosphine_is_not():
+    """Each donor is a stereocentre of its complex; only the phosphine P is one without the metal as well."""
+    for smiles, locked in (
+        ("C[NH]1CC[O-]->[Pd+2](<-[Cl-])(<-[Cl-])<-1", ["N"]),
+        ("[CH3-]->[Pd+2](<-[Cl-])<-[CH-](C)CC", ["C"]),
+        ("C[P](CC)(c1ccccc1)->[Pd+2](<-[Cl-])(<-[Cl-])<-[Cl-]", []),
+    ):
+        mol, metals = _with_metals(smiles)
+        assert stereo.point_centres(mol, metals), smiles
+        symbols = sorted(mol.GetAtomWithIdx(i).GetSymbol() for i in stereo.coordination_locked_centres(mol, metals))
+        assert symbols == locked, smiles
+
+
+def test_bound_amine_hands_merge_only_where_the_complex_is_symmetric():
+    """Two bound-N hand pairs are one variant only by the complex's own symmetry, not by the metal-cut graph's:
+    all four pairs stay when one carboxylate binds, and the two mixed pairs of a symmetric macrocycle merge.
+    """
+    one_arm, metals = _with_metals(ONE_ARM_BOUND_PT)
+    macrocycle, macro_metals = _with_metals("C1C[NH]2->[Zn+2]34(<-[Cl-])<-[NH](C1)CC[NH]->3CC[NH]->4CCC2")
+
+    assert len(_labels(one_arm, exclude=metals)) == 4
+    assert len(_labels(macrocycle, exclude=macro_metals)) == 3
 
 
 def test_equivalent_chelate_arms_do_not_create_donor_point_stereo():

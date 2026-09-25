@@ -82,7 +82,7 @@ class Constraints:
 
         Released atoms are no longer pose-frozen, so a strained contact may break or a new one form. Every
         structural hold (frozen core, metal sphere, coplanarity cap, centroid dummies) is carried
-        through by `copy`. The caller adds encounter bounds if releasing leaves a fragment unconstrained.
+        through by `copy`. The caller adds fragment contact bounds if releasing leaves a fragment unconstrained.
         """
         dk, angular = self.contacts
         return self.copy(

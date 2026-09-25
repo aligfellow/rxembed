@@ -70,13 +70,14 @@ def _radial_distance_windows(iso, mol, atoms, positions, base_distances=None, co
     return radial, hyb
 
 
-def narrow_span_pairs(base_iso, source, padded, haptic, lengths, native_reach, context=None):
-    """Return same-ligand donor-position pairs that cannot span `CHELATE_SPAN_ANGLE` (135 deg) or more.
+def narrow_span_pairs(base_iso, source, padded, geom, haptic, lengths, native_reach, context=None):
+    """Return, per polyhedron vertex angle, the same-ligand donor-position pairs that cannot span it.
 
-    No-loss: a compiled angle row this wide keeps a floor >= CHELATE_SPAN_ANGLE - ANGLE_PAD (127 deg). Any
-    path that could instead widen that row (`metal_polyhedron.relaxed_shell`'s bite-corner image) only
-    commits a witness whose span also fits the same native reach within 1e-7, which this test has already
-    shown a pair this wide cannot do.
+    No-loss: a compiled angle row keeps a floor >= its vertex angle - ANGLE_PAD, so a pair whose shortest
+    triangle at that floor exceeds its native reach cannot sit there. Any path that could instead widen the row
+    (`metal_polyhedron.relaxed_shell`'s bite-corner image) only commits a witness whose span also fits the same
+    native reach within 1e-7. A census-bite pair is compiled at its bite, not its vertex angle, so below
+    CHELATE_SPAN_ANGLE it is left to the edge rule and the per-candidate screen.
     """
     base, metal = base_iso.graph, base_iso.metal
     frag = frag_map(base)
@@ -84,17 +85,23 @@ def narrow_span_pairs(base_iso, source, padded, haptic, lengths, native_reach, c
     atoms = {padded[i] for i in real_slots}
     positions, _ = resolve_lengths(source, lengths)
     radial, _hyb = _radial_distance_windows(base_iso, source, atoms, positions, context=context)
-    span = (CHELATE_SPAN_ANGLE - ANGLE_PAD, 180.0)
-    narrow = set()
+    dirs = POLYHEDRA[geom].vertex_dirs
+    angles = sorted({round(vertex_angle(p, q), 6) for p, q in itertools.combinations(dirs, 2)})
+    narrow = {}
     for i, j in itertools.combinations(real_slots, 2):
         a, b = padded[i], padded[j]
         if frag[a] != frag[b] or base.GetBondBetweenAtoms(a, b) is not None:
             continue
         left, right = radial.distances[tuple(sorted((metal, a)))], radial.distances[tuple(sorted((metal, b)))]
         x, y = sorted((a, b))
-        if triangle_distances(left, right, span)[0] > float(native_reach[x, y]) + SPAN_TOL:
-            narrow.add(frozenset((i, j)))
-    return frozenset(narrow)
+        bite = chelate_bite_window(base, a, b, atoms) is not None
+        for angle in angles:
+            if bite and angle < CHELATE_SPAN_ANGLE:
+                continue
+            floor = (max(0.0, angle - ANGLE_PAD), 180.0)
+            if triangle_distances(left, right, floor)[0] > float(native_reach[x, y]) + SPAN_TOL:
+                narrow.setdefault(angle, set()).add(frozenset((i, j)))
+    return {angle: frozenset(pairs) for angle, pairs in narrow.items()}
 
 
 def _chelate_span_failure(iso, reach, radial, links, compiled=None, context=None):

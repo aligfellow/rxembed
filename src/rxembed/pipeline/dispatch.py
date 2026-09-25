@@ -43,7 +43,7 @@ from .stereo_check import signature
 logger = logging.getLogger("rxembed")
 
 _STEREO_MODES = {"unassigned", "racemic", "separate", "free", "preserve", "all", "invert"}
-_STEREO_KINDS = {"point", "ez", "axial", "planar", "helical", "default"}
+_STEREO_KINDS = {"point", "ez", "axial", "planar", "helical", "locked", "default"}
 _STEREO_FILTERS = {"free", "preserve", "invert", "racemic"}
 
 

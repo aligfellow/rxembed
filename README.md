@@ -126,12 +126,17 @@ connectivity and bond orders. Choose the two decisions separately:
   its reactive or multicentre bond orders are part of the input model.
 
 The XYZ format does not carry a standard molecular charge. `charge=0` is an explicit neutral assumption, not
-an inferred value; pass the dataset or calculation charge for ions.
+an inferred value; pass the dataset or calculation charge for ions. At `charge=0`, `read_xyz` warns when a metal
+ends over its valence electrons, negative, or with an odd electron count, which is how an ion read without its
+charge usually looks; it never infers the total.
 
 Bond-order assignment first preserves the selected edge set. If xyz2mol cannot assign that topology, `read_xyz`
-warns before retrying its jointly perceived connectivity; it keeps the selected graph only if both attempts
-fail and RDKit validates that graph at the requested charge. `bond_orders="xyzgraph"` requires
-`connectivity="xyzgraph"`. Every returned graph has the requested total formal charge. Pass `fallback=False` to
+warns before retrying its jointly perceived connectivity. If both fail, it keeps the selected graph with the
+reading that has fewer radical electrons: xyz2mol's, with the charge a metal cannot hold past its valence
+electrons moved onto anionic donors as radicals, or xyzgraph's own charges when they reach the total and keep
+each metal within its valence electrons. That rescue, like a ligand read at a lower-ranked charge to keep the
+metal within its valence electrons, logs one warning and is recorded in `_rxembedChargeRescue` (empty
+otherwise). `bond_orders="xyzgraph"` requires `connectivity="xyzgraph"`. Every returned graph has the requested total formal charge. Pass `fallback=False` to
 require the selected perceivers. The returned Mol records the actual connectivity and bond-order sources in
 `_rxembedConnectivity`, `_rxembedBondOrders`, and `_rxembedPerceptionFallback` properties. When an independent
 RDKit/xyz2mol check confirms a nonmetal bond xyzgraph's graph omitted, `read_xyz` restores it and records the
@@ -244,7 +249,12 @@ use `center=` to enumerate only one, or `stereo=` to vary selected stereo:
 ```python
 n_hands = rx.metal(path, stereo={"N5": "racemic"})
 all_hands = rx.metal(path, stereo="racemic")
+locked_hands = rx.metal(path, stereo={"locked": "racemic"})
 ```
+
+The measured hand includes that of a donor which is a stereocentre only while bound, such as an amine N or a
+σ-alkyl C. Every arrangement carries it, and one that cannot hold it fails to embed. `{"locked": "racemic"}`
+instead enumerates both hands of each such centre with every arrangement, leaving the other stereo as measured.
 
 XYZ and SMILES use the same model distances, polyhedron and graph-derived chelate angle preferences. Use
 `rx.metal(struct, lengths="input")` to measure M–L distances from coordinates explicitly; the default,
@@ -438,7 +448,8 @@ The reasons use element symbols and 0-based atom indices:
 - `bond C9-C10 squeezed to 0.87 A`, `stretched to 2.33 A` or `C4...C9 clash at 0.90 A`: the ligand is strained
   in this arrangement.
 - `N3 reads R, not S` or `N3 no longer reads S`: a ligand stereocentre, often a coordinated amine N, inverted or
-  lost its configuration.
+  lost its configuration. For a bound amine N, the remedy names `stereo={'locked': 'racemic'}`: its measured
+  hand may not fit this arrangement.
 - `found 0/1 DG seeds with the requested metal and ligand stereo`: no seed had the requested hand together with
   the ligand R/S. With fixed ligand stereocentres some hands cannot exist.
 

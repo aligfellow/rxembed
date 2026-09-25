@@ -1,5 +1,6 @@
 """Test donor-to-polyhedron seating and arrangement labels."""
 
+import itertools
 import random
 from collections import Counter
 
@@ -9,6 +10,16 @@ from rdkit import Chem
 import rxembed as rx
 from rxembed import metal_slots as slots
 from rxembed.metal_polyhedron import CHELATE_SPAN_ANGLE, hull_edges, vertex_angle, vertex_dirs
+
+
+def _wide_narrow(dirs, pair):
+    """Return a `narrow` mapping that forbids `pair` at every vertex angle >= CHELATE_SPAN_ANGLE.
+
+    Mirrors `metal_screen.narrow_span_pairs`'s per-angle form while keeping the old, angle-agnostic "wide
+    bite" test fixtures: those cared only that a pair could not span *some* wide angle, not which one.
+    """
+    angles = {round(vertex_angle(p, q), 6) for p, q in itertools.combinations(dirs, 2)}
+    return {angle: frozenset({pair}) for angle in angles if angle >= CHELATE_SPAN_ANGLE}
 
 
 def test_square_pyramidal_150_degree_pair_is_trans():
@@ -51,7 +62,7 @@ def test_narrow_drops_only_the_orderings_placing_the_pair_on_a_wide_vertex_pair(
     """
     mol = Chem.MolFromSmiles(smiles)
     dirs = vertex_dirs(geometry)
-    narrow = frozenset({frozenset((0, 1))})
+    narrow = _wide_narrow(dirs, frozenset((0, 1)))
 
     unpruned = slots.distinct_vertex_orderings(mol, donors, geometry)
     pruned = slots.distinct_vertex_orderings(mol, donors, geometry, narrow=narrow)
@@ -97,7 +108,7 @@ def test_explicit_perms_bypass_narrow_and_linked():
     dirs = vertex_dirs(geometry)
     unpruned = slots.distinct_vertex_orderings(mol, donors, geometry)
     bad = next(o for o in unpruned if vertex_angle(dirs[o.index(0)], dirs[o.index(1)]) >= CHELATE_SPAN_ANGLE)
-    narrow = frozenset({frozenset((0, 1))})
+    narrow = _wide_narrow(dirs, frozenset((0, 1)))
 
     assert bad not in slots.distinct_vertex_orderings(mol, donors, geometry, narrow=narrow)
     assert slots.distinct_vertex_orderings(mol, donors, geometry, perms=(bad,), narrow=narrow) == [bad]
@@ -107,8 +118,8 @@ def _drop_forbidden_orderings(perms, dirs, narrow, linked=frozenset()):
     """Filter a streamed order out when a constrained donor pair sits on a vertex pair its rule forbids.
 
     Two rules share this one filter, each mapping its constrained donor pairs to a forbidden set of vertex
-    pairs: `narrow` (a same-ligand pair too short to reach a wide, >= CHELATE_SPAN_ANGLE, vertex pair) is
-    forbidden on the wide vertex pairs; `linked` (`metal_enumeration._isomers_for_geometry`'s chelate-backbone
+    pairs: `narrow` (a mapping of vertex angle to the same-ligand pairs that cannot span it) is forbidden on
+    the vertex pairs at that angle; `linked` (`metal_enumeration._isomers_for_geometry`'s chelate-backbone
     or direct-bond pairs, see `chelate_edge_links`) is forbidden on the non-edge (`hull_edges`) vertex pairs.
     A donor pair in both takes the union: it is dropped by whichever vertex-pair check it lands on. Both sets
     are computed once per geometry, and either has already proven no completion can survive its screen. Empty
@@ -122,7 +133,7 @@ def _drop_forbidden_orderings(perms, dirs, narrow, linked=frozenset()):
     wide, off_edge = slots._forbidden_vertex_pairs(dirs, narrow, linked)
 
     def forbidden(order):
-        if any(frozenset((order[i], order[j])) in narrow for i, j in wide):
+        if any(frozenset((order[i], order[j])) in forbidden_pairs for i, j, forbidden_pairs in wide):
             return True
         return any(frozenset((order[i], order[j])) in linked for i, j in off_edge)
 
@@ -155,7 +166,10 @@ def test_pruned_backtracking_matches_sweep_then_filter(geometry):
     rotations = slots.point_group(tuple(map(tuple, dirs)))[0]
     rng = random.Random(geometry)
     pairs = [frozenset((i, j)) for i in range(n) for j in range(i + 1, n)]
-    narrow = frozenset(rng.sample(pairs, max(1, n // 2)))
+    wide_angles = {round(vertex_angle(dirs[i], dirs[j]), 6) for i in range(n) for j in range(i + 1, n)}
+    wide_angles = {angle for angle in wide_angles if angle >= CHELATE_SPAN_ANGLE}
+    narrow_pairs = frozenset(rng.sample(pairs, max(1, n // 2)))
+    narrow = dict.fromkeys(wide_angles, narrow_pairs)
     linked = frozenset(rng.sample(pairs, max(1, n // 2)))
 
     baseline = list(_drop_forbidden_orderings(slots.isomer_permutations(geometry), dirs, narrow, linked))

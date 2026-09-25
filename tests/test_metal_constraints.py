@@ -707,6 +707,16 @@ def test_five_ring_bite_rows_admit_chelate_compressed_crystal_bites():
     assert checked == 3, f"expected FOPSOT's three 5-ring bites, found {checked}"
 
 
+def test_diselenophosphate_four_ring_bite_follows_its_backbone():
+    """WIRGOV's Se-P-Se 4-ring bite: the backbone triangle (83.9-86.3 deg at the model Au-Se leg) misses the
+    ring-size census window (58-81 deg) by 0.04 deg once SPAN_TOL-widened reach is not the thing decided on.
+    `_bite_window_and_reach` must then hand out the triangle, not a spurious sliver overlap, so the input's
+    own arrangement stays admissible.
+    """
+    isomers = rx.metal("CCOP1(OCC)=[Se]->[Au+3](<-[I-])(<-[I-])<-[Se-]1", "square_planar")
+    assert len(isomers) == 1
+
+
 @pytest.mark.parametrize(
     ("geometry", "coordination_number"),
     [("trigonal_bipyramidal", 5), ("square_pyramidal", 5), ("octahedral", 6)],

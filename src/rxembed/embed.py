@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -70,7 +71,14 @@ from .metal_stereo import (
     site_classes,
 )
 from .relax import MAX_ITERS, UFFRecord, UFFTypingError, bonding_failure, error_summary, restrained_uff
-from .stereo import apply_point_stereo, axis_stereo, bond_stereo, point_stereo, stereo_from_3d
+from .stereo import (
+    apply_point_stereo,
+    axis_stereo,
+    bond_stereo,
+    coordination_locked_centres,
+    point_stereo,
+    stereo_from_3d,
+)
 from .utils import atom_label
 
 logger = logging.getLogger("rxembed")  # configured by rxembed.set_verbose
@@ -125,6 +133,7 @@ _REMEDY = {
     "numeric_fix": (_LOOSER_FIX, "constrain="),
     "connectivity": (_LOOSER_FIX, _ISOMER),
     "requested_stereo": ("stereo='free'", _ISOMER),
+    "locked_stereo": ("rx.metal(..., stereo={'locked': 'racemic'})", _ISOMER),
     "seeding": (_LOOSER_FIX, _LOOSER_CONSTRAIN, _ISOMER),
 }
 
@@ -152,6 +161,26 @@ def _group_failures(failures):
 def _describe_groups(groups):
     """Return grouped failures as ``'3x detail, 1x detail'``, most common first."""
     return ", ".join(f"{count}x {failure}" for failure, count in groups.most_common())
+
+
+def _log_replacement_round(operation, index, kept, asked, started):
+    """Report one fresh-seed replacement round's budget and cost, for benchmark attribution."""
+    logger.debug(
+        "%s: replace round %d/%d, %d/%d kept",
+        operation,
+        index + 1,
+        _REPLACEMENT_ROUNDS,
+        kept,
+        asked,
+        extra={
+            "replacement": {
+                "round": index + 1,
+                "asked": asked,
+                "kept": kept,
+                "seconds": time.monotonic() - started,
+            }
+        },
+    )
 
 
 def _headline(groups, iso, cons):
@@ -474,7 +503,11 @@ def _ligand_stereo_failure(mol, iso):
     for atom, expected in wanted_points.items():
         if realised_points.get(atom) != expected:
             found = realised_points.get(atom, "unassigned")
-            return _ligand_stereo_fault(atom_label(mol, atom), expected, found, (atom,))
+            fault = _ligand_stereo_fault(atom_label(mol, atom), expected, found, (atom,))
+            # A coordination-locked hand is the input arrangement's, which this arrangement may not hold.
+            if atom in coordination_locked_centres(mol, metal_indices(mol)):
+                return replace(fault, kind="locked_stereo")
+            return fault
     realised_ez = bond_stereo(realised)
     for pair, expected in wanted_ez.items():
         if realised_ez.get(pair) != expected:
@@ -995,6 +1028,7 @@ class Conformers:
             "seating_crossed",
             "ligand_stereo",
             "ligand_stereo_unassigned",
+            "locked_stereo",
         }
     )
 
@@ -1248,12 +1282,14 @@ class Conformers:
         for batch_index in range(_REPLACEMENT_ROUNDS):
             if not left:
                 break
+            round_started = time.monotonic()
             count = _REPLACEMENT_FACTOR * len(left)
             trial_params = replace(params, seed=params.seed + 1 + batch_index)
             cons = self.cons.copy()
             mol, ids, _target = seed_conformers(Chem.Mol(source), cons, self.iso, count, trial_params)
             if not ids:
                 previous_signature = None
+                _log_replacement_round(operation, batch_index, 0, count, round_started)
                 continue
             batch = Conformers(mol, ids, cons, self.iso, params=trial_params, _coord_state_prep=self._coord_state_prep)
             # A constrained replacement must use the same stiffness ladder as the original batch.  A single
@@ -1299,11 +1335,13 @@ class Conformers:
                     one_reason and atoms and kind not in _STABLE_SHAPE_KINDS and signature == previous_signature
                 )
                 if crossed_every_seed or repeated_reason:
+                    _log_replacement_round(operation, batch_index, 0, count, round_started)
                     return left
                 previous_signature = signature
             else:
                 previous_signature = None
             batch._remove(batch_rejected)
+            _log_replacement_round(operation, batch_index, len(batch.ids), count, round_started)
             self.uff.surrogates.update(batch.uff.surrogates)
             self.uff.retyped.update(batch.uff.retyped)
             scores = {

@@ -25,7 +25,7 @@ from rxembed.metal_polyhedron import POLYHEDRA, hull_edges, record, vertex_dirs
 from rxembed.metal_stereo import chelate_links, donor_classes, realised_chirality, site_classes
 from rxembed.pipeline import geom_check as geom
 from tests.conftest import TMQMG_DIR
-from tests.metal_fixtures import ferrocene
+from tests.metal_fixtures import ferrocene, one_arm_bound_pt
 
 _MA2B2 = "CCCN[Pd](Cl)(Cl)NCCC"  # square-planar MA2B2 -> the cis / trans pair
 _ASYMMETRIC_NN_NI = "O=C1[O-]->[Ni+2]2(<-[CH-](c3ccccc3)N1c1ccccc1)<-[N](O)=C(c1ccccn1)c1cccc[n]->21"
@@ -463,6 +463,17 @@ def test_defined_and_enumerated_ligand_stereo_share_one_label():
     assert {iso.stereo_label for iso in isomers} == {"N4:R,C6:R", "N4:R,C6:S"}
 
 
+def test_bound_amine_hands_are_enumerated_only_on_request():
+    """A geometry input keeps its measured bound-N hands; stereo={'locked': 'racemic'} adds every other pair."""
+    mol = one_arm_bound_pt()
+    measured = rx.cxsmiles(mol)
+    identities = [rx.cxsmiles(iso) for iso in rx.metal(mol, stereo={"locked": "racemic"})]
+
+    assert [rx.cxsmiles(iso) for iso in rx.metal(mol)] == [measured]
+    assert measured in identities
+    assert len(set(identities)) == len(identities) == 4
+
+
 def test_asymmetric_nn_complex_keeps_both_substrate_orientations_per_stereoisomer():
     mol = Chem.AddHs(Chem.MolFromSmiles(_ASYMMETRIC_NN_NI))
     by_stereo = {}
@@ -750,15 +761,27 @@ def test_tethered_donor_network_rejects_the_unrealistic_fihtoh_cis_state():
 
 
 def test_observed_tethered_screen_keeps_the_matching_assignment(monkeypatch):
+    """The tether's own reach screen sets the real per-call orbit limit, not the module-wide MAX_EXHAUSTIVE_ORBITS:
+    this donor network's tether admits only one arrangement, so an exact-fit cap of 1 must still admit it.
+    """
     smiles = "COC(=O)c1cc2O[P](C(C)C)(C(C)C)->[Ni+2]3(<-[Cl-])<-[c-]2c(O[P]->3(C(C)C)C(C)C)c1"
     source = rx.embed(rx.metal(smiles, "square_planar")[0], n=1, seed=42, threads=1).mol
-    monkeypatch.setattr(slots, "MAX_EXHAUSTIVE_ORBITS", 1)
-    monkeypatch.setattr(metal_enumeration, "MAX_EXHAUSTIVE_ORBITS", 1)
+    monkeypatch.setattr(metal_enumeration, "_screen_limit", lambda *_args: 1)
 
     isomers = rx.metal(source, "square_planar")
 
     assert len(isomers) == 1
     assert isomers[0].label == "trans"
+
+
+def test_observed_tethered_screen_breaks_when_the_orbit_cap_is_too_tight(monkeypatch):
+    """A cap under the tether's one true arrangement must raise, proving the previous test's patch has teeth."""
+    smiles = "COC(=O)c1cc2O[P](C(C)C)(C(C)C)->[Ni+2]3(<-[Cl-])<-[c-]2c(O[P]->3(C(C)C)C(C)C)c1"
+    source = rx.embed(rx.metal(smiles, "square_planar")[0], n=1, seed=42, threads=1).mol
+    monkeypatch.setattr(metal_enumeration, "_screen_limit", lambda *_args: 0)
+
+    with pytest.raises(ValueError, match="more than 0 distinct constitutional"):
+        rx.metal(source, "square_planar")
 
 
 _EN_LA_HEXACHLORO_SQA = "[Cl-]->[La+3]1(<-[Cl-])(<-[Cl-])(<-[Cl-])(<-[Cl-])(<-[Cl-])<-[NH2]CC[NH2]->1"
@@ -862,6 +885,67 @@ def test_vudtul_chelate_bite_and_pair_rule_survive_the_span_screen():
     assert rx.metal(embedded, observed_only=True)[0].geometry == "trigonal_planar"
 
 
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
+def test_clathrochelate_keeps_its_measured_trigonal_prism():
+    """ZITSIH: a Fe clathrochelate whose boron caps hold a trigonal prism the bites-only screen
+    (`metal_constraints.bounded_bites`) does not see, so it drifts toward an octahedron and rejects the
+    measured arrangement. The input conformer realises its own arrangement (it is a witness: every measured
+    same-ligand donor span fits within the native reach), so no model certificate may screen it out.
+    """
+    charges = {
+        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
+    }
+    mol = rx.read_xyz(
+        str(TMQMG_DIR / "xyz" / "ZITSIH.xyz"),
+        charge=charges["ZITSIH"],
+        connectivity="xyzgraph",
+        bond_orders="xyz2mol",
+    )
+    isomers = rx.metal(mol, lengths="model")
+    assert len(isomers) == 1
+
+
+def test_podand_pair_reach_prunes_the_same_set_the_full_screen_would_keep(monkeypatch):
+    """A CN6 bis-chelate (two 5-ring en backbones, bite well under 180 deg): the per-angle pair rule prunes
+    same-ligand pairs that cannot span a wide polyhedron vertex angle before generation, and must keep exactly
+    what the full per-candidate reach screen alone would keep (its no-loss argument, cheap to check directly).
+    """
+    smiles = "Cl[Co]12(Cl)(NCCN1)NCCN2"
+    pruned = {rx.cxsmiles(iso) for iso in rx.metal(smiles, "octahedral")}
+
+    monkeypatch.setattr(metal_enumeration, "narrow_span_pairs", lambda *_args: {})
+    unpruned = {rx.cxsmiles(iso) for iso in rx.metal(smiles, "octahedral")}
+
+    assert pruned == unpruned
+    assert pruned, "the fixture must enumerate at least one isomer, or the comparison proves nothing"
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
+def test_podand_pair_reach_prunes_under_the_cap():
+    """SORGAK: a La podand (a polyether chain plus a dioxazole ring and NCS), all ten donors constitutionally
+    distinct, so no ligand symmetry divides its orbit count and the plain assignment cap (1,000) is exceeded
+    at 2,270 orbits. Generalising the narrow-span rule from one angle to every polyhedron vertex angle
+    (`metal_screen.narrow_span_pairs`) prunes that down under the cap before generation, with no isomer lost
+    (the reach screen would have rejected every pruned orbit anyway). Runs a few minutes.
+    """
+    charges = {
+        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
+    }
+    mol = rx.read_xyz(
+        str(TMQMG_DIR / "xyz" / "SORGAK.xyz"),
+        charge=charges["SORGAK"],
+        connectivity="xyzgraph",
+        bond_orders="xyz2mol",
+    )
+    reference = rx.cxsmiles(mol)
+
+    isomers = rx.metal(mol, lengths="model")
+
+    assert reference in {rx.cxsmiles(iso) for iso in isomers}
+
+
 def test_chelate_links_ignore_coordination_shortcuts():
     mol = Chem.MolFromSmiles("CCCCC")
     rw = Chem.RWMol(mol)
@@ -912,12 +996,19 @@ def test_multimetal_numeric_fix_bypasses_ground_state_reach_screen(screen):
 
 
 @pytest.mark.parametrize("geometry", [None, "square_planar"])
-def test_only_explicit_observed_selection_bypasses_reach_screen(monkeypatch, geometry):
+def test_the_input_arrangement_survives_a_screen_that_rejects_everything_else(monkeypatch, geometry):
+    """The input conformer realises its own arrangement, so no model certificate may screen that one out:
+    with `unreachable_span` failing every candidate, `rx.metal(mol, geometry)` still returns exactly the
+    witnessed input arrangement, the same as `observed_only=True` returns explicitly.
+    """
     smiles = "[NH2]1CC[NH2]->[Pd+2](<-[Cl-])(<-[Br-])<-1"
     mol = rx.embed(rx.metal(smiles, "SPL")[0], n=1, seed=42, threads=1).mol
     reference = rx.cxsmiles(mol)
     monkeypatch.setattr(metal_enumeration, "unreachable_span", lambda *_args: "incompatible native reach")
-    assert not rx.metal(mol, geometry)
+    isomers = rx.metal(mol, geometry)
+
+    assert len(isomers) == 1
+    assert rx.cxsmiles(isomers[0]) == reference
     isomers = rx.metal(mol, geometry, observed_only=True)
 
     assert len(isomers) == 1

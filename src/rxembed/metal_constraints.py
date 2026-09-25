@@ -444,7 +444,10 @@ def _bite_window_and_reach(mol, left, right, donors, matrix, lengths, row):
     lower, upper = _site_span(matrix, left, right)
     reach = _bite_reach(left_leg, right_leg, (max(0.0, lower - SPAN_TOL), upper + SPAN_TOL))
     if prior is not None:
-        if reach[1] < prior[0] or reach[0] > prior[1]:
+        # Decide agreement on the backbone triangle itself, not the SPAN_TOL-widened reach: the slack is
+        # numerical room for the returned window, not licence to call a miss an overlap.
+        exact = _bite_reach(left_leg, right_leg, (lower, upper))
+        if exact[1] < prior[0] or exact[0] > prior[1]:
             return reach, reach
         return (max(prior[0], reach[0]), min(prior[1], reach[1])), reach
     if reach[0] <= row[0] and reach[1] >= row[1]:

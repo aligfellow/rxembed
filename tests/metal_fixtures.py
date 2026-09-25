@@ -4,6 +4,12 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Geometry import Point3D
 
+import rxembed as rx
+
+# Each amine N carries one acid and one carboxylate arm, and only one carboxylate binds Pt(II). Cutting the metal
+# leaves a C2-symmetric ligand; the complex has no such symmetry, so its four bound-N hand pairs are distinct.
+ONE_ARM_BOUND_PT = "OC(=O)CN1(CC(=O)[O-]->[Pt+2]12<-[Cl-])CCN->2(CC(=O)O)CC(=O)[O-]"
+
 
 def ferrocene():
     """Build two Cp anions datively bound to Fe(II) with an eta5 sandwich geometry."""
@@ -30,3 +36,8 @@ def ferrocene():
             conf.SetAtomPosition(carbon, Point3D(1.21 * np.cos(angle), 1.21 * np.sin(angle), z))
     mol.AddConformer(conf)
     return mol
+
+
+def one_arm_bound_pt():
+    """Embed `ONE_ARM_BOUND_PT` once: a geometry input whose two bound amine N are coordination-locked."""
+    return rx.embed(rx.metal(ONE_ARM_BOUND_PT, "SPL")[0], n=1, seed=7).mol

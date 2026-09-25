@@ -6,14 +6,15 @@ Modifications:
 - the canonical numbering boundary (``blind_canonical_order``, applied in ``get_lig_mol``)
 - hydride-bridge and agostic reconnection
 - ``_sanitized`` as the single sanitize, so every candidate is ranked on one rule
+- the metal-charge cap and its rescue (``_rescue_over_cap_ligand_charges``, ``_hole_donors``)
 
 The atom order of the returned mol is the file's, not the canonical one.
 Canonicalisation happens inside, and is mapped back before returning.
 """
 
 import logging
-from itertools import combinations
-from math import comb
+from itertools import combinations, product
+from math import comb, prod
 
 import numpy as np
 from rdkit import Chem, rdBase
@@ -49,6 +50,9 @@ TRANSITION_METALS_NUM: list[int] = [
 
 _UNSANITIZABLE = 999  # sorts above any real implicit-H count, so such a candidate loses
 _BOND_ORDER_MAX_ITERS = 10_000  # bound each native charge hypothesis; failure advances the existing ladder
+# Bound the AC2mol fallback in _fast_bond_orders. Its time grows with the number of valence combinations
+# (seconds past about 1,000, and a porphyrin has millions), while the ligands it reads need fewer than ten.
+_AC2BO_MAX_COMBINATIONS = 256
 _H, _B, _C = 1, 5, 6  # atomic numbers used by the reconnection and agostic checks
 _PT = GetPeriodicTable()
 
@@ -365,12 +369,17 @@ def lig_checks(lig_mol, coordinating_atoms, resonate=True):
     stable, canonicalising first makes the winner invariant too -- shuffling the un-canonicalised input
     flipped a metal's oxidation state ([Hf+2] <-> [Hf+4]), migrated charges, and flipped stereo on 31 of
     142 fixtures. The chosen form is mapped back to the caller's own numbering before it is yielded.
+    Without ``resonate`` nothing is enumerated, and both such callers already pass get_lig_mol's
+    canonical numbering, so the form is checked as given.
     """
-    order = blind_canonical_order(lig_mol, coordinating_atoms)  # order[new] = old
-    new_of = {old: new for new, old in enumerate(order)}
-    canon = Chem.RenumberAtoms(lig_mol, order)
-    coord_canon = {new_of[int(a)] for a in coordinating_atoms if int(a) in new_of}
-    back = [new_of[i] for i in range(lig_mol.GetNumAtoms())]  # canon -> original numbering
+    if resonate:
+        order = blind_canonical_order(lig_mol, coordinating_atoms)  # order[new] = old
+        new_of = {old: new for new, old in enumerate(order)}
+        canon = Chem.RenumberAtoms(lig_mol, order)
+        coord_canon = {new_of[int(a)] for a in coordinating_atoms if int(a) in new_of}
+        back = [new_of[i] for i in range(lig_mol.GetNumAtoms())]  # canon -> original numbering
+    else:
+        canon, coord_canon, back = lig_mol, {int(a) for a in coordinating_atoms}, None
 
     # _donor_localised_candidates has already placed the charges, so it passes resonate=False. The
     # enumeration is also combinatorial on a large porphyrin, where each meso substituent is its own
@@ -423,7 +432,7 @@ def lig_checks(lig_mol, coordinating_atoms, resonate=True):
 
         # back to the caller's numbering (the enumeration ran on the blind-canonical one)
         yield (
-            Chem.RenumberAtoms(res_mol, back),
+            res_mol if back is None else Chem.RenumberAtoms(res_mol, back),
             len(positive_atoms),
             len(negative_atoms),
             N_aromatic,
@@ -533,6 +542,28 @@ def _fast_bond_orders(mol, charge, coordinating_atoms, return_pool=False):
         native.append((c, cand))
         for candidate in possible:
             consider(candidate, c)
+
+    if not native:
+        # RDKit's port of AC2mol throws at every charge on some graphs the Python original assigns, such as
+        # a saturated amide anion. That is a property of the graph, not the geometry, so AC2mol runs here at
+        # the hint, bounded, and a form counts only when it is clean (upstream's own acceptance test).
+        try:
+            assigned = AC2mol(
+                Chem.Mol(mol),
+                Chem.GetAdjacencyMatrix(mol),
+                [atom.GetAtomicNum() for atom in mol.GetAtoms()],
+                int(charge),
+                allow_charged_fragments=True,
+                use_atom_maps=False,
+                max_combinations=_AC2BO_MAX_COMBINATIONS,
+            )
+            if assigned:
+                assigned = _localise_donor_pairs(assigned, coordinating_atoms)
+                for candidate in lig_checks(assigned, coordinating_atoms, resonate=False):
+                    if candidate[1] + candidate[2] == 0 and candidate[5] == 0:
+                        consider(candidate, charge)
+        except (KeyError, ValueError):  # upstream's electron table has no entry for some elements, such as Al
+            pass
 
     # ...and the candidates the blind search cannot reach.
     for c in charges:
@@ -717,25 +748,54 @@ def _ligand_charge_pool(mol, charge, coordinating_atoms):
     return [(Chem.RenumberAtoms(candidate, back), q) for candidate, q in pool]
 
 
-def _rescue_over_cap_ligand_charge(lig_sources, total_lig_charge, overall_charge, limit):
-    """Find one ligand substitution that brings the metal charge within its valence-electron cap.
+# ponytail: an exhaustive product over each ligand's ranked charges; an over-cap ligand's pool holds one or two
+# alternatives, so the bound only stops a pathological complex. Search fewest-changes-first if one needs it.
+_JOINT_RESCUE_MAX = 4096
 
-    Each ligand fragment is resolved to its own best charge independently of what that implies for the
-    metal, so the sum can push the metal over its cap when a different, ranked-but-not-best candidate for
-    one ligand would have kept it under. Try each ligand's alternative charges, best-ranked first, in
-    place of its current pick, holding every other ligand fixed; return the first substitution (index,
-    ligand mol, ligand charge, new ligand-charge total) that satisfies the cap, or None if no single
-    substitution does. Ties across ligands favour fragment order, since only one ligand carries the
-    ambiguity in every case measured (see the row-C follow-up report).
+
+def _rescue_over_cap_ligand_charges(lig_sources, overall_charge, limit):
+    """Return the ligand substitutions that bring the metal charge within its valence-electron cap.
+
+    Each ligand fragment is resolved to its own best charge without regard to what that implies for the
+    metal, so the sum can push the metal over its cap when ranked-but-not-best candidates for some ligands
+    would have kept it under. Search every ligand's ranked charges together and take the fewest ligands
+    changed, then the earliest in fragment order, then the best ranks; ranks do not compare across ligands,
+    so fragment order decides first. Returns
+    ``[(index, ligand mol, ligand charge), ...]``, or None when nothing fits.
     """
-    for index, (m, coord, current_charge) in enumerate(lig_sources):
-        for candidate_mol, candidate_charge in _ligand_charge_pool(m, current_charge, coord):
-            if candidate_charge == current_charge:
-                continue
-            new_total = total_lig_charge - current_charge + candidate_charge
-            if overall_charge - new_total <= limit:
-                return index, candidate_mol, candidate_charge, new_total
-    return None
+    options = [
+        [(None, charge), *((m, q) for m, q in _ligand_charge_pool(fragment, charge, donors) if q != charge)]
+        for fragment, donors, charge in lig_sources
+    ]
+    if prod(map(len, options)) > _JOINT_RESCUE_MAX:
+        return None
+    fits = (
+        choice
+        for choice in product(*(range(len(option)) for option in options))
+        if overall_charge - sum(options[i][j][1] for i, j in enumerate(choice)) <= limit
+    )
+    changed = [[(i, j) for i, j in enumerate(choice) if j] for choice in fits]
+    best = min(changed, key=lambda change: (len(change), change), default=None)
+    return None if best is None else [(i, *options[i][j]) for i, j in best]
+
+
+def _hole_donors(mol, metal, holes):
+    """Return `holes` anionic donors of `metal` that keep a lone pair after giving up one electron each.
+
+    A metal still over its cap after every closed-shell reading takes back its excess from its donors as
+    radicals. The most negative donors go first, since they hold the excess negative charge, then those
+    with most nonbonding electrons, then canonical rank so the choice does not follow atom order. A donor
+    needs three nonbonding electrons, so it keeps a pair to donate and its metal bond. Returns None when
+    too few donors qualify.
+    """
+    ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=True))
+    donors = [
+        atom
+        for atom in mol.GetAtomWithIdx(metal).GetNeighbors()
+        if atom.GetFormalCharge() < 0 and lone_pair_electrons(atom, {metal}) >= 3
+    ]
+    donors.sort(key=lambda a: (a.GetFormalCharge(), -lone_pair_electrons(a, {metal}), ranks[a.GetIdx()]))
+    return donors[:holes] if len(donors) >= holes else None
 
 
 # A kappa-H metal borohydride's bridging B-H is elongated (~1.6 A) vs a terminal B-H (~1.18), so the
@@ -812,7 +872,7 @@ def _agostic_ch_metal_pairs(mol, xyz_coords, capture=False):
     return pairs
 
 
-def get_tmc_mol(xyz_file, overall_charge, with_stereo=False, agostic=False, graph=None):
+def get_tmc_mol(xyz_file, overall_charge, with_stereo=False, agostic=False, graph=None, radicals=False):
     """Perceive bond orders and charges for a transition-metal complex from ``xyz_file`` or a given ``graph``.
 
     ``agostic`` also writes a dative H->M for a C-H pointing at the metal within ``_AGOSTIC_CH_MAX``; off by
@@ -820,8 +880,10 @@ def get_tmc_mol(xyz_file, overall_charge, with_stereo=False, agostic=False, grap
     ``(mol, xyz_coords)`` pair to use in place of perceiving connectivity from the file: the bonds are taken
     as given and only their orders and formal charges are assigned, so it is expected to already carry
     ``get_basic_mol``'s seeded structural charges (N with four neighbours, B with four, O with three).
-    A metal charge above its valence electron count is an impossible oxidation state; a single-metal read
-    first tries a ranked-but-not-best charge for one ligand before raising (`_rescue_over_cap_ligand_charge`).
+    A metal charge above its valence electron count is an impossible oxidation state. A single-metal read
+    first tries ranked-but-not-best ligand charges (`_rescue_over_cap_ligand_charges`), then, with
+    ``radicals``, moves the excess onto anionic donors as radicals (`_hole_donors`) before raising. A rescue
+    names itself in the returned Mol's ``_rxembedChargeRescue`` property.
     """
     mol, xyz_coords = graph if graph is not None else get_basic_mol(xyz_file, overall_charge)
     if graph is None:
@@ -897,27 +959,9 @@ def get_tmc_mol(xyz_file, overall_charge, with_stereo=False, agostic=False, grap
     tm = Chem.Mol(metal_frags[0])
     for fragment in metal_frags[1:]:
         tm = Chem.CombineMols(tm, fragment)
-    tm = Chem.RWMol(tm)
-    metals = [a for a in tm.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS_NUM]
-    if len(tmc_indices) == 1:
-        metals[0].SetFormalCharge(overall_charge - total_lig_charge)
-        limit = _PT.GetNOuterElecs(metals[0].GetAtomicNum())
-        if metals[0].GetFormalCharge() > limit:
-            # Each ligand was resolved to its own best charge without regard to what that implies for the
-            # metal; before refusing, see whether a ranked-but-not-best candidate for one ligand brings
-            # the metal back under its cap.
-            rescue = _rescue_over_cap_ligand_charge(lig_sources, total_lig_charge, overall_charge, limit)
-            if rescue is not None:
-                index, candidate_mol, _candidate_charge, total_lig_charge = rescue
-                source = lig_sources[index][0]
-                if candidate_mol.GetNumAtoms() == source.GetNumAtoms():
-                    for a_lig, a_orig in zip(candidate_mol.GetAtoms(), source.GetAtoms()):
-                        if a_orig.HasProp("__origIdx"):
-                            a_lig.SetIntProp("__origIdx", a_orig.GetIntProp("__origIdx"))
-                lig_list[index] = candidate_mol
-                metals[0].SetFormalCharge(overall_charge - total_lig_charge)
-    else:
-        perceived = total_lig_charge + sum(a.GetFormalCharge() for a in metals)
+    single = len(tmc_indices) == 1
+    if not single:
+        perceived = total_lig_charge + sum(a.GetFormalCharge() for a in tm.GetAtoms())
         if perceived != overall_charge:
             raise ValueError(
                 "xyz2mol cannot allocate oxidation states between multiple metals: supplied metal charges and "
@@ -925,39 +969,78 @@ def get_tmc_mol(xyz_file, overall_charge, with_stereo=False, agostic=False, grap
                 "graph or use read_xyz(..., metal_charges={atom_index: charge, ...})"
             )
 
-    for metal in metals:
+    def assemble(ligands, ligand_total):
+        """Join the metal and ligand fragments with dative bonds, then apply the fixes that move charge."""
+        emol = Chem.RWMol(tm)
+        if single:
+            next(a for a in emol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS_NUM).SetFormalCharge(
+                overall_charge - ligand_total
+            )
+        for lmol in ligands:
+            emol = Chem.RWMol(Chem.CombineMols(emol, lmol))
+        orig_to_emol = {a.GetIntProp("__origIdx"): a.GetIdx() for a in emol.GetAtoms()}
+        for metal, donors in coordinating_atoms.items():
+            mi = orig_to_emol[metal]
+            for donor in donors:
+                di = orig_to_emol[donor]
+                if emol.GetBondBetweenAtoms(di, mi) is None:
+                    emol.AddBond(di, mi, Chem.BondType.DATIVE)
+        # Agostic C-H...M: now that every ligand is perceived and reassembled, reconnect the recorded
+        # H->M datives (begin=H donor). Doing it here, not before disconnection, is what keeps the
+        # ligand a normal fragment through bond-order perception (see _agostic_ch_metal_pairs).
+        for h_orig, m_orig in agostic_pairs:
+            hi, mi = orig_to_emol.get(h_orig), orig_to_emol.get(m_orig)
+            if hi is not None and mi is not None and emol.GetBondBetweenAtoms(hi, mi) is None:
+                emol.AddBond(hi, mi, Chem.BondType.DATIVE)
+        return fix_NO2(_localise_donor_pairs(emol))
+
+    # The metal-charge cap is judged on the assembled complex, since fix_NO2 moves charge off the metal.
+    emol = assemble(lig_list, total_lig_charge)
+    rescue = ""
+    if single:
+        metal = next(a for a in emol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS_NUM)
+        symbol, limit, read = metal.GetSymbol(), _PT.GetNOuterElecs(metal.GetAtomicNum()), metal.GetFormalCharge()
+        over = f"{symbol}{read:+d} is over its {limit} valence electrons at charge={overall_charge}"
+        fixed = read - (overall_charge - total_lig_charge)  # fix_NO2 takes 2 off the metal per nitro group
+        substitutions = (
+            _rescue_over_cap_ligand_charges(lig_sources, overall_charge + fixed, limit) if read > limit else None
+        )
+        if substitutions:
+            for index, candidate_mol, candidate_charge in substitutions:
+                source = lig_sources[index][0]
+                if candidate_mol.GetNumAtoms() == source.GetNumAtoms():
+                    for a_lig, a_orig in zip(candidate_mol.GetAtoms(), source.GetAtoms()):
+                        if a_orig.HasProp("__origIdx"):
+                            a_lig.SetIntProp("__origIdx", a_orig.GetIntProp("__origIdx"))
+                lig_list[index] = candidate_mol
+                total_lig_charge += candidate_charge - lig_sources[index][2]
+            emol = assemble(lig_list, total_lig_charge)
+            metal = next(a for a in emol.GetAtoms() if a.GetAtomicNum() in TRANSITION_METALS_NUM)
+            rescue = (
+                f"{over}; read {symbol}{metal.GetFormalCharge():+d} with {len(substitutions)} ligand charge(s) changed"
+            )
+        holes = metal.GetFormalCharge() - limit
+        holders = _hole_donors(emol, metal.GetIdx(), holes) if radicals and holes > 0 else None
+        if holders:
+            metal.SetFormalCharge(limit)
+            for donor in holders:
+                donor.SetFormalCharge(donor.GetFormalCharge() + 1)
+                donor.SetNumRadicalElectrons(donor.GetNumRadicalElectrons() + 1)
+            names = ", ".join(f"{d.GetSymbol()}{d.GetIntProp('__origIdx')}" for d in holders)
+            radical = "radicals" if holes > 1 else "a radical"
+            rescue = f"{over}; read {symbol}{limit:+d} with {radical} on {names}; check charge="
+
+    for metal in emol.GetAtoms():
+        if metal.GetAtomicNum() not in TRANSITION_METALS_NUM:
+            continue
         limit = _PT.GetNOuterElecs(metal.GetAtomicNum())
         if metal.GetFormalCharge() > limit:
             symbol = metal.GetSymbol()
             raise ValueError(
-                f"{symbol}+{metal.GetFormalCharge()} is an impossible oxidation state ({symbol} has only "
-                f"{limit} valence electrons); pass charge= or metal_charges= to read_xyz with the intended split"
+                f"{symbol}+{metal.GetFormalCharge()} is an impossible oxidation state at charge={overall_charge} "
+                f"({symbol} has only {limit} valence electrons); check charge= (and metal_charges= for several "
+                "metals), or build the complex from a dative SMILES"
             )
-
-    for lmol in lig_list:
-        tm = Chem.CombineMols(tm, lmol)
-
-    emol = Chem.RWMol(tm)
-    orig_to_emol = {a.GetIntProp("__origIdx"): a.GetIdx() for a in emol.GetAtoms()}
-    for metal, donors in coordinating_atoms.items():
-        mi = orig_to_emol[metal]
-        for donor in donors:
-            di = orig_to_emol[donor]
-            if emol.GetBondBetweenAtoms(di, mi) is None:
-                emol.AddBond(di, mi, Chem.BondType.DATIVE)
-
-    # Agostic C-H...M: now that every ligand is perceived and reassembled, reconnect the recorded
-    # H->M datives (begin=H donor). Doing it here, not before disconnection, is what keeps the
-    # ligand a normal fragment through bond-order perception (see _agostic_ch_metal_pairs).
-    for h_orig, m_orig in agostic_pairs:
-        hi, mi = orig_to_emol.get(h_orig), orig_to_emol.get(m_orig)
-        if hi is not None and mi is not None and emol.GetBondBetweenAtoms(hi, mi) is None:
-            emol.AddBond(hi, mi, Chem.BondType.DATIVE)
-
-    # Fix specific cases
-    # Operate on emol directly to preserve properties
-    emol = _localise_donor_pairs(emol)
-    emol = fix_NO2(emol)
 
     tmc_mol = _sanitized(emol.GetMol())
     # Atom-count invariant: the source XYZ has every hydrogen explicit, so a correct perception
@@ -976,5 +1059,7 @@ def get_tmc_mol(xyz_file, overall_charge, with_stereo=False, agostic=False, grap
     # before the disconnection, so it maps them back to the order of the xyz file, which is the
     # order the coordinates are in and the one a caller addressing atoms by index expects.
     order = [i for _, i in sorted((a.GetIntProp("__origIdx"), a.GetIdx()) for a in tmc_mol.GetAtoms())]
-    tmc_mol = Chem.RenumberAtoms(tmc_mol, order)
+    tmc_mol = Chem.RenumberAtoms(tmc_mol, order)  # drops Mol properties, so the rescue note is set after it
+    if rescue:
+        tmc_mol.SetProp("_rxembedChargeRescue", rescue)
     return tmc_mol, xyz_coords

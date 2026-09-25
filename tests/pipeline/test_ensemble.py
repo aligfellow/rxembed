@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom, rdMolTransforms
+from rdkit.Chem import rdMolTransforms
 
 import rxembed as rx
 from rxembed import metal_core as metal
@@ -675,32 +675,28 @@ def test_wrap_labels_its_computed_force_field_single_point():
     assert ens.energy_kind == "ff"
 
 
-# --- encounter bounds: a probe geometry decides a discrete question, so it must not read process history ---
+# --- fragment contacts: mc's explore pass must re-bound every free ion pair, not one chosen contact ---
 
 
-def _two_fragments():
-    return Chem.AddHs(Chem.MolFromSmiles("OC(=O)CCCc1ccccc1.NCCCCN"))
+@pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
+def test_salt_searched_with_mc_stays_in_contact_range_with_no_pair_singled_out():
+    """Every heavy-atom pair across a salt's two ions gets a contact-range bound after mc(explore=True).
 
+    A single closest pair from a throwaway probe embed used to leave every other cross-ion pair free to
+    drift once the seeded ionic contact released. `bounds.fragment_contacts` bounds every cross-ion pair
+    instead, so nothing but the shared van der Waals ceiling can separate the ions.
+    """
+    es = rx.embed("CC(=O)[O-].C[NH3+]", contacts="auto", n=3, seed=1)
+    ens = es[0] if isinstance(es, rx.EnsembleSet) else es
+    assert any(ens.cons.contacts), "the seeded ionic contact must be recorded as releasable before explore"
+    before = ens.n
 
-def _burn_global_rng(n=64):
-    """Consume RDKit global randomness, standing in for whatever ran before us in a real session."""
-    for _ in range(n):
-        m = Chem.AddHs(Chem.MolFromSmiles("CCCCO"))
-        rdDistGeom.EmbedMolecule(m, rdDistGeom.ETKDGv3())  # deliberately unseeded
+    ens.mc(preset="rapid", explore=True, seed=1)
 
-
-def test_encounter_bounds_ignore_global_rng():
-    mol = _two_fragments()
-    assert len(Chem.GetMolFrags(mol)) >= 2, "fixture must be multi-fragment to exercise the encounter bounds"
-    before = ensemble_module.encounter_bounds(mol)
-    assert before, "no inter-fragment bound was produced: the fixture is not exercising the code"
-    _burn_global_rng()
-    assert ensemble_module.encounter_bounds(mol) == before
-
-
-def test_probe_seed_is_forwarded(monkeypatch):
-    seen = []
-    real = ensemble_module.probe_conformer
-    monkeypatch.setattr(ensemble_module, "probe_conformer", lambda m, s: (seen.append(s), real(m, s))[1])
-    ensemble_module.encounter_bounds(_two_fragments(), seed=4321)
-    assert seen == [4321]
+    assert ens.n > before, "explore added nothing; this fixture no longer exercises the re-bound"
+    frags = [[i for i in frag if ens._mol.GetAtomWithIdx(i).GetAtomicNum() > 1] for frag in Chem.GetMolFrags(ens._mol)]
+    assert len(frags) == 2, "fixture must stay a two-ion salt to exercise the cross-ion bound"
+    cross = [(min(i, j), max(i, j)) for i in frags[0] for j in frags[1]]
+    assert cross, "no cross-ion heavy pair to bound: the fixture is not exercising the code"
+    missing = [pair for pair in cross if pair not in ens.cons.distances]
+    assert not missing, f"{len(missing)} of {len(cross)} cross-ion pair(s) have no contact-range bound: {missing}"

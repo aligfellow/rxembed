@@ -10,6 +10,7 @@ from __future__ import annotations
 import itertools
 import logging
 import math
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 
@@ -244,8 +245,8 @@ def _fragment_components(mol, cons):
     return components if len(components) > 1 else None
 
 
-def _cap_fragment_contacts(mol, cons, bm):
-    """Give every cross-component heavy pair a van der Waals ceiling instead of RDKit's unset default.
+def fragment_contacts(mol, cons, bm):
+    """Return ``{(i, j): (floor, ceiling)}`` keeping every free cross-component heavy pair in contact range.
 
     RDKit's own bounds matrix already gives a far pair a lower bound at the van der Waals sum, including a
     pair split across fragments, but leaves the upper bound at its raw "no information" default for any pair
@@ -254,11 +255,13 @@ def _cap_fragment_contacts(mol, cons, bm):
     and stay within contact range: every cross-component pair gets the same ceiling, RDKit's own floor for
     that pair plus each side's own reach (its largest known intra-component span) plus contact slack. No
     pair is singled out, so a fragment settles wherever distance geometry puts it, a vacant metal site if
-    one fits, otherwise anywhere within that shared range.
+    one fits, otherwise anywhere within that shared range. This is the one rule for keeping free components
+    together; any caller that must re-bound them after releasing other holds (`Ensemble.mc`'s explore pass)
+    uses it too, rather than a probe conformer and a single chosen pair.
     """
     components = _fragment_components(mol, cons)
     if components is None:
-        return
+        return {}
     component_of = {a: ci for ci, c in enumerate(components) for a in c}
     # A component already pinned some other way (fix=/constrain=) needs no contact ceiling of its own; only
     # skip a pair where BOTH sides are pinned, since forcing one together could fight an intentional separation
@@ -272,13 +275,21 @@ def _cap_fragment_contacts(mol, cons, bm):
             span = bm[min(x, y)][max(x, y)]
             if span < _NATIVE_UNSET and span > reach[ci]:
                 reach[ci] = span
+    windows = {}
     for i, j in itertools.combinations(heavy, 2):
         ci, cj = component_of.get(i), component_of.get(j)
         if ci is None or cj is None or ci == cj or (ci in touched and cj in touched):
             continue
         a, b = min(i, j), max(i, j)
         vdw = bm[b][a]  # RDKit's own van der Waals floor for this pair
-        bm[a][b] = min(bm[a][b], vdw + reach[ci] + reach[cj] + _FRAGMENT_CONTACT_SLACK)
+        windows[a, b] = (vdw, vdw + reach[ci] + reach[cj] + _FRAGMENT_CONTACT_SLACK)
+    return windows
+
+
+def _cap_fragment_contacts(mol, cons, bm):
+    """Write `fragment_contacts` as an upper-bound ceiling into the embedding matrix, in place."""
+    for (a, b), (_lo, hi) in fragment_contacts(mol, cons, bm).items():
+        bm[a][b] = min(bm[a][b], hi)
 
 
 def coordination_reach_base(mol, reach, metals):
@@ -477,35 +488,34 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
     try:
         for name, value in overrides.items():
             setattr(p, name, value)
-        for attempt in range(2 if embed_params is None else 1):
-            if embed_params is None:
-                p.useRandomCoords = bool(attempt)  # Retry an empty search with the same model and bounds.
-            with rdBase.BlockLogs() if isolated_h else nullcontext():
-                ids = list(rdDistGeom.EmbedMultipleConfs(work, search_count, p))
-            # Counts describe rejected native attempts, even in successful searches, not failed conformers.
-            counts = p.GetFailureCounts() if p.trackFailures else ()
-            failures = {
-                name: counts[int(cause)]
-                for name, cause in rdDistGeom.EmbedFailureCauses.names.items()
-                if int(cause) < len(counts) and counts[int(cause)]
-            }
-            logger.debug(
-                "DG random=%s knowledge=%s chirality=%s legacy=%s: %d/%d conformers; rejected attempts %s",
-                p.useRandomCoords,
-                p.useBasicKnowledge,
-                p.enforceChirality,
-                p.useLegacyImplementation,
-                len(ids),
-                search_count,
-                failures if p.trackFailures else "not tracked",
+        started = time.monotonic()
+        with rdBase.BlockLogs() if isolated_h else nullcontext():
+            ids = list(rdDistGeom.EmbedMultipleConfs(work, search_count, p))
+        elapsed = time.monotonic() - started
+        # Counts describe rejected native attempts, even in a successful search, not failed conformers.
+        counts = p.GetFailureCounts() if p.trackFailures else ()
+        failures = {
+            name: counts[int(cause)]
+            for name, cause in rdDistGeom.EmbedFailureCauses.names.items()
+            if int(cause) < len(counts) and counts[int(cause)]
+        }
+        logger.debug(
+            "DG random=%s knowledge=%s chirality=%s legacy=%s: %d/%d conformers; rejected attempts %s%s",
+            p.useRandomCoords,
+            p.useBasicKnowledge,
+            p.enforceChirality,
+            p.useLegacyImplementation,
+            len(ids),
+            search_count,
+            failures if p.trackFailures else "not tracked",
+            "" if ids else "; random starts: EmbedParams(native=...), useRandomCoords=True",
+            extra={"dg": {"seconds": elapsed, "asked": search_count, "returned": len(ids), "rejects": failures}},
+        )
+        if any(cid < 0 for cid in ids):
+            raise TimeoutError(
+                f"native RDKit embedding exceeded timeout={p.timeout}s; "
+                "increase native.timeout or inspect bounds/stereo with rx.set_verbose('DEBUG')"
             )
-            if any(cid < 0 for cid in ids):
-                raise TimeoutError(
-                    f"native RDKit embedding exceeded timeout={p.timeout}s; "
-                    "increase native.timeout or inspect bounds/stereo with rx.set_verbose('DEBUG')"
-                )
-            if ids:
-                break
     finally:
         for name, value in previous.items():
             setattr(p, name, value)

@@ -15,6 +15,8 @@ Modifications here:
 - ``get_proto_mol`` seeded atom 0 from ``Chem.MolFromSmarts``, making it a query atom while every
   other atom was plain. ``RemoveHs`` would not remove a query atom, so an explicit H could survive
   based on the index ordering of the .xyz file.
+- ``AC2BO`` takes ``max_combinations`` and raises a ``ValueError`` before enumerating more valence
+  combinations than that.
 
 Only the path used by rxembed (obabel-derived connectivity through AC2mol) is kept; upstream's
 Huckel and van-der-Waals connectivity routes and its CLI entry point are deleted.
@@ -23,6 +25,7 @@ Huckel and van-der-Waals connectivity routes and its CLI entry point are deleted
 import copy
 import itertools
 import logging
+import math
 from collections import defaultdict
 
 import networkx as nx
@@ -535,11 +538,14 @@ def get_UA_pairs(UA, AC, DU, use_graph=True):
     return UA_pairs
 
 
-def AC2BO(AC, atoms, charge, allow_charged_fragments=True, use_graph=True, allow_carbenes=True):
+def AC2BO(
+    AC, atoms, charge, allow_charged_fragments=True, use_graph=True, allow_carbenes=True, max_combinations=None
+):
     """Search bond orders and charges for the assignment with the fewest formal charges (Kim & Kim, Fig. 2).
 
     UA is the unsaturated-atom list, DU their degree of unsaturation, and best_BO the running-best bond
-    order matrix; these are the paper's own names.
+    order matrix; these are the paper's own names. The search visits every combination of per-atom
+    valences, so ``max_combinations`` raises before it starts when there are more.
     """
     global atomic_valence
     global atomic_valence_electrons
@@ -568,6 +574,9 @@ def AC2BO(AC, atoms, charge, allow_charged_fragments=True, use_graph=True, allow
             )
         valences_list_of_lists.append(possible_valence)
 
+    combinations = math.prod(len(options) for options in valences_list_of_lists)
+    if max_combinations is not None and combinations > max_combinations:
+        raise ValueError(f"{combinations} valence combinations exceed the search bound of {max_combinations}")
     valences_list = itertools.product(*valences_list_of_lists)  # e.g. [[4],[2,1]] -> [[4,2],[4,1]]
 
     best_BO = AC.copy()
@@ -707,6 +716,7 @@ def AC2mol(
     use_graph=True,
     use_atom_maps=True,
     allow_carbenes=True,
+    max_combinations=None,
 ):
     """Assign bond orders and charges to ``mol`` from its adjacency matrix ``AC``."""
     BO, atomic_valence_electrons = AC2BO(
@@ -716,6 +726,7 @@ def AC2mol(
         allow_charged_fragments=allow_charged_fragments,
         use_graph=use_graph,
         allow_carbenes=allow_carbenes,
+        max_combinations=max_combinations,
     )
     mol = BO2mol(
         mol,

@@ -16,9 +16,11 @@ from rdkit import Chem, rdBase
 
 from .metal_core import (
     COORDINATION_METALS,
+    HAND_TAG,
     VACANT,
     canonical_metal_graph,
     connect_metal,
+    donor_chirality_sign,
     materialized_state,
     metal_indices,
 )
@@ -453,17 +455,6 @@ def _clear_bond_stereo(mol, pairs):
                     adjacent.SetBondDir(Chem.BondDir.NONE)
 
 
-def _implicit_h(mol, idx):
-    """Return whether atom `idx` is a routine hydrogen that SMILES folds into its neighbour's H count."""
-    atom = mol.GetAtomWithIdx(int(idx))
-    return (
-        atom.GetAtomicNum() == 1
-        and atom.GetIsotope() == atom.GetFormalCharge() == atom.GetNumRadicalElectrons() == 0
-        and atom.GetDegree() == 1
-        and atom.GetNeighbors()[0].GetAtomicNum() not in {*COORDINATION_METALS, 1}
-    )
-
-
 def _atom_key(atom):
     """Return the atom fields a SMILES round trip must keep."""
     return (
@@ -489,16 +480,24 @@ def _bond_table(mol, mapping):
     return out
 
 
-def _round_trip_graph_error(expected, actual, written):
-    """Return the first constitutional change made by parsing a written SMILES."""
-    if actual is None:
+def _round_trip_graph_error(expected, smi, written):
+    """Return the first constitutional change made by parsing a written SMILES.
+
+    Parses with every atom explicit, then applies RDKit's own default `RemoveHs` and reads which written
+    atoms survive: RDKit decides which hydrogens a round trip keeps, not a model of that rule (a modelled
+    rule mismatched RDKit's own choice for a hydroxycarbene O-H that fixes the bond's E/Z).
+    """
+    params = Chem.SmilesParserParams()
+    params.removeHs = False
+    parsed = Chem.MolFromSmiles(smi, params)
+    if parsed is None:
         return "does not parse"
-    if len(set(written)) != len(written):
+    if len(set(written)) != len(written) or parsed.GetNumAtoms() != len(written):
         return "has an inconsistent written atom map"
-    explicit = [int(idx) for idx in written if not _implicit_h(expected, idx)]
-    if actual.GetNumAtoms() != len(explicit):
-        return "has an inconsistent written atom map"
-    at = {old: new for new, old in enumerate(explicit)}
+    for atom, idx in zip(parsed.GetAtoms(), written, strict=True):
+        atom.SetIntProp("_rxembedWritten", int(idx))
+    actual = Chem.RemoveHs(parsed)
+    at = {atom.GetIntProp("_rxembedWritten"): atom.GetIdx() for atom in actual.GetAtoms()}
     omitted = set(range(expected.GetNumAtoms())) - set(at)
     if any(
         expected.GetAtomWithIdx(idx).GetAtomicNum() != 1
@@ -621,7 +620,7 @@ def _check_round_trip(mol, smi, written, expected):
     """Raise unless `smi` parses back to `mol`'s graph with `expected` atoms including hydrogen."""
     back = Chem.MolFromSmiles(smi)
     actual = None if back is None else _atoms_with_h(back)
-    graph_error = _round_trip_graph_error(mol, back, written)
+    graph_error = _round_trip_graph_error(mol, smi, written)
     if actual == expected and not graph_error:
         return
     got = "does not parse" if actual is None else f"parses back as {actual} atoms"
@@ -635,17 +634,32 @@ def _check_round_trip(mol, smi, written, expected):
     )
 
 
-def _write_dative(mol, stereo_label):
+def _write_dative(mol, stereo_label, *, stated=False):
     """Return canonical dative SMILES plus atom-position and bond-position maps.
 
     The atom-position map is what an `atomProp` block indexes; only atoms that remain explicit have one.
     Every accepted M-donor bond is normalized to dative first, including every extra leg of a hydrogen.
+    ``stated=True`` marks `mol`'s point tags as an isomer's own hands, which win over its carried coordinates.
 
     Raises instead of returning a SMILES that will not round-trip: an unreadable string is worse than none.
     """
     source = Chem.Mol(mol)
     source.UpdatePropertyCache(strict=False)
     expected = _atoms_with_h(source)
+    # An isomer can state a hand against its carried coordinates: an enumerated locked donor or stereo='invert'.
+    # Parity reads the tag in the all-bonds basis rxembed stores. A tag left in RDKit's 3D basis, which omits a
+    # dative bond at an odd slot (`metal_core._retag`), would read as stated against the coordinates.
+    against = (
+        {
+            atom.GetIdx()
+            for atom in source.GetAtoms()
+            if atom.GetDegree() == 4  # noqa: PLR2004  four explicit carriers fix the parity without an implicit H
+            and atom.GetChiralTag() in HAND_TAG.values()
+            and HAND_TAG.get(donor_chirality_sign(source, -1, atom.GetIdx())) == mirror_tag(atom.GetChiralTag())
+        }
+        if stated and source.GetNumConformers()
+        else set()
+    )
     stereo_label = without_bond_stereo(
         stereo_label,
         coordination_locked_double_bonds(source, metal_indices(source)),
@@ -663,6 +677,9 @@ def _write_dative(mol, stereo_label):
     elif out.GetNumConformers():
         # Normalizing metal bonds changes neighbour order; rebase retained stereo from coordinates.
         stereo_from_3d(out, metal_indices(out), apply=True)
+        for idx in against:
+            atom = out.GetAtomWithIdx(idx)
+            atom.SetChiralTag(mirror_tag(atom.GetChiralTag()))
     _drop_unproved_stereo(out, wanted, wanted_bonds)
     out, reduced = remove_routine_hydrogens(out, _kept_hydrogens(out, wanted_bonds))
     original = {new: old for old, new in reduced.items()}
@@ -898,7 +915,7 @@ def cxsmiles(source):
     }
     centres = tuple(m for m in metals if bound[m])
     if not centres:
-        core, at, bond_positions, _unwritable = _write_dative(complexed, ligand_stereo)
+        core, at, bond_positions, _unwritable = _write_dative(complexed, ligand_stereo, stated=iso is not None)
         fields = [
             *_cx_bond_stereo(core, ligand_stereo, at, bond_positions),
             *_atrop_bond_stereo(core, ligand_stereo, at),
@@ -931,7 +948,7 @@ def cxsmiles(source):
         records = [(stated, state) for state in centre_states(stated)]
     if {state.atom for _record, state in records} != set(centres):
         raise ValueError("the isomer does not carry one state per metal")
-    core, at, bond_positions, _unwritable = _write_dative(complexed, ligand_stereo)
+    core, at, bond_positions, _unwritable = _write_dative(complexed, ligand_stereo, stated=iso is not None)
     centre_notes = {}
     for record_iso, state in records:
         centre_notes[state.atom] = _arrangement_notes(record_iso, state, at)

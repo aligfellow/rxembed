@@ -12,7 +12,7 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdMolAlign
 
-from rxembed.bounds import DEFAULT_SEED, EmbedParams, probe_conformer
+from rxembed.bounds import EmbedParams, bounds_matrix, fragment_contacts
 from rxembed.constraints import constraint_value, graft_owns, match, resolve_atom, within_window
 from rxembed.embed import BASE_STIFFNESS, Conformers, Failure
 from rxembed.metal_core import connect_metal, donor_chirality_sign, frag_map, metal_index, metal_indices
@@ -210,30 +210,6 @@ class EnsembleSet(list):
         return paths
 
 
-def encounter_bounds(mol, slack=1.5, seed=DEFAULT_SEED):
-    """Keep each fragment pair near van der Waals contact through its closest heavy atoms in a probe embed.
-
-    `probe_conformer` embeds each fragment in its own frame on the origin, so its closest pair is the atoms
-    nearest each fragment's centre (a complex's metal), not a real contact.
-    """
-    probe = probe_conformer(mol, seed)
-    if probe is None:
-        return {}
-    pt = Chem.GetPeriodicTable()
-    pos = probe.GetConformer().GetPositions()
-    frags = [[i for i in frag if mol.GetAtomWithIdx(i).GetAtomicNum() > 1] for frag in Chem.GetMolFrags(mol)]
-    bounds = {}
-    for a in range(len(frags)):
-        for b in range(a + 1, len(frags)):
-            fa, fb = frags[a], frags[b]
-            if not fa or not fb:
-                continue
-            i, j = min(((i, j) for i in fa for j in fb), key=lambda p: np.linalg.norm(pos[p[0]] - pos[p[1]]))
-            vdw = pt.GetRvdw(mol.GetAtomWithIdx(i).GetAtomicNum()) + pt.GetRvdw(mol.GetAtomWithIdx(j).GetAtomicNum())
-            bounds[(i, j)] = (vdw, vdw + slack)
-    return bounds
-
-
 @dataclass
 class Ensemble(Conformers):
     """Add search, selection and scoring verbs to a core Conformers result.
@@ -324,10 +300,11 @@ class Ensemble(Conformers):
         if explore and any(self.cons.contacts):  # second pass: contacts released, structure kept
             relaxed = self.cons.relaxed()
             # releasing the grip frees the fragments it linked. openconf's own search never sees rxembed's DG
-            # bounds matrix (bounds._cap_fragment_contacts only applies there), so explore re-bounds every
+            # bounds matrix (bounds.fragment_contacts only applies there), so explore re-bounds every
             # inter-fragment pair here instead (setdefault never overrides a surviving structural hold).
             if len(Chem.GetMolFrags(self._mol)) > 1:  # keep the fragments together once contacts are freed
-                for k, v in encounter_bounds(self._mol).items():
+                bm = bounds_matrix(self._mol)
+                for k, v in fragment_contacts(self._mol, relaxed, bm).items():
                     relaxed.distances.setdefault(k, v)
             more = self._openconf_search(relaxed, " explore", options)
             if more:

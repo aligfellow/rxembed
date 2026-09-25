@@ -7,6 +7,7 @@ import math
 import re
 from dataclasses import dataclass, replace
 
+import numpy as np
 from rdkit import Chem
 
 from .bounds import coordination_reach_base, ligand_reach
@@ -55,7 +56,14 @@ from .metal_polyhedron import (
     resolve_geometry,
 )
 from .metal_screen import narrow_span_pairs, unreachable_span
-from .metal_slots import assignment_cap_error, chelate_edge_links, distinct_vertex_orderings, has_tether, input_ordering
+from .metal_slots import (
+    SPAN_TOL,
+    assignment_cap_error,
+    chelate_edge_links,
+    distinct_vertex_orderings,
+    has_tether,
+    input_ordering,
+)
 from .metal_stereo import chelate_links, chirality_of, donor_classes, face_has_orientation, site_classes
 from .stereo import (
     apply_point_stereo,
@@ -64,6 +72,7 @@ from .stereo import (
     bond_stereo,
     clear_atrop,
     clear_ez,
+    coordination_locked_centres,
     coordination_locked_double_bonds,
     defined_stereo_label,
     enumerate_unassigned,
@@ -115,6 +124,9 @@ def _ligand_stereo_request(mol, stereo):
             if not 0 <= index < mol.GetNumAtoms() or mol.GetAtomWithIdx(index).GetSymbol() != symbol:
                 raise ValueError(f"stereo selector {selector!r} is not an atom in this molecule")
             exact[index] = mode
+        if "locked" in stereo:  # an atom selector still wins, as it does over "point"
+            for index in coordination_locked_centres(mol, metal_indices(mol)):
+                exact.setdefault(index, stereo["locked"])
     centres = point_centres(mol, exclude=metal_indices(mol))
     invalid = sorted(set(exact) - centres)
     if invalid:
@@ -391,6 +403,26 @@ class _Request:
     graft_ref: dict | None = None
 
 
+def _witnessed_retention(retained, observed_only, base, source, donors, haptic, native_reach):
+    """Return `retained`, or None where it is not a witness to its own arrangement.
+
+    The input proves its own arrangement only by realising it: `observed_only` names it explicitly, and
+    otherwise every measured same-ligand donor span must fit within the native reach the screen itself reads.
+    A hand-placed conformer can put donors where the ligand cannot reach, and then proves nothing, so only a
+    witness may exempt its arrangement from the reach screen below.
+    """
+    if retained is None or observed_only or native_reach is None:
+        return retained
+    at = source.GetConformer().GetPositions()
+    real = sorted(d for d in donors if d not in haptic)
+    frag = frag_map(base)
+    witnessed = not any(
+        frag[a] == frag[b] and np.linalg.norm(at[a] - at[b]) > float(native_reach[a, b]) + SPAN_TOL
+        for a, b in itertools.combinations(real, 2)
+    )
+    return retained if witnessed else None
+
+
 def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
     """Enumerate every distinct `Isomer` of one polyhedron `geom` (frozen core held, spectators retained)."""
     base, m = base_iso.graph, base_iso.metal
@@ -416,7 +448,7 @@ def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
     distances = ligand_distance_matrix(base) if tethered else None
     retained = (
         input_ordering(base, m, padded, geom, haptic, roles, classes=classes)
-        if request.observed_only and base.GetNumConformers() and shape_gap(base, m, donors, haptic, geom)[3]
+        if base.GetNumConformers() and shape_gap(base, m, donors, haptic, geom)[3]
         else None
     )
     if request.observed_only:
@@ -440,12 +472,13 @@ def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
     screen_context = compile_context(source) if native_reach is not None else None
     if screen_context is not None:
         screen_context["native_reach"] = native_reach  # metal_constraints.seated_bites' own fact, seeded once
+    retained = _witnessed_retention(retained, request.observed_only, base, source, donors, haptic, native_reach)
     # Prune same-ligand pairs the compiled screen would reject wholesale before the streamed tethered pool
     # (metal_slots.distinct_vertex_orderings' uncapped else-branch) can raise its resource cap on them.
     narrow = (
-        narrow_span_pairs(base_iso, source, padded, haptic, request.lengths, native_reach, screen_context)
+        narrow_span_pairs(base_iso, source, padded, geom, haptic, request.lengths, native_reach, screen_context)
         if native_reach is not None
-        else frozenset()
+        else {}
     )
     # A same-ligand chelate-backbone or direct-bond pair must sit on a polyhedron hull edge (a chemistry
     # claim; see metal_slots.chelate_edge_links). Same gate as `narrow`: a single screened centre with no fix=.

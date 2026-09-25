@@ -11,7 +11,6 @@ from rdkit import Chem
 
 from .metal_core import VACANT, frag_map, ligand_distance_matrix, vertex_atom
 from .metal_polyhedron import (
-    CHELATE_SPAN_ANGLE,
     MAX_EXHAUSTIVE_ORBITS,
     POLYHEDRA,
     canonical_slots,
@@ -239,7 +238,7 @@ def _forbidden_vertex_pairs(dirs, narrow, linked):
     sweep-then-filter oracle `test_metal_slots.py` keeps for the equivalence test.
     """
     pairs = [(i, j) for i in range(len(dirs)) for j in range(i + 1, len(dirs))]
-    wide = [(i, j) for i, j in pairs if vertex_angle(dirs[i], dirs[j]) >= CHELATE_SPAN_ANGLE] if narrow else ()
+    wide = [(i, j, narrow[angle]) for i, j in pairs if (angle := round(vertex_angle(dirs[i], dirs[j]), 6)) in narrow]
     edges = hull_edges(tuple(map(tuple, dirs))) if linked else frozenset()
     off_edge = [(i, j) for i, j in pairs if frozenset((i, j)) not in edges] if linked else ()
     return wide, off_edge
@@ -260,8 +259,8 @@ def _seat_pruned_orderings(dirs, rotations, narrow, linked):
     n = len(dirs)
     wide, off_edge = _forbidden_vertex_pairs(dirs, narrow, linked)
     checks = [[] for _ in range(n)]  # checks[vertex] = [(earlier_vertex, forbidden_donor_pairs), ...]
-    for i, j in wide:
-        checks[j].append((i, narrow))
+    for i, j, forbidden in wide:
+        checks[j].append((i, forbidden))
     for i, j in off_edge:
         checks[j].append((i, linked))
 
@@ -322,18 +321,18 @@ def distinct_vertex_orderings(
     distances=None,
     retained=None,
     max_orbits=None,
-    narrow=frozenset(),
+    narrow=None,
     linked=frozenset(),
 ):
     """Enumerate distinct coordination isomers under exact graph and polyhedron symmetries.
 
     `perms` overrides the candidate vertex orderings (default ``isomer_permutations(geometry)``); a ``fix=``
     enumeration passes the subset that keeps each frozen donor pinned to its input vertex, and a
-    coordinate-derived ordering is retained first. `narrow` prunes same-ligand donor-position pairs that
-    cannot span a wide bite (`metal_screen.narrow_span_pairs`); `linked` prunes same-ligand
-    donor-position pairs held to a polyhedron hull edge (`chelate_edge_links`). Both apply only to the
-    streamed tethered pool (see `_forbidden_vertex_pairs`), dropping an order its rule forbids before the cap
-    below can raise on an orbit no completion of it could ever satisfy.
+    coordinate-derived ordering is retained first. `narrow` maps each polyhedron vertex angle to the
+    same-ligand donor-position pairs that cannot span it (`metal_screen.narrow_span_pairs`); `linked` prunes
+    same-ligand donor-position pairs held to a polyhedron hull edge (`chelate_edge_links`). Both apply only to
+    the streamed tethered pool (see `_forbidden_vertex_pairs`), dropping an order its rule forbids before the
+    cap below can raise on an orbit no completion of it could ever satisfy.
 
     Canonical vertex classes and same-ligand path lengths distinguish candidates under proper rotations. No
     graph heuristic proves conformational reachability, so feasibility remains the embedder's job.
@@ -341,6 +340,7 @@ def distinct_vertex_orderings(
     dirs = vertex_dirs(geometry)
     if dirs is None:
         return perms
+    narrow = narrow or {}
     frag = frag_map(mol)  # same ligand = same fragment
     limit = MAX_EXHAUSTIVE_ORBITS if max_orbits is None else int(max_orbits)
     tethered = has_tether(donors, frag, haptic)

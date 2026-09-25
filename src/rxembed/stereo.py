@@ -676,6 +676,26 @@ def coordination_locked_double_bonds(mol, metals):
     return locked
 
 
+def coordination_locked_centres(mol, metals):
+    """Return the donor stereocentres that exist only while bound: labile in the free ligand, fixed by coordination.
+
+    RDKit's potential-stereo rule on the metal-free graph decides lability: a free amine N inverts, so it is no
+    stereocentre there, while a phosphine P or a ring carbon is. A locked hand belongs to the coordination
+    arrangement, as a metal-closed ring's E/Z does (`coordination_locked_double_bonds`), yet no arrangement fixes
+    it: a chelate ring can twist far enough to reverse it.
+    """
+    metals = set(metals)
+    if not metals:
+        return set()
+    free = {
+        element.centeredOn
+        for element in Chem.FindPotentialStereo(ligand_graph(mol, metals), cleanIt=False, flagPossible=True)
+        if element.type == Chem.StereoType.Atom_Tetrahedral
+    }
+    donors = {n.GetIdx() for m in metals for n in mol.GetAtomWithIdx(m).GetNeighbors()} - metals
+    return (point_centres(mol, exclude=metals) & donors) - free
+
+
 def _lock_double_bond(work, fb):
     """Pin a coordination-locked double bond to an arbitrary definite stereo on ``work``; return True on success.
 
@@ -1313,7 +1333,18 @@ def enumerate_unassigned(
         return [(variant, "")], 0, 1, unsupported
     atom_centers = [e.centeredOn for e in unassigned if e.type == Chem.StereoType.Atom_Tetrahedral]
     bond_centers = [e.centeredOn for e in unassigned if e.type == Chem.StereoType.Bond_Double]
-    opts = StereoEnumerationOptions(onlyUnassigned=True, unique=True, maxIsomers=cap)
+    # RDKit's `unique` keys on `work`, where a bound arm reads like a free one once the metal is cut. Key on the
+    # complex: a sigma donor keeps a single bond, so RDKit ranks every carrier of its hand, and a haptic face
+    # marks its atoms instead, since the three-membered rings of its bonds would hide the face's E/Z.
+    opts = StereoEnumerationOptions(onlyUnassigned=True, unique=not exclude, maxIsomers=cap)
+    metal_bonds = [(metal, n.GetIdx()) for metal in exclude for n in mol.GetAtomWithIdx(metal).GetNeighbors()]
+    faces = {
+        atom
+        for metal in exclude
+        for site in haptic_sites(mol, [donor for m, donor in metal_bonds if m == metal])
+        if len(site) > 1
+        for atom in site
+    }
     total = 2 ** (len(unassigned) + len(atrop_centers))
     work_isos = list(EnumerateStereoisomers(work, opts)) if unassigned else [work]
     work_isos = _enumerate_atrop(work_isos, atrop_centers, cap)
@@ -1349,7 +1380,18 @@ def enumerate_unassigned(
             cap_to_metal,
             _point_cip_codes(full, atom_centers),
         )
-        key = Chem.MolToSmiles(full, canonical=True), label
+        keyed = Chem.RWMol(full)
+        keyed.RemoveAllConformers()  # coordinates would break the symmetry the key must see
+        for metal, donor in metal_bonds:
+            if donor in faces:
+                keyed.RemoveBond(metal, donor)
+                keyed.GetAtomWithIdx(donor).SetAtomMapNum(mol.GetAtomWithIdx(metal).GetAtomicNum())
+            else:
+                keyed.GetBondBetweenAtoms(metal, donor).SetBondType(Chem.BondType.SINGLE)
+        keyed = keyed.GetMol()
+        keyed.UpdatePropertyCache(strict=False)
+        Chem.SetDoubleBondNeighborDirections(keyed)  # the SMILES writer reads E/Z only from bond directions
+        key = Chem.MolToCXSmiles(keyed)
         if key in seen:
             continue
         seen.add(key)
