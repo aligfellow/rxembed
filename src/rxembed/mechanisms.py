@@ -23,7 +23,9 @@ from .constraints import (
     FIX_DISTANCE_TOL,
     graft_owns,
     merge_pulls,
+    out_of_plane_row,
     periodic_window,
+    plane_torsion_cap,
     stated_dihedral,
 )
 from .metal_core import disconnect_metal
@@ -89,7 +91,7 @@ class DGContext:
     def topo(self):
         """Bond-path lengths on the metal-stripped graph; a real backbone gives a finite distance."""
         if self._topo is None:
-            # A donor's temporary M-L stereo carrier is not a ligand-backbone path. RDKit may also retain
+            # A donor's temporary M-L carrier bond is not a ligand-backbone path. RDKit may also retain
             # a distance cache from before that bond was added; neither may change angle-prior ownership.
             self._topo = Chem.GetDistanceMatrix(disconnect_metal(self.mol), force=True)
         return self._topo
@@ -271,39 +273,51 @@ class Coplanar(Mechanism):
 
     @override
     def dg_post(self, cons, ctx):
-        for i, j, k, w, anchor, cap in cons.coplanar:
-            if stated_dihedral(cons, i, j, k, w):  # the same override owns the seed and the FF
+        for row in cons.coplanar:
+            i, j, _k, _w, anchor, cap = row
+            if stated_dihedral(cons, *row[:4]):  # the same override owns the seed and the FF
                 continue
             if anchor is None:  # the graph proves a plane but not which periodic well
                 continue
-            key = (min(i, w), max(i, w))
-            if key in cons.distances:  # a stated distance window is truth; an angle-derived prior only intersects
-                continue
-            window = cons.angles.get((i, j, k)) or cons.angles.get((k, j, i))
-            if window is None:  # nothing pins M-D-X, so say nothing
-                continue
-            edge = _coplanar_bound(ctx.bm, (i, j, k, w), window, anchor, cap)
-            if edge is None:
-                continue
-            anti = anchor >= _RIGHT_ANGLE  # the metal is anti (far) to w in-plane vs syn (near)
-            a, b = key  # a < b; bm[b][a] is the lower bound, bm[a][b] the upper
-            if anti and ctx.bm[b][a] < edge <= ctx.bm[a][b]:  # anti: floor at the cap edge
-                ctx.bm[b][a] = edge
-            elif not anti and ctx.bm[b][a] <= edge < ctx.bm[a][b]:  # syn: ceiling at the cap edge
-                ctx.bm[a][b] = edge
+            for k, w in _coplanar_axes(ctx.mol, row):
+                key = (min(i, w), max(i, w))
+                if key in cons.distances:  # a stated distance window is truth; an angle-derived prior only intersects
+                    continue
+                window = cons.angles.get((i, j, k)) or cons.angles.get((k, j, i))
+                if window is None:  # nothing pins M-D-X, so say nothing
+                    continue
+                torsion_cap = cap
+                if out_of_plane_row(ctx.mol, row):  # the loosest dihedral the M-D-X window allows, so still a bound
+                    torsion_cap = plane_torsion_cap(cap, min(window, key=lambda angle: math.sin(math.radians(angle))))
+                edge = _coplanar_bound(ctx.bm, (i, j, k, w), window, anchor, torsion_cap)
+                if edge is None:
+                    continue
+                anti = anchor >= _RIGHT_ANGLE  # the metal is anti (far) to w in-plane vs syn (near)
+                a, b = key  # a < b; bm[b][a] is the lower bound, bm[a][b] the upper
+                if anti and ctx.bm[b][a] < edge <= ctx.bm[a][b]:  # anti: floor at the cap edge
+                    ctx.bm[b][a] = edge
+                elif not anti and ctx.bm[b][a] <= edge < ctx.bm[a][b]:  # syn: ceiling at the cap edge
+                    ctx.bm[a][b] = edge
 
     @override
     def uff_terms(self, ff, cons, conf, stiffness):
         if not cons.coplanar:
             return
-        for i, j, k, w, anchor, cap in cons.coplanar:
-            if graft_owns((i, j, k, w), cons.frozen, cons.haptic):
+        mol = conf.GetOwningMol()
+        for row in cons.coplanar:
+            i, j, _k, _w, anchor, cap = row
+            if graft_owns(row[:4], cons.frozen, cons.haptic):
                 continue
-            if stated_dihedral(cons, i, j, k, w):
+            if stated_dihedral(cons, *row[:4]):
                 continue
-            phi = rdMolTransforms.GetDihedralDeg(conf, i, j, k, w)
-            lo, hi = _coplanar_window(phi, cap, anchor)
-            ff.UFFAddTorsionConstraint(i, j, k, w, False, lo, hi, _COPLANAR_FC)
+            axes = _coplanar_axes(mol, row)
+            for k, w in axes:
+                torsion_cap = cap
+                if out_of_plane_row(mol, row):
+                    torsion_cap = plane_torsion_cap(cap, rdMolTransforms.GetAngleDeg(conf, i, j, k))
+                phi = rdMolTransforms.GetDihedralDeg(conf, i, j, k, w)
+                lo, hi = _coplanar_window(phi, torsion_cap, anchor)
+                ff.UFFAddTorsionConstraint(i, j, k, w, False, lo, hi, _COPLANAR_FC / len(axes))
 
 
 class Plane(Mechanism):
@@ -604,6 +618,16 @@ def _coplanar_bound(bm, atoms, window, anchor, cap):
         values += [_cosine_rule_sq(min(max(b * cosine, ij[0]), ij[1]), b, cosine) for b in jw]
         return math.sqrt(max(0.0, min(values)))
     return math.sqrt(max(0.0, *(_cosine_rule_sq(a, b, cosine) for a, b in itertools.product(ij, jw))))
+
+
+def _coplanar_axes(mol, row):
+    """Return the (axis, far) atom pairs a coplanar row is measured through.
+
+    A dihedral row has its one axis. An out-of-plane row caps the metal's angle from the donor's own plane,
+    which belongs to neither donor bond, so it is shared between both.
+    """
+    _i, _j, k, w = row[:4]
+    return ((k, w), (w, k)) if out_of_plane_row(mol, row) else ((k, w),)
 
 
 def _coplanar_window(phi, cap, anchor=None):

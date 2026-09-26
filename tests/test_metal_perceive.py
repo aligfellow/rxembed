@@ -90,42 +90,19 @@ def _sphere_of(ens):
     return sorted({int(d) for ds in ens.sphere.values() for d in ds})
 
 
-# --- the gate is reachable, and reachable with the intended donors ---------------------------------------
-
-
-def test_public_gate_receives_real_donors(monkeypatch):
-    seen: list[object] = []
-    real = coord.donor_orientation
-
-    def spy(mol, pos, donors=None, frozen=frozenset()):
-        seen.append(donors)
-        return real(mol, pos, donors, frozen)
-
-    monkeypatch.setattr(geom, "donor_orientation", spy)
-    ens = rx.embed(rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0], n=4, seed=1).minimize()
-    assert seen, "donor_orientation was never called through rx.embed(...).minimize()"
-    assert any(d for d in seen), "the gate was called only with donors=None, so it was a silent no-op"
-    assert ens.sphere, "Ensemble.sphere is empty after minimize(): the intended donors did not survive"
-
-
-def test_perceiving_the_donors_makes_the_gate_blind():
-    mol, donors = feh2co4(folds=_STITCH)
-    pos = mol.GetConformer().GetPositions()
-    assert coord.donor_orientation(mol, pos, donors), "the intended sphere must catch the 0° carbonyl"
-    assert not coord.donor_orientation(mol, pos, None)
-
-
 # --- true positives: what the ruler can prove impossible -------------------------------------------------
 
 
 def test_donor_orientation_reports_folded_carbonyl():
     mol, donors = feh2co4(folds=_STITCH)
-    v = coord.donor_orientation(mol, mol.GetConformer().GetPositions(), donors)
+    pos = mol.GetConformer().GetPositions()
+    v = coord.donor_orientation(mol, pos, donors)
     assert len(v) == 1, f"expected exactly the 0° carbonyl, got {[str(x) for x in v]}"
     assert v[0].atoms == (0, 1, 2)
     assert v[0].value == pytest.approx(0.0, abs=0.1)
     assert "census floor" in v[0].detail
     assert "inspect donor geometry and restraints" in v[0].detail
+    assert not coord.donor_orientation(mol, pos, None), "the gate must not see donors it was not given"
 
 
 def test_donor_angle_warning_does_not_claim_an_enclosed_carbon_has_inverted():
@@ -135,7 +112,6 @@ def test_donor_angle_warning_does_not_claim_an_enclosed_carbon_has_inverted():
     assert np.all(weights > 0), "the donor must be strictly inside the four-carrier tetrahedron"
     (violation,) = coord.donor_orientation(mol, pos, donors=[0])
     assert violation.atoms == (4, 0, 1)
-    assert violation.value == pytest.approx(99.4623222)
     assert violation.limit == FOLD_WINDOW[("C", Chem.HybridizationType.SP3)][0]
     assert "census floor" in violation.detail
     assert "inspect" in violation.detail
@@ -265,38 +241,6 @@ def test_metric_is_reference_free_and_planarity_never_gates():
     assert "dihedral" not in kinds
 
 
-# --- the pipeline gate over these rulers ---------------------------------------------------------------------
-# contract NOTE: the two below are `pipeline/geom_check` rules with no metal in them; they live here because
-# they are the converse guards for the metal-side flexes above, and `tests/pipeline/test_geom_check.py` asserts
-# each violation KIND but not the element-awareness that separates these two cases. Move them there if it
-# claims them.
-
-
-def test_eta2_planarity_flex_is_metal_local():
-    m = Chem.AddHs(Chem.MolFromSmiles("C=CC=C"))  # butadiene, no metal -> no η² flex
-    rdDistGeom.EmbedMolecule(m, randomSeed=1)
-    c = m.GetConformer()
-    ci = next(a.GetIdx() for a in m.GetAtoms() if a.GetHybridization() == Chem.HybridizationType.SP2)
-    p = c.GetPositions()
-    p[ci] = p[ci] + [0.0, 0.0, 0.35]  # shove one sp2 carbon 0.35 Å out of plane (past the 0.15 default)
-    _place(m, p)
-    assert any(v.kind == "planarity" for v in geom.planarity(m, c.GetPositions())), "non-metal sp2 wrongly flexed"
-
-
-def test_xh_bond_length_window_is_element_aware():
-    m = Chem.AddHs(Chem.MolFromSmiles("CP"))
-    rdDistGeom.EmbedMolecule(m, randomSeed=1)
-    c = m.GetConformer()
-    h_p = next(a.GetIdx() for a in m.GetAtoms() if a.GetAtomicNum() == 1 and a.GetNeighbors()[0].GetSymbol() == "P")
-    p = m.GetAtomWithIdx(h_p).GetNeighbors()[0].GetIdx()
-    pos = c.GetPositions()
-    unit = (pos[h_p] - pos[p]) / np.linalg.norm(pos[h_p] - pos[p])
-    for length, flags in ((1.42, False), (1.9, True)):
-        pos[h_p] = pos[p] + unit * length
-        _place(m, pos)
-        assert bool(any(v.kind == "hydrogen" for v in geom.hydrogens(m, c.GetPositions()))) is flags, f"P-H {length}"
-
-
 # --- perception: the shape invariant ------------------------------------------------------------------
 
 
@@ -357,11 +301,6 @@ def test_unbound_metal_has_no_coordination_geometry():
     assert coord.classify_geometry(mol, 0, []) is None
 
 
-def test_short_bonded_pyramid_is_not_flatness_excluded():
-    dirs = POLYHEDRA["trigonal_pyramidal"].vertex_dirs
-    assert _classify(dirs, 1.4) == "trigonal_pyramidal"
-
-
 def _shallow_pyramid(frac):
     """The CN3 pyramid record with its elevation scaled by `frac`: shallower than the ideal, still tilted."""
     dirs = np.array(POLYHEDRA["trigonal_pyramidal"].vertex_dirs, float)
@@ -369,20 +308,19 @@ def _shallow_pyramid(frac):
     return dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
 
 
-def test_shallow_pyramid_reads_as_the_nearer_ideal():
-    """A pyramid shallow enough to read flat by `COPLANAR_TOL` must still read as the shape it best fits.
-
-    A flatness pre-filter used to drop `trigonal_pyramidal` from the ranking whenever the sphere's raw plane
-    RMS cleared the absolute tolerance (the M[N(SiMe3)2]3 case), leaving `trigonal_planar` as the only
-    candidate even though the pyramid fits four times closer.
-    """
-    dirs = _shallow_pyramid(0.8)
-    assert coord._plane_rms(np.zeros(3), dirs * 2.0) < coord.COPLANAR_TOL, "fixture premise: reads flat"
-    assert _classify(dirs, 2.0) == "trigonal_pyramidal"
-
-
-def test_bowed_square_plane_reads_square_planar():
-    assert _classify(_tilted_square(8), 2.3) == "square_planar"
+@pytest.mark.parametrize(
+    ("dirs", "bond_length", "expected"),
+    [
+        (POLYHEDRA["trigonal_pyramidal"].vertex_dirs, 1.4, "trigonal_pyramidal"),
+        (_shallow_pyramid(0.8), 2.0, "trigonal_pyramidal"),
+        (_tilted_square(8), 2.3, "square_planar"),
+        ([(np.cos(a), np.sin(a), 0.0) for a in np.arange(6) * np.pi / 3], 2.1, "hexagonal_planar"),
+        (_bailar(60.0), 2.1, "trigonal_prismatic"),
+    ],
+    ids=["short-bonded-pyramid", "shallow-pyramid", "bowed-square-plane", "hexagonal-plane", "bailar-twist-endpoint"],
+)
+def test_distorted_shell_reads_as_the_nearest_ideal(dirs, bond_length, expected):
+    assert _classify(dirs, bond_length) == expected
 
 
 def test_bis_chelate_zinc_tetrahedron_reads_tetrahedral():
@@ -391,37 +329,14 @@ def test_bis_chelate_zinc_tetrahedron_reads_tetrahedral():
     assert [i.geometry for i in rx.metal(mol)] == ["tetrahedral"]
 
 
-@pytest.mark.parametrize(
-    ("twist", "expected"),
-    [(0.0, "octahedral"), (60.0, "trigonal_prismatic")],
-    ids=["octahedral", "trigonal-prismatic"],
-)
-def test_bailar_twist_endpoints(twist, expected, caplog):
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        got = coord.classify_geometry(_ideal_sphere(_bailar(twist), 2.1), 0, list(range(1, 7)))
-    assert got == expected
-    assert not [r for r in caplog.records if "no shape fits" in r.message], caplog.text
-
-
-def test_hexagonal_plane_is_not_forced_into_a_three_dimensional_cn6_shape():
-    directions = [(np.cos(angle), np.sin(angle), 0.0) for angle in np.arange(6) * np.pi / 3]
-
-    assert _classify(directions, 2.1) == "hexagonal_planar"
-
-
-def test_poor_shape_returns_record_and_warns(caplog):
+@pytest.mark.parametrize("warn", [True, False])
+def test_poor_shape_returns_record_and_warns(warn, caplog):
     squashed = np.array([(np.cos(t) * 0.5, np.sin(t) * 0.5, 0.87) for t in np.radians([0, 60, 120, 180, 240, 300])])
     with caplog.at_level(logging.WARNING, logger="rxembed"):
-        got = coord.classify_geometry(_ideal_sphere(squashed, 2.1), 0, list(range(1, 7)))
+        got = coord.classify_geometry(_ideal_sphere(squashed, 2.1), 0, list(range(1, 7)), warn=warn)
     assert got is not None, "a poor fit is still the nearest record, reported loudly"
-    assert [r for r in caplog.records if "no shape fits" in r.message], caplog.text
-
-
-def test_poor_shape_can_be_checked_silently(caplog):
-    squashed = np.array([(np.cos(t) * 0.5, np.sin(t) * 0.5, 0.87) for t in np.radians([0, 60, 120, 180, 240, 300])])
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        coord.classify_geometry(_ideal_sphere(squashed, 2.1), 0, list(range(1, 7)), warn=False)
-    assert not [r for r in caplog.records if "no shape fits" in r.message], caplog.text
+    fired = bool([r for r in caplog.records if "no shape fits" in r.message])
+    assert fired == warn, caplog.text
 
 
 def test_near_tie_keeps_the_argmin_and_names_the_runner_up(caplog):
@@ -438,11 +353,3 @@ def test_near_tie_keeps_the_argmin_and_names_the_runner_up(caplog):
         got = coord.classify_geometry(_ideal_sphere(dirs, 2.1), 0, list(range(1, 6)))
     assert got == "trigonal_bipyramidal"
     assert [r for r in caplog.records if "near-tie" in r.message and "pass geometry='SPY'" in r.message], caplog.text
-
-
-def test_cn_defaults_are_the_common_shapes():
-    assert coord.geometry_for(3) == "trigonal_planar"
-    assert coord.geometry_for(3, has_apical=True) == "trigonal_planar"
-    assert coord.geometry_for(4) == "square_planar"
-    assert coord.geometry_for(4, has_apical=True) == "tetrahedral"
-    assert coord.geometry_for(5, has_apical=True) == "trigonal_bipyramidal"

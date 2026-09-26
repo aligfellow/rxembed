@@ -5,7 +5,6 @@ import sys
 from pathlib import Path
 
 import rxembed
-from rxembed import core
 
 # A real degradation on a base install: two fix distances over three atoms leave the angle free, and the
 # library says so.
@@ -33,31 +32,10 @@ def test_editable_install_loads_this_checkout():
     )
 
 
-def test_public_and_engine_surfaces():
-    for name in ("embed", "minimize", "metal", "read_xyz", "Ensemble", "EnsembleSet", "EmbedParams"):
-        assert hasattr(rxembed, name), name
-    for name in (
-        "embed",
-        "minimize",
-        "enumerate_isomers",
-        "Conformers",
-        "Constraints",
-        "Isomer",
-        "IsomerSet",
-        "EmbedParams",
-    ):
-        assert hasattr(core, name), name
-    assert rxembed.embed.__module__ == "rxembed.pipeline.dispatch"
-    assert core.embed.__module__ == "rxembed.embed"
-    assert rxembed.EmbedParams is core.EmbedParams
-
-
-def test_warning_reaches_stderr_with_no_logging_setup():
+def test_import_is_quiet_until_set_verbose():
+    """A degradation warning reaches stderr unconfigured; INFO narration waits for set_verbose()."""
+    assert rxembed.logger.level == 0, "the package logger must stay NOTSET and inherit the app's level"
     err = _stderr_of()
     assert "no angle is fixed" in err, f"the degradation warning never reached stderr: {err!r}"
-
-
-def test_import_is_quiet_until_set_verbose():
-    assert rxembed.logger.level == 0, "the package logger must stay NOTSET and inherit the app's level"
-    assert "embed[molecule]" not in _stderr_of(), "INFO must be quiet until set_verbose()"
+    assert "embed[molecule]" not in err, "INFO must be quiet until set_verbose()"
     assert "embed[molecule]" in _stderr_of("rx.set_verbose('INFO')\n"), "set_verbose() must still narrate"

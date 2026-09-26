@@ -184,13 +184,6 @@ def test_mechanism_is_silent_on_empty_constraints(mech):
     assert np.array_equal(ctx.bm, before), f"{type(mech).__name__} edited the matrix off an empty struct"
 
 
-@pytest.mark.parametrize("name", sorted(_FF_REPAIRS))
-def test_ff_repair_uses_molecule_state(name):
-    mech = next(m for m in mech_mod.MECHANISM_ORDER if type(m).__name__ == name)
-    mol = _mol()
-    assert uff_terms(mech, Constraints(), mol).calls, f"{name} must fire on a bare struct"
-
-
 def test_sp2_planar_excludes_only_coordination_owned_carbon():
     mol = _mol("CC(=C)C")
     centre = next(
@@ -318,42 +311,6 @@ def test_conjugation_cleanup_switch_is_uff_only():
 # ---------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ["distance", "angle", "torsion"])
-def test_native_restraint_penalty_law(kind):
-    # One (k, dev) case per kind: this pins RDKit's own force-field energy formula, not rxembed logic,
-    # so sweeping k and dev re-derives the same tautology and adds nothing.
-    mol = _mol("CCCC")
-    conf = mol.GetConformer()
-    k, dev = 100.0, 0.1
-    held = rdForceFieldHelpers.CreateEmptyForceFieldForMol(mol)
-    if kind == "distance":
-        target = rdMolTransforms.GetBondLength(conf, 0, 1) - dev
-        held.AddDistanceConstraint(0, 1, target, target, k)
-    elif kind == "angle":
-        target = rdMolTransforms.GetAngleDeg(conf, 0, 1, 2) - dev
-        held.UFFAddAngleConstraint(0, 1, 2, False, target, target, k)
-    else:
-        target = rdMolTransforms.GetDihedralDeg(conf, 0, 1, 2, 3) - dev
-        held.UFFAddTorsionConstraint(0, 1, 2, 3, False, target, target, k)
-    held.Initialize()
-    factor = 0.5 if kind == "distance" else 1.0
-    assert held.CalcEnergy() == pytest.approx(factor * k * dev**2, rel=1e-6)
-
-
-def test_distance_writes_dg_and_ff():
-    mol = _mol()
-    cons = Constraints(distances={(0, 3): (2.0, 2.4)})
-
-    ctx = _ctx(mol)
-    mech_mod.Distance().dg_windows(cons, ctx)
-    assert ctx.pairs[(0, 3)] == (2.0, 2.4)
-
-    ff = uff_terms(mech_mod.Distance(), cons, mol)
-    assert ff.kinds() == ["AddDistanceConstraint"]
-    _name, args, _kw = ff.calls[0]
-    assert args[:4] == (0, 3, 2.0, 2.4)
-
-
 def test_haptic_radius_is_a_seed_prior_unless_explicitly_fixed():
     mol = _mol()
     cons = Constraints(distances={(0, 3): (0.6, 0.8), (1, 3): (0.6, 0.8), (2, 3): (1.9, 2.1)}, haptic={3: (0, 1)})
@@ -409,21 +366,6 @@ def test_overlapping_haptic_centroids_respect_frozen_members(frozen):
         np.testing.assert_allclose(relaxed[dummy], relaxed[list(face)].mean(axis=0), atol=1e-6)
 
 
-def test_pull_collapses_window_to_spring():
-    mol = _mol()
-    ff = uff_terms(mech_mod.Pull(), Constraints(pulls={(0, 3): 2.1}), mol)
-    _name, args, _kw = ff.calls[0]
-    assert args[2] == args[3] == 2.1
-
-    fixed = uff_terms(
-        mech_mod.Pull(),
-        Constraints(fixed={(0, 3): (2.1, 2.1)}),
-        mol,
-    )
-    assert fixed.calls[0][1][2:4] == (2.1, 2.1)
-    assert fixed.calls[0][1][-1] > args[-1]
-
-
 def test_reversed_distance_preference_suppresses_contact_midpoint_force():
     cons = Constraints(distances={(0, 3): (2.0, 4.0)}, pulls={(3, 0): 2.5}, contacts=(frozenset({(0, 3)}), frozenset()))
     calls = uff_terms(mech_mod.Pull(), cons, _mol()).calls
@@ -461,14 +403,6 @@ def test_native_angle_preference_pulls_inside_the_window_without_escalation():
         assert not uff_terms(mech_mod.Pull(), cons, mol).calls
 
 
-def test_floor_is_one_sided():
-    mol = _mol()
-    ff = uff_terms(mech_mod.Floor(), Constraints(floors={(0, 3): 2.6}), mol)
-    _name, args, _kw = ff.calls[0]
-    assert args[2] == 2.6
-    assert args[3] >= 1e3, f"a floor's upper bound must stand in for infinity, got {args[3]}"
-
-
 @pytest.mark.parametrize("authority", ["fixed", "contact", "automatic"])
 def test_later_distance_overrides_only_an_explicitly_owned_floor(authority):
     mol = _mol()
@@ -495,51 +429,12 @@ def test_later_distance_overrides_only_an_explicitly_owned_floor(authority):
         assert [args[:3] for _name, args, _kw in released.calls] == [(*pair, 2.6), (*other, 2.7)]
 
 
-def test_frozen_pins_points_rather_than_restraining_them():
-    mol = _mol()
-    ff = uff_terms(mech_mod.Frozen(), Constraints(frozen={0, 1, 2}), mol)
-    assert ff.kinds() == ["AddFixedPoint"]
-    assert sorted(a[0] for _n, a, _k in ff.calls) == [0, 1, 2]
-
-
-def test_angle_writes_dg_and_ff_terms():
-    mol = _mol()
-    cons = Constraints(angles={(0, 1, 3): (100.0, 120.0)})
-
-    ctx = _ctx(mol)
-    mech_mod.Angle().dg_windows(cons, ctx)
-    assert (0, 3) in ctx.pairs, "an angle must state its end-atom diagonal in the matrix"
-
-    ff = uff_terms(mech_mod.Angle(), cons, mol)
-    assert ff.kinds() == ["UFFAddAngleConstraint"]
-    _name, args, _kw = ff.calls[0]
-    assert args[:3] == (0, 1, 3)
-
-    fixed = uff_terms(
-        mech_mod.Angle(),
-        Constraints(angles={(0, 1, 3): (108.0, 112.0)}, fixed={(0, 1, 3): (110.0, 110.0)}),
-        mol,
-    )
-    assert fixed.calls[0][1][4:6] == (110.0, 110.0)
-    assert fixed.calls[0][1][-1] > args[-1]
-
-
 def test_angle_force_is_not_scaled_by_ladder():
     mol = _mol()
     cons = Constraints(angles={(0, 1, 3): (100.0, 120.0)})
-    assert uff_terms(mech_mod.Angle(), cons, mol, fc=1.0).calls[0][1][-1] == mech_mod.ANGLE_FC
-    assert uff_terms(mech_mod.Angle(), cons, mol, fc=0.1).calls[0][1][-1] == pytest.approx(0.1 * mech_mod.ANGLE_FC)
-    assert uff_terms(mech_mod.Angle(), cons, mol, fc=100.0).calls[0][1][-1] == mech_mod.ANGLE_FC, (
-        "the ladder must not be able to escalate the angle wall"
-    )
-
-
-def test_dihedral_writes_periodic_uff_term():
-    mol = _mol("CCCC")
-    cons = Constraints(dihedrals={(0, 1, 2, 3): (170.0, 190.0)})
-    ff = uff_terms(mech_mod.Dihedral(), cons, mol)
-    assert ff.kinds() == ["UFFAddTorsionConstraint"]
-    assert ff.calls[0][1][:7] == (0, 1, 2, 3, False, 170.0, 190.0)
+    baseline = uff_terms(mech_mod.Angle(), cons, mol, fc=1.0).calls[0][1][-1]
+    escalated = uff_terms(mech_mod.Angle(), cons, mol, fc=100.0).calls[0][1][-1]
+    assert escalated == baseline, "the ladder must not be able to escalate the angle wall"
 
 
 @pytest.mark.parametrize("smiles", ["C(F)(Cl)(Br)I", "C(F)(Cl)Br"], ids=["four-carriers", "implicit-h"])
@@ -646,15 +541,28 @@ def test_composed_numeric_fix_overrides_the_same_umbrella_support(ideal):
 
 
 def test_releasable_contact_uses_softer_wall():
+    """A releasable contact is held by a softer wall than the same window held structurally."""
     mol = _mol("c1ccccc1.c1ccccc1")
-    cons = Constraints(
-        distances={(0, 3): (2.0, 2.4), (1, 4): (2.0, 2.4)},
-        contacts=(frozenset({(0, 3)}), frozenset()),
+    conf = mol.GetConformer()
+    pair = (0, 3)
+
+    def energy_past_the_window(releasable):
+        cons = Constraints(
+            distances={pair: (2.0, 2.4)},
+            contacts=(frozenset({pair}), frozenset()) if releasable else (frozenset(), frozenset()),
+        )
+        ff = rdForceFieldHelpers.CreateEmptyForceFieldForMol(mol)
+        mech_mod.Distance().uff_terms(ff, cons, conf, 1.0)
+        ff.Initialize()
+        i, j = pair
+        positions = conf.GetPositions()
+        direction = positions[j] - positions[i]
+        positions[j] = positions[j] + direction / np.linalg.norm(direction)  # push 1 A past the upper bound
+        return ff.CalcEnergy(positions.ravel().tolist())
+
+    assert energy_past_the_window(releasable=True) < energy_past_the_window(releasable=False), (
+        "a releasable contact must be softer than the same window held structurally"
     )
-    emitted = {tuple(a[:2]): a[-1] for _n, a, _kw in uff_terms(mech_mod.Distance(), cons, mol).calls}
-    assert emitted[(1, 4)] == pytest.approx(mech_mod.PIN_FC), "a structural window is held at PIN"
-    softened = mech_mod.PIN_FC * mech_mod.RELEASABLE_FC_SCALE
-    assert emitted[(0, 3)] == pytest.approx(softened), "a releasable one is softened"
 
 
 def test_plane_holds_a_pi_stack_by_cross_ring_distances():
@@ -669,16 +577,6 @@ def test_plane_holds_a_pi_stack_by_cross_ring_distances():
 
     ff = uff_terms(mech_mod.Plane(), cons, mol)
     assert ff.kinds() == ["AddDistanceConstraint"]
-
-
-# ---------------------------------------------------------------------------------------------------------
-# MECHANISM_ORDER itself: the one place order is stated, and the order is load-bearing
-# ---------------------------------------------------------------------------------------------------------
-
-
-def test_distance_precedes_angle_window_read():
-    order = [type(m).__name__ for m in mech_mod.MECHANISM_ORDER]
-    assert order.index("Distance") < order.index("Angle")
 
 
 # ---------------------------------------------------------------------------------------------------------

@@ -21,8 +21,8 @@ _PT = Chem.GetPeriodicTable()
 
 # --- the sp2-donor coplanarity cap (`coplanar_donor`, `cons.coplanar`) -------------------------------
 # An sp2 donor binds from an in-plane sigma lone pair, so the metal sits in its sp2 framework.
-COPLANAR_CAP = 45.0  # deg half-window off the anchor: clears the tmQM/Kulik census p95 of 40°. Never a
-# point, which would annihilate the real scatter out to that tail.
+COPLANAR_CAP = 45.0  # deg half-window off the anchor: clears the tmQM/Kulik census p95 of 40° for the metal's
+# angle out of a donor's plane. Never a point, which would annihilate the real scatter out to that tail.
 _COPLANAR_ANCHOR = 180.0  # deg: the external sector of a donor with two direct substituents
 
 # --- the chelate-ring hinge (`ring_hinge`, `cons.coplanar`) ----------------------------------------------
@@ -63,14 +63,15 @@ FOLD_MEDIAN = {  # deg: census median per class; `fold` = max |M-D-X - median|, 
 # false-flags a real crystal but sits 25-30 deg below typical donation, a dead band a fold hides in. Only
 # the wall may tighten: a tighter gate would flag real crystals.
 _FOLD_WALL_FLOOR = {cls: min(lo + 12.0, FOLD_MEDIAN[cls] - 5.0) for cls, (lo, _hi) in FOLD_WINDOW.items()}
+# deg: half-width of a window centred on a donor's graph-derived M-D-X angle. A free sp2 donor centres on the
+# external bisector of the ligand's native internal angle (a fixed 120-degree centre pushes a five-membered
+# donor out of plane; a chelate already pins its donor axis). An sp donor is linear, so it centres on 180.
+_CENTRED_PAD = 6.0
 # deg (floor, ceiling): the wall `orient_donor` writes on every donor substituent, heavy or proton. One rule
-# leans an acyl leg off the sphere, splays a slow-inverting P-H, and splays a folded amine's H. The sp rows are
-# overridden tight: an sp donor is linear, so its wall sits at its median (~165), not a nitrile-bending 152.
+# leans an acyl leg off the sphere, splays a slow-inverting P-H, and splays a folded amine's H. An sp row is
+# centred instead: nothing else holds a linear donor straight, so the relax rides whatever floor it is given.
 _ORIENT_WALL = {cls: (floor, FOLD_WINDOW[cls][1]) for cls, floor in _FOLD_WALL_FLOOR.items()}
-_ORIENT_WALL[("N", _SP)] = _ORIENT_WALL[("C", _SP)] = (165.0, 180.0)
-# deg: retain the centring width, but derive the external bisector from the ligand's native internal angle.
-# A fixed 120-degree centre pushes a five-membered donor out of plane. A chelate already pins its donor axis.
-_CENTRED_SP2_PAD = 6.0
+_ORIENT_WALL[("N", _SP)] = _ORIENT_WALL[("C", _SP)] = (180.0 - _CENTRED_PAD, 180.0)
 _MAX_SIGMA = {  # sigma bonds a class can carry: more is a hypervalent / mis-perceived centre -> unknown
     Chem.HybridizationType.SP: 2,
     Chem.HybridizationType.SP2: 3,
@@ -305,7 +306,7 @@ def _centred_sp2_window(mol, donor, neighbours):
     cosine = (a * a + b * b - c * c) / (2.0 * a * b)
     internal = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
     centre = 180.0 - 0.5 * internal
-    return centre - _CENTRED_SP2_PAD, min(180.0, centre + _CENTRED_SP2_PAD)
+    return centre - _CENTRED_PAD, min(180.0, centre + _CENTRED_PAD)
 
 
 def orient_donor(mol, metal, d, donor_set, cons, *, hyb=None, stripped=None):
@@ -369,9 +370,9 @@ def coplanar_donor(mol, metal, d, donor_set, cons, *, hyb=None):
     * one heavy neighbour (carboxylate O, thione S): a proper dihedral M-D-C-X against C's heaviest other
       heavy substituent, graph-undirected so it carries no syn/anti bias. A donor bridged straight to
       another donor of the same ring is `ring_hinge`'s case instead;
-    * two heavy neighbours (amidate/imine N, aryl carbanion C): an improper M-D-X-Y of the donor's own
-      direct substituents (their order does not matter, both define the same anti lone-pair sector), so an
-      N-aryl amidate's phenyl stays free to twist.
+    * two heavy neighbours (amidate/imine N, aryl carbanion C): the metal's angle out of the donor's own
+      X-D-Y plane, the quantity the census measured. It belongs to neither donor bond, so `Coplanar` reads it
+      through both, and an N-aryl amidate's phenyl stays free to twist.
 
     No M-D-C angle wall is written here: `orient_donor`'s fold wall already pins M-D-X for every calibrated
     class, and the FF torsion alone holds an uncalibrated one.
@@ -393,7 +394,7 @@ def coplanar_donor(mol, metal, d, donor_set, cons, *, hyb=None):
         if ref is not None:  # an aldehyde-O whose C carries only H gets none: no reference atom
             cons.coplanar.append((metal, d, bridge, ref.GetIdx(), None, COPLANAR_CAP))
     elif len(heavy) == 2:  # noqa: PLR2004  two heavy neighbours: improper M out of the donor's own X-D-Y plane
-        cons.coplanar.append((metal, d, heavy[0], heavy[1], _COPLANAR_ANCHOR, COPLANAR_CAP))  # a single dihedral
+        cons.coplanar.append((metal, d, *sorted(heavy), _COPLANAR_ANCHOR, COPLANAR_CAP))
 
 
 def ring_hinge(mol, metal, donor_set, cons):

@@ -12,13 +12,13 @@ from rxembed.pipeline import search
 def test_missing_mc_backend_preserves_ensemble(monkeypatch):
     monkeypatch.setattr(search, "available", lambda: False)
     ens = rx.embed("CCCCCCO", n=3, seed=1).minimize()
-    before = (list(ens.ids), dict(ens.energies), ens.energy_kind, ens._stage)
+    before = (list(ens.ids), dict(ens.energies), ens.energy_kind)
     positions = {i: ens.mol.GetConformer(i).GetPositions() for i in ens.ids}
 
     with pytest.raises(ImportError, match=r"mc needs openconf; pip install 'rxembed\[search\]'"):
         ens.mc(preset="rapid")
 
-    assert (ens.ids, ens.energies, ens.energy_kind, ens._stage) == before
+    assert (ens.ids, ens.energies, ens.energy_kind) == before
     for i, expected in positions.items():
         np.testing.assert_array_equal(ens.mol.GetConformer(i).GetPositions(), expected)
 
@@ -37,23 +37,36 @@ def test_failed_search_clears_stale_energies(monkeypatch):
 
     assert not ens.energies
     assert not ens.energy_kind
-    assert ens._stage == "seeded"
 
 
 # --- config resolution: a preset, then single-knob overrides ----------------------------------------------
 
 
 @pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
-def test_unknown_passthrough_field_is_refused_by_name():
-    with pytest.raises(TypeError, match="not_a_field"):
-        search._config("rapid", None, None, None, None, constrained=False, not_a_field=1)
+def test_unknown_passthrough_field_is_refused_by_name(caplog):
+    ens = rx.embed("CCCC", n=1, seed=1)
+    with caplog.at_level("WARNING", logger="rxembed"):
+        ens.mc(preset="rapid", not_a_field=1)
+
+    assert "not_a_field" in caplog.text
 
 
 @pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
-def test_constrained_search_rejects_low_mode(caplog):
+def test_constrained_search_rejects_low_mode(monkeypatch, caplog):
+    ens = rx.embed("CCCCCCO", n=1, seed=1, fix={(0, 6): 4.0})
+    real_config = search._config
+    captured = []
+
+    def spy(*args, **kw):
+        cfg = real_config(*args, **kw)
+        captured.append(cfg)
+        return cfg
+
+    monkeypatch.setattr(search, "_config", spy)
     with caplog.at_level("WARNING", logger="rxembed"):
-        cfg = search._config("rapid", None, None, True, None, constrained=True)
-    assert not cfg.use_low_mode_following
+        ens.mc(preset="ensemble", low_mode=True)
+
+    assert not captured[-1].use_low_mode_following
     assert any("low-mode" in r.getMessage() for r in caplog.records)
 
 

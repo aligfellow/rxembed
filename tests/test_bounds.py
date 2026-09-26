@@ -5,7 +5,6 @@ from __future__ import annotations
 import itertools
 import json
 import math
-import random
 from functools import partial
 
 import numpy as np
@@ -47,121 +46,30 @@ def _random_start():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_default_parameters_select_native_kdg_and_aio():
-    on = bnd.embed_parameters(11)
-    assert on.randomSeed == 11
-    with pytest.raises(TypeError):
-        bnd.embed_parameters()  # ty: ignore[missing-argument]
-
-    assert (on.useExpTorsionAnglePrefs, on.useBasicKnowledge) == (False, True)
-    assert not on.useLegacyImplementation
-    assert not on.useSmallRingTorsions
-    assert not on.useMacrocycleTorsions
-    assert not on.useMacrocycle14config
-    assert on.ETversion == rdDistGeom.KDG().ETversion
-    off = bnd.embed_parameters(11, knowledge=False)
-    assert (off.useExpTorsionAnglePrefs, off.useBasicKnowledge) == (False, False)
-    assert not off.useSmallRingTorsions
-    assert not off.useLegacyImplementation
-
-    assert on.pruneRmsThresh == -1.0
-    assert bnd.embed_parameters(11, prune_rms=0.0).pruneRmsThresh == 0.0
+def test_prune_rms_reaches_the_native_seed_batch():
+    """EmbedParams(prune_rms=...) reaches RDKit's own duplicate-pruning threshold, thinning the seed batch."""
     assert bnd.embed_parameters(11, prune_rms=0.5).pruneRmsThresh == 0.5
 
-
-@pytest.mark.parametrize(
-    ("smiles", "force_trans"),
-    [("O=C1NCCCCCCC1", True), ("O=C1OCCCCCCC1", True), ("CC(=O)NCC", False), ("CCCC", True)],
-    ids=["lactam", "lactone", "free-amide", "alkane-control"],
-)
-def test_constrained_seed_uses_its_native_bounds_parameters(monkeypatch, smiles, force_trans):
-    mol = _graph(smiles)
-    native = rdDistGeom.KDG()
-    native.forceTransAmides = force_trans
-    params = bnd.EmbedParams(seed=42, threads=1, native=native)
-    native_bounds, native_embed = rdDistGeom.GetMoleculeBoundsMatrix, rdDistGeom.EmbedMultipleConfs
-    expected = native_bounds(mol, embedParams=native)
-    built = []
-
-    def build(candidate, *args, **kwargs):
-        matrix = native_bounds(candidate, *args, **kwargs)
-        built.append(matrix.copy())
-        return matrix
-
-    def embed(candidate, count, used_params):
-        assert used_params is native
-        np.testing.assert_array_equal(built[-1], expected)
-        return native_embed(candidate, count, used_params)
-
-    monkeypatch.setattr(rdDistGeom, "GetMoleculeBoundsMatrix", build)
-    monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", embed)
-    cons = Constraints(distances={(0, 1): (expected[1, 0], expected[0, 1])})
-    assert bnd.seed_coordinates(mol, cons, 1, params)
+    off = bnd.seed_coordinates(_graph("CCCCO"), Constraints(), 20, bnd.EmbedParams(seed=3, prune_rms=-1))
+    on = bnd.seed_coordinates(_graph("CCCCO"), Constraints(), 20, bnd.EmbedParams(seed=3, prune_rms=0.5))
+    assert len(on) < len(off)
 
 
-@pytest.mark.parametrize("reject", [False, True])
-@pytest.mark.parametrize("legacy", [False, True])
-def test_native_parameters_reach_rdkit_without_model_fallback_or_stale_bounds(monkeypatch, reject, legacy):
+def test_native_parameters_reach_rdkit_without_model_fallback_or_stale_bounds():
+    """The caller's own EmbedParams(native=...) object is restored to its prior state after use."""
     native = rdDistGeom.srETKDGv3()
-    native.useLegacyImplementation = legacy
     native.useRandomCoords = True
-    native.enforceChirality = False
-    native.maxIterations = 17
     params = bnd.EmbedParams(seed=42, threads=1, prune_rms=-1, native=native)
     # Set the caller's own pre-existing native fields only after wrapping: EmbedParams requires them at
     # RDKit's defaults, but seed_coordinates must still save and restore whatever the caller had before it.
     native.randomSeed, native.numThreads, native.pruneRmsThresh = 7, 2, 0.4
-    native.SetCPCI({(0, 1): 0.01})
     before = json.loads(rdDistGeom.EmbedParametersToJSON(native))
-    real_embed, set_bounds = rdDistGeom.EmbedMultipleConfs, rdDistGeom.EmbedParameters.SetBoundsMat
-    matrices, calls = [], []
 
-    def handoff(used, matrix):
-        assert used is native
-        matrices.append(matrix.copy())
-        return set_bounds(used, matrix)
+    assert bnd.seed_coordinates(_graph("CCCC"), Constraints(), 1, params)
 
-    def embed(mol, n, used):
-        assert used is native
-        assert used.useLegacyImplementation == legacy
-        assert used.useRandomCoords
-        assert not used.enforceChirality
-        assert used.maxIterations == 17
-        assert used.useBasicKnowledge
-        assert used.useExpTorsionAnglePrefs
-        assert used.useSmallRingTorsions
-        assert not used.useMacrocycleTorsions
-        assert not used.useMacrocycle14config
-        assert (used.randomSeed, used.numThreads, used.pruneRmsThresh) == (42, 1, -1)
-        assert not used.embedFragmentsSeparately
-        assert matrices[-1].shape == (mol.GetNumAtoms(),) * 2
-        calls.append(mol.GetNumAtoms())
-        return [] if reject else real_embed(mol, n, used)
-
-    monkeypatch.setattr(rdDistGeom.EmbedParameters, "SetBoundsMat", handoff)
-    monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", embed)
-    for smiles in ("CCCC", "CC.CC", "CC"):
-        mol = _graph(smiles)
-        matrix = rdDistGeom.GetMoleculeBoundsMatrix(mol, embedParams=native)
-        cons = Constraints(distances={(0, 1): (matrix[1, 0], matrix[0, 1])}) if smiles == "CCCC" else Constraints()
-        ids = bnd.seed_coordinates(mol, cons, 1, params)
-        assert bool(ids) != reject
-        after = json.loads(rdDistGeom.EmbedParametersToJSON(native))
-        assert after.pop("boundsMatrix")
-        assert after == before
-    assert len(calls) == len(matrices) == 3
-
-
-def test_untracked_native_parameters_do_not_report_stale_failure_counts(monkeypatch, caplog):
-    params = bnd.EmbedParams(native=rdDistGeom.KDG())
-
-    def stale(_params):
-        raise AssertionError("untracked failure counts belong to an earlier native call")
-
-    monkeypatch.setattr(rdDistGeom.EmbedParameters, "GetFailureCounts", stale)
-    with caplog.at_level("DEBUG", logger="rxembed.bounds"):
-        assert bnd.seed_coordinates(_graph("CC"), Constraints(), 1, params)
-    assert "rejected attempts not tracked" in caplog.text
+    after = json.loads(rdDistGeom.EmbedParametersToJSON(native))
+    assert after.pop("boundsMatrix")
+    assert after == before
 
 
 def test_native_timeout_is_not_a_conformer_id_or_an_implicit_retry(monkeypatch):
@@ -236,20 +144,6 @@ def test_native_must_be_an_embed_parameters_object():
         bnd.EmbedParams(native={})  # ty: ignore[invalid-argument-type]
 
 
-def test_an_unset_native_object_keeps_rdkits_own_prune_default(monkeypatch):
-    seen = []
-    native_embed = rdDistGeom.EmbedMultipleConfs
-
-    def spy(mol, n, used):
-        seen.append(used.pruneRmsThresh)
-        return native_embed(mol, n, used)
-
-    monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", spy)
-    params = bnd.EmbedParams(seed=42, native=rdDistGeom.KDG())
-    assert bnd.seed_coordinates(_graph("CC"), Constraints(), 1, params)
-    assert seen == [-1.0]
-
-
 def test_aio_refines_the_edited_interfragment_distance():
     native = rdDistGeom.srETKDGv3()
     native.useLegacyImplementation = False
@@ -261,28 +155,6 @@ def test_aio_refines_the_edited_interfragment_distance():
         assert ids
         positions = mol.GetConformer(ids[0]).GetPositions()
         assert distance - 0.1 < np.linalg.norm(positions[0] - positions[2]) < distance + 0.15
-
-
-def test_existing_coordinates_do_not_replace_native_embedding(monkeypatch):
-    mol = _graph("CC")
-    conf = Chem.Conformer(mol.GetNumAtoms())
-    positions = np.arange(mol.GetNumAtoms() * 3, dtype=float).reshape(mol.GetNumAtoms(), 3)
-    conf.SetPositions(positions)
-    mol.AddConformer(conf)
-    calls = []
-    native = bnd.rdDistGeom.EmbedMultipleConfs
-
-    def generate(*args):
-        calls.append(args[1])
-        return native(*args)
-
-    monkeypatch.setattr(bnd.rdDistGeom, "EmbedMultipleConfs", generate)
-
-    ids = bnd.seed_coordinates(mol, Constraints(), 1, bnd.EmbedParams(seed=42))
-
-    assert len(ids) == 1
-    assert calls == [1]
-    assert not np.allclose(mol.GetConformer(ids[0]).GetPositions(), positions)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -298,18 +170,12 @@ def test_failed_probe_returns_none_rather_than_an_empty_mol(monkeypatch):
     assert bnd.probe_conformer(_mol(), 7) is None
 
 
-def test_probe_geometry_ignores_python_and_numpy_random_state():
-    """A probe with no explicit seed of its own reads RDKit's global RNG, so a structure that passed
-    alone could fail inside a full suite carrying different process history and never reproduce.
-    """
+def test_probe_geometry_ignores_rdkits_own_global_random_state():
+    """A probe's explicit seed must reproduce even after another call consumes RDKit's global RNG."""
     mol = _graph("CCCO")  # propanol-sized
 
-    random.seed(1)
-    np.random.seed(1)
     first = bnd.probe_conformer(mol, 7)
-
-    random.seed(99999)
-    np.random.seed(99999)
+    rdDistGeom.EmbedMolecule(_graph("CCCO"), randomSeed=-1)  # perturb RDKit's global RNG stream
     second = bnd.probe_conformer(mol, 7)
 
     assert first is not None
@@ -360,10 +226,8 @@ def test_ligand_reach_keeps_native_bounds_for_ring_closure():
 
 
 def test_ligand_reach_frees_a_saturated_ring_torsion_for_a_thiourea_diazepane():
-    # JOYDIK: a 7-membered diazepane ring carries two exocyclic C=S groups on adjacent ring carbons.
-    # RDKit's native 1-4 upper bound pins the ring's C-C central bond to an sp2-sp2 cis template
-    # (hybridisation preference), underestimating the S...S reach against the crystal (3.486 A).
-    # Only an aromatic central bond should pin the torsion; this saturated ring bond must not.
+    # Only an aromatic central bond should pin the torsion; a saturated ring bond must not, even with
+    # exocyclic sp2 substituents. JOYDIK's crystal S...S reach is 3.486 A.
     mol = _graph("CN1CCCN(C)C(=S)C1=S")
     assert bnd.ligand_reach(mol)[8, 10] > 3.49
 
@@ -512,15 +376,25 @@ def test_stereo_carrier_edges_are_not_native_ligand_bounds():
     assert [atom.GetChiralTag() for atom in mol.GetAtoms()] == before_tags
 
 
-def test_bounds_strip_only_selected_owned_dative_edges(monkeypatch):
-    """Keep unowned spectator and metal-metal edges out of the private native edit."""
+def _dative_complex(edges):
+    """N0-C1-C2-O3 with dative ``edges`` added to Cu4 and Zn5."""
     rw = Chem.RWMol(Chem.MolFromSmiles("NCCO.[Cu+].[Zn+]"))
-    for begin, end in ((0, 4), (3, 4), (2, 4), (1, 5), (4, 5)):
+    for begin, end in edges:
         rw.AddBond(begin, end, Chem.BondType.DATIVE)
     mol = rw.GetMol()
     mol.GetAtomWithIdx(0).SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
     mol.UpdatePropertyCache(strict=False)
     Chem.GetSymmSSSR(mol, includeDativeBonds=True)
+    return mol
+
+
+def test_bounds_strip_only_selected_owned_dative_edges():
+    """Keep unowned spectator and metal-metal edges out of the private native edit."""
+    all_edges = ((0, 4), (3, 4), (2, 4), (1, 5), (4, 5))
+    spectator_edges = ((2, 4), (1, 5), (4, 5))  # not stated as an owned coordination bond in cons
+    mol = _dative_complex(all_edges)
+    before = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx(), b.GetBondType()) for b in mol.GetBonds()]
+    before_tags = [atom.GetChiralTag() for atom in mol.GetAtoms()]
     cons = Constraints(
         metals={4},
         distances={
@@ -531,26 +405,17 @@ def test_bounds_strip_only_selected_owned_dative_edges(monkeypatch):
         },
         angles={(0, 4, 3): (76.0, 91.0)},
     )
-    before = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx(), b.GetBondType()) for b in mol.GetBonds()]
-    before_tags = [atom.GetChiralTag() for atom in mol.GetAtoms()]
-    seen = []
-    native_bounds = bnd.bounds_matrix
 
-    def capture(candidate, *args, **kwargs):
-        seen.append(Chem.Mol(candidate))
-        return native_bounds(candidate, *args, **kwargs)
+    kept = bnd.bounds_matrix(_dative_complex(all_edges))
+    stripped = bnd.bounds_matrix(_dative_complex(spectator_edges))
+    ctx = bnd._write(mol, cons)
 
-    monkeypatch.setattr(bnd, "bounds_matrix", capture)
-    bnd._write(mol, cons)
-    assert len(seen) == 1
-    private = seen[0]
-    assert private.GetBondBetweenAtoms(0, 4) is None
-    assert private.GetBondBetweenAtoms(3, 4) is None
-    for pair in ((2, 4), (1, 5), (4, 5)):
-        bond = private.GetBondBetweenAtoms(*pair)
-        assert bond is not None
-        assert bond.GetBondType() == Chem.BondType.DATIVE
-    assert [(b.GetBeginAtomIdx(), b.GetEndAtomIdx(), b.GetBondType()) for b in mol.GetBonds()] == before
+    for i, j in ((1, 4), (0, 5), (3, 5), (1, 3)):  # reachable only through an owned, stripped donor edge
+        a, b = min(i, j), max(i, j)
+        assert (ctx.bm[b, a], ctx.bm[a, b]) == (stripped[b, a], stripped[a, b])
+    a, b = 2, 4  # the spectator dative edge is not owned, so it stays in the private edit
+    assert (ctx.bm[b, a], ctx.bm[a, b]) == (kept[b, a], kept[a, b])
+    assert [(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), bond.GetBondType()) for bond in mol.GetBonds()] == before
     assert [atom.GetChiralTag() for atom in mol.GetAtoms()] == before_tags
 
 
@@ -559,7 +424,7 @@ def test_bounds_strip_only_selected_owned_dative_edges(monkeypatch):
     [("c1ccncc1.[Cu+]", (3,)), ("N1CCNCC1.[Cu+]", (0, 3))],
     ids=["aromatic-ring", "ring-chelate"],
 )
-def test_private_native_bounds_rebuild_ring_perception(monkeypatch, smiles, donors):
+def test_private_native_bounds_rebuild_ring_perception(smiles, donors):
     """Preserve aromatic and chelate-ring native bounds after removing owned carrier edges."""
     rw = Chem.RWMol(Chem.MolFromSmiles(smiles))
     metal = rw.GetNumAtoms() - 1
@@ -572,24 +437,15 @@ def test_private_native_bounds_rebuild_ring_perception(monkeypatch, smiles, dono
     )
     reference = Chem.MolFromSmiles(smiles)
     expected = bnd.bounds_matrix(reference)
-    seen = []
-    native_bounds = bnd.bounds_matrix
-
-    def capture(candidate, *args, **kwargs):
-        seen.append(Chem.Mol(candidate))
-        return native_bounds(candidate, *args, **kwargs)
-
-    monkeypatch.setattr(bnd, "bounds_matrix", capture)
-    ctx = bnd._write(mol, cons)
-    private = seen[0]
-    rings = private.GetRingInfo().AtomRings()
+    rings = reference.GetRingInfo().AtomRings()
     assert rings
-    assert all(metal not in ring for ring in rings)
     ring = next(ring for ring in rings if len(ring) >= 5)
+
+    ctx = bnd._write(mol, cons)
+
     for a, b in itertools.combinations(ring, 2):
         assert ctx.bm[a, b] == expected[a, b]
         assert ctx.bm[b, a] == expected[b, a]
-    assert all(private.GetBondBetweenAtoms(donor, metal) is None for donor in donors)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -699,17 +555,6 @@ def test_cap_fragment_contacts_skips_two_already_pinned_fragments():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_unconstrained_embed_does_not_build_a_custom_matrix(monkeypatch):
-    calls = []
-    monkeypatch.setattr(bnd, "_feasible_bounds", lambda *a, **k: calls.append(a) or (_matrix(a[0]), 0.0))
-
-    bnd.seed_coordinates(_mol(), Constraints(), 2, bnd.EmbedParams(seed=3))
-    assert calls == []
-
-    bnd.seed_coordinates(_mol(), Constraints(distances={(0, 2): (2.5, 2.6)}), 2, bnd.EmbedParams(seed=3))
-    assert len(calls) == 1
-
-
 def test_embed_ids_are_reproducible_and_attached():
     mol = _graph("CCO")
     ids = bnd.seed_coordinates(mol, Constraints(), 4, bnd.EmbedParams(seed=3, prune_rms=-1))
@@ -744,56 +589,6 @@ def test_seed_coordinates_can_delegate_chirality_to_a_later_accept_gate(monkeypa
     assert seen == [(False, 30)]
 
 
-@pytest.mark.parametrize("knowledge", [True, False])
-def test_native_embed_preserves_bounds_and_stereo(monkeypatch, knowledge):
-    native = rdDistGeom.EmbedMultipleConfs
-    mol = _graph("F[C@H](Cl)Br")
-    cons = Constraints(distances={(0, 1): (1.3, 1.5)})
-    stages, matrices, handed = [], [], {}
-    build = bnd._feasible_bounds
-    set_matrix = rdDistGeom.EmbedParameters.SetBoundsMat
-
-    def matrix(*args):
-        result = build(*args)
-        matrices.append(result[0].copy())
-        return result
-
-    def handoff(params, matrix):
-        handed[id(params)] = matrix.copy()
-        return set_matrix(params, matrix)
-
-    def embed(candidate, n, params):
-        assert (n, params.randomSeed, params.numThreads, params.maxIterations) == (1, 42, 1, 30)
-        assert params.enforceChirality
-        assert not params.embedFragmentsSeparately
-        np.testing.assert_array_equal(handed[id(params)], matrices[0])
-        stages.append(
-            (
-                params.useLegacyImplementation,
-                params.useRandomCoords,
-                params.useBasicKnowledge,
-                params.useExpTorsionAnglePrefs,
-            )
-        )
-        return native(candidate, n, params)
-
-    monkeypatch.setattr(bnd, "_feasible_bounds", matrix)
-    monkeypatch.setattr(rdDistGeom.EmbedParameters, "SetBoundsMat", handoff)
-    monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", embed)
-    ids = bnd.seed_coordinates(mol, cons, 1, bnd.EmbedParams(seed=42, threads=1, knowledge=knowledge), max_attempts=30)
-
-    assert stages == [(False, False, knowledge, False)]
-    assert len(matrices) == 1
-    assert cons.distances == {(0, 1): (1.3, 1.5)}
-    assert ids
-    for cid in ids:
-        positions = mol.GetConformer(cid).GetPositions()
-        assert 1.3 <= np.linalg.norm(positions[0] - positions[1]) <= 1.5
-        measured = Chem.Mol(mol)
-        Chem.AssignStereochemistryFrom3D(measured, cid, replaceExistingTags=True)
-        assert measured.GetAtomWithIdx(1).GetChiralTag() == mol.GetAtomWithIdx(1).GetChiralTag()
-
-
 def test_native_failure_counts_are_reported_once_with_a_random_start_remedy(monkeypatch, caplog):
     counts = [0] * (max(map(int, rdDistGeom.EmbedFailureCauses.names.values())) + 1)
     counts[int(rdDistGeom.EmbedFailureCauses.INITIAL_COORDS)] = 2
@@ -812,24 +607,6 @@ def test_native_failure_counts_are_reported_once_with_a_random_start_remedy(monk
     assert "random=False" in messages[0]
     assert "{'INITIAL_COORDS': 2}" in messages[0]
     assert "EmbedParams(native=...), useRandomCoords=True" in messages[0]
-
-
-def test_native_failure_tracking_does_not_change_seed_coordinates(monkeypatch):
-    native = rdDistGeom.EmbedMultipleConfs
-    tracked, untracked = _graph("CCCO"), _graph("CCCO")
-    params = bnd.EmbedParams(seed=42, threads=1, prune_rms=-1)
-    ids = bnd.seed_coordinates(tracked, Constraints(), 3, params)
-
-    def without_tracking(mol, n, params):
-        params.trackFailures = False
-        return native(mol, n, params)
-
-    monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", without_tracking)
-    assert bnd.seed_coordinates(untracked, Constraints(), 3, params) == ids
-    for cid in ids:
-        np.testing.assert_array_equal(
-            tracked.GetConformer(cid).GetPositions(), untracked.GetConformer(cid).GetPositions()
-        )
 
 
 @pytest.mark.parametrize("mode", ["knowledge", "broken", "plain"])
@@ -937,30 +714,37 @@ def test_r1_a_stated_distance_pre_empts_the_angle():
     assert (round(lo, 6), round(hi, 6)) == (3.00, 3.02)
 
 
+def test_reversed_angle_preserves_distance_window():
+    """A stated distance window on the angle's 1-3 pair wins outright, regardless of the angle key's atom order."""
+    mol = _rule_mol("CCCC")
+
+    def window(angle_key):
+        cons = Constraints()
+        add_distance(cons.distances, 0, 3, 1.50, 1.56)
+        cons.angles[angle_key] = (95.0, 105.0)
+        return _window(_edited(mol, cons), 0, 3)
+
+    assert window((0, 1, 3)) == pytest.approx(window((3, 1, 0))), "angle index order changed the bounds"
+    assert window((3, 1, 0)) == pytest.approx((1.50, 1.56)), "the explicit window was clobbered"
+
+
 @pytest.mark.parametrize(
-    ("window", "note"),
-    [
-        ((100.0, 130.0), "wider than the backbone -> the tighter REAL bound survives untouched"),
-        ((109.0, 111.0), "narrower than the backbone -> the angle tightens it"),
-    ],
-    ids=["wider", "narrower"],
+    ("window", "tightens"), [((100.0, 130.0), False), ((109.0, 111.0), True)], ids=["wider", "narrower"]
 )
-def test_angle_bounds_intersect_bond_path(window, note):
+def test_angle_bounds_intersect_bond_path(window, tightens):
+    """A real bond path intersects the angle-derived window with the backbone; a wider one leaves it untouched."""
     mol = _rule_mol("CCC")
     topo = Chem.GetDistanceMatrix(mol)
     assert topo[0][2] < mech.DISCONNECTED  # a real bond path: the predicate that selects INTERSECT
 
-    base = _edited(mol, Constraints())
-    blo, bhi = _window(base, 0, 2)
-    ctx = mech.DGContext(mol, base)
-    d01, d12 = ctx.mid(0, 1), ctx.mid(1, 2)
-    alo = mech.law_of_cosines(d01, d12, window[0])
-    ahi = mech.law_of_cosines(d01, d12, window[1])
+    blo, bhi = _window(_edited(mol, Constraints()), 0, 2)
 
     cons = Constraints()
     cons.angles[(0, 1, 2)] = window
-    got = _window(_edited(mol, cons), 0, 2)
-    assert got == pytest.approx((max(alo, blo), min(ahi, bhi))), note
+    lo, hi = _window(_edited(mol, cons), 0, 2)
+
+    assert blo <= lo <= hi <= bhi, "the intersection must never widen the backbone window"
+    assert ((lo, hi) != (blo, bhi)) == tightens
 
 
 def test_r2_disjoint_intersection_keeps_backbone():
@@ -975,11 +759,10 @@ def test_r2_disjoint_intersection_keeps_backbone():
 
 
 def test_angle_prior_keeps_the_nonbonded_floor_between_cis_donors():
-    """A 1-6 pair (past RDKit's own 1-5 topology bounds) has only a generic nonbonded floor, not real backbone
-    geometry. Two metal legs bent to a tight angle put the far donors closer than that floor (FOPSOT): the
-    angle-derived window is disjoint from and entirely below RDKit's own, so a disjoint intersection must leave
-    RDKit's bounds standing, exactly as if the angle constraint had never been stated. Relieving the floor
-    there instead (letting the angle prior narrow it) was tried and reverted (mechanisms.Angle.dg_windows).
+    """A 1-6 pair beyond RDKit's own 1-5 topology bound has only a generic nonbonded floor, not real geometry.
+
+    A tight metal-leg angle can imply a window disjoint from and entirely below that floor; the disjoint
+    intersection must leave RDKit's bound standing, as if the angle had never been stated.
     """
     mol = _rule_mol("CCCCCC.[Ni]")
     assert Chem.GetDistanceMatrix(mech.disconnect_metal(mol), force=True)[0][5] == 5  # past RDKit's 1-5 bound

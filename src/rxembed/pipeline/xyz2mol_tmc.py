@@ -3,7 +3,7 @@
 Modifications:
 - ranked assignment (``_fast_bond_orders`` + ``_donor_localised_candidates`` + ``_lig_rank_key``)
 - the invented-H gate (``_invented_hydrogens``)
-- the canonical numbering boundary (``blind_canonical_order``, applied in ``get_lig_mol``)
+- the canonical numbering and bond-order boundary (``blind_canonical_order``, ``_canonical_bonds``)
 - hydride-bridge and agostic reconnection
 - ``_sanitized`` as the single sanitize, so every candidate is ranked on one rule
 - the metal-charge cap and its rescue (``_rescue_over_cap_ligand_charges``, ``_hole_donors``)
@@ -50,9 +50,6 @@ TRANSITION_METALS_NUM: list[int] = [
 
 _UNSANITIZABLE = 999  # sorts above any real implicit-H count, so such a candidate loses
 _BOND_ORDER_MAX_ITERS = 10_000  # bound each native charge hypothesis; failure advances the existing ladder
-# Bound the AC2mol fallback in _fast_bond_orders. Its time grows with the number of valence combinations
-# (seconds past about 1,000, and a porphyrin has millions), while the ligands it reads need fewer than ten.
-_AC2BO_MAX_COMBINATIONS = 256
 _H, _B, _C = 1, 5, 6  # atomic numbers used by the reconnection and agostic checks
 _PT = GetPeriodicTable()
 
@@ -75,6 +72,24 @@ def blind_canonical_order(mol: Chem.Mol, coordinating_atoms=()) -> list:
     for idx, rank in enumerate(ranks):
         order[rank] = idx
     return order
+
+
+def _canonical_bonds(mol):
+    """Return `mol` with its bonds re-added in sorted atom-pair order.
+
+    RenumberAtoms keeps the input's bond list, and a bond-order search walks bonds in that order. A coordinate
+    reader adds bonds in distance order, so two geometries of one graph would otherwise reach different first
+    assignments.
+    """
+    bonds = sorted((*sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx())), b.GetBondType()) for b in mol.GetBonds())
+    rw = Chem.RWMol(mol)
+    for begin, end, _bond_type in bonds:
+        rw.RemoveBond(begin, end)
+    for begin, end, bond_type in bonds:
+        rw.AddBond(begin, end, bond_type)
+    out = rw.GetMol()
+    out.UpdatePropertyCache(strict=False)
+    return out
 
 
 logger = logging.getLogger(__name__)
@@ -489,6 +504,32 @@ def _donor_localised_candidates(mol, charge, coordinating_atoms):
     return out
 
 
+def _saturated_donor_charges(mol, coordinating_atoms):
+    """Return ``{donor: charge}`` for donors whose missing valence no bond order can supply.
+
+    A donor short of its default valence normally closes it with a pi bond to a neighbour. When every
+    neighbour already spends its whole valence on sigma bonds and has no lone pair to donate, no pi
+    partner exists, so the deficit can only be a formal charge (an amido N-, an alkoxide O-). RDKit's
+    bond-order search throws at every total charge on such a donor instead of charging it.
+    """
+    out = {}
+    for index in coordinating_atoms:
+        atom = mol.GetAtomWithIdx(int(index))
+        deficit = _PT.GetDefaultValence(atom.GetAtomicNum()) - atom.GetDegree()
+        if deficit <= 0 or not atom.GetDegree():
+            continue
+        # A neighbour already at its default valence, with 4 or fewer outer electrons, has no lone pair left
+        # to spare as a pi donor: no pi partner exists for `atom`, so its deficit must be a formal charge.
+        no_lone_pair = all(
+            n.GetDegree() >= _PT.GetDefaultValence(n.GetAtomicNum())
+            and _PT.GetNOuterElecs(n.GetAtomicNum()) <= 4
+            for n in atom.GetNeighbors()
+        )
+        if no_lone_pair:
+            out[atom.GetIdx()] = -deficit
+    return out
+
+
 def _fast_bond_orders(mol, charge, coordinating_atoms, return_pool=False):
     """Perceive bond orders with RDKit's compiled implementation.
 
@@ -514,6 +555,19 @@ def _fast_bond_orders(mol, charge, coordinating_atoms, return_pool=False):
     native = []
     strict, relaxed = {}, {}
 
+    if charge == 0 and all(
+        atom.GetDegree() == _PT.GetDefaultValence(atom.GetAtomicNum()) and not atom.GetFormalCharge()
+        for atom in mol.GetAtoms()
+    ):
+        # A graph that already closes every atom's default valence with single bonds is its own Lewis
+        # structure (AC2mol's first test). RDKit's compiled search skips that test and instead promotes
+        # a saturated ring such as P6 to a hypervalent P#P/P-P pattern, stripping the donors' lone pairs.
+        single = Chem.Mol(mol)
+        single.UpdatePropertyCache(strict=False)
+        saturated = next(iter(lig_checks(single, coordinating_atoms, resonate=False)), None)
+        if saturated is not None and saturated[4] == 0:
+            return [(saturated[0], 0)] if return_pool else (saturated[0], 0)
+
     def consider(candidate, candidate_charge):
         if candidate[4] != 0:
             return
@@ -526,9 +580,12 @@ def _fast_bond_orders(mol, charge, coordinating_atoms, return_pool=False):
         ):
             strict[candidate_charge] = candidate
 
+    seeded = _saturated_donor_charges(mol, coordinating_atoms)
     for c in charges:
         try:
             work = Chem.RWMol(mol)
+            for index, q in seeded.items():
+                work.GetAtomWithIdx(index).SetFormalCharge(q)
             rdDetermineBonds.DetermineBondOrders(
                 work,
                 charge=int(c),
@@ -542,28 +599,6 @@ def _fast_bond_orders(mol, charge, coordinating_atoms, return_pool=False):
         native.append((c, cand))
         for candidate in possible:
             consider(candidate, c)
-
-    if not native:
-        # RDKit's port of AC2mol throws at every charge on some graphs the Python original assigns, such as
-        # a saturated amide anion. That is a property of the graph, not the geometry, so AC2mol runs here at
-        # the hint, bounded, and a form counts only when it is clean (upstream's own acceptance test).
-        try:
-            assigned = AC2mol(
-                Chem.Mol(mol),
-                Chem.GetAdjacencyMatrix(mol),
-                [atom.GetAtomicNum() for atom in mol.GetAtoms()],
-                int(charge),
-                allow_charged_fragments=True,
-                use_atom_maps=False,
-                max_combinations=_AC2BO_MAX_COMBINATIONS,
-            )
-            if assigned:
-                assigned = _localise_donor_pairs(assigned, coordinating_atoms)
-                for candidate in lig_checks(assigned, coordinating_atoms, resonate=False):
-                    if candidate[1] + candidate[2] == 0 and candidate[5] == 0:
-                        consider(candidate, charge)
-        except (KeyError, ValueError):  # upstream's electron table has no entry for some elements, such as Al
-            pass
 
     # ...and the candidates the blind search cannot reach.
     for c in charges:
@@ -652,7 +687,7 @@ def get_lig_mol(mol, charge, coordinating_atoms):
 
     order = blind_canonical_order(mol, coordinating_atoms)  # order[new] = old
     new_of = {old: new for new, old in enumerate(order)}
-    canon = Chem.RenumberAtoms(mol, order)
+    canon = _canonical_bonds(Chem.RenumberAtoms(mol, order))
     coord = [new_of[int(a)] for a in coordinating_atoms if int(a) in new_of]
     back = [new_of[i] for i in range(mol.GetNumAtoms())]  # canon -> the caller's numbering
     atoms = [a.GetAtomicNum() for a in canon.GetAtoms()]
@@ -741,7 +776,7 @@ def _ligand_charge_pool(mol, charge, coordinating_atoms):
         return []
     order = blind_canonical_order(mol, coordinating_atoms)  # order[new] = old
     new_of = {old: new for new, old in enumerate(order)}
-    canon = Chem.RenumberAtoms(mol, order)
+    canon = _canonical_bonds(Chem.RenumberAtoms(mol, order))
     coord = [new_of[int(a)] for a in coordinating_atoms if int(a) in new_of]
     back = [new_of[i] for i in range(mol.GetNumAtoms())]  # canon -> the caller's numbering
     pool = _fast_bond_orders(canon, charge, coord, return_pool=True)

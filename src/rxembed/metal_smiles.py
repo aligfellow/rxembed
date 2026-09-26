@@ -49,6 +49,7 @@ logger = logging.getLogger("rxembed.metal")  # spelled out, not __name__: the na
 _E_BOND = {Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOTRANS}
 _Z_BOND = {Chem.BondStereo.STEREOZ, Chem.BondStereo.STEREOCIS}
 _POINT_TAGS = {"CW": Chem.ChiralType.CHI_TETRAHEDRAL_CW, "CCW": Chem.ChiralType.CHI_TETRAHEDRAL_CCW}
+_TAG_CODES = {tag: code for code, tag in _POINT_TAGS.items()}
 _CX_BOND_FIELD = re.compile(r"(?:^|,)([ct]):((?:\d+(?:,\d+)*)?)(?=,|$)")
 _CX_BOND_PREFIX = re.compile(r"(?:^|,)[ct]:")
 
@@ -375,7 +376,7 @@ def _rebase_native_stereo(mol, wanted, wanted_bonds, params):
         tag = back.GetAtomWithIdx(positions[idx]).GetChiralTag()
         if tag not in _POINT_TAGS.values():
             raise ValueError(f"native canonicalization lost point stereo at atom {idx}")
-        mapped_wanted[positions[idx]] = "CW" if tag == Chem.ChiralType.CHI_TETRAHEDRAL_CW else "CCW"
+        mapped_wanted[positions[idx]] = _TAG_CODES[tag]
     mapped_bonds = {frozenset(positions[idx] for idx in pair): code for pair, code in wanted_bonds.items()}
     smi, rebased_order, rebased_bonds = _write_native_stereo(back, mapped_wanted, mapped_bonds, rebase=False)
     return smi, [order[idx] for idx in rebased_order], rebased_bonds
@@ -389,9 +390,6 @@ def _write_native_stereo(mol, wanted, wanted_bonds, *, rebase=True):
     atom order as given, for the second pass of `_rebase_native_stereo`.
     """
     mol = Chem.Mol(mol)
-    for idx, code in wanted.items():
-        if code in _POINT_TAGS:
-            mol.GetAtomWithIdx(idx).SetChiralTag(_POINT_TAGS[code])
     params = Chem.SmilesWriteParams()
     params.cleanStereo = False  # every retained tag was proved upstream; RDKit otherwise deletes chiral amines
     params.canonical = rebase
@@ -646,6 +644,12 @@ def _write_dative(mol, stereo_label, *, stated=False):
     source = Chem.Mol(mol)
     source.UpdatePropertyCache(strict=False)
     expected = _atoms_with_h(source)
+    # A raw CW/CCW code (a centre CIP cannot rank) is a tag in `source`'s bond order. Set it there, so each edit
+    # below carries it into the written order as it carries any tag: removing a hydrogen or re-seating a bond
+    # can mirror a tag, and the bare code cannot follow that.
+    raw = {idx: _POINT_TAGS[code] for idx, code in point_stereo(stereo_label).items() if code in _POINT_TAGS}
+    for idx, tag in raw.items():
+        source.GetAtomWithIdx(idx).SetChiralTag(tag)
     # An isomer can state a hand against its carried coordinates: an enumerated locked donor or stereo='invert'.
     # Parity reads the tag in the all-bonds basis rxembed stores. A tag left in RDKit's 3D basis, which omits a
     # dative bond at an odd slot (`metal_core._retag`), would read as stated against the coordinates.
@@ -676,14 +680,21 @@ def _write_dative(mol, stereo_label, *, stated=False):
             bond.SetStereo(Chem.BondStereo.STEREONONE)  # RDKit leaves single-bond atrop tags behind.
     elif out.GetNumConformers():
         # Normalizing metal bonds changes neighbour order; rebase retained stereo from coordinates.
+        stated_raw = {idx: out.GetAtomWithIdx(idx).GetChiralTag() for idx in raw}  # the label wins, as R/S does
         stereo_from_3d(out, metal_indices(out), apply=True)
         for idx in against:
             atom = out.GetAtomWithIdx(idx)
             atom.SetChiralTag(mirror_tag(atom.GetChiralTag()))
+        for idx, tag in stated_raw.items():
+            out.GetAtomWithIdx(idx).SetChiralTag(tag)
     _drop_unproved_stereo(out, wanted, wanted_bonds)
     out, reduced = remove_routine_hydrogens(out, _kept_hydrogens(out, wanted_bonds))
     original = {new: old for old, new in reduced.items()}
-    wanted = {reduced[idx]: code for idx, code in wanted.items() if idx in reduced}
+    wanted = {
+        reduced[idx]: _TAG_CODES[out.GetAtomWithIdx(reduced[idx]).GetChiralTag()] if idx in raw else code
+        for idx, code in wanted.items()
+        if idx in reduced
+    }
     wanted_bonds = {
         frozenset(reduced[idx] for idx in pair): code for pair, code in wanted_bonds.items() if pair <= reduced.keys()
     }

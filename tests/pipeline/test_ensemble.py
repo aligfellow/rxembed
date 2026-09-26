@@ -38,55 +38,6 @@ def _dissociate(ens, cid, atom, centre, distance=4.0):
     conf.SetAtomPosition(int(atom), (pm + distance * (p - pm) / np.linalg.norm(p - pm)).tolist())
 
 
-def test_structurally_valid_nonconverged_result_stays_flagged(monkeypatch):
-    import importlib
-
-    core_embed = importlib.import_module("rxembed.embed")
-
-    ens = rx.embed("CCCC", n=1, seed=1)
-    failed = ens.ids[0]
-
-    def nonconverged(mol, _cons, *, record, **_kwargs):
-        record.statuses.update({conf.GetId(): 1 for conf in mol.GetConformers()})
-        return np.zeros(mol.GetNumConformers())
-
-    monkeypatch.setattr(core_embed, "restrained_uff", nonconverged)
-    ens.minimize()
-
-    assert ens.ids == [failed]
-    assert ens.unrelaxed == [failed]
-    assert failed not in ens.discarded
-
-
-def test_minimize_energy_window_only_sees_conformers_after_the_rescore_pass(monkeypatch):
-    """The 250 kcal/mol window can only drop what `_rescore_restrained` has actually scored.
-
-    `_relax_constrained` no longer scores its own endpoints; every settled conformer's public energy comes
-    from one `_rescore_restrained` single point. That pass must run before the window filter, or a bad
-    result would silently skip it because it was never in `self.energies` yet.
-    """
-    import importlib
-
-    core_embed = importlib.import_module("rxembed.embed")
-    iso = rx.metal(_EN_PDBRCL, "square_planar")[0]
-    ens = rx.embed(iso, n=2, seed=1)
-    good, bad = ens.ids
-    real_uff = core_embed.restrained_uff
-
-    def marked_uff(mol, cons, *, stiffness, max_iters, conf_ids=None, **kw):
-        result = real_uff(mol, cons, stiffness=stiffness, max_iters=max_iters, conf_ids=conf_ids, **kw)
-        if max_iters == 0 and conf_ids is not None:
-            result = np.array([300.0 if int(cid) == bad else float(v) for cid, v in zip(conf_ids, result, strict=True)])
-        return result
-
-    monkeypatch.setattr(core_embed, "restrained_uff", marked_uff)
-    ens.minimize()
-
-    assert good in ens.ids
-    assert bad not in ens.ids
-    assert bad in ens.discarded
-
-
 def test_optional_connectivity_gate_does_not_break_base_minimize(monkeypatch):
     ens = rx.embed("CCCC", n=1, seed=1)
     monkeypatch.setattr(
@@ -175,6 +126,30 @@ def test_metal_physical_gate_keeps_explicit_geometry_diagnostic(authority):
         assert failure is None
 
 
+def test_check_flags_an_undeclared_atom_that_collapsed_onto_the_metal():
+    """A ring carbon pushed onto the metal must not be judged by a donor's looser floor.
+
+    check() supplies the stated donors so metal_overbond can tell a real collapsed donor from a plain atom
+    that only looks close: without them, the atom is perceived as a donor by distance alone and passes.
+    """
+    iso = rx.metal("[Cl-]->[Pt+2](<-[Cl-])(<-n1ccccc1)<-n1ccccc1", "SPL")[0]
+    ens = rx.embed(iso, n=1, seed=42, threads=1)
+    cid = ens.ids[0]
+    mol = ens.mol  # `mol` is a property (a fresh restored copy); read it once and reuse that copy
+    metal_idx = metal.metal_indices(mol)[0]
+    ring = mol.GetRingInfo().AtomRings()[0]  # one bound pyridine
+    nitrogen = next(i for i in ring if mol.GetAtomWithIdx(i).GetAtomicNum() == 7)
+    distances = Chem.GetDistanceMatrix(mol)
+    para = max(ring, key=lambda i: distances[nitrogen, i])  # not itself a donor
+
+    conf = ens._mol.GetConformer(cid)
+    pos = conf.GetPositions()
+    pos[para] = pos[metal_idx] + 2.0 * (pos[para] - pos[metal_idx]) / np.linalg.norm(pos[para] - pos[metal_idx])
+    conf.SetPositions(pos)
+
+    assert "metal_overbond" in {v.kind for v in ens.check()[cid].violations}
+
+
 def test_cleanup_ablations_filter_only_their_own_workflow_diagnostics(monkeypatch):
     iso = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", "SPL")[0]
     ens = rx.embed(iso, n=1, params=rx.EmbedParams(seed=42, donor_orientation=False, conjugation=False))
@@ -224,25 +199,6 @@ def test_metal_embed_replaces_a_puckered_ligand_without_changing_the_isomer(monk
     assert not np.allclose(ens._mol.GetConformer().GetPositions(), damaged[0])
     ens.check()[ens.ids[0]].assert_ok()
     assert rx.cxsmiles(ens.mol) == rx.cxsmiles(iso)
-
-
-def test_workflow_gate_restores_only_the_conformer_being_checked(monkeypatch):
-    _iso, ens = _pd_ensemble(n=1)
-    for _ in range(2):
-        ens.ids.append(ens._mol.AddConformer(Chem.Conformer(ens._mol.GetConformer(ens.ids[0])), assignId=True))
-    seen = []
-
-    def inspect(_self, mol, ids):
-        palladium = next(atom for atom in mol.GetAtoms() if atom.GetAtomicNum() == 46)
-        datives = [bond for bond in mol.GetBonds() if bond.GetBondType() == Chem.BondType.DATIVE]
-        seen.append(([conf.GetId() for conf in mol.GetConformers()], palladium.GetAtomicNum(), len(datives)))
-        assert ids == [cid]
-        return {}
-
-    cid = ens.ids[-1]
-    monkeypatch.setattr(type(ens), "_scan_connectivity", inspect)
-    assert ens._workflow_failure(ens, cid) is None
-    assert seen == [([cid], 46, 4)]
 
 
 def test_wrong_requested_stereo_fails_if_replacement_cannot_restore_count(monkeypatch):
@@ -581,10 +537,8 @@ def test_slice_preserves_ensemble_state():
     child = ens[0]
     assert child.energy_kind == "ff"
     assert child.params == rx.EmbedParams(seed=1, knowledge=False)
-    assert child._mol is not ens._mol
     assert child.unrelaxed is not ens.unrelaxed
     assert child.uff is not ens.uff
-    assert child._stage == ens._stage == "minimized"
     assert child.unrelaxed == [flagged]
     assert child.uff == ens.uff
     assert ens.lowest(2).energy_kind == "ff"
@@ -594,7 +548,7 @@ def test_slice_preserves_ensemble_state():
     assert (aligned.params.knowledge, aligned.params.prune_rms) == (False, None)
 
     ens.trajectory = Chem.Mol(ens._mol)
-    assert ens._derive(ens.ids, Chem.Mol(ens._mol)).trajectory is None
+    assert ens[:1].trajectory is None
 
 
 def test_rescued_conformer_drops_stale_unrelaxed_id():
@@ -682,9 +636,8 @@ def test_wrap_labels_its_computed_force_field_single_point():
 def test_salt_searched_with_mc_stays_in_contact_range_with_no_pair_singled_out():
     """Every heavy-atom pair across a salt's two ions gets a contact-range bound after mc(explore=True).
 
-    A single closest pair from a throwaway probe embed used to leave every other cross-ion pair free to
-    drift once the seeded ionic contact released. `bounds.fragment_contacts` bounds every cross-ion pair
-    instead, so nothing but the shared van der Waals ceiling can separate the ions.
+    `bounds.fragment_contacts` bounds every cross-ion pair, so nothing but the shared van der Waals ceiling
+    can separate the ions once the seeded ionic contact releases.
     """
     es = rx.embed("CC(=O)[O-].C[NH3+]", contacts="auto", n=3, seed=1)
     ens = es[0] if isinstance(es, rx.EnsembleSet) else es

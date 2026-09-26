@@ -44,6 +44,10 @@ _CERTIFICATE_STEPS = 32  # accelerated-gradient step budget for the refinement s
 _CROSS_EPS = 1e-9  # Å, floating-point slack shared by every closed-bound comparison against a reach matrix
 _COMPILED_CONSTRAINTS_KEY = "_span_compiled"  # context scratch slot: this candidate's compiled constraints,
 # written by _compiled_span_failure and consumed once by unreachable_span; never read stale (see both).
+_CERTIFICATE_MEMO_KEY = "_certificate_memo"  # context scratch slot: _certified_conflict results for this
+# screen. A screen reasks the same bounds many times across candidates but never across screens, so the memo
+# lives in the caller's context and is freed with it, rather than in a module-level cache that keeps evicting
+# entries mid-screen and recomputing them.
 
 
 def _radial_distance_windows(iso, mol, atoms, positions, base_distances=None, context=None):
@@ -316,10 +320,16 @@ def _centering_matrix(n):
     return np.eye(n) - np.ones((n, n)) / n
 
 
-def _euclidean_conflict(matrix, *, refine=False):
-    """Say whether these distance bounds are impossible, cached since every candidate reasks the same ones."""
+def _euclidean_conflict(matrix, *, refine=False, context=None):
+    """Say whether these distance bounds are impossible, memoised since every candidate reasks the same ones."""
     array = np.ascontiguousarray(matrix, dtype=float)
-    return _certified_conflict(array.shape[0], array.tobytes(), bool(refine))
+    key = (array.shape[0], array.tobytes(), bool(refine))
+    if context is None:
+        return _certified_conflict(*key)
+    memo = context.setdefault(_CERTIFICATE_MEMO_KEY, {})
+    if key not in memo:
+        memo[key] = _certified_conflict(*key)
+    return memo[key]
 
 
 def _eigen_witnesses(groups, values, vectors, centre):
@@ -350,7 +360,6 @@ def _projected_witnesses(gram, lower, upper, n):
     yield basis @ basis.T
 
 
-@functools.lru_cache(maxsize=4096)
 def _certified_conflict(n, payload, refine):
     """Return a certified positive squared-distance margin, or None without a Euclidean contradiction.
 
@@ -472,7 +481,7 @@ def _compiled_span_failure(iso, reach, compiled=None, native=None, context=None)
         for subset in _route_certificate_subsets(path):
             atoms = sorted((iso.metal, *subset))
             # Refine the whole route once; its smaller diagnostic subsets retain the cheap midpoint test.
-            if _euclidean_conflict(closed[np.ix_(atoms, atoms)], refine=subset == path) is not None:
+            if _euclidean_conflict(closed[np.ix_(atoms, atoms)], refine=subset == path, context=context) is not None:
                 return f"compiled coordination distances have no Euclidean realization at atoms {atoms}"
     return None
 

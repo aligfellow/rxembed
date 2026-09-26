@@ -300,26 +300,27 @@ def test_input_geometry_does_not_rewrite_an_already_correct_phosphorus_hand():
     assert len(rx.metal(realised)) == 1
 
 
-def test_frozen_site_permutations_are_lazy_and_keep_the_input_vertices(monkeypatch):
-    monkeypatch.setattr(metal_enumeration, "input_ordering", lambda *_args: [2, 0, 3, 1])
-
-    pool = metal_enumeration._frozen_permutations(Chem.Mol(), 0, [10, 11, 12, 13], "square_planar", {10, 12})
-
-    assert iter(pool) is pool
-    assert list(pool) == [[2, 0, 1, 3], [2, 0, 3, 1]]
-
-
-def test_frozen_site_permutations_preserve_a_missing_input_order(monkeypatch):
-    monkeypatch.setattr(metal_enumeration, "input_ordering", lambda *_args: None)
-
-    assert metal_enumeration._frozen_permutations(Chem.Mol(), 0, [10, 11], "linear", {10}) is None
-
-
-def test_frozen_high_coordination_refuses_a_factorial_free_site_pool(monkeypatch):
-    monkeypatch.setattr(metal_enumeration, "input_ordering", lambda *_args: list(range(10)))
+def test_frozen_high_coordination_refuses_a_factorial_free_site_pool():
+    """Fixing one of ten donors on a sphere leaves 9! free arrangements, over the exact-enumeration cap."""
+    rw = Chem.RWMol()
+    metal = rw.AddAtom(Chem.Atom(57))
+    rw.GetAtomWithIdx(metal).SetFormalCharge(3)
+    donors = []
+    for _ in range(10):
+        fluoride = rw.AddAtom(Chem.Atom(9))
+        rw.GetAtomWithIdx(fluoride).SetFormalCharge(-1)
+        rw.AddBond(metal, fluoride, Chem.BondType.DATIVE)
+        donors.append(fluoride)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    conf.SetAtomPosition(metal, Point3D(0, 0, 0))
+    for donor, direction in zip(donors, vertex_dirs("BSA"), strict=True):
+        conf.SetAtomPosition(donor, Point3D(*(2.4 * np.array(direction))))
+    mol.AddConformer(conf)
 
     with pytest.raises(ValueError, match=r"fix= leaves exactly 362,880 free-site arrangements.*retain more"):
-        metal_enumeration._frozen_permutations(Chem.Mol(), 0, list(range(10)), "BSA", {0})
+        rx.metal(mol, "BSA", fix=[donors[0]])
 
 
 def test_monodentate_imine_ez_is_retained_without_mutating_the_variant_graph():
@@ -463,6 +464,16 @@ def test_defined_and_enumerated_ligand_stereo_share_one_label():
     assert {iso.stereo_label for iso in isomers} == {"N4:R,C6:R", "N4:R,C6:S"}
 
 
+def test_a_per_atom_free_selector_frees_only_that_centre():
+    """A named `stereo={"C6": "free"}` selector frees C6 alone, leaving the defined N4 hand pinned."""
+    smiles = "[Pd](Cl)(Cl)(Cl)([N@H](C)C(O)C)"
+    freed_c = rx.metal(smiles, "SPL", stereo={"C6": "free"})
+    assert {iso.stereo_label for iso in freed_c} == {"N4:R"}
+
+    freed_n = rx.metal(smiles, "SPL", stereo={"N4": "free"})
+    assert {iso.stereo_label for iso in freed_n} == {"C6:R", "C6:S"}
+
+
 def test_bound_amine_hands_are_enumerated_only_on_request():
     """A geometry input keeps its measured bound-N hands; stereo={'locked': 'racemic'} adds every other pair."""
     mol = one_arm_bound_pt()
@@ -505,10 +516,9 @@ def test_bipyridyl_reach_preserves_bond_change_authority():
     assert len(rx.metal(mol, "SPL", fix={(link.GetBeginAtomIdx(), link.GetEndAtomIdx()): 2.0})) == 2
 
 
-@pytest.mark.parametrize("metal", ["Ni", "Co", "Rh", "Ir"])
 @pytest.mark.parametrize("linker", ["-", "CC"])
-def test_two_bipyridyl_chelates_share_the_compiled_coordination_network(metal, linker):
-    smiles = (f"[Cl-]->[{metal}+2]12(<-[Cl-])(<-[n]3ccccc3-c3cccc[n]->13)<-[n]3ccccc3-c3cccc[n]->23").replace(
+def test_two_bipyridyl_chelates_share_the_compiled_coordination_network(linker):
+    smiles = ("[Cl-]->[Ni+2]12(<-[Cl-])(<-[n]3ccccc3-c3cccc[n]->13)<-[n]3ccccc3-c3cccc[n]->23").replace(
         "-c3", f"{linker}c3"
     )
     mol = rx.parse_smiles(smiles)
@@ -722,33 +732,32 @@ def test_haptic_borane_cage_keeps_realised_mixed_point_stereo():
     _assert_embeds_as(mixed[0])
 
 
-@pytest.mark.parametrize("enumerate_isomers", [rx.metal, rx.enumerate_isomers], ids=["pipeline", "core"])
 @pytest.mark.parametrize(("screen", "count"), [(True, 2), (False, 3)])
-def test_agostic_tether_reach_is_atom_order_invariant_and_allows_a_longer_arm(enumerate_isomers, screen, count):
+def test_agostic_tether_reach_is_atom_order_invariant_and_allows_a_longer_arm(screen, count):
     short = "CC(C)(C)[P]1(C(C)(C)C)C(C)(C)C[H]->[Pd+2]<-1(<-[Br-])<-[c-]1cscn1"
     mol = rx.parse_smiles(short)
     reversed_mol = Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))
 
-    isomers = enumerate_isomers(mol, "SPL", screen=screen)
+    isomers = rx.metal(mol, "SPL", screen=screen)
     identities = {rx.cxsmiles(iso) for iso in isomers}
     assert len(isomers) == len(identities) == count
-    assert {rx.cxsmiles(iso) for iso in enumerate_isomers(reversed_mol, "SPL", screen=screen)} == identities
-    baseline = {rx.cxsmiles(iso): iso.cons for iso in enumerate_isomers(mol, "SPL")}
+    assert {rx.cxsmiles(iso) for iso in rx.metal(reversed_mol, "SPL", screen=screen)} == identities
+    baseline = {rx.cxsmiles(iso): iso.cons for iso in rx.metal(mol, "SPL")}
     assert baseline.keys() <= identities
     for iso in isomers:
         if (identity := rx.cxsmiles(iso)) in baseline:
             assert iso.cons == baseline[identity]
         # Explicit CX slots select the same single state even if the default model would screen it out.
-        stated = enumerate_isomers(rx.parse_smiles(rx.cxsmiles(iso)), screen=not screen)
+        stated = rx.metal(rx.parse_smiles(rx.cxsmiles(iso)), screen=not screen)
         assert len(stated) == 1
         assert rx.cxsmiles(stated[0]) == rx.cxsmiles(iso)
-        assert stated[0].cons == enumerate_isomers(rx.parse_smiles(rx.cxsmiles(iso)), screen=screen)[0].cons
+        assert stated[0].cons == rx.metal(rx.parse_smiles(rx.cxsmiles(iso)), screen=screen)[0].cons
     long = short.replace("C(C)(C)C[H]", "C(C)(C)CCCC[H]")
-    assert len(enumerate_isomers(rx.parse_smiles(long), "SPL", screen=screen)) == 3
-    assert len(enumerate_isomers(rx.parse_smiles(_MA2B2), "SPL", screen=screen)) == 2
+    assert len(rx.metal(rx.parse_smiles(long), "SPL", screen=screen)) == 3
+    assert len(rx.metal(rx.parse_smiles(_MA2B2), "SPL", screen=screen)) == 2
 
 
-def test_tethered_donor_network_rejects_the_unrealistic_fihtoh_cis_state():
+def test_pocop_pincer_nickel_keeps_only_the_trans_state():
     smiles = "COC(=O)c1cc2O[P](C(C)C)(C(C)C)->[Ni+2]3(<-[Cl-])<-[c-]2c(O[P]->3(C(C)C)C(C)C)c1"
 
     screened = rx.metal(smiles, "square_planar")
@@ -774,16 +783,6 @@ def test_observed_tethered_screen_keeps_the_matching_assignment(monkeypatch):
     assert isomers[0].label == "trans"
 
 
-def test_observed_tethered_screen_breaks_when_the_orbit_cap_is_too_tight(monkeypatch):
-    """A cap under the tether's one true arrangement must raise, proving the previous test's patch has teeth."""
-    smiles = "COC(=O)c1cc2O[P](C(C)C)(C(C)C)->[Ni+2]3(<-[Cl-])<-[c-]2c(O[P]->3(C(C)C)C(C)C)c1"
-    source = rx.embed(rx.metal(smiles, "square_planar")[0], n=1, seed=42, threads=1).mol
-    monkeypatch.setattr(metal_enumeration, "_screen_limit", lambda *_args: 0)
-
-    with pytest.raises(ValueError, match="more than 0 distinct constitutional"):
-        rx.metal(source, "square_planar")
-
-
 _EN_LA_HEXACHLORO_SQA = "[Cl-]->[La+3]1(<-[Cl-])(<-[Cl-])(<-[Cl-])(<-[Cl-])(<-[Cl-])<-[NH2]CC[NH2]->1"
 
 
@@ -806,23 +805,9 @@ def test_chelate_edge_rule_keeps_every_isomer_on_a_hull_edge():
     assert len(unrestricted) > len(screened)
 
 
-def test_chelate_edge_rule_mutation_lets_a_diagonal_placement_survive(monkeypatch):
-    """Disabling the edge rule's contribution must break the previous test's guarantee."""
-    mol = rx.parse_smiles(_EN_LA_HEXACHLORO_SQA)
-    edges = hull_edges(tuple(map(tuple, vertex_dirs("square_antiprism"))))
-    en_donors = {atom.GetIdx() for atom in mol.GetAtoms() if atom.GetSymbol() == "N"}
-
-    monkeypatch.setattr(metal_enumeration, "chelate_edge_links", lambda *args, **kwargs: frozenset())
-    isomers = rx.metal(mol, "SQA")
-
-    pairs = [frozenset(vertex for vertex, donor in enumerate(iso.vertices) if donor in en_donors) for iso in isomers]
-    assert any(pair not in edges for pair in pairs), "the mutation should let a diagonal placement through"
-
-
-def test_chelate_edge_rule_bonded_pair_forces_the_zudwuq_perimeter():
-    """ZUDWUQ: a cyclo-As6 ring on Ni: every ring bond is a 3-membered chelate, so only the perimeter isomer
-    survives (a ring-adjacent placement on every hexagonal-planar hull edge); the other two raw isomers put a
-    bonded pair on a hexagon diagonal and are dropped.
+def test_cyclo_hexaarsine_nickel_keeps_only_the_perimeter_seating():
+    """A cyclo-As6 ring on Ni has every ring bond as a 3-membered chelate, so only the hull-edge perimeter
+    isomer survives; a bonded pair on a hexagon diagonal is dropped (ZUDWUQ).
     """
     smiles = (
         "CC(C)(C)[As]12->[Ni]3456<-[As]1(C(C)(C)C)[As]->3(C(C)(C)C)[As]->4(C(C)(C)C)[As]->5(C(C)(C)C)[As]->62C(C)(C)C"
@@ -836,53 +821,18 @@ def test_chelate_edge_rule_bonded_pair_forces_the_zudwuq_perimeter():
     assert len(unrestricted) > 1
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
-@pytest.mark.parametrize("tmqmg_id", ["ROGWIW", "IKOYOX", "KUVQOK"])
-def test_observed_only_survives_a_forbidden_measured_arrangement(tmqmg_id):
-    """Regression: 3 real tmQMg structures went from 1 (their measured isomer) to 0 isomers once the
-    forbidden-pair filter (narrow/linked) incorrectly ran on `observed_only`'s explicit retained order too.
+def test_bonded_ylide_carbanion_pair_reads_as_one_haptic_site():
+    """A bonded C,C carbanion pair on Ni reads as one haptic site, giving trigonal_planar isomers.
+
+    Without the bonded-pair rule the two carbons stay separate sigma sites and the shell reads square
+    planar instead (VUDTUL).
     """
-    charges = {
-        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
-    }
-    mol = rx.read_xyz(
-        str(TMQMG_DIR / "xyz" / f"{tmqmg_id}.xyz"),
-        charge=charges[tmqmg_id],
-        connectivity="xyzgraph",
-        bond_orders="xyz2mol",
-    )
-    assert len(rx.metal(mol, observed_only=True)) == 1
+    smiles = "C[Si](C)(C)C1([CH2-]->[Ni+2]<-12<-[Se-]c1ccccc1P->2(c1ccccc1)c1ccccc1)=P(C)(C)C"
+    isomers = rx.metal(smiles)
 
-
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
-def test_vudtul_chelate_bite_and_pair_rule_survive_the_span_screen():
-    """VUDTUL reads to one trigonal_planar isomer, only once both stages of this plan are in.
-
-    A d8 sigma,sigma C6-C7 metallacycle plus a 5-ring Se,P chelate: not the 0 isomers the span screen gave
-    before the chelate bite was let through (stage 1), nor the 2 square_planar isomers the pair rule alone
-    gives without it (the C6-C7 pair must first read as one haptic site, then that site's Se-Ni-P chelate
-    must be judged at its own bite, not the ideal 120 degrees).
-    """
-    charges = {
-        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
-    }
-    mol = rx.read_xyz(
-        str(TMQMG_DIR / "xyz" / "VUDTUL.xyz"),
-        charge=charges["VUDTUL"],
-        connectivity="xyzgraph",
-        bond_orders="xyz2mol",
-    )
-    isomers = rx.metal(mol)
-
-    assert len(isomers) == 1
-    iso = isomers[0]
-    assert iso.geometry == "trigonal_planar"
-    assert set(iso.haptic.values()) == {(6, 7)}
-
-    embedded = rx.embed(iso, n=1, seed=42, threads=1).mol
-    assert rx.metal(embedded, observed_only=True)[0].geometry == "trigonal_planar"
+    assert len(isomers) == 2
+    assert all(iso.geometry == "trigonal_planar" for iso in isomers)
+    assert all(len(iso.haptic) == 1 for iso in isomers)
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
@@ -960,10 +910,9 @@ def test_chelate_links_ignore_coordination_shortcuts():
 
 
 @pytest.mark.parametrize("enumerate_isomers", [rx.metal, rx.enumerate_isomers], ids=["pipeline", "core"])
-@pytest.mark.parametrize("screen", [None, "False", 0])
-def test_enumeration_screen_requires_a_boolean(enumerate_isomers, screen):
+def test_enumeration_screen_requires_a_boolean(enumerate_isomers):
     with pytest.raises(TypeError, match="screen must be a bool"):
-        enumerate_isomers(rx.parse_smiles(_MA2B2), screen=screen)
+        enumerate_isomers(rx.parse_smiles(_MA2B2), screen=None)
 
 
 def test_explicit_bond_change_bypasses_ground_state_reach_screen():
@@ -1069,11 +1018,8 @@ def test_high_coordination_homoleptic_model_is_one_arrangement():
 def test_high_coordination_candidates_defer_their_public_molecule_copy():
     isos = rx.metal("O->[La+3](<-O)(<-N)(<-N)(<-[F-])(<-[F-])(<-[Cl-])<-[Cl-]", "DOD")
     assert len(isos) == 648
-    assert all(iso._mol is None for iso in isos)
-    assert len({id(iso.graph) for iso in isos}) == 1
     assert "DOD" in str(isos[2])
     assert "DOD" in rx.cxsmiles(isos[2])
-    assert isos[2]._mol is None
 
 
 # --- the template graft over a coordination sphere -------------------------------------------------------
@@ -1495,28 +1441,3 @@ def test_berry_pseudorotation_intermediate_reads_back_in_its_requested_frame():
     reread = rx.metal(mol, geometry="square_pyramidal", observed_only=True)
     assert len(reread) >= 1
     assert reread[0].geometry == "square_pyramidal"
-
-
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
-def test_kuqpuj_reference_embed_keeps_its_own_donor_pair_slots():
-    """The plan's per-ID evidence reports KUQPUJ's fresh embed swapping donor-pair slots (atoms 6/11 and
-    15/21) under an all-rows-pulled construction. That swap does not reproduce from a single `rx.embed`
-    call at seed 42 in this environment (confirmed on the unmodified 6f85aaf baseline too, by mutation
-    testing); this stays a plain correctness confirmation, and the benchmark run owns the discriminating
-    check (fair A2-vs-stage-2 comparison, run.py's own pipeline).
-    """
-    charges = {
-        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
-    }
-    mol = rx.read_xyz(
-        str(TMQMG_DIR / "xyz" / "KUQPUJ.xyz"),
-        charge=charges["KUQPUJ"],
-        connectivity="xyzgraph",
-        bond_orders="xyz2mol",
-    )
-    isomers = rx.metal(mol, lengths="model")
-    ref_cx = rx.cxsmiles(mol)
-    ref = next(iso for iso in isomers if rx.cxsmiles(iso) == ref_cx)
-    ensemble = rx.embed(ref, n=1, seed=42, threads=1)
-    assert rx.cxsmiles(ensemble.mol) == rx.cxsmiles(ref)

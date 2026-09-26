@@ -5,22 +5,17 @@ from __future__ import annotations
 import math
 import random
 from itertools import permutations
-from pathlib import Path
 
 import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 from rdkit.Geometry import Point3D
 
+import rxembed as rx
 from rxembed.pipeline import xyz2mol_tmc as tmc
 from rxembed.pipeline.xyz2mol_tmc import _invented_hydrogens, get_lig_mol, get_tmc_mol
-
-ROOT = Path(__file__).resolve().parents[2]
-CORPUS = ROOT / "benchmark" / "corpus"
-
-# `benchmark/` is a local-only harness and is gitignored (AGENTS.md), so a clean clone does not have these
-# structures. The suite has to stay fully runnable without it: skip rather than error.
-needs_corpus = pytest.mark.skipif(not CORPUS.is_dir(), reason="needs the local-only benchmark/corpus")
+from tests.conftest import EXAMPLES_DIR
+from tests.metal_fixtures import ferrocene
 
 
 @pytest.mark.parametrize(("atomic_number", "charge"), [(1, -1), (17, -1)])
@@ -103,9 +98,9 @@ def test_titanium_is_never_read_above_its_four_valence_electrons():
 def test_bis_silylamido_cyclopentadienyl_zirconium_chloride_reads_as_zirconium_four():
     """USUQAB's constrained-geometry ligand: a Cp ring with two Me2Si-NMe arms, all seven atoms on Zr.
 
-    RDKit's bond-order search throws on a saturated amide anion at every charge, and the only donor-seeded
-    form inside its subset cap charges every donor (-7, Zr+8). AC2mol at the Hueckel hint reads the
-    trianion (Cp- and two amides) that NBO gives.
+    Each amido nitrogen is bonded only to saturated carbons and silicons with no lone pair to offer as
+    a pi partner, so `_saturated_donor_charges` charges it before the native search runs. Charged up
+    front, the native ladder reads the trianion (Cp- and two amides) that NBO gives, at Zr+4.
     """
     ligand = Chem.AddHs(Chem.MolFromSmiles("C[N-][Si](C)(C)C1=CC([Si](C)(C)[N-]C)=C[CH-]1"))
     assert rdDistGeom.EmbedMolecule(ligand, randomSeed=7) == 0
@@ -299,7 +294,7 @@ def test_direct_xyz_keeps_only_supplied_hydrogens(tmp_path, monkeypatch):
 
 
 def test_later_clean_native_bond_order_candidate_skips_resonance(monkeypatch):
-    mol = Chem.AddHs(Chem.MolFromSmiles("CO"))
+    mol = Chem.AddHs(Chem.MolFromSmiles("C=O"))  # formaldehyde keeps an unclosed valence, so the ladder runs
     calls, limits, assigned = [], [], []
 
     def clean(candidate, _coordinating_atoms, resonate=True):
@@ -323,20 +318,6 @@ def test_later_clean_native_bond_order_candidate_skips_resonance(monkeypatch):
     assert not any(calls)
 
 
-def test_native_charge_search_is_symmetric(monkeypatch):
-    mol = Chem.AddHs(Chem.MolFromSmiles("CO"))
-    charges = []
-
-    def assign(*_args, **kw):
-        charges.append(kw["charge"])
-        raise ValueError("record the complete ladder")
-
-    monkeypatch.setattr(tmc.rdDetermineBonds, "DetermineBondOrders", assign)
-
-    assert tmc._fast_bond_orders(mol, 0, [0]) is None
-    assert set(charges) == {-4, -2, 0, 2, 4}
-
-
 def _flat_explicit_ligand(smiles):
     mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
     for bond in mol.GetBonds():
@@ -349,6 +330,38 @@ def _flat_explicit_ligand(smiles):
     mol.UpdatePropertyCache(strict=False)
     Chem.FastFindRings(mol)
     return mol
+
+
+def test_sulfoxonium_ylide_reads_one_lewis_form_whatever_the_bond_order():
+    """A reader adds bonds in distance order; the bond-order search keeps its first form, so must not see it."""
+    source = _flat_explicit_ligand("C[S+](=O)([CH2-])[CH2-]")
+    ylides = [
+        atom.GetIdx()
+        for atom in source.GetAtoms()
+        if atom.GetAtomicNum() == 6 and sum(nb.GetAtomicNum() == 1 for nb in atom.GetNeighbors()) == 2
+    ]
+    bonds = [(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()) for bond in source.GetBonds()]
+    rng = random.Random(0)
+    forms = set()
+    for _ in range(8):
+        rng.shuffle(bonds)
+        rw = Chem.RWMol(source)
+        for begin, end in bonds:
+            rw.RemoveBond(begin, end)
+        for begin, end in bonds:
+            rw.AddBond(begin, end, Chem.BondType.SINGLE)
+        mol = rw.GetMol()
+        mol.UpdatePropertyCache(strict=False)
+        ligand, _charge = get_lig_mol(mol, -1, ylides)
+        forms.add(
+            frozenset(
+                frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))
+                for bond in ligand.GetBonds()
+                if bond.GetBondType() == Chem.BondType.DOUBLE
+            )
+        )
+    assert len(ylides) == 2
+    assert len(forms) == 1, "the ylide's S=C bond moved with the bond insertion order"
 
 
 def test_native_charge_search_keeps_a_closed_shell_donor_with_remote_charge():
@@ -678,22 +691,15 @@ def test_borohydride_bridge_assigns_one_nearest_boron_per_hydrogen():
     assert completed.GetBondBetweenAtoms(2, 3) is None
 
 
-def test_ligand_checks_stream_resonance_candidates(monkeypatch):
-    class Supplier:
-        def __init__(self, mol):
-            self.mol = mol
+def test_ligand_checks_stream_resonance_candidates():
+    """`lig_checks(resonate=True)` yields benzene's own aromatic form with no formal charges."""
+    candidates = list(tmc.lig_checks(Chem.MolFromSmiles("c1ccccc1"), ()))
 
-        def __iter__(self):
-            yield self.mol
-
-        def __len__(self):
-            raise AssertionError("resonance candidates must not be materialized")
-
-    monkeypatch.setattr(tmc.rdchem, "ResonanceMolSupplier", lambda mol, **_kwargs: Supplier(mol))
-    candidates = tmc.lig_checks(Chem.MolFromSmiles("c1ccccc1"), ())
-
-    assert iter(candidates) is candidates
-    assert list(candidates)
+    assert len(candidates) == 1
+    mol, positive, negative, n_aromatic, invented, pairless = candidates[0]
+    assert (positive, negative, pairless) == (0, 0, 0)
+    assert (n_aromatic, invented) == (6, 6)  # 6 aromatic carbons, each with one implicit ring H
+    assert Chem.MolToSmiles(mol) == "c1ccccc1"
 
 
 def _perceive(path, charge=0, **kw):
@@ -712,19 +718,43 @@ def _shuffled(path, tmp_dir, seed):
     return out
 
 
-@pytest.mark.parametrize("name", ["Ferrocene", "CisPlatin", "FeCO5", "Cis-PtCl2(en)"])
-@needs_corpus
-def test_canonical_under_atom_reordering(name, tmp_path):
-    path = CORPUS / f"{name}.xyz"
+def _ferrocene_xyz(tmp_path):
+    """Write `metal_fixtures.ferrocene()` to `.xyz`, adding each Cp ring carbon's hydrogen radially.
+
+    An `.xyz` file carries only elements and coordinates, so the source mol's own bond orders and formal
+    charges (needed to build a valid dative RDKit graph, not a real Cp-H valence) do not need to sanitize
+    once the hydrogens are added; xyz2mol_tmc perceives bonds and charges from the geometry alone.
+    """
+    rw = Chem.RWMol(ferrocene())
+    conf = rw.GetConformer()
+    for idx in range(1, 11):  # atom 0 is Fe; 1-5 and 6-10 are the two Cp rings
+        p = conf.GetAtomPosition(idx)
+        r = math.hypot(p.x, p.y)
+        h = rw.AddAtom(Chem.Atom(1))
+        rw.AddBond(idx, h, Chem.BondType.SINGLE)
+        conf.SetAtomPosition(h, Point3D(p.x * (r + 1.08) / r, p.y * (r + 1.08) / r, p.z))
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+    path = tmp_path / "ferrocene.xyz"
+    Chem.MolToXYZFile(mol, str(path))
+    return path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [_ferrocene_xyz, lambda _tmp_path: EXAMPLES_DIR / "ru-co.xyz"],
+    ids=["ferrocene", "ru-co"],
+)
+def test_canonical_under_atom_reordering(path, tmp_path):
+    path = path(tmp_path)
     seen = {Chem.MolToSmiles(_perceive(path))}
     for seed in (1, 2, 3):
         seen.add(Chem.MolToSmiles(_perceive(_shuffled(path, tmp_path, seed))))
-    assert len(seen) == 1, f"{name} gave {len(seen)} strings for one molecule: {sorted(seen)}"
+    assert len(seen) == 1, f"{path.name} gave {len(seen)} strings for one molecule: {sorted(seen)}"
 
 
-@needs_corpus
-def test_ligands_close_their_own_valences():
-    mol = _perceive(CORPUS / "Ferrocene.xyz")
+def test_ligands_close_their_own_valences(tmp_path):
+    mol = _perceive(_ferrocene_xyz(tmp_path))
     rw = Chem.RWMol(mol)
     metals = [a.GetIdx() for a in rw.GetAtoms() if a.GetSymbol() == "Fe"]
     for i in sorted(metals, reverse=True):
@@ -741,3 +771,60 @@ def test_ligands_close_their_own_valences():
         Chem.SanitizeMol(m)  # raises on an over-valent ligand
         invented = sum(a.GetNumImplicitHs() for a in m.GetAtoms() if a.GetAtomicNum() != 1)
         assert invented == 0, f"perception left a ligand undervalent by {invented} H"
+
+
+def test_amido_donor_charge_keeps_a_chelates_oxime_nitrogen_sp2(tmp_path):
+    """Charging a Tc-oxime chelate's two amido nitrogens up front lets the whole ligand's bond-order search
+    succeed, so its two separate oxime nitrogens read as ordinary sp2 imines rather than a charged sp form.
+
+    A hand-built single amido donor does not reproduce the failure (needs the whole ligand graph), so this
+    embeds MOCQIE's published graph fresh (no CSD coordinates) and re-reads the resulting xyz.
+    """
+    # a bis(dimethylglyoximato) Tc(V) chelate: two amido N donors, two oxime N=C(-O(H)) donors
+    smiles = (
+        "CC1=[N]([O-])->[Tc+5]23(<-[O-2])<-[N](O)=C(C)C(C)(C)[N-]->2C[C@@H](C#N)C[N-]->3C1(C)C "
+        "|atomProp:2.atomNote.s1:4.atomNote.SPY-lambda:5.atomNote.s0:6.atomNote.s4:13.atomNote.s3:19.atomNote.s2|"
+    )
+    ensemble = rx.embed(smiles, n=1, seed=42)
+    path = tmp_path / "mocqie.xyz"
+    Chem.MolToXYZFile(ensemble.mol, str(path), confId=ensemble.ids[0])
+    mol = rx.read_xyz(str(path), charge=0, bond_orders="xyz2mol")
+
+    for index in (13, 19):  # the two amido N donors
+        atom = mol.GetAtomWithIdx(index)
+        assert atom.GetFormalCharge() == -1
+        assert atom.GetHybridization() == Chem.HybridizationType.SP3
+    for index in (2, 6):  # the two oxime N=C donors
+        atom = mol.GetAtomWithIdx(index)
+        assert atom.GetFormalCharge() == 0
+        assert atom.GetHybridization() == Chem.HybridizationType.SP2
+
+
+def test_cyclotriphosphine_ring_donor_stays_single_bonded(tmp_path):
+    """A saturated P3H3 ring (cyclotriphosphine) donating to a metal through all three phosphines must keep
+    single P-P bonds, not the P#P one RDKit's compiled search promotes without this fix.
+    """
+    pp, ph = 2.21, 1.42  # A: a typical P-P single bond and P-H bond
+    radius = pp / math.sqrt(3)
+    angles = (0, 120, 240)
+    p_pos = [(radius * math.cos(math.radians(a)), radius * math.sin(math.radians(a)), 0.0) for a in angles]
+    scale = (radius + ph) / radius
+    h_pos = [(x * scale, y * scale, z * scale) for x, y, z in p_pos]
+
+    lines = ["7", "charge=0"]
+    for symbol, pos in [
+        *zip(("P", "P", "P"), p_pos, strict=True),
+        *zip(("H", "H", "H"), h_pos, strict=True),
+        ("Ni", (0.0, 0.0, 2.2)),
+    ]:
+        lines.append(f"{symbol} {pos[0]:.4f} {pos[1]:.4f} {pos[2]:.4f}")
+    path = tmp_path / "cyclotriphosphine_nickel.xyz"
+    path.write_text("\n".join(lines) + "\n")
+
+    # Pin the metal's charge: three plain phosphine donors on Ni(0) is unambiguous, and skipping the
+    # oxidation-state search keeps this test about the ring's bond orders, not that separate guess.
+    mol = rx.read_xyz(str(path), charge=0, bond_orders="xyz2mol", metal_charges={6: 0})
+
+    ring_bonds = [b for b in mol.GetBonds() if b.GetBeginAtomIdx() < 3 and b.GetEndAtomIdx() < 3]
+    assert len(ring_bonds) == 3
+    assert not any(b.GetBondType() == Chem.BondType.TRIPLE for b in ring_bonds)

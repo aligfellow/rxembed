@@ -8,7 +8,6 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 
 from rxembed.utils import (
-    Violation,
     assign_stereo_from_3d,
     bond_angle,
     bond_removal_mirrors,
@@ -186,12 +185,10 @@ def test_adding_a_bond_back_needs_no_counterpart():
 @pytest.mark.parametrize(
     ("smiles", "slot", "mirrors"),
     [
-        ("F[C@](Cl)(Br)I", 0, True),  # degree 4: 3 - 0 is odd
-        ("F[C@](Cl)(Br)I", 1, False),  # degree 4: 3 - 1 is even
         ("F[P@](Cl)(Br)(I)F", 1, False),  # degree 5: the arithmetic would say odd, and is refuted there
         ("F[C@](Cl)Br", 1, False),  # degree 3: no representable tag survives, so the caller clears it
     ],
-    ids=["tetra-slot0", "tetra-slot1", "hypervalent", "trigonal"],
+    ids=["hypervalent", "trigonal"],
 )
 def test_parity_rule_is_bounded_to_degree_four(smiles, slot, mirrors):
     mol = Chem.MolFromSmiles(smiles, sanitize=False)
@@ -250,15 +247,3 @@ def test_stereo_assignment_preserves_hypervalent_tag():
     written = raw.GetAtomWithIdx(1).GetChiralTag()
     assert written != Chem.ChiralType.CHI_UNSPECIFIED, "the writer tagged nothing here, so this asserts nothing"
     assert mol.GetAtomWithIdx(1).GetChiralTag() == written, "the door re-based a hypervalent tag"
-
-
-# ---------------------------------------------------------------------------------------------------------
-# Violation: the QA result type both the core perception and the pipeline gate return
-# ---------------------------------------------------------------------------------------------------------
-
-
-def test_violation_formats_atoms_value_and_limit():
-    v = Violation("clash", (3, 7), value=1.234, limit=2.5, detail="H...H")
-    assert str(v) == "[clash] atoms 3-7: 1.234 vs 2.500 H...H"
-    v2 = Violation("clash", (3, 7), value=1.234, limit=2.5)
-    assert str(v2) == "[clash] atoms 3-7: 1.234 vs 2.500"

@@ -28,6 +28,8 @@ from .constraints import (
     canonical_key,
     compose,
     constraint_value,
+    out_of_plane,
+    out_of_plane_row,
     resolve_atom,
     resolve_core,
     stated_dihedral,
@@ -42,12 +44,14 @@ from .metal_core import (
     MetalState,
     connect_metal,
     donor_chirality_sign,
+    ligand_degree,
     materialized_state,
     materialized_states,
     metal_index,
     metal_indices,
     surrogate_all_metals,
 )
+from .metal_donor_orient import stripped_hybridisation
 from .metal_isomer import Isomer, from_geometry, winding_signature
 from .metal_perceive import (
     FIT_FLOOR,
@@ -260,8 +264,13 @@ def _structural_failure(mol, cid, cons, iso=None):
         atoms, cap = key[:4], key[5]
         if stated_dihedral(cons, *atoms):
             continue
-        measured = constraint_value(pos, atoms, cons.haptic)
         accepted = 0.0, cap + _STRUCT_CAP_SLACK
+        if out_of_plane_row(mol, key):  # the census measured this angle, not a dihedral about one donor bond
+            deviation = out_of_plane(pos, *atoms)
+            if not np.isfinite(deviation) or deviation > accepted[1]:
+                return _window_failure(_real_graph(mol, iso), cons, "coplanarity", atoms, deviation, accepted)
+            continue
+        measured = constraint_value(pos, atoms, cons.haptic)
         if measured is None or not np.isfinite(measured):
             return _window_failure(_real_graph(mol, iso), cons, "coplanarity", atoms, measured, accepted)
         value = abs(measured)
@@ -733,7 +742,21 @@ def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
     stereo_bonds = stereo_donor_bonds(mol, iso)
     max_attempts = 30 if has_point_stereo else 0
     reflectable = _reflection_is_free(mol, iso, cons, targets, stereo_bonds)
-    if stereo_bonds:
+    carried = list(stereo_bonds)
+    if iso is not None:
+        # ETKDG holds a triple bond's neighbours linear only across bonds it sees, so a terminal sp donor (not
+        # bridging, not side-on) carries its metal bond too. The bounds matrix ignores every carried bond.
+        hyb = stripped_hybridisation(mol)
+        sites = Counter(donor for donor, _metal in iso.donor_bonds)
+        carried += [
+            (donor, metal)
+            for donor, metal in iso.donor_bonds
+            if hyb.get(donor) == Chem.HybridizationType.SP
+            and sites[donor] == 1
+            and ligand_degree(atom := mol.GetAtomWithIdx(donor)) == 1
+            and not any(nb.GetIdx() in sites for nb in atom.GetNeighbors())
+        ]
+    if carried:
         missing = {
             donor
             for donor, _metal_idx in stereo_bonds
@@ -746,8 +769,8 @@ def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
             full = connect_metal(full, iso.donor_bonds)
             apply_point_stereo(full, iso.stereo_label, missing)
             tags = {donor: full.GetAtomWithIdx(donor).GetChiralTag() for donor in missing}
-        iso.restore(mol)  # use the actual metal, not an isotope surrogate, as the donor's fourth reference
-        mol = connect_metal(mol, stereo_bonds)
+        iso.restore(mol)  # the real metal: a donor's fourth stereo reference, and what the bounds basis strips
+        mol = connect_metal(mol, carried)
         for donor, tag in tags.items():
             mol.GetAtomWithIdx(donor).SetChiralTag(tag)
     if not needs_selection:
@@ -766,7 +789,9 @@ def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
         while kept.GetNumConformers() < target and used < budget:
             need = target - kept.GetNumConformers()
             batch_n = min(_REPLACEMENT_FACTOR * need, pool, budget - used)
-            hard_chirality = not has_point_stereo or attempt == 0
+            # RDKit's chirality post-check also tests the sphere's donor-donor windows, which only the relax
+            # ladder meets, so enforcing it here would reject seeds no batch could ever pass.
+            hard_chirality = not has_point_stereo
             trial_prune = -1 if len(targets) > 1 else params.prune_rms
             trial = replace(params, seed=params.seed + attempt, prune_rms=trial_prune)
             ids = seed_coordinates(
@@ -812,7 +837,7 @@ def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
             len(ids),
             target,
         )
-    if stereo_bonds:
+    if carried:
         mol, _metals = surrogate_all_metals(mol)  # UFF still receives the bondless surrogate graph
     return mol, ids, target if needs_selection else None
 
@@ -1267,9 +1292,9 @@ class Conformers:
         encounter bounds or move phantom indices. ``validator`` may add pipeline publication checks after the
         core contract; it never controls how a replacement is generated or relaxed. The search stops early
         when every seed of one batch crossed to another donor-slot seating, or when two consecutive batches
-        are rejected in full for the same non-shape reason at the same atoms: a fresh seed cannot change a
-        structural basin a batch has already shown it lands in twice. A wrong labelled shape never stops
-        this way, only a fresh seed can rescue it, and its residual is a near-tie call a later seed can
+        are rejected in full for the same set of non-shape reasons at the same atoms: a fresh seed cannot
+        change a structural basin a batch has already shown it lands in twice. A wrong labelled shape never
+        stops this way, only a fresh seed can rescue it, and its residual is a near-tie call a later seed can
         still cross.
         Rank settled survivors by their endpoint scores; keep unscored fallbacks in generation order.
         """
@@ -1319,8 +1344,6 @@ class Conformers:
             fully_rejected = bool(batch_rejected) and batch_rejected == set(batch.ids)
             if fully_rejected:
                 signature = {reason.key for reason in reasons.values()}
-                one_reason = len(signature) == 1
-                kind, atoms = next(iter(signature)) if one_reason else (None, ())
                 # The crossing is read by the acceptance gate on a restored seed, not on a ladder endpoint.
                 accepted = {r.key for r, cids in failures.items() if cids}
                 crossed_every_seed = (
@@ -1330,9 +1353,13 @@ class Conformers:
                 )
                 # A wrong labelled shape is excluded here: only a fresh seed can rescue it (see
                 # _stable_coordination_failure), and its residual is a near-tie judgement call that a
-                # later batch's seed can still cross, unlike a structural tear at the same atoms.
+                # later batch's seed can still cross, unlike a structural tear at the same atoms. A batch can
+                # fail for more than one reason at once; the stop only needs every one of them to be a known,
+                # non-shape site repeating from the batch before.
                 repeated_reason = (
-                    one_reason and atoms and kind not in _STABLE_SHAPE_KINDS and signature == previous_signature
+                    bool(signature)
+                    and all(kind not in _STABLE_SHAPE_KINDS and atoms for kind, atoms in signature)
+                    and signature == previous_signature
                 )
                 if crossed_every_seed or repeated_reason:
                     _log_replacement_round(operation, batch_index, 0, count, round_started)

@@ -23,6 +23,7 @@ _ALPHA_DIIMINE_NI = (
 )
 _ETA2_PT = "C[CH]1=[CH](F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1"
 _NATIVE_ATROP = "CC1=CC=CC(I)=C1N1C(C)=CC=C1Br |wU:7.7|"
+_AZA_BIARYL_CR = "[O+]#[C-]->[Cr]1(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[n]2cccnc2-c2nccc[n]->12"
 
 
 def _mol(smiles):
@@ -74,9 +75,11 @@ def test_metal_point_tag_is_not_ligand_stereo():
 
 def test_point_cip_memo_tracks_content_not_object_identity():
     """Flipping a chiral tag in place must not get served the previous, now-stale, cached answer."""
-    mol = _mol("CCO[C@H](c1ccccc1C)[CH]1=[CH]2[CH]3=[CH2]->[Fe]<-3<-2<-1(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]")
+    mol, metals = _with_metals(
+        "CCO[C@H](c1ccccc1C)[CH]1=[CH]2[CH]3=[CH2]->[Fe]<-3<-2<-1(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]"
+    )
     idx = 3
-    assert stereo._point_cip_codes(mol, [idx]) == {idx: "R"}
+    assert stereo.defined_stereo_label(mol, metals) == "C3:R"
 
     atom = mol.GetAtomWithIdx(idx)
     mirrored = {
@@ -85,16 +88,7 @@ def test_point_cip_memo_tracks_content_not_object_identity():
     }[atom.GetChiralTag()]
     atom.SetChiralTag(mirrored)
 
-    assert stereo._point_cip_codes(mol, [idx]) == {idx: "S"}
-
-
-def test_point_cip_memo_returns_a_copy_a_caller_cannot_poison():
-    mol = _mol("C[C@H](N)C(=O)O")
-    idx = 1
-    codes = stereo._point_cip_codes(mol, [idx])
-    want = dict(codes)
-    codes[idx] = "poisoned"
-    assert stereo._point_cip_codes(mol, [idx]) == want
+    assert stereo.defined_stereo_label(mol, metals) == "C3:S"
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -230,35 +224,24 @@ def test_atrop_axis_must_be_stated():
 
 
 def test_explicit_hydrogen_leaves_an_aryl_imine_axis_free():
+    """An explicit-H aryl-imine single bond is not enumerated as an atrop axis."""
     ligand = Chem.AddHs(_mol("Cc1cccc(C)c1C=NC"))
-    axis = next(
-        tuple(sorted((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())))
-        for bond in ligand.GetBonds()
-        if bond.GetBondType() == Chem.BondType.SINGLE
-        and sum(atom.GetIsAromatic() for atom in (bond.GetBeginAtom(), bond.GetEndAtom())) == 1
-        and any(
-            other.GetBondType() == Chem.BondType.DOUBLE
-            for atom in (bond.GetBeginAtom(), bond.GetEndAtom())
-            if not atom.GetIsAromatic()
-            for other in atom.GetBonds()
-        )
-    )
-
-    ranks = list(Chem.CanonicalRankAtoms(ligand, breakTies=False, includeChirality=True))
-    assert not stereo._native_atrop_candidate(ligand, axis, ranks)
+    variants, *_ = stereo.enumerate_unassigned(ligand, include="all")
+    assert all(not stereo.axis_stereo(label) for _variant, label in variants)
 
 
 def test_equivalent_ring_paths_do_not_define_an_atrop_axis():
+    """A biaryl bond with one ring symmetric under either ortho path is not an atrop axis."""
     mol = _mol("Cc1cccc(C)c1-c1c(Br)cccc1I")
-    axis = next(
-        tuple(sorted((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())))
-        for bond in mol.GetBonds()
-        if bond.GetBondType() == Chem.BondType.SINGLE
-        and all(atom.GetIsAromatic() for atom in (bond.GetBeginAtom(), bond.GetEndAtom()))
-    )
+    variants, *_ = stereo.enumerate_unassigned(mol, include="all")
+    assert all(not stereo.axis_stereo(label) for _variant, label in variants)
 
-    ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False, includeChirality=True))
-    assert not stereo._native_atrop_candidate(mol, axis, ranks)
+
+def test_unsubstituted_aza_biaryl_is_not_an_atrop_axis():
+    """A chelate-locked, unsubstituted aza-biaryl bond is not enumerated as an atrop axis."""
+    mol, metals = _with_metals(_AZA_BIARYL_CR)
+    variants, *_ = stereo.enumerate_unassigned(mol, exclude=metals, include="all")
+    assert all(not stereo.axis_stereo(label) for _variant, label in variants)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -438,6 +421,7 @@ def test_measured_point_requires_centre_inside_carriers_independent_of_bond_orde
 
 
 def test_aromatic_eta1_donor_is_not_made_stereogenic_by_stale_hybridization():
+    """An aromatic eta1 donor keeps a stale SP3 hybridization tag from becoming a point stereocentre."""
     mol, metals = _with_metals("Cc1cc[cH-](c1)->[Ru+]")
     donor = next(
         atom
@@ -446,9 +430,10 @@ def test_aromatic_eta1_donor_is_not_made_stereogenic_by_stale_hybridization():
     )
     donor.SetHybridization(Chem.HybridizationType.SP3)
 
-    _work, caps = stereo._build_enumeration_graph(mol, metals)
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(mol, exclude=metals)
 
-    assert not caps
+    assert variants == [(mol, "")]
+    assert (n_unassigned, total, unresolved) == (0, 1, 0)
 
 
 def test_coordination_locked_alkene_is_not_enumerated():
@@ -586,17 +571,25 @@ def test_stereo_references_survive_metal_bond_removal_and_renumbering():
         assert sorted(stereo.bond_stereo(label).values()) == ["E", "E"]
 
 
-def test_donor_cap_is_a_stereo_proxy_and_does_not_overcap_a_double_bond():
+def test_donor_cap_is_a_stereo_proxy_and_does_not_overcap_a_double_bond(capfd):
+    """A metal donor cap must not add a point stereocentre on top of the donor's own double-bond E/Z."""
     imine, metals = _with_metals("CC=[NH]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
-    work, caps = stereo._build_enumeration_graph(imine, metals)
-    assert len(caps) == 1
-    assert next(b for b in work.GetBonds() if b.GetEndAtomIdx() in caps).GetBondType() == Chem.BondType.SINGLE
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(imine, exclude=metals)
+    assert {label for _variant, label in variants} == {"C1=N2:E", "C1=N2:Z"}
+    assert (n_unassigned, total, unresolved) == (1, 2, 0)
 
     referenced, metals = _with_metals("[H][C](=O)(P)->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
     referenced.GetAtomWithIdx(1).SetHybridization(Chem.HybridizationType.SP3)  # stale input perception
-    work, caps = stereo._build_enumeration_graph(referenced, metals)
-    assert not caps
-    assert work.GetNumAtoms() == referenced.GetNumAtoms()
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(referenced, exclude=metals)
+    assert variants == [(referenced, "")]
+    assert (n_unassigned, total, unresolved) == (0, 1, 0)
+
+    # two identical H already rule out a point centre; capping this donor anyway overvalences it
+    bis_amine, metals = _with_metals("CC=CC[NH2]->[Ni+2](<-[O-]C(=O)C)<-[NH2]CC=CC")
+    capfd.readouterr()  # discard warnings from the cases above
+    variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(bis_amine, exclude=metals)
+    assert (n_unassigned, total, unresolved) == (2, 4, 0)
+    assert "valence" not in capfd.readouterr().err
 
 
 def test_metal_strip_and_graft_are_inverse():

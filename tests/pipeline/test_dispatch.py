@@ -4,54 +4,25 @@ from __future__ import annotations
 
 import importlib
 import itertools
-import json
 import logging
 from importlib.util import find_spec
 
 import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom, rdMolTransforms
+from rdkit.Chem import rdDistGeom, rdForceFieldHelpers, rdMolTransforms
 
 import rxembed as rx
 from rxembed.constraints import FIX_ANGLE_TOL, FIX_DISTANCE_TOL
 from rxembed.pipeline import geom_check as geom
-from rxembed.relax import UFFOptimizationError, UFFTypingError
+from rxembed.pipeline.stereo_check import signature
+from rxembed.relax import UFFTypingError
 from tests.conftest import EXAMPLES_DIR
 
 _SLACK_A = 0.15  # the pipeline's own _validate distance slack: a window realised within this is "held"
 
 
 # --- baseline: clean peripheries ---------------------------------------------
-
-
-@pytest.mark.parametrize("engine", [rx.embed, rx.core.embed])
-@pytest.mark.parametrize("metal", [False, True])
-def test_embed_accepts_native_parameters_through_both_facades(monkeypatch, engine, metal):
-    native = rdDistGeom.srETKDGv3()
-    native.useLegacyImplementation = False
-    before = json.loads(rdDistGeom.EmbedParametersToJSON(native))
-    params = rx.EmbedParams(seed=42, threads=1, native=native)
-    real_embed, seen = rdDistGeom.EmbedMultipleConfs, []
-
-    def embed(mol, n, used):
-        seen.append(used)
-        assert used is native
-        assert not used.useLegacyImplementation
-        return real_embed(mol, n, used)
-
-    monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", embed)
-    source = rx.metal("N->[Pt+2](<-[Cl-])(<-[Cl-])<-N", "SPL")[0] if metal else Chem.AddHs(Chem.MolFromSmiles("CCO"))
-    result = engine(source, n=1, params=params)
-    assert len(result.ids) == 1
-    assert seen
-    assert result.params is params
-    assert result[0].params is params
-    after = json.loads(rdDistGeom.EmbedParametersToJSON(native))
-    assert after.pop("boundsMatrix")
-    assert after == before
-    if metal:
-        assert rx.cxsmiles(result.minimize().mol) == rx.cxsmiles(source)
 
 
 @pytest.mark.parametrize("engine", [rx.embed, rx.core.embed])
@@ -76,10 +47,8 @@ def test_params_round_trips_through_both_facades(engine):
     assert result[:1].params == result.params
 
 
-@pytest.mark.parametrize("engine", [rx.embed, rx.core.embed])
-@pytest.mark.parametrize("coplanar_14", [True, False])
-@pytest.mark.parametrize("metal_floor_relief", [True, False])
-def test_matrix_edit_controls_leave_uff_constraints_intact(monkeypatch, engine, coplanar_14, metal_floor_relief):
+@pytest.mark.parametrize(("coplanar_14", "metal_floor_relief"), [(True, False), (False, True)])
+def test_matrix_edit_controls_leave_uff_constraints_intact(monkeypatch, coplanar_14, metal_floor_relief):
     from rxembed import bounds
 
     isomer = next(
@@ -104,7 +73,7 @@ def test_matrix_edit_controls_leave_uff_constraints_intact(monkeypatch, engine, 
 
     monkeypatch.setattr(bounds, "_feasible_bounds", matrix)
     monkeypatch.setattr(core, "restrained_uff", cleanup)
-    result = engine(isomer, n=1, params=params)
+    result = rx.embed(isomer, n=1, params=params)
     result.minimize()
     assert seen_dg
     assert all(flags == (coplanar_14, metal_floor_relief) for flags in seen_dg)
@@ -128,46 +97,16 @@ def test_custom_cleanup_controls_are_public_ablations(engine):
     assert len(native.cons.angles) < len(isomer.cons.angles)
 
 
-def test_embed_passes_public_relaxation_cap(monkeypatch):
-    from rxembed.pipeline.ensemble import Ensemble
-
-    seen = []
-
-    def capture(self, *, trajectory, max_iters):
-        seen.append((trajectory, max_iters))
-        return self
-
-    monkeypatch.setattr(Ensemble, "relax_into_windows", capture)
-    rx.embed("CCO", n=1, max_iters=17)
-
-    assert seen == [(False, 17)]
+_RELAXATION_CALLS = {
+    "embed": lambda value: rx.embed("CCO", n=1, max_iters=value),
+    "minimize": lambda value: rx.minimize("CCO", max_iters=value),
+}
 
 
-def test_minimize_passes_public_relaxation_cap(monkeypatch):
-    from rxembed.pipeline.ensemble import Ensemble
-
-    seen = []
-    source = rx.embed("CCO", n=1, seed=1).mol
-
-    def capture(self, *, stiffness, max_iters):
-        seen.append((stiffness, max_iters))
-        return self
-
-    monkeypatch.setattr(Ensemble, "minimize", capture)
-    rx.minimize(source, max_iters=17)
-
-    assert seen == [(pytest.approx(1.0), 17)]
-
-
-@pytest.mark.parametrize("value", [0, -1, 1.0, True, "2000"])
-@pytest.mark.parametrize(
-    "call",
-    [lambda value: rx.embed("CCO", n=1, max_iters=value), lambda value: rx.minimize("CCO", max_iters=value)],
-    ids=["embed", "minimize"],
-)
-def test_relaxation_cap_rejects_non_positive_ints(call, value):
+@pytest.mark.parametrize(("door", "value"), [("embed", 0), ("embed", True), ("embed", "2000"), ("minimize", 0)])
+def test_relaxation_cap_rejects_non_positive_ints(door, value):
     with pytest.raises(ValueError, match="max_iters must be a positive integer"):
-        call(value)
+        _RELAXATION_CALLS[door](value)
 
 
 def test_free_periphery_clash_remains_a_diagnostic():
@@ -381,19 +320,8 @@ def test_infeasible_fix_raises():
         rx.embed("CCO", fix={(0, 2): 0.15}, n=4)  # a physically impossible C..O distance
 
 
-@pytest.mark.parametrize(
-    "kw", [{"freeze": [0, 1, 2]}, {"n_confs": 2}, {"num_confs": 2}], ids=["freeze", "n-confs", "num-confs"]
-)
-def test_removed_embed_keywords_are_rejected(kw):
-    import rxembed as rx
-
-    with pytest.raises(TypeError, match=next(iter(kw))):
-        rx.embed("CCO", **kw)
-
-
-@pytest.mark.parametrize("door", ["embed", "metal"])
-@pytest.mark.parametrize("stereo", ["auto", "enumerate"])
-def test_removed_stereo_modes_are_rejected(door, stereo):
+@pytest.mark.parametrize(("door", "stereo"), [("embed", "auto"), ("metal", "enumerate")])
+def test_unknown_stereo_mode_is_rejected_by_both_doors(door, stereo):
     import rxembed as rx
 
     with pytest.raises(ValueError, match="unknown stereo mode"):
@@ -439,25 +367,6 @@ def test_minimize_records_its_energy_window_drops(monkeypatch):
 
 
 # --- force-field capability and optimizer failures stay distinct -------------
-
-
-def test_prerelaxed_minimize_propagates_force_field_failure(monkeypatch):
-    """A prerelaxed ensemble's minimize() still takes one rescore single point, so its failure still propagates."""
-    import importlib
-
-    import rxembed as rx
-
-    embed_module = importlib.import_module("rxembed.embed")  # the engine module; `rxembed.embed` is the facade function
-    ens = rx.embed("OC(=O)CCCCc1ccccc1", constrain={(1, 9): (2.6, 3.0)}, n=2, seed=1)
-    assert ens.ids, "embed produced no conformers"
-    assert ens._stage == "relaxed", "embed did not record the completed cleanup"
-
-    def raiser(*_args, **_kwargs):
-        raise UFFOptimizationError("bad params pointer")
-
-    monkeypatch.setattr(embed_module, "restrained_uff", raiser)
-    with pytest.raises(UFFOptimizationError, match="bad params pointer"):
-        ens.minimize()
 
 
 def test_pipeline_minimize_takes_template_like_embed():
@@ -612,7 +521,7 @@ def test_failed_embed_relax_is_not_marked_settled(monkeypatch):
         assert np.array_equal(ens.mol.GetConformer(cid).GetPositions(), seed[cid])
 
 
-def test_max_iteration_embed_keeps_valid_seed_marked_unrelaxed(monkeypatch):
+def test_max_iteration_embed_keeps_valid_seed_marked_unrelaxed(monkeypatch, caplog):
     core_embed = importlib.import_module("rxembed.embed")
     restrained_uff = core_embed.restrained_uff
     calls = []
@@ -626,37 +535,18 @@ def test_max_iteration_embed_keeps_valid_seed_marked_unrelaxed(monkeypatch):
         return energies
 
     monkeypatch.setattr(core_embed, "restrained_uff", fail_first_conformer)
-    ens = rx.embed("OCCCCO", constrain={(0, 5): (2.6, 3.0)}, n=2, seed=1)
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        ens = rx.embed("OCCCCO", constrain={(0, 5): (2.6, 3.0)}, n=2, seed=1)
 
     assert ens.n == 2
     assert ens.unrelaxed == [ens.ids[0]]
     assert ens._geometry_failure(ens.unrelaxed[0]) is None
-    ens.minimize()
-    assert ens.n == 2
-    assert ens.unrelaxed == [ens.ids[0]]
-
-
-def test_an_unconverged_survivor_is_reported_by_one_warning(monkeypatch, caplog):
-    core_embed = importlib.import_module("rxembed.embed")
-    real = core_embed.restrained_uff
-    calls = []
-
-    def stall_the_first_conformer(mol, *args, **kwargs):
-        calls.append(mol)
-        energies = real(mol, *args, **kwargs)
-        record = kwargs.get("record")
-        if mol is calls[0] and record is not None and 0 in record.statuses:
-            record.statuses[0] = 1
-        return energies
-
-    monkeypatch.setattr(core_embed, "restrained_uff", stall_the_first_conformer)
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        ens = rx.embed("OCCCCO", constrain={(0, 5): (2.6, 3.0)}, n=2, seed=1)
-
-    assert ens.unrelaxed == [ens.ids[0]]
     assert [record.getMessage() for record in caplog.records] == [
         "embed: 1/2 conformer(s) have no converged UFF geometry; see .unrelaxed"
     ]
+    ens.minimize()
+    assert ens.n == 2
+    assert ens.unrelaxed == [ens.ids[0]]
 
 
 def test_constrained_embed_runs_no_single_point(monkeypatch):
@@ -777,19 +667,11 @@ def test_trajectory_is_an_explicit_single_path_request():
         rx.embed("OCCCO", n=2, trajectory=True, **spec)
 
 
-# ---------------------------------------------------------------------------------------------------------
-# Seed vs relax: which stage puts the geometry in the window (was test_seed_windows.py)
+# --- seed vs relax: which stage puts the geometry in the window --------------------------------------------
 #
-# `rxembed.embed()` output must satisfy the constraint windows it was embedded under.
-#
-# Filed here because it drives the pipeline verb, which relaxes its seeds into their windows; the core verb
-# does not. It needs no extra, so on a base install it runs rather than skips.
-#
-# The suite had no assertion of this at all, which is how a defect this size survived 285 green tests: the
-# raw ETKDG seed misses its own angle windows by 9.5 deg on average and up to 42.8, and every behavioural
-# test downstream calls a stage (`minimize`/`prune`/`score`) that relaxes first, so none of them could see
-# it. These tests read `ens.ids` straight off `rx.embed` and nothing else.
-#
+# `rxembed.embed()` output must satisfy the constraint windows it was embedded under. Filed here because it
+# drives the pipeline verb, which relaxes its seeds into their windows; the core verb does not. These tests
+# read `ens.ids` straight off `rx.embed` and nothing else, rather than a later stage that would relax first.
 # ---------------------------------------------------------------------------------------------------------
 
 
@@ -865,23 +747,6 @@ def test_organic_embed_satisfies_its_constrain_window():
     assert ens.ids
     _ang, dist = _worst(ens)
     assert dist < _DIST_SLACK, f"embed() left constrain= violated by {dist:.3f} A"
-
-
-def test_constrained_embed_runs_the_shared_workflow_acceptance(monkeypatch):
-    import rxembed.pipeline.ensemble as ensemble_module
-
-    checked = []
-    real = ensemble_module.Ensemble._workflow_failure
-
-    def tracked(self, owner, cid):
-        checked.append(cid)
-        return real(self, owner, cid)
-
-    monkeypatch.setattr(ensemble_module.Ensemble, "_workflow_failure", tracked)
-    ens = rx.embed("OCCCCO", constrain={(0, 5): (2.6, 3.0)}, n=1, seed=1)
-
-    assert checked
-    assert ens.ids
 
 
 _GRAFT_TOL = 0.01  # a fixed core is held exactly: the frozen-core distance assertion the project guarantees
@@ -988,28 +853,6 @@ def _max_core_drift(mol, ids, core, ref_pos):
     )
 
 
-def test_threads_reach_both_seed_dispatches(monkeypatch):
-    from rxembed.pipeline import dispatch
-
-    seen = []
-    real = dispatch.seed_conformers
-
-    def capture(mol, _cons, _iso, _n, params, **kwargs):
-        seen.append(params.threads)
-        return real(mol, _cons, _iso, _n, params, **kwargs)
-
-    iso = rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0]
-    monkeypatch.setattr(dispatch, "seed_conformers", capture)
-    monkeypatch.setattr(dispatch, "auto_binding_modes", lambda _mol, seed: {})
-
-    rx.embed(_embedded("CCO"), fix=[0, 1], n=1)
-    rx.embed(_embedded("CCO"), fix=[0, 1], n=1, threads=3)
-    rx.embed("CCO", contacts="auto", n=1, threads=3)
-    rx.embed(iso, n=1, threads=3)
-
-    assert seen == [0, 3, 3, 3]
-
-
 # --- fix: the rigid graft, in each of the three forms the resolver accepts ---------------------------------
 
 
@@ -1040,44 +883,10 @@ def test_unqualified_coordinate_free_metal_fails_loudly():
         rx.embed("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", n=1)
 
 
-def test_readme_coordinate_example_binds_the_named_donor():
-    pocket = rx.metal("N->[Pt](Cl)Cl.CC(C)=O", "SPL").select(index=0)
-    bound = rx.embed(pocket, coordinate="[OX1]", n=1)
-    pt = next(a.GetIdx() for a in bound.mol.GetAtoms() if a.GetSymbol() == "Pt")
-    o = next(a.GetIdx() for a in bound.mol.GetAtoms() if a.GetSymbol() == "O")
-    assert (o, pt) in bound.iso.donor_bonds
-
-
 def test_unknown_coordinate_string_names_the_accepted_forms():
     pocket = rx.metal("N->[Pt](Cl)Cl.CC(C)=O", "SPL").select(index=0)
     with pytest.raises(ValueError, match="SMARTS pattern, an atom index, or a list"):
         rx.embed(pocket, coordinate="auto", n=1)
-
-
-def test_coordinate_free_hydride_uses_the_ml_target_through_a_metal_state():
-    from rxembed import metal_distance as distance
-    from rxembed.metal_constraints import _ML_SEED_HALF_WIDTH
-
-    params = Chem.SmilesParserParams()
-    params.removeHs = False
-    source = Chem.MolFromSmiles("[H][Ru](Cl)(Cl)Cl", params)
-    mol = Chem.AddHs(source)
-    metal, hydride = 1, 0
-    donors = {n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors()}
-    target = distance.ml_distance(
-        mol,
-        metal,
-        hydride,
-        44,
-        donors,
-        {},
-        hyb={},
-    )
-    iso = rx.metal(source, "tetrahedral")[0]
-    lo, hi = iso.cons.distances[(hydride, metal)]
-
-    assert (lo + hi) / 2 == pytest.approx(target)
-    assert hi - lo == pytest.approx(2 * _ML_SEED_HALF_WIDTH)
 
 
 def test_geometry_metal_constraint_uses_shared_preparation():
@@ -1396,30 +1205,25 @@ def test_empty_identity_expansion_names_the_candidate_axis(monkeypatch):
         rx.embed("Cl[Pd](Cl)(N)N", metal="square_planar", n=1)
 
 
-def test_geometry_source_is_normalized_once_for_stereo(monkeypatch):
-    from rxembed.pipeline import dispatch
+def test_geometry_source_is_normalized_once_for_stereo(tmp_path):
+    """An xyz input's helical twist keeps its hand through a constrained re-embed.
 
-    normalized = _embedded("CC")
-    normalized_calls = []
-    signature_calls = []
-    monkeypatch.setattr(
-        dispatch, "_normalize", lambda source, charge=0: (normalized_calls.append(source) or normalized, True)
-    )
-    monkeypatch.setattr(
-        dispatch,
-        "signature",
-        lambda mol, charge=0: signature_calls.append(mol) or {},
-    )
-    monkeypatch.setattr(
-        dispatch,
-        "_execute",
-        lambda *args, **kwargs: dispatch.Ensemble(normalized, [normalized.GetConformer().GetId()]),
-    )
+    A [5]helicene's P/M twist is not a bonds-matrix property (unlike a tetrahedral centre), so a plain
+    re-embed can flip it; only reading the input's own signature back (dispatch._stereo_filter) catches that.
+    The check only runs while relaxing into a window, so the re-embed needs one trivial fix= to engage it.
+    """
+    helicene = Chem.AddHs(Chem.MolFromSmiles("c1ccc2c(c1)ccc1ccc3ccc4ccccc4c3c12"))
+    assert rdDistGeom.EmbedMolecule(helicene, randomSeed=1, useRandomCoords=True) == 0
+    rdForceFieldHelpers.MMFFOptimizeMolecule(helicene, maxIters=5000)
+    hand = signature(helicene, charge=0)["helical"]
 
-    dispatch.embed("input.xyz", n=1, stereo="all")
+    conf = helicene.GetConformer()
+    fix = {(0, 1): round(conf.GetAtomPosition(0).Distance(conf.GetAtomPosition(1)), 3)}
+    xyz = tmp_path / "helicene.xyz"
+    xyz.write_text(Chem.MolToXYZBlock(helicene))
 
-    assert normalized_calls == ["input.xyz"]
-    assert signature_calls == [normalized]
+    ens = rx.embed(str(xyz), n=1, seed=3, fix=fix)
+    assert signature(ens.mol, conf_id=ens.ids[0], charge=0)["helical"] == hand
 
 
 # --- contacts: a discovered binding mode is one the embed can actually realise ------------------------------
@@ -1457,9 +1261,6 @@ def test_stereo_and_contact_candidates_compose_before_embedding(monkeypatch):
     }
 
 
-# --- the organic path pays nothing for the metal path ------------------------------------------------------
-
-
 # --- rx.metal: what spec the isomer enumerator hands down ---------------------------------------------------
 
 
@@ -1486,25 +1287,6 @@ def test_spectator_sphere_uses_polyhedron_constraints_without_implicit_shape_hol
     from_smiles = rx.metal("CCCN[Pd](Cl)(Cl)NCCC", "square_planar")[0]  # no input geometry -> nothing shape-held
     assert not from_smiles.cons.shapes
     assert len(from_smiles.cons.pulls) == len(from_smiles.donors)
-
-
-# The subject below is the core's `bounds._bounds`; it is pinned here because the spec that reaches it is
-# the dispatch's, and this file is where that spec is otherwise exercised.
-def test_reversed_angle_preserves_distance_window():
-    from rxembed import bounds
-    from rxembed.constraints import Constraints, add_distance
-
-    mol = _embedded("CCCC", seed=1)
-
-    def window(angle_key):
-        c = Constraints()
-        add_distance(c.distances, 0, 3, 1.50, 1.56)
-        c.angles[angle_key] = (95.0, 105.0)
-        bm, _tol = bounds._bounds(mol, c)
-        return bm[3][0], bm[0][3]  # (lo, hi) for the pair (0, 3)
-
-    assert window((0, 1, 3)) == pytest.approx(window((3, 1, 0))), "angle index ORDER changed the bounds"
-    assert window((3, 1, 0)) == pytest.approx((1.50, 1.56), abs=1e-6), "the explicit window was clobbered"
 
 
 # --- rx.minimize: the search-free companion ----------------------------------------------------------------

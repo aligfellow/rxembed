@@ -350,8 +350,9 @@ def _write(mol, cons, params=None):
     Separate from `_bounds` because smoothing repairs in place: `_feasible_bounds` needs the matrix as
     written, before repair, to diff against the smoothed result.
     """
-    # Labelled ligand stereo temporarily adds dative M-L edges so RDKit has the donor's full CIP basis. Remove
-    # only edges owned by a selected metal's explicit M-L distance, on a private copy.
+    # `seed_conformers` temporarily adds dative M-L edges so RDKit sees a labelled donor's full CIP basis and a
+    # terminal sp donor's linear axis. Remove only edges owned by a selected metal's explicit M-L distance, on a
+    # private copy.
     owned = {tuple(sorted(atoms)) for atoms in cons.distances}
     removable = []
     for bond in mol.GetBonds():

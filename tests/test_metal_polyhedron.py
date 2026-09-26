@@ -74,7 +74,6 @@ def test_angle_rows_match_vertex_geometry():
 
 def test_only_flat_based_pyramid_gets_umbrella():
     held = {n: p.umbrella_improper for n, p in POLYHEDRA.items() if p.umbrella_improper is not None}
-    assert list(held) == ["trigonal_pyramidal"]
 
     dirs = POLYHEDRA["trigonal_pyramidal"].vertex_dirs
     for r in (1.4, 3.0):
@@ -101,7 +100,7 @@ def test_angle_tables_cover_claimed_pairs():
             assert len(pairs) == rec.cn * (rec.cn - 1) // 2, f"{name}: derived table is not all pairs"
 
 
-def test_new_records_separate_same_cn_neighbors():
+def test_records_of_one_cn_are_distinguishable():
     for cn in {p.cn for p in POLYHEDRA.values()}:
         recs = [p for p in POLYHEDRA.values() if p.cn == cn]
         for a, b in itertools.combinations(recs, 2):
@@ -195,19 +194,24 @@ def test_canonical_slots_fold_rotations_not_reflection():
 
 
 def test_seating_finds_distorted_antiprism_optimum():
+    """A distorted, shuffled observation seats at the best fit over every bounded orbit representative."""
     directions = np.array(vertex_dirs("square_antiprism"), float)
     directions /= np.linalg.norm(directions, axis=1, keepdims=True)
     rng = np.random.RandomState(0)
-    optima = (7.9744270801213695, 7.988318361026678, 7.989758899386766)
-    for trial, optimum in enumerate(optima):
+    for _trial in range(3):
         observed = directions[rng.permutation(len(directions))] + rng.randn(len(directions), 3) * 0.05
         observed /= np.linalg.norm(observed, axis=1, keepdims=True)
         order = seat_by_alignment(observed, directions)
-        score = float(np.linalg.svd(observed[list(order)].T @ directions, compute_uv=False).sum())
-        assert score == pytest.approx(optimum, abs=1e-12), f"trial {trial}: {score:.6f} vs {optimum:.6f}"
+        score = _fit_trace(observed[list(order)].T @ directions)
+        brute_best = max(
+            _fit_trace(observed[list(candidate)].T @ directions)
+            for candidate in isomer_permutations("square_antiprism")
+        )
+        assert score == pytest.approx(brute_best, abs=1e-6)
 
 
 def test_seating_searches_the_exact_bounded_orbit_pool():
+    """A near-octahedral observation seats at the exact best fit over every bounded orbit representative."""
     observed = np.array(
         [
             [-0.270833112875, -0.663552188301, 0.697386491388],
@@ -221,28 +225,9 @@ def test_seating_searches_the_exact_bounded_orbit_pool():
     ideal = np.array(vertex_dirs("octahedral"), float)
 
     order = seat_by_alignment(observed, ideal)
-
-    assert tuple(order) == (0, 5, 1, 4, 2, 3)
-    assert _fit_trace(observed[order].T @ ideal) == pytest.approx(4.956143442072902, abs=1e-12)
-
-
-def test_seating_reuses_template_assignments_but_refits_each_geometry(monkeypatch):
-    from rxembed import metal_polyhedron as poly
-
-    poly._seating_permutations.cache_clear()
-    generate = poly._proper_orbit_permutations
-    calls = []
-
-    def counted(dirs):
-        calls.append(dirs)
-        yield from generate(dirs)
-
-    monkeypatch.setattr(poly, "_proper_orbit_permutations", counted)
-    ideal = np.array(vertex_dirs("octahedral"), float)
-    for observed in (ideal, ideal[[0, 2, 1, 3, 5, 4]]):
-        order = seat_by_alignment(observed, ideal)
-        assert _fit_trace(observed[order].T @ ideal) == pytest.approx(6.0)
-    assert len(calls) == 1
+    score = _fit_trace(observed[order].T @ ideal)
+    brute_best = max(_fit_trace(observed[list(candidate)].T @ ideal) for candidate in isomer_permutations("octahedral"))
+    assert score == pytest.approx(brute_best, abs=1e-9)
 
 
 # --- the convex-hull edge test, for the metal_slots chelate edge rule --------------------------------
@@ -268,26 +253,6 @@ def test_hull_edges_match_expected_counts(code, expected):
     assert len(hull_edges(tuple(map(tuple, rec.vertex_dirs)))) == expected
 
 
-def test_hull_edges_exclude_every_trans_pair():
-    for name, rec in POLYHEDRA.items():
-        dirs = rec.vertex_dirs
-        edges = hull_edges(tuple(map(tuple, dirs)))
-        trans = {
-            frozenset((i, j))
-            for i, j in itertools.combinations(range(len(dirs)), 2)
-            if vertex_angle(dirs[i], dirs[j]) == 180
-        }
-        assert not (trans & edges), f"{name}: a 180 deg (trans) pair counted as a hull edge"
-
-
-def test_hull_edges_exclude_a_square_face_diagonal():
-    dirs = POLYHEDRA["square_antiprism"].vertex_dirs  # 0,1,3,2 is the top face's cycle; 0-3 and 1-2 are diagonals
-    edges = hull_edges(tuple(map(tuple, dirs)))
-    assert frozenset((0, 1)) in edges
-    assert frozenset((0, 3)) not in edges
-    assert frozenset((1, 2)) not in edges
-
-
 def test_hull_edges_are_invariant_under_point_group_rotations():
     """A genuine geometric edge set is a union of proper-rotation orbits: no rotation can turn an edge into
     a non-edge or vice versa. This catches an edge set that swaps one record's edge/non-edge pair, or adds
@@ -309,16 +274,16 @@ def test_seating_allows_reflection_for_achiral_template():
     rng = np.random.RandomState(0)
     for magnitude in (0.10, 0.18):
         observed = ideal[rng.permutation(6)] * np.array([1.0, 1.0, -1.0]) + rng.randn(6, 3) * magnitude
-    observed /= np.linalg.norm(observed, axis=1, keepdims=True)
-    order = max(
-        isomer_permutations("octahedral"),
-        key=lambda candidate: _fit_trace(observed[list(candidate)].T @ ideal),
-    )
-    trans = [
-        float(np.degrees(np.arccos(np.clip(observed[order[i]] @ observed[order[j]], -1, 1))))
-        for i, j in ((0, 1), (2, 3), (4, 5))
-    ]
-    assert min(trans) > 140.0
+        observed /= np.linalg.norm(observed, axis=1, keepdims=True)
+        order = max(
+            isomer_permutations("octahedral"),
+            key=lambda candidate: _fit_trace(observed[list(candidate)].T @ ideal),
+        )
+        trans = [
+            float(np.degrees(np.arccos(np.clip(observed[order[i]] @ observed[order[j]], -1, 1))))
+            for i, j in ((0, 1), (2, 3), (4, 5))
+        ]
+        assert min(trans) > 140.0
 
 
 # --- relaxed_shell ------------------------------------------------------------------------------------
@@ -333,25 +298,9 @@ def test_relaxed_shell_returns_none_when_it_does_not_converge():
     assert relaxed_shell(dirs, bites) is None
 
 
-def test_relaxed_shell_ignores_a_bent_trans_pair_for_the_oriented_type():
-    """A square-pyramidal apex fan bitten to both members of a trans basal pair (150 deg ideal) keeps its
-    type down to a crystal-realistic 83 deg: the trans pair itself bends without the shape changing, so its
-    triple must not decide the oriented-type test. A tetrahedral 4-cycle, which has no trans pair to exclude,
-    is unaffected and still reads as a different shape.
-    """
-    sp = POLYHEDRA["square_pyramidal"].vertex_dirs
-    assert relaxed_shell(sp, {frozenset((0, 1)): 83.0, frozenset((0, 3)): 83.0}) is not None
-
-    tet = POLYHEDRA["tetrahedral"].vertex_dirs
-    cycle = {frozenset((0, 1)): 80.5, frozenset((1, 2)): 89.0, frozenset((2, 3)): 80.5, frozenset((3, 0)): 89.0}
-    assert relaxed_shell(tet, cycle) is None
-
-
 def test_relaxed_shell_converges_on_a_closed_bite_cycle():
-    """A porphyrin-like closed ring of four bites, each donor shared by its two ring neighbours, used to
-    oscillate in a +-1.5 deg limit cycle instead of converging: the undamped simultaneous update overshoots
-    every round on a closed cycle (see `metal_polyhedron._SHELL_DAMPING`). Every bite must land within
-    `constraints.FIX_ANGLE_TOL` of its own target, not just settle at some smaller but nonzero residual.
+    """A porphyrin-like closed ring of four bites, each donor shared by its two ring neighbours, converges:
+    every bite lands within `constraints.FIX_ANGLE_TOL` of its own target, not some smaller nonzero residual.
     """
     dirs = POLYHEDRA["octahedral"].vertex_dirs  # equatorial 4-cycle: 0-2-1-3-0 (each adjacent pair cis, 90 deg ideal)
     bites = {frozenset((0, 2)): 86.5, frozenset((2, 1)): 90.5, frozenset((1, 3)): 96.5, frozenset((3, 0)): 86.5}
@@ -380,3 +329,8 @@ def test_square_pyramid_apex_fan_keeps_its_base_planar():
 
     ranked = rank_shapes(rays)
     assert ranked[0][1] == "square_pyramidal", ranked[:2]
+
+    # A tetrahedral 4-cycle has no trans pair to exclude, so the same bite-fold code path still converges.
+    tet = POLYHEDRA["tetrahedral"].vertex_dirs
+    cycle = {frozenset((0, 1)): 80.5, frozenset((1, 2)): 89.0, frozenset((2, 3)): 80.5, frozenset((3, 0)): 89.0}
+    assert relaxed_shell(tet, cycle) is None

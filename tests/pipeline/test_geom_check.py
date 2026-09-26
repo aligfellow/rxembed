@@ -90,21 +90,19 @@ def test_ensemble_checks_every_tracked_conformer():
 
 
 def test_geom_check_prints_the_shape_record():
-    """`check()`'s summary carries the acceptance gate's shape record; a core seed that never ran the gate
-    (`rx.core.embed`'s raw output, before `minimize()`) prints an explicit ungated line instead of silently
-    omitting it, which is what exposes `rx.core.embed` seeds, `mc` output and `wrap`.
-    """
+    """`check()`'s report carries the acceptance gate's shape record, explicit "ungated" before it ever ran."""
     iso = next(
         iter(rx.enumerate_isomers(Chem.AddHs(Chem.MolFromSmiles("[Fe](N)(O)(F)(Cl)Br")), "trigonal_bipyramidal"))
     )
     confs = rx.core.embed(iso, n=1, seed=1)
 
     seed_report = geom.check(confs.mol, confs.ids[0], donors=iso.donors)
-    assert "no shape record (ungated)" in seed_report.summary()
+    assert seed_report.shape == "no shape record (ungated)"
 
     confs.minimize()
     report = geom.check(confs.mol, confs.ids[0], donors=iso.donors)
-    assert "Fe0 TBP" in report.summary()
+    assert report.shape is not None
+    assert report.shape.startswith("Fe0 TBP")
 
 
 def test_geometry_check_rejects_nonfinite_coordinates():
@@ -173,6 +171,32 @@ def test_planarity_checks_local_fused_rings_not_their_super_ring():
     violations = geom.planarity(mol, pos)
 
     assert not any(violation.detail == "aromatic ring puckered" for violation in violations)
+
+
+def test_eta2_planarity_flex_is_metal_local():
+    mol = Chem.AddHs(Chem.MolFromSmiles("C=CC=C"))  # butadiene, no metal -> no eta2 flex
+    rdDistGeom.EmbedMolecule(mol, randomSeed=1)
+    conf = mol.GetConformer()
+    ci = next(a.GetIdx() for a in mol.GetAtoms() if a.GetHybridization() == Chem.HybridizationType.SP2)
+    pos = conf.GetPositions()
+    pos[ci] = pos[ci] + [0.0, 0.0, 0.35]  # shove one sp2 carbon 0.35 A out of plane (past the 0.15 default)
+    conf.SetPositions(pos)
+
+    assert any(v.kind == "planarity" for v in geom.planarity(mol, pos)), "non-metal sp2 wrongly flexed"
+
+
+def test_xh_bond_length_window_is_element_aware():
+    mol = Chem.AddHs(Chem.MolFromSmiles("CP"))
+    rdDistGeom.EmbedMolecule(mol, randomSeed=1)
+    conf = mol.GetConformer()
+    h = next(a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 1 and a.GetNeighbors()[0].GetSymbol() == "P")
+    p = mol.GetAtomWithIdx(h).GetNeighbors()[0].GetIdx()
+    pos = conf.GetPositions()
+    unit = (pos[h] - pos[p]) / np.linalg.norm(pos[h] - pos[p])
+    for length, flagged in ((1.42, False), (1.9, True)):
+        pos[h] = pos[p] + unit * length
+        conf.SetPositions(pos)
+        assert bool(any(v.kind == "hydrogen" for v in geom.hydrogens(mol, pos))) is flagged, f"P-H {length}"
 
 
 # --- one deliberate break per violation kind --------------------------------------------------------------

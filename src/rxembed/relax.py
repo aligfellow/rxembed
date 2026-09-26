@@ -7,9 +7,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from rdkit import Chem, rdBase
-from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers, rdMolTransforms, rdtrajectory
+from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers, rdtrajectory
 
-from .constraints import DIHEDRAL_ATOMS
 from .mechanisms import MECHANISM_ORDER
 from .metal_core import COORDINATION_METALS, materialise_phantoms, strip_phantoms
 from .utils import CARBON_Z, Violation, atom_label
@@ -363,23 +362,6 @@ def _select_uff_graph(work, cons, frozen):
     _raise_uff_typing_error(work, sorted(missing))
 
 
-def _seat_fixed_dihedrals(confs, fixed, frozen):
-    """Rotate connected fixed dihedrals near target without disturbing a rigid graft."""
-    frozen = sorted(frozen)
-    for atoms, (lo, hi) in fixed.items():
-        if len(atoms) != DIHEDRAL_ATOMS:
-            continue
-        i, j, k, w = atoms
-        for conf in confs:
-            before = conf.GetPositions().copy() if frozen else None
-            try:
-                rdMolTransforms.SetDihedralDeg(conf, i, j, k, w, 0.5 * (lo + hi))
-            except (RuntimeError, ValueError):
-                pass  # rings may not rotate; the strict post-UFF gate remains authoritative
-            if before is not None and not np.array_equal(conf.GetPositions()[frozen], before[frozen]):
-                conf.SetPositions(before)  # a coordinate graft is stricter than a numeric torsion
-
-
 @dataclass
 class UFFRecord:
     """Collect what `restrained_uff` reports besides energies, across every call given the same record.
@@ -425,7 +407,7 @@ def restrained_uff(
     walls stop strengthening at 1, and native UFF, target pulls and structural repairs are unchanged, so it
     is not a multiplier over the whole objective. Metal and haptic typing changes only a private graph;
     relaxed real-atom coordinates return to ``mol``. Any exception restores every selected conformer to its
-    coordinates before torsion seating or minimisation.
+    coordinates before minimisation.
 
     ``record``, a `UFFRecord`, receives each minimised conformer's optimizer status and frames and the private
     typing changes; a single point records no status.
@@ -436,7 +418,6 @@ def restrained_uff(
     original = {conf.GetId(): conf.GetPositions().copy() for conf in confs}
     energies = []
     try:
-        _seat_fixed_dihedrals(confs, cons.fixed if max_iters else {}, frozen)
         work = materialise_phantoms(mol, cons.haptic)
         work = _ff_surrogate(work, cons.metals, cons.phantoms)
         target, effective_cons, dative_edges, replacements = _select_uff_graph(work, cons, frozen)

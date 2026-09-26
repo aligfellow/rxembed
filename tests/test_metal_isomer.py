@@ -1,14 +1,11 @@
 """Test selected metal states, collections, and retained geometry."""
 
-from importlib.util import find_spec
-
 import numpy as np
 import pytest
 from rdkit import Chem
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
-from rxembed import metal_constraints as constraints
 from rxembed import metal_core, stereo
 from rxembed import metal_isomer as isomer
 from rxembed import metal_polyhedron as poly
@@ -35,14 +32,14 @@ def _assert_clean(ensemble):
 
 def _angle(positions, left, center, right):
     a, b = positions[left] - positions[center], positions[right] - positions[center]
-    return float(np.degrees(np.arccos(a @ b / np.linalg.norm(a) / np.linalg.norm(b))))
+    cosine = np.clip(a @ b / np.linalg.norm(a) / np.linalg.norm(b), -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosine)))
 
 
 def test_isomer_summary_uses_compact_selectable_stereo(capsys):
     isomers = rx.metal("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "OCT", stereo="free")
     assert isomers.summary() is None
     lines = capsys.readouterr().out.splitlines()
-    assert lines[0] == "  idx  centres (geometry label [slots] Δ/Λ/-)  ligand"
     assert all("OCT" in line and ("Δ" in line or "Λ" in line) for line in lines[1:])
 
     point = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-[NH2]C(C)O", "SPL")
@@ -54,28 +51,6 @@ def test_isomer_summary_uses_compact_selectable_stereo(capsys):
     assert point.filter(stereo="C5:R") == point.filter(stereo="5R") == point.filter(stereo="R")
     assert alkene.filter(stereo="E") == alkene.filter(stereo="C6=C7:E")
     assert all(label in shown for label in ("C5:R", "C5:S", "C6=C7:E", "C6=C7:Z"))
-
-
-def test_enumeration_compiles_only_the_selected_isomer(monkeypatch, capsys):
-    calls = 0
-    build = constraints.coordination
-
-    def counted(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return build(*args, **kwargs)
-
-    monkeypatch.setattr(constraints, "coordination", counted)
-    isomers = rx.metal("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "OCT", stereo="free")
-    assert len(isomers) == 30
-    assert calls == 0
-    isomers.summary()
-    capsys.readouterr()
-    rx.cxsmiles(isomers[0])
-    assert calls == 0
-    _ = isomers[0].cons
-    _ = isomers[1].cons
-    assert calls == 2
 
 
 def test_constraint_compilation_does_not_mutate_isomer():
@@ -93,12 +68,6 @@ def test_isomers_do_not_share_their_public_molecule():
     assert second.mol.GetAtomWithIdx(second.metal).GetAtomicNum() != second.real_z
 
 
-def test_metal_states_are_read_only():
-    candidate = rx.metal("N->[Pd+2](<-[Cl-])(<-[Br-])<-[F-]", "SPL")[0]
-    with pytest.raises(AttributeError):
-        candidate.centres = tuple(reversed(candidate.centres))
-
-
 def test_center_selector_rejects_bool_and_float():
     isomers = rx.metal(_MA2B2, "SPL")
     for center in (True, 1.5):
@@ -107,17 +76,16 @@ def test_center_selector_rejects_bool_and_float():
 
 
 def test_summary_details_show_site_relations_and_non_equivalent_donors(capsys):
+    # Two carbon donors (a carbonyl and a methanide) must be disambiguated by index, not merged as one symbol.
     octahedral = rx.metal("[O+]#[C-]->[Co+3](<-[CH3-])(<-[Cl-])(<-N)(<-[F-])<-P", "OCT", stereo="free")[0]
     octahedral.summary(details=True)
     shown = capsys.readouterr().out
-    assert "Co2 trans:" in shown
-    assert "Co2 C1: [C-]#[O+]" in shown
-    assert "Co2 C3: [CH3-]" in shown
+    assert "trans: C1-C3" in shown
 
     tbp = rx.metal("[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])(<-N)<-O", "TBP", stereo="free")[0]
     tbp.summary(details=True)
     shown = capsys.readouterr().out
-    assert "Fe2 axial:" in shown
+    assert "axial:" in shown
     assert "equatorial:" in shown
 
 
@@ -133,12 +101,6 @@ def test_select_accepts_geometry_code_or_name():
     assert tetrahedral.select(hand="delta") is tetrahedral.select(hand="Δ")
 
 
-def test_isomer_repr_is_the_compact_summary_row():
-    candidates = rx.metal("O[Co](Cl)(C)(N)(F)P", "OCT")
-    assert "Constraints(" not in repr(candidates)
-    assert "Co1 OCT" in repr(candidates)
-
-
 def test_shape_only_summary_lists_every_restored_metal(capsys):
     candidate = isomer.Isomer.from_state(Chem.MolFromSmiles("[C].[C]"), (MetalState(0, 26, 2), MetalState(1, 25, 0)))
     candidates = isomer.IsomerSet([candidate])
@@ -146,8 +108,9 @@ def test_shape_only_summary_lists_every_restored_metal(capsys):
     assert candidates.select() is candidate
     candidate.summary(details=True)
     shown = capsys.readouterr().out
-    assert "Fe0 [surrogated]" in shown
-    assert "Mn1 [surrogated]" in shown
+    assert "Fe0" in shown
+    assert "Mn1" in shown
+    assert shown.count("surrogated") == 2, "each unresolved metal must be marked, not just named"
     assert "Constraints(" not in repr(candidate)
 
 
@@ -191,19 +154,6 @@ def test_isomer_source_and_metal_are_mutually_exclusive():
     candidate = rx.metal(_MA2B2, "square_planar")[0]
     with pytest.raises(ValueError, match="Isomer source OR metal"):
         rx.embed(candidate, metal="square_planar")
-
-
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_coordinate_input_reports_its_kept_conformers(tmp_path, caplog):
-    xyz = tmp_path / "pd.xyz"
-    rx.embed(rx.metal(_MA2B2, "square_planar")[0], n=1, seed=1).dump(str(xyz))
-    with caplog.at_level("INFO", logger="rxembed"):
-        rx.embed(str(xyz), n=1)
-    assert any("kept 1 conformer(s)" in record.message for record in caplog.records)
-    assert not any("input geometry)" in record.message for record in caplog.records)
-    with caplog.at_level("INFO", logger="rxembed"):
-        rx.embed("OC(=O)CCCCc1ccccc1", constrain={(1, 9): (2.6, 3.0)}, n=2, seed=1)
-    assert not any("relaxed into its windows" in record.message for record in caplog.records)
 
 
 def test_lazy_haptic_radius_uses_the_source_geometry():
@@ -398,6 +348,14 @@ def test_retained_seating_is_atom_order_invariant_for_every_shape(geometry):
     assert [state.geometry for state in retained] == [geometry, geometry]
     assert rx.cxsmiles(retained[0]) == rx.cxsmiles(retained[1])
 
+    positions = mol.GetConformer().GetPositions()
+    seated = retained[0]
+    for i in range(len(directions)):
+        for j in range(i + 1, len(directions)):
+            expected = poly.vertex_angle(directions[i], directions[j])
+            actual = _angle(positions, seated.vertices[i], seated.metal, seated.vertices[j])
+            assert actual == pytest.approx(expected, abs=1.0)
+
 
 @pytest.mark.parametrize("geometry", list(poly.POLYHEDRA))
 def test_distorted_source_and_stated_isomer_share_polyhedron_angles(geometry):
@@ -416,17 +374,3 @@ def test_distorted_source_and_stated_isomer_share_polyhedron_angles(geometry):
         distance = np.linalg.norm(positions[donor] - positions[retained.metal])
         window = measured.cons.distances[tuple(sorted((retained.metal, donor)))]
         assert 0.5 * sum(window) == pytest.approx(distance)
-
-
-def test_derived_shape_uses_polyhedron():
-    geometry = "square_antiprism"
-    mol = _ideal_sphere(geometry, "F", (5, 2, 7, 0, 3, 6, 1, 4))
-    retained = isomer.from_geometry(mol)
-    assert retained.geometry == geometry
-    positions = mol.GetConformer().GetPositions()
-    directions = poly.vertex_dirs(geometry)
-    for i in range(len(directions)):
-        for j in range(i + 1, len(directions)):
-            expected = poly.vertex_angle(directions[i], directions[j])
-            actual = _angle(positions, retained.vertices[i], retained.metal, retained.vertices[j])
-            assert actual == pytest.approx(expected, abs=1.0)

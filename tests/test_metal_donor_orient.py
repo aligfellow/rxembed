@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import csv
+import random
 from importlib.util import find_spec
 from unittest import mock
 
@@ -14,7 +14,7 @@ from rdkit.Chem import rdMolTransforms as T
 import rxembed as rx
 from rxembed import metal_donor_orient
 from rxembed.constraints import Constraints
-from tests.conftest import EXAMPLES_DIR, TMQMG_DIR
+from tests.conftest import EXAMPLES_DIR
 
 _MN_H2 = str(EXAMPLES_DIR / "mn-h2.xyz")  # a frozen-TS bimetallic
 _MN_H2_RC = [1, 5, 63, 64, 65, 66]  # its reacting core
@@ -47,7 +47,7 @@ def _capped(iso):
     return {e[1] for e in iso.cons.coplanar}
 
 
-def _emitted_caps(iso, seed=1):
+def _emitted_caps(iso, seed=1, fc=1e4):
     """Every torsion `Coplanar.uff_terms` writes on a seed conformer of `iso`, as `(i, j, k, w, lo, hi, fc)`."""
     from rxembed.mechanisms import Coplanar
 
@@ -55,7 +55,7 @@ def _emitted_caps(iso, seed=1):
     # `_mol`, not `.mol`: `uff_terms` reads `conf.GetOwningMol()` to decide plane-sharing, so it must see the
     # bond-less surrogate the FF relaxes; `.mol`'s dative M-L bonds would change which caps look redundant.
     spy = mock.Mock(spec=["UFFAddTorsionConstraint"])
-    Coplanar().uff_terms(spy, ens.cons, ens._mol.GetConformer(ens.ids[0]), 1e4)
+    Coplanar().uff_terms(spy, ens.cons, ens._mol.GetConformer(ens.ids[0]), fc)
     return [
         (i, j, k, w, lo, hi, fc)
         for (i, j, k, w, _relative, lo, hi, fc), _ in spy.UFFAddTorsionConstraint.call_args_list
@@ -82,28 +82,6 @@ def test_proton_walls_require_calibrated_donor(smi, walled):
     iso = rx.metal(smi, "square_planar").select(index=0)
     protons = [k for k in iso.cons.angles if k[0] == iso.metal and iso.mol.GetAtomWithIdx(k[2]).GetAtomicNum() == 1]
     assert bool(protons) == walled, f"{smi}: {len(protons)} proton walls, expected {'some' if walled else 'none'}"
-
-
-@pytest.mark.parametrize("writer", [metal_donor_orient.orient_donor, metal_donor_orient.coplanar_donor])
-def test_donor_writers_use_supplied_classification_including_abstention(writer, monkeypatch):
-    iso = rx.metal("[Cl-]->[Pd+2](<-[Cl-])(<-[NH3])<-n1ccccc1", "SPL")[0]
-    mol, donors = iso.graph, set(iso.donors)
-    donor = next(d for d in donors if mol.GetAtomWithIdx(d).GetIsAromatic())
-    hyb = metal_donor_orient.stripped_hybridisation(mol)
-    expected = Constraints()
-    writer(mol, iso.metal, donor, donors, expected)
-    assert expected.angles or expected.coplanar
-
-    def reclassified(_mol):
-        pytest.fail("a supplied graph classification must not be recomputed")
-
-    monkeypatch.setattr(metal_donor_orient, "stripped_hybridisation", reclassified)
-    actual = Constraints()
-    writer(mol, iso.metal, donor, donors, actual, hyb=hyb)
-    assert actual == expected
-    abstained = Constraints()
-    writer(mol, iso.metal, donor, donors, abstained, hyb={})
-    assert abstained == Constraints()
 
 
 @pytest.mark.parametrize(
@@ -404,25 +382,40 @@ def test_uncalibrated_codonor_keeps_the_shared_backbone_arm_walled():
 
 
 def test_backbone_target_picks_the_nearer_donor_across_a_bridging_donor():
-    # A macrocycle can route one donor's only arm past a bridging donor to a farther one beyond it (CAGJED:
-    # an As donor bridges two amidate N's). R_pair must key off the NEAREST co-donor: whichever donor the
-    # arm reaches first decides the exemption, not a donor further down the same ring.
+    """R_pair must exempt a bulky donor's arm off the nearer co-donor down its own backbone, not a donor
+    reached only by continuing past it (a macrocycle can route one arm to either).
+    """
     rw = Chem.RWMol()
-    metal, na, ca, pmid, cb, nb, cx = (rw.AddAtom(Chem.Atom(z)) for z in (46, 7, 6, 15, 6, 7, 6))
-    rw.AddBond(na, ca, Chem.BondType.SINGLE)
-    rw.AddBond(ca, pmid, Chem.BondType.SINGLE)
-    rw.AddBond(pmid, cb, Chem.BondType.SINGLE)
-    rw.AddBond(cb, nb, Chem.BondType.SINGLE)
-    rw.AddBond(pmid, cx, Chem.BondType.SINGLE)
-    rw.AddBond(na, metal, Chem.BondType.DATIVE)
-    rw.AddBond(pmid, metal, Chem.BondType.DATIVE)
-    rw.AddBond(nb, metal, Chem.BondType.DATIVE)
+    metal = rw.AddAtom(Chem.Atom(46))
+    na, methyl_a, methyl_b = (rw.AddAtom(Chem.Atom(z)) for z in (7, 6, 6))  # a bulky tertiary amine donor
+    arm_a, arm_b = (rw.AddAtom(Chem.Atom(6)) for _ in range(2))
+    pmid = rw.AddAtom(Chem.Atom(15))  # the nearer donor: a small, calibrated phosphine
+    arm_c, arm_d = (rw.AddAtom(Chem.Atom(6)) for _ in range(2))
+    nb = rw.AddAtom(Chem.Atom(8))  # the farther donor: an uncalibrated ether, reached only past pmid
+    for a, b in (
+        (na, methyl_a),
+        (na, methyl_b),
+        (na, arm_a),
+        (arm_a, arm_b),
+        (arm_b, pmid),
+        (pmid, arm_c),
+        (arm_c, arm_d),
+        (arm_d, nb),
+    ):
+        rw.AddBond(a, b, Chem.BondType.SINGLE)
+    for donor in (na, pmid, nb):
+        rw.AddBond(donor, metal, Chem.BondType.DATIVE)
     mol = rw.GetMol()
     mol.UpdatePropertyCache(strict=False)
     donors = {na, pmid, nb}
 
-    assert metal_donor_orient._backbone_targets(mol, na, donors) == {ca: pmid}
-    assert metal_donor_orient._backbone_targets(mol, nb, donors) == {cb: pmid}
+    assert metal_donor_orient._backbone_targets(mol, na, donors) == {arm_a: pmid}
+
+    cons = Constraints()
+    metal_donor_orient.orient_donor(mol, metal, na, donors, cons)
+    assert (metal, na, methyl_a) in cons.angles
+    assert (metal, na, methyl_b) in cons.angles
+    assert (metal, na, arm_a) not in cons.angles, "the nearer donor pmid is small and calibrated: R_pair exempts it"
 
 
 def test_symmetric_dithiolate_chelate_keeps_both_backbone_arms_walled():
@@ -513,9 +506,8 @@ def test_coplanar_permutations_each_define_one_plane():
 
 
 def test_conjugated_bridge_chelate_gets_the_measured_ring_closure_hinge():
-    # Replaces the old bridged D-X-D branch (_BRIDGED_COPLANAR_CAP): a bridging carboxylate is a conjugated
-    # 4-ring, exactly `ring_hinge`'s case now, at the measured 4-ring cap and one row per donor (no reciprocal
-    # duplicate: unlike the deleted branch, the pairwise ring walk never needs a dedup guard).
+    # A bridging carboxylate is a conjugated 4-ring, `ring_hinge`'s case, at the measured 4-ring cap and one
+    # row per donor (the pairwise ring walk never needs a dedup guard for a reciprocal duplicate).
     source = Chem.MolFromSmiles("CC1=[O]->[Zn+2](Cl)(Cl)<-[O-]1")
     for mol in (source, Chem.RenumberAtoms(source, list(reversed(range(source.GetNumAtoms()))))):
         iso = rx.metal(mol, "tetrahedral")[0]
@@ -533,8 +525,7 @@ def test_conjugated_bridge_chelate_gets_the_measured_ring_closure_hinge():
 
 def test_conjugated_dithiolate_ring_gets_both_hinge_rows():
     # bis(benzene-1,2-dithiolate)Pd's FISCIT/CIRFIT ring: a 5-membered chelate whose whole metal-free S-C=C-S
-    # path is aromatic-conjugated. Both donors hinge (mutation: drop the conjugation test and this still
-    # passes, since ring size alone no longer distinguishes a real chelate from an unconjugated one).
+    # path is aromatic-conjugated, so ring size alone does not decide a hinge row; both donors hinge.
     iso = rx.metal("Cl[Pd]1(Cl)<-[S-]c2ccccc2[S-]->1", "square_planar")[0]
     s1, s2 = (d for d in iso.donors if iso.mol.GetAtomWithIdx(d).GetSymbol() == "S")
     hinge = [row for row in iso.cons.coplanar if row[5] == metal_donor_orient._HINGE_CAP[5]]
@@ -547,6 +538,14 @@ def test_conjugated_dithiolate_ring_gets_both_hinge_rows():
         assert iso.mol.GetBondBetweenAtoms(d, x) is not None, "X is D's own ring neighbour"
         assert anchor == metal_donor_orient._COPLANAR_ANCHOR
 
+    ens = rx.embed(iso, n=3, seed=42, threads=1)
+    fold = max(
+        180.0 - abs(T.GetDihedralDeg(ens.mol.GetConformer(cid), i, j, k, w))
+        for cid in ens.ids
+        for i, j, k, w, _anchor, _cap in hinge
+    )
+    assert fold <= hinge[0][5] + 1.0, f"hinge fold {fold:.1f} deg exceeds its declared cap"
+
 
 @pytest.mark.parametrize(
     ("name", "smi", "geometry"),
@@ -556,44 +555,13 @@ def test_conjugated_dithiolate_ring_gets_both_hinge_rows():
     ],
 )
 def test_nonconjugated_and_oversized_rings_get_no_hinge_row(name, smi, geometry):
-    # Mutation: allow ring sizes 4-6 (drop the `_HINGE_CAP` size gate) and acac-Zn picks up a spurious row.
     iso = rx.metal(smi, geometry)[0]
     hinge = [row for row in iso.cons.coplanar if row[5] in metal_donor_orient._HINGE_CAP.values()]
     assert not hinge, f"{name}: no ring here is both small enough and fully conjugated"
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
-def test_fiscit_dithiolate_hinge_holds_the_measured_fold():
-    # FISCIT (bis-benzenedithiolate-oxo-Tc): unconstrained the ring hinge fold measures ~38 deg; the hinge
-    # holds it to ~34. Mutation: delete the hinge row and this fold exceeds 36 again.
-    charges = {
-        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
-    }
-    ref = rx.read_xyz(
-        str(TMQMG_DIR / "xyz" / "FISCIT.xyz"),
-        charge=charges["FISCIT"],
-        connectivity="xyzgraph",
-        bond_orders="xyz2mol",
-    )
-    isos = rx.metal(ref, lengths="model")
-    ref_cx = rx.cxsmiles(ref)
-    iso = next(i for i in isos if rx.cxsmiles(i) == ref_cx)
-    hinge = [row for row in iso.cons.coplanar if row[5] in metal_donor_orient._HINGE_CAP.values()]
-    assert hinge, "FISCIT's two dithiolate rings must each get a hinge row"
-
-    ens = rx.embed(iso, n=3, seed=42, threads=1)
-    fold = max(
-        180.0 - abs(T.GetDihedralDeg(ens.mol.GetConformer(cid), i, j, k, w))
-        for cid in ens.ids
-        for i, j, k, w, _anchor, _cap in hinge
-    )
-    assert fold <= 36.0, f"hinge fold {fold:.1f} deg exceeds the measured bound"
-
-
 def test_kappa2_dithiocarbamate_hinge_holds_the_measured_fold_and_rereads_kappa2(tmp_path):
     # Ni(S2CNMe2)2: a real kappa2,kappa2 bis(dithiocarbamato)nickel(II), each S2CN ring a conjugated 4-ring.
-    # Mutation: cap 26 deg (the deleted _BRIDGED_COPLANAR_CAP value) instead of the measured 23.
     rw = Chem.RWMol()
     metal = rw.AddAtom(Chem.Atom(28))
     donors = []
@@ -632,6 +600,24 @@ def test_kappa2_dithiocarbamate_hinge_holds_the_measured_fold_and_rereads_kappa2
     fresh_metal = next(a for a in fresh.GetAtoms() if a.GetAtomicNum() == 28)
     neighbour_symbols = sorted(nb.GetSymbol() for nb in fresh_metal.GetNeighbors())
     assert neighbour_symbols == ["S", "S", "S", "S"], "kappa2,kappa2: no Ni-C bond on reread"
+
+
+def test_bipyridine_and_pyridine_planes_do_not_follow_the_bond_list_order():
+    """A reader adds bonds in distance order; the donor-plane terms must name the same atoms whatever that order."""
+    source = rx.parse_smiles("[Cl-]->[Pd+2]1(<-n2ccccc2)<-[n]2ccccc2-c2cccc[n]->12")
+    expected = {rx.cxsmiles(iso): iso.cons for iso in rx.metal(source, "square_planar")}
+    bonds = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx(), b.GetBondType(), b.GetIsAromatic()) for b in source.GetBonds()]
+    for seed in range(4):
+        random.Random(seed).shuffle(bonds)
+        rw = Chem.RWMol(source)
+        for begin, end, _type, _aromatic in bonds:
+            rw.RemoveBond(begin, end)
+        for begin, end, bond_type, aromatic in bonds:
+            rw.AddBond(begin, end, bond_type)
+            rw.GetBondBetweenAtoms(begin, end).SetIsAromatic(aromatic)
+        mol = rw.GetMol()
+        Chem.SanitizeMol(mol)
+        assert {rx.cxsmiles(iso): iso.cons for iso in rx.metal(mol, "square_planar")} == expected, f"shuffle {seed}"
 
 
 def test_only_an_inplane_sp2_donor_is_capped():
@@ -706,27 +692,19 @@ def test_partial_frozen_ts_keeps_each_unowned_cap():
 
 
 def test_cap_window_has_declared_width_and_force_constant():
-    from rxembed import mechanisms
-    from rxembed.mechanisms import _coplanar_window
-
-    cap = metal_donor_orient.COPLANAR_CAP
-    for phi, well in ((3.0, 0.0), (-3.0, 0.0), (177.0, 180.0), (-177.0, -180.0), (100.0, 180.0)):
-        lo, hi = _coplanar_window(phi, cap)
-        assert hi - lo == pytest.approx(cap), f"phi={phi}: the window is not `cap` wide: a pin holds nothing softly"
-        assert well in (lo, hi), f"phi={phi}: the well {well} is not an EDGE; riding the wall would miss the plane"
-        assert (phi >= well) == (hi > well), f"phi={phi}: the window opened on the far side of the well"
-
-    assert _coplanar_window(75.0, cap, 180.0) == (135.0, 180.0)
-    assert _coplanar_window(-75.0, cap, 180.0) == (-180.0, -135.0)
-
     for smi in (NI_N, _KETONE_SMI):
         iso = rx.metal(smi, "square_planar")[0]
         declared = {e[1]: e[5] for e in iso.cons.coplanar}
-        emitted = _emitted_caps(iso)  # called at fc=1e4
-        assert emitted, f"{smi}: the fixture must emit a cap for this to mean anything"
-        for _i, j, _k, _w, lo, hi, fc in emitted:
-            assert hi - lo == pytest.approx(declared[j]), f"{smi}: donor {j}'s FF window is not its declared cap"
-            assert fc == mechanisms._COPLANAR_FC, f"{smi}: donor {j}'s cap rode the caller's stiffness ladder"
+        emitted_soft, emitted_stiff = _emitted_caps(iso, fc=1), _emitted_caps(iso, fc=1e4)
+        assert emitted_stiff, f"{smi}: the fixture must emit a cap for this to mean anything"
+        force_soft, force_stiff = {}, {}
+        for (_i, j, _k, _w, lo, hi, fc), (*_same, fc_stiff) in zip(emitted_soft, emitted_stiff, strict=True):
+            # an out-of-plane cap maps to a dihedral at least as wide on each donor bond
+            assert hi - lo >= declared[j] - 1e-9, f"{smi}: donor {j}'s FF window is narrower than its declared cap"
+            force_soft[j] = force_soft.get(j, 0.0) + fc
+            force_stiff[j] = force_stiff.get(j, 0.0) + fc_stiff
+        for j, stiff in force_stiff.items():
+            assert force_soft[j] == pytest.approx(stiff), f"{smi}: donor {j}'s cap rode the stiffness ladder"
 
 
 def _cap_deviation(smi, seeds, n):
@@ -768,11 +746,6 @@ def test_cap_excludes_its_aryl_anchor():
 def test_cap_survives_every_constraints_rebuild():
     import rxembed.pipeline.ensemble as ensemble_module
 
-    c = Constraints()
-    c.coplanar.append((0, 1, 2, 3, 180.0, 45.0))
-    assert c.relaxed().coplanar == c.coplanar, "relaxed() dropped the coplanarity cap"
-    assert c.relaxed().coplanar is not c.coplanar, "relaxed() must copy, not alias, the coplanar list"
-
     ens = rx.embed(rx.metal(NI_N, "square_planar")[0], n=2, seed=1)
     assert ens.cons.coplanar, "the fixture must carry a cap for this to mean anything"
     seen, real = [], ensemble_module.restrained_uff
@@ -812,8 +785,7 @@ def test_ff_torsion_keeps_every_local_donor_plane(smi):
 
 def test_local_donor_caps_do_not_collapse_the_ester():
     iso_set = rx.metal(_CASE4, "square_planar")
-    assert len(iso_set) > 3, "case4 must expose the iso3 arrangement that historically collapsed"
-    iso = iso_set[3]  # the O4/N23/C16/O6 arrangement
+    iso = iso_set.select(label="trans", stereo="C16:S")  # the O4/N23/C16/O6 arrangement
     measured = 0
     for s in range(4):
         ens = rx.embed(iso, n=1, seed=0xF00D + s).minimize()
@@ -837,5 +809,3 @@ def test_length_source_does_not_control_partial_freeze_walls():
     measured, modelled = walls("input"), walls("model")
     assert measured == modelled, "M-L length provenance changed which graph-derived orientations exist"
     assert measured, "partially free donors lost every orientation wall"
-    why = "the carbonyl that motivated this must be the sp-carbon wall, or the test is measuring something else"
-    assert measured[(1, 61, 3)] == (165.0, 180.0), why

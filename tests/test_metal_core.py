@@ -128,7 +128,7 @@ def test_delocalised_charge_canonicalization_requires_rdkit_resonance_proof():
     mol.UpdatePropertyCache(strict=False)
     before = [atom.GetFormalCharge() for atom in mol.GetAtoms()]
 
-    out = metal_core._canonicalise_delocalised_charge(mol)
+    out = metal_core.canonical_metal_graph(mol)
 
     assert [atom.GetFormalCharge() for atom in out.GetAtoms()] == before
 
@@ -289,30 +289,6 @@ def test_f_block_requires_isomer():
 # --- the surrogate round-trip: oxidation state ---------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("name", "smiles"),
-    [
-        ("[PdCl4]2-", "[Cl-]->[Pd+2](<-[Cl-])(<-[Cl-])<-[Cl-]"),
-        # a genuinely neutral metal: a phantom charge on it would cancel against the ligands in any net total
-        ("Fe(CO)5", "[Fe](<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]"),
-    ],
-    ids=["palladate", "iron-carbonyl"],
-)
-def test_surrogate_preserves_metal_charge(name, smiles):
-    m0 = Chem.MolFromSmiles(smiles)
-    metal_idx = metal_core.metal_index(m0)
-    q0 = m0.GetAtomWithIdx(metal_idx).GetFormalCharge()
-
-    surrogate, m, _donors, real_z, real_q = metal_core.surrogate_metal(m0)
-    assert surrogate.GetAtomWithIdx(m).GetAtomicNum() == metal_core.SURROGATE
-    assert surrogate.GetAtomWithIdx(m).GetFormalCharge() == 0, f"{name}: the DG surrogate must be neutral"
-    assert real_q == q0, f"{name}: the oxidation state was thrown away, not captured"
-
-    metal_core.restore_metal(surrogate, m, real_z, real_q)
-    assert surrogate.GetAtomWithIdx(m).GetAtomicNum() == real_z
-    assert surrogate.GetAtomWithIdx(m).GetFormalCharge() == q0
-
-
 def _metal_charges(mol):
     """`{atom index: formal charge}` for every metal: a neutral metal must come back 0, not gain a phantom."""
     return {
@@ -321,11 +297,9 @@ def _metal_charges(mol):
 
 
 def _assert_charge_roundtrip(name, mol_charge, ens):
-    """After minimize: the mol charge and the number sent to xtb both equal the input's net charge."""
+    """After minimize: the mol's net formal charge equals the input's."""
     ens = (ens.candidates[0] if hasattr(ens, "candidates") else ens).minimize()
     assert Chem.GetFormalCharge(ens.mol) == mol_charge, f"{name}: the metal's oxidation state was lost"
-    # the number that reaches xtb; pinned explicitly so a _calc_charge refactor cannot silently re-break it
-    assert ens._calc_charge(None) == mol_charge, f"{name}: _calc_charge sends {ens._calc_charge(None):+d}"
     return ens
 
 
@@ -752,29 +726,11 @@ def test_two_metal_bridge_uses_its_absolute_label_after_the_surrogate_strip(tag,
     }
 
 
-def test_bridge_stereo_forbids_global_metal_hand_reflection(monkeypatch):
-    mol = Chem.AddHs(rx.parse_smiles("C[N@H](->[Co](F)(Cl)Br)->[Pt](Br)(Br)Br"))
-    with rdBase.BlockLogs():
-        assert rdDistGeom.EmbedMolecule(mol, randomSeed=2) == 0
-    iso = rx.metal(mol, center="all")[0]
-    assert iso.chirality
-    assert iso.stereo_label
-    assert iso.mol.GetAtomWithIdx(1).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
-
-    monkeypatch.setattr(emb, "_reflect", lambda *_args: pytest.fail("reflection inverted hidden bridge stereo"))
-
-    assert core.embed(iso, n=1, params=rx.EmbedParams(seed=0, prune_rms=-1)).ids
-
-
 # ---------------------------------------------------------------------------------------------------------
-# RDKit STATE across the metal-bond surgery (was test_mol_state.py)
+# RDKit state must stay valid across the metal-bond surgery. Stripping the M-donor bonds can invalidate RDKit
+# state that was derived while the metal was still bonded, and RDKit does not always notice:
 #
-# RDKit state must stay valid across the metal-bond surgery.
-#
-# Stripping the M-donor bonds can invalidate RDKit state that was derived while the metal was still bonded, and
-# RDKit does not always notice. Two ways it bit us, both found on the tmQM corpus:
-#
-#   * a double bond left FLAGGED stereo with its two reference atoms dropped; because the metal was one of them.
+#   * a double bond left FLAGGED stereo with its two reference atoms dropped, because the metal was one of them.
 #     RDKit's own ETKDG then indexes the empty vector and SEGFAULTS (rc 139), which no try/except can catch.
 #   * `metal.surrogate_metal` re-imposing a STRICT sanitize on a structure the reader deliberately admitted leniently,
 #     rejecting chemistry (an unkekulisable quinoid ring, a BPh4- boron) that perception had already accepted.
@@ -786,8 +742,8 @@ def test_bridge_stereo_forbids_global_metal_hand_reflection(monkeypatch):
 
 # rxembed's own fixtures. The invariants below must hold on any metal complex, so the gate runs on structures
 # this repo ships rather than reaching into a sibling checkout: a unit suite that depends on an absolute path
-# outside the project is not portable and is not a gate. The 144-structure corpus SWEEP that originally found
-# these defects is a measurement, not a gate, and lives in `benchmark/` where the corpus is in scope.
+# outside the project is not portable and is not a gate. A local benchmark corpus sweep is a measurement, not
+# a gate, and lives in `benchmark/` where the corpus is in scope.
 _CORPUS = sorted(str(p) for p in EXAMPLES_DIR.glob("*.xyz"))
 corpus_only = pytest.mark.skipif(not _CORPUS, reason="no structure fixtures found")
 

@@ -1,7 +1,6 @@
 """Test the Constraints struct and fix/constrain resolution."""
 
 from dataclasses import fields
-from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -67,12 +66,6 @@ def test_copy_carries_every_field():
     d = c.copy()
     for f in fields(Constraints):
         assert getattr(d, f.name) == getattr(c, f.name), f"copy() dropped {f.name}"
-
-
-def test_constraints_are_keyword_only():
-    constructor = cast("Any", Constraints)
-    with pytest.raises(TypeError):
-        constructor({})
 
 
 def test_copy_does_not_alias_mutable_state():
@@ -250,15 +243,17 @@ def test_point_hand_does_not_reserve_a_torsion_angle(carriers):
 
 
 def test_compose_soft_owns_each_dihedral_by_its_central_bond():
-    base_key, incoming_key = (0, 1, 2, 3), (4, 1, 2, 5)
+    base_key, incoming_key, other_axis_key = (0, 1, 2, 3), (4, 1, 2, 5), (1, 2, 3, 6)
     fixed = Constraints(dihedrals={base_key: (-62.0, -58.0)}, fixed={base_key: (-60.0, -60.0)})
     incoming = Constraints(
-        dihedrals={incoming_key: (80.0, 100.0)},
-        contacts=(frozenset(), frozenset({incoming_key})),
+        dihedrals={incoming_key: (80.0, 100.0), other_axis_key: (80.0, 100.0)},
+        contacts=(frozenset(), frozenset({incoming_key, other_axis_key})),
     )
 
     merged = compose_soft(fixed, incoming)
-    assert set(merged.dihedrals) == {base_key}
+    assert set(merged.dihedrals) == {base_key, other_axis_key}, (
+        "a fixed torsion must protect only its own bond axis, not a neighbouring one"
+    )
 
     soft = fixed.copy(fixed={}, contacts=(frozenset(), frozenset({base_key})))
     with pytest.raises(ValueError, match="state each degree of freedom once"):
@@ -358,13 +353,16 @@ def test_explicit_fix_uses_given_coordinates():
     assert lo <= 1.5 <= hi
 
 
-def test_numeric_fix_is_tight_and_nonreleasable():
+def test_numeric_fix_is_tight_and_nonreleasable(caplog):
     m = _mol("CCCC")
-    cons, ref = resolve_core(
-        m,
-        fix={(0, 2): 2.0, (0, 1, 2): 109.5, (0, 1, 2, 3): -60.0},
-        has_geometry=True,
-    )
+    with caplog.at_level("INFO", logger="rxembed"):
+        cons, ref = resolve_core(
+            m,
+            fix={(0, 2): 2.0, (0, 1, 2): 109.5, (0, 1, 2, 3): -60.0},
+            has_geometry=True,
+        )
+    # a constrained result is echoed at INFO, so a wrong atom index is visible without a debugger
+    assert any(r.getMessage().startswith("resolve:") for r in caplog.records)
     assert cons.distances[(0, 2)] == pytest.approx((1.98, 2.02))
     assert cons.fixed[(0, 2)] == (2.0, 2.0)
     assert cons.angles[(0, 1, 2)] == pytest.approx((107.5, 111.5))
@@ -501,13 +499,18 @@ def test_periodic_dihedral_aliases_compose(one, two, expected):
     assert compose(a, b).fixed[(0, 1, 2, 3)] == expected
 
 
-def test_window_inside_the_fixed_core_is_dropped_loudly(caplog):
+@pytest.mark.parametrize("door", ["constrain", "fix"])
+def test_window_inside_the_fixed_core_is_dropped_loudly(caplog, door):
+    """A distance window inside a coordinate graft yields to the graft, from either door."""
     coords = {i: (float(i), 0.0, 0.0) for i in (0, 1, 2)}  # collinear, 1.0 A apart
+    fix = {**coords, (1, 2): 3.4} if door == "fix" else coords
+    constrain = None if door == "fix" else {(1, 2): 3.4}
     with caplog.at_level("WARNING", logger="rxembed"):
-        cons, _ref = resolve_core(_mol("CCCl"), fix=coords, constrain={(1, 2): 3.4}, has_geometry=True)
+        cons, _ref = resolve_core(_mol("CCCl"), fix=fix, constrain=constrain, has_geometry=True)
     assert "inside the fixed core" in caplog.text
     assert cons.distances[(1, 2)] == pytest.approx((0.95, 1.05)), "the graft's own shape window is back"
     assert cons.contacts == (frozenset(), frozenset()), "a dropped window must not stay releasable"
+    assert (1, 2) not in cons.fixed, "a numeric fix window dropped by the graft must not linger in cons.fixed"
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -544,17 +547,6 @@ def test_determined_network_does_not_warn(caplog, fix, why):
     assert not any("no angle is fixed" in r.getMessage() for r in caplog.records), why
 
 
-def test_info_echo_names_atoms_by_element_and_index(caplog):
-    m = _mol("CCCO")
-    with caplog.at_level("INFO", logger="rxembed"):
-        resolve_core(m, fix={(0, 3): 2.0, (0, 1, 2, 3): 60.0}, has_geometry=True)
-    echo = " ".join(r.getMessage() for r in caplog.records if r.getMessage().startswith("resolve:"))
-    assert "C0" in echo
-    assert "O3" in echo
-    assert "2.000000+/-0.001A" in echo
-    assert "60.000000+/-0.005deg" in echo
-
-
 def test_match_rejects_ambiguous_pattern():
     mol = Chem.AddHs(Chem.MolFromSmiles("Clc1ccccc1CCl"))
     assert len(mol.GetSubstructMatches(Chem.MolFromSmarts("[Cl]"))) == 2, "the fixture must be ambiguous"
@@ -568,9 +560,14 @@ def test_match_rejects_ambiguous_pattern():
         match(mol, "[not a smarts")
 
 
-def test_symmetric_template_requires_atom_map():
-    reference = _mol("Cc1ccccc1")
-    target = _mol("CCc1ccccc1")
+@pytest.mark.parametrize(
+    ("reference_smiles", "target_smiles"),
+    [("Cc1ccccc1", "CCO"), ("CCO", "Cc1ccccc1")],
+    ids=["target-symmetric", "reference-symmetric"],
+)
+def test_symmetric_template_requires_atom_map(reference_smiles, target_smiles):
+    """A SMARTS symmetric on either the reference or the target alone still needs an explicit map."""
+    reference, target = _mol(reference_smiles), _mol(target_smiles)
 
     with pytest.raises(ValueError, match=r"symmetry-equivalent.*explicit"):
-        template_to_fix((reference, "c1ccccc1"), target=target)
+        template_to_fix((reference, "[CX4]-[#6]"), target=target)

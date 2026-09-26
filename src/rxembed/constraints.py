@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 import os
 from copy import deepcopy
 from dataclasses import dataclass, field, fields, replace
@@ -374,6 +375,32 @@ def constraint_value(positions, atoms, haptic=None, window=None):
         middle = 0.5 * sum(window)
         value = middle + (value - middle + _STRAIGHT) % (2 * _STRAIGHT) - _STRAIGHT
     return value
+
+
+def out_of_plane_row(mol, row):
+    """Return whether a coplanar row caps its first atom out of the donor's own plane: both far atoms bond the donor."""
+    donor = row[1]
+    return all(mol.GetBondBetweenAtoms(donor, atom) is not None for atom in row[2:4])
+
+
+def out_of_plane(positions, metal, donor, left, right):
+    """Return the angle in degrees between the donor-metal bond and the left-donor-right plane."""
+    normal = np.cross(positions[left] - positions[donor], positions[right] - positions[donor])
+    bond = positions[metal] - positions[donor]
+    scale = np.linalg.norm(normal) * np.linalg.norm(bond)
+    if scale == 0.0:
+        return float("nan")
+    return float(np.degrees(np.arcsin(min(1.0, abs(np.dot(normal, bond)) / scale))))
+
+
+def plane_torsion_cap(cap, angle):
+    """Return the dihedral about one donor bond that puts the metal ``cap`` degrees out of plane at that M-D-X angle.
+
+    The metal's height over the plane is sin(M-D-X) * sin(dihedral offset) bond lengths, so one axis-free cap
+    maps to a different dihedral on each donor bond; 90 means the angle leaves no dihedral to cap.
+    """
+    ratio = math.sin(math.radians(cap)) / max(math.sin(math.radians(angle)), np.finfo(float).eps)
+    return 90.0 if ratio >= 1.0 else math.degrees(math.asin(ratio))
 
 
 def within_window(value, window, slack=0.0):

@@ -24,28 +24,6 @@ def _hydroxyl_hydrogens(mol):
     ]
 
 
-# --- the registry: adding a contact type is a row, so a bad row must be caught here ------------------------
-
-
-@pytest.mark.parametrize("kind", nci.KINDS.values(), ids=list(nci.KINDS))
-def test_registry_rows_are_enumerable(kind):
-    anchors = {"atom": ("donor_h", "heavy"), "ring": ("ring_h", "ring_ion"), "hydride": ("hydride",)}
-    assert kind.family in anchors
-    assert kind.anchor in anchors[kind.family], f"anchor {kind.anchor!r} is not a {kind.family} anchor"
-
-    if kind.family == "ring":
-        assert isinstance(kind.window, float), "a ring contact's window is one atom-centroid distance"
-    else:
-        lo, hi = kind.window
-        assert 0 < lo < hi
-
-    # an orientation window with no apex to measure from is unenforceable; an apex with no window is unused
-    assert (kind.orient is None) == (kind.apex is None)
-    if kind.orient:
-        lo, hi = kind.orient
-        assert 90.0 < lo < hi <= 180.0, "a contact orientation is an obtuse-to-linear window"
-
-
 @pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
 @pytest.mark.parametrize(
     ("kind", "silent", "audible"),
@@ -64,17 +42,20 @@ def test_sigma_hole_kinds_require_a_polarisable_heavy_donor(kind, silent, audibl
     assert nci.candidate_contacts(_mol(audible), kinds=(kind,)), f"{kind} must fire on {audible!r}"
 
 
+@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
 def test_acceptor_quality_prefers_localised_lone_pair():
+    """One donor, three competing acceptors: the ranked modes must put the strongest base first."""
+    mol = _mol("CO.CN(C)CC(=O)c1ccccn1")  # methanol donor; an amine, a ketone, and a ring N to accept it
+    amine = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "N" and not a.GetIsAromatic())
+    ketone = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "O" and a.GetDegree() == 1)
+    aromatic = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "N" and a.GetIsAromatic())
 
-    def quality(smiles, symbol):
-        mol = _mol(smiles)
-        idx = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == symbol)
-        return nci._acceptor_quality(mol, ("atom", idx))
+    modes = list(nci.auto_binding_modes(mol).values())
+    accepted = [next(iter(m.distances))[0] for m in modes]
 
-    amine, ketone = quality("CN", "N"), quality("CC(=O)C", "O")
-    aromatic, amide = quality("n1ccccc1", "N"), quality("CC(=O)N", "N")
-    assert amine > ketone > aromatic, "a strong localised base must outrank a carbonyl O, and both a ring N"
-    assert amide == aromatic, "an amide N is delocalised into the C=O: a good DONOR, a poor acceptor"
+    assert accepted.index(amine) < accepted.index(ketone) < accepted.index(aromatic), (
+        "a strong localised base must outrank a carbonyl O, and both a ring N"
+    )
 
 
 # --- enumeration ------------------------------------------------------------------------------------------

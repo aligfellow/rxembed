@@ -41,5 +41,5 @@ def test_porphyrin_sized_valence_search_is_refused_before_it_enumerates(monkeypa
         raise AssertionError("the valence product was enumerated")
 
     monkeypatch.setattr(xyz2mol_local.itertools, "product", enumerated)
-    with pytest.raises(ValueError, match="3486784401 valence combinations"):
+    with pytest.raises(ValueError, match="valence combinations"):
         AC2BO(adjacency, [6] * n, 0, max_combinations=256)

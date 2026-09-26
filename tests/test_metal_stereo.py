@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import importlib
-import itertools
-from collections import Counter
 
 import numpy as np
 import pytest
-from rdkit import Chem, rdBase
-from rdkit.Chem import rdDistGeom
+from rdkit import Chem
 
 import rxembed as rx
 from rxembed import metal_stereo as metal
@@ -18,8 +15,6 @@ from rxembed.metal_polyhedron import POLYHEDRA, orientation_parity, point_group
 
 emb = importlib.import_module("rxembed.embed")
 
-_MATRIX_CONFS = 32
-_RX_CONFS = 8
 _ACAC = "CC(=O)C=C([O-])C"
 
 
@@ -125,9 +120,9 @@ def test_resonance_identity_case_table_isomer_counts(smiles, want):
     assert len(rx.metal(smiles, "SPL")) == want
 
 
-def test_tetraphenylporphyrinato_nitrogens_merge_above_the_former_size_cap():
-    # meso-tetraphenylporphyrinato dianion, one Lewis form (two pyrrolide N-, two pyridine-type N): 48 heavy
-    # atoms, above the deleted 40-atom cap. All four donors sit in one macrocyclic conjugated system.
+def test_tetraphenylporphyrinato_nitrogens_merge_into_one_site_class():
+    # meso-tetraphenylporphyrinato dianion, one Lewis form (two pyrrolide N-, two pyridine-type N): all four
+    # donors sit in one 48-heavy-atom macrocyclic conjugated system, so they share one resonance identity.
     smiles = "c1ccc(cc1)-c1c2ccc([n-]2)c(-c2ccccc2)c2ccc(n2)c(-c2ccccc2)c2ccc([n-]2)c(-c2ccccc2)c2ccc1n2"
     mol = Chem.MolFromSmiles(smiles)
     nitrogens = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() == 7]
@@ -150,10 +145,9 @@ def test_bis_dithiolene_lewis_forms_give_one_isomer_set():
     """A Mo bis-dithiolene chelate enumerates alike whether one wing is drawn dithiolate or dithione.
 
     Same connectivity, H counts and total charge either way; the metal absorbs the difference (Mo(VI) with
-    two dithiolates vs Mo(IV) with one dithiolate and one neutral dithione). Before this identity ignored
-    charge everywhere, the mixed reading's dithione wing carried a different conjugated-system charge than
-    its dithiolate twin, so the two chemically identical ligands looked inequivalent and the enumeration lost
-    the ligand-exchange symmetry the dithiolate reading has, giving 5 isomers instead of 3.
+    two dithiolates vs Mo(IV) with one dithiolate and one neutral dithione). Resonance identity ignores
+    charge, so both readings give the two chemically identical ligands the same class and the same
+    ligand-exchange symmetry.
     """
     dithiolate = "[Mo+6]12(<-[Cl-])(<-[Br-])(<-[S-]C=C[S-]->1)<-[S-]C=C[S-]->2"
     mixed = "[Mo+4]12(<-[Cl-])(<-[Br-])(<-[S-]C=C[S-]->1)<-S=CC=S->2"
@@ -225,35 +219,6 @@ def test_equivalent_site_assignments_preserve_links_and_vacancy():
     assert all(3 not in assignment and 3 not in assignment.values() for assignment in assignments)
 
 
-def _native_embed(smiles, n=_MATRIX_CONFS):
-    with rdBase.BlockLogs():
-        mol = Chem.MolFromSmiles(smiles)
-        params = rdDistGeom.ETKDGv3()
-        params.randomSeed = 7
-        params.pruneRmsThresh = -1
-        ids = list(rdDistGeom.EmbedMultipleConfs(mol, n, params))
-    assert len(ids) == n, smiles
-    return mol, ids
-
-
-def _center_and_neighbors(mol):
-    center = next(a.GetIdx() for a in mol.GetAtoms() if a.GetDegree() >= 4)
-    return center, [a.GetIdx() for a in mol.GetAtomWithIdx(center).GetNeighbors()]
-
-
-def _longest_pairs(mol, neighbors, n):
-    bm = rdDistGeom.GetMoleculeBoundsMatrix(mol)
-    return sorted(itertools.combinations(neighbors, 2), key=lambda q: bm[max(q)][min(q)], reverse=True)[:n]
-
-
-def _volume_signs(mol, ids, atoms):
-    return {int(np.sign(_signed_volume(*(mol.GetConformer(cid).GetPositions()[a] for a in atoms)))) for cid in ids}
-
-
-def _signed_volume(p1, p2, p3, p4):
-    return float((p1 - p4) @ np.cross(p2 - p4, p3 - p4))
-
-
 def _orientation_parity(mol, cid, iso):
     """Fit every observed vertex to the ideal shape and return proper (+1) or mirrored (-1)."""
     pos = mol.GetConformer(int(cid)).GetPositions()
@@ -266,41 +231,7 @@ def _orientation_parity(mol, cid, iso):
     observed /= np.linalg.norm(observed, axis=1, keepdims=True)
     ideal = np.asarray(POLYHEDRA[iso.geometry].vertex_dirs, float)
     ideal /= np.linalg.norm(ideal, axis=1, keepdims=True)
-    u, _s, vt = np.linalg.svd(ideal.T @ observed)
-    return int(np.sign(np.linalg.det(u @ vt)))
-
-
-def test_rdkit_native_tetrahedral_tags_build_signed_chiral_sets():
-    for token, tag, sign in (
-        ("@", Chem.ChiralType.CHI_TETRAHEDRAL_CCW, 1),
-        ("@@", Chem.ChiralType.CHI_TETRAHEDRAL_CW, -1),
-    ):
-        mol, ids = _native_embed(f"N[C{token}](F)(Cl)Br")
-        center, neighbors = _center_and_neighbors(mol)
-        assert mol.GetAtomWithIdx(center).GetChiralTag() == tag
-        assert _volume_signs(mol, ids, neighbors) == {sign}
-
-
-def test_rdkit_native_non_tetrahedral_tag_matrix_has_no_signed_volume():
-    for permutation in range(1, 4):
-        mol, ids = _native_embed(f"Cl[Pt@SP{permutation}]([35Cl])([36Cl])[37Cl]")
-        _center, neighbors = _center_and_neighbors(mol)
-        assert _volume_signs(mol, ids, neighbors) == {-1, 1}, f"SP{permutation} unexpectedly stayed planar"
-
-    for permutation in range(1, 21):
-        mol, ids = _native_embed(f"Cl[Pt@TB{permutation}]([35Cl])([36Cl])([37Cl])[38Cl]")
-        center, neighbors = _center_and_neighbors(mol)
-        axial = tuple(sorted(_longest_pairs(mol, neighbors, 1)[0]))
-        equatorial = sorted(set(neighbors) - set(axial))
-        atoms = (axial[0], equatorial[0], equatorial[1], center)
-        assert _volume_signs(mol, ids, atoms) == {-1, 1}, f"TB{permutation} unexpectedly selected one hand"
-
-    for permutation in range(1, 31):
-        mol, ids = _native_embed(f"Cl[Th@OH{permutation}]([35Cl])([36Cl])([37Cl])([38Cl])[39Cl]")
-        center, neighbors = _center_and_neighbors(mol)
-        trans = sorted(tuple(sorted(q)) for q in _longest_pairs(mol, neighbors, 3))
-        atoms = (*(q[0] for q in trans), center)
-        assert _volume_signs(mol, ids, atoms) == {-1, 1}, f"OH{permutation} unexpectedly selected one hand"
+    return orientation_parity(observed, ideal)
 
 
 def test_orientation_parity_covers_every_full_rank_polyhedron_symmetry():
@@ -345,29 +276,6 @@ def test_orientation_reader_skips_achiral_incomplete_and_collapsed_centres():
     )
 
 
-def test_rxembed_post_dg_gate_covers_every_chiral_candidate_before_cleanup():
-    fixtures = (
-        ("seesaw", "O->[Fe+2](<-[Cl-])(<-[CH3-])<-N"),
-        ("trigonal_bipyramidal", "O->[Fe+3](<-[Cl-])(<-[CH3-])(<-N)<-[F-]"),
-        ("square_pyramidal", "O->[Fe+3](<-[Cl-])(<-[CH3-])(<-N)<-[F-]"),
-        ("octahedral", "O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P"),
-    )
-    tested = Counter()
-    for geometry, smiles in fixtures:
-        for iso in rx.metal(smiles, geometry):
-            assert iso.chirality in {"delta", "lambda"}
-            conformers = emb.embed(iso, n=_RX_CONFS, params=rx.EmbedParams(seed=7, prune_rms=-1))
-            assert len(conformers) == _RX_CONFS
-            assert {_orientation_parity(conformers._mol, cid, iso) for cid in conformers.ids} == {1}
-            tested[geometry] += len(conformers)
-    assert tested == {
-        "seesaw": 12 * _RX_CONFS,
-        "trigonal_bipyramidal": 20 * _RX_CONFS,
-        "square_pyramidal": 30 * _RX_CONFS,
-        "octahedral": 30 * _RX_CONFS,
-    }
-
-
 def test_chiral_ligand_filters_wrong_metal_hands_before_uff(monkeypatch):
     smiles = "O->[Co+3](<-[Cl-])(<-[CH3-])(<-[NH2][C@H](C)CC)(<-[F-])<-P"
     expected = [x for x in Chem.FindMolChiralCenters(Chem.MolFromSmiles(smiles), includeUnassigned=True) if x[1] != "?"]
@@ -396,19 +304,6 @@ def test_chiral_ligand_filters_wrong_metal_hands_before_uff(monkeypatch):
         one.GetAtomWithIdx(expected[0][0]).SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
         Chem.AssignStereochemistryFrom3D(one, confId=one.GetConformer().GetId(), replaceExistingTags=True)
         assert [x for x in Chem.FindMolChiralCenters(one, includeUnassigned=True) if x[1] != "?"] == expected
-
-
-def test_free_hand_reflection_preserves_distances_and_flips_chirality():
-    iso = rx.metal("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "octahedral")[0]
-    conformers = emb.embed(iso, n=1, params=rx.EmbedParams(seed=7, prune_rms=-1))
-    mol, cid = conformers._mol, conformers.ids[0]
-    before = np.asarray(Chem.Get3DDistanceMatrix(mol, confId=cid))
-    parity = _orientation_parity(mol, cid, iso)
-
-    emb._reflect(mol, cid)
-
-    assert np.allclose(Chem.Get3DDistanceMatrix(mol, confId=cid), before)
-    assert _orientation_parity(mol, cid, iso) == -parity
 
 
 def _distinct_donor_isomer(geometry):

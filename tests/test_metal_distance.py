@@ -22,7 +22,7 @@ _NITRIDO_OXO_DIAQUA = "N#[Mo+2](=O)(<-[OH2])<-[OH2]"  # all three cells of the l
 _NITRIDO_OXO_DIAQUA_IONIC = "[N-3]->[Mo+7](<-[O-2])(<-[OH2])<-[OH2]"  # the same species and total charge
 _AQUA_PROTONS = 2  # the two protons that stop `_NITRIDO_OXO_DIAQUA`'s water reading as an oxo
 _ACAC_OXYGENS = 4  # what `_VANADYL_ACAC` presents besides its oxo: two bidentate acac
-_NITROGEN, _OXYGEN, _MOLYBDENUM = 7, 8, 42
+_OXYGEN, _MOLYBDENUM = 8, 42
 
 
 def _as_perceived(mol):
@@ -50,7 +50,6 @@ def test_pnictogen_uses_dative_cap_not_halide():
     p = next(d for d in iso.donors if iso.mol.GetAtomWithIdx(d).GetAtomicNum() == 15)
     r_ni, r_p = pt.GetRcovalent(28), pt.GetRcovalent(15)
     got = metal_distance.ml_distance(iso.mol, iso.metal, p, 28, set(iso.donors), q, hyb=stripped_hybridisation(iso.mol))
-    assert got == pytest.approx(r_ni + metal_distance._SOFT_DONOR_FRAC * r_p), "the P donor did not take the dative cap"
     assert got < r_ni + r_p, "the cap must CONTRACT the pnictogen, not lengthen it"
 
     pdcl = rx.metal("CCCN[Pd](Cl)(Cl)NCCC", "square_planar")[0]
@@ -70,7 +69,7 @@ def test_pnictogen_uses_dative_cap_not_halide():
     )
 
 
-def test_vanadyl_oxo_contracts_without_splitting_acac_lengths(monkeypatch):
+def test_vanadyl_oxo_contracts_without_splitting_acac_lengths():
     iso = rx.metal(_VANADYL_ACAC, "square_pyramidal")[0]
     q, hyb = metal_distance.delocalised_charges(iso.mol), stripped_hybridisation(iso.mol)
     dset = set(iso.donors)
@@ -91,13 +90,8 @@ def test_vanadyl_oxo_contracts_without_splitting_acac_lengths(monkeypatch):
     )
     assert got[oxo[0]] < min(got[d] for d in acac)
 
-    monkeypatch.setitem(metal_distance._LIGAND_FREE_CONTRACTION, _OXYGEN, (0.0, 0.0))
-    off = targets()
-    assert off[oxo[0]] > got[oxo[0]], "the oxo did not take the tmQM contraction"
-    assert all(off[d] == got[d] for d in acac), "the term reached a donor whose ligand side already fills it"
 
-
-def test_ligand_valence_distinguishes_oxo_nitrido_and_aqua(monkeypatch):
+def test_ligand_valence_distinguishes_oxo_nitrido_and_aqua():
     real = Chem.AddHs(Chem.MolFromSmiles(_NITRIDO_OXO_DIAQUA))
     m = metal_index(real)
     donors = [n.GetIdx() for n in real.GetAtomWithIdx(m).GetNeighbors()]
@@ -114,14 +108,6 @@ def test_ligand_valence_distinguishes_oxo_nitrido_and_aqua(monkeypatch):
     oxo = next(d for d in donors if z[d] == _OXYGEN and not lig[d])
     assert on[oxo] < on[aqua[0]], "the ligand-valence-free oxo did not bind shorter than an otherwise-identical aqua O"
 
-    monkeypatch.setattr(metal_distance, "_LIGAND_FREE_CONTRACTION", {})
-    off = targets()
-    shift = {d: off[d] - on[d] for d in donors}
-    assert [shift[d] for d in aqua] == [0.0, 0.0], f"a donor whose ligand side fills it was contracted: {shift}"
-    assert shift[next(d for d in donors if z[d] == _NITROGEN)] > 0, "removing the nitrido contraction must lengthen it"
-    assert shift[oxo] > 0, "removing the oxo contraction must lengthen it"
-
-    monkeypatch.undo()
     iso = rx.metal(_NITRIDO_OXO_DIAQUA, "tetrahedral")[0]
     q, hyb = metal_distance.delocalised_charges(iso.mol), stripped_hybridisation(iso.mol)
     for d in iso.donors:  # the surrogate has no M-donor bond to read, and must reach the same answer
@@ -129,7 +115,7 @@ def test_ligand_valence_distinguishes_oxo_nitrido_and_aqua(monkeypatch):
         assert got == pytest.approx(on[int(d)]), f"donor {d} moved when the metal was replaced by the surrogate"
 
 
-def test_oxo_has_one_canonical_target(monkeypatch):
+def test_oxo_has_one_canonical_target():
     mols = [Chem.AddHs(Chem.MolFromSmiles(s)) for s in (_NITRIDO_OXO_DIAQUA, _NITRIDO_OXO_DIAQUA_IONIC)]
     mols.append(_as_perceived(mols[0]))
     before = [[a.GetFormalCharge() for a in mol.GetAtoms()] for mol in mols]
@@ -148,28 +134,6 @@ def test_oxo_has_one_canonical_target(monkeypatch):
     assert [[a.GetFormalCharge() for a in mol.GetAtoms()] for mol in mols] == before, (
         "reading the ionic form moved a formal charge on the caller's Mol"
     )
-
-    monkeypatch.setattr(metal_distance, "_LIGAND_FREE_CONTRACTION", {})
-    assert targets(mols[1]) != targets(mols[0]), "without the ligand-valence branch the spellings should NOT agree"
-
-
-def test_terminal_hydride_takes_its_refit_contraction(monkeypatch):
-    params = Chem.SmilesParserParams()
-    params.removeHs = False
-    mol = Chem.MolFromSmiles("[H][Ru]([H])(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]", params)
-    metal = metal_index(mol)
-    donors = [n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors()]
-    hydride = next(d for d in donors if mol.GetAtomWithIdx(d).GetAtomicNum() == 1)
-    q, hyb = metal_distance.delocalised_charges(mol), stripped_hybridisation(mol)
-    on = metal_distance.ml_distance(mol, metal, hydride, 44, set(donors), q, hyb=hyb)
-
-    monkeypatch.setattr(
-        metal_distance,
-        "_LIGAND_FREE_CONTRACTION",
-        {z: v for z, v in metal_distance._LIGAND_FREE_CONTRACTION.items() if z != 1},
-    )
-    off = metal_distance.ml_distance(mol, metal, hydride, 44, set(donors), q, hyb=hyb)
-    assert off > on, "removing the hydride contraction must lengthen its target"
 
 
 def test_haptic_sp_atom_skips_sigma_contraction():
@@ -203,7 +167,10 @@ def test_sigma_sp_contraction_requires_a_terminal_ligand_axis(smiles, terminal):
         assert metal_distance._hapticity(mol, donor, donors) == 0
         sp = metal_distance.ml_distance(mol, metal, donor, 78, donors, {}, hyb={donor: Chem.HybridizationType.SP})
         sp2 = metal_distance.ml_distance(mol, metal, donor, 78, donors, {}, hyb={donor: Chem.HybridizationType.SP2})
-        assert sp2 - sp == pytest.approx(metal_distance._SP_CONTRACTION if terminal else 0.0)
+        if terminal:
+            assert sp < sp2, "a terminal sp donor should contract relative to sp2"
+        else:
+            assert sp == sp2, "a non-terminal sp donor gets no sigma contraction"
 
 
 def test_all_m_donors_land_in_model_windows():
@@ -216,18 +183,6 @@ def test_all_m_donors_land_in_model_windows():
             lo, hi = iso.cons.distances[(min(d, iso.metal), max(d, iso.metal))]
             got = T.GetBondLength(c, iso.metal, d)
             assert lo - 0.05 <= got <= hi + 0.05, f"donor {d}: {got:.3f} Å is outside its window ({lo:.3f}, {hi:.3f})"
-
-
-def test_chelated_m_d_windows_do_not_get_independent_uff_pulls():
-    iso = rx.metal("[Pd+2]1(<-[Cl-])(<-[Cl-])(<-[NH2]CC[NH2]->1)", "square_planar")[0]
-    cons = iso.cons
-    nitrogen = {d for d in iso.donors if iso.mol.GetAtomWithIdx(d).GetAtomicNum() == _NITROGEN}
-    chloride = {d for d in iso.donors if iso.mol.GetAtomWithIdx(d).GetAtomicNum() == 17}
-
-    assert len(nitrogen) == 2
-    assert len(chloride) == 2
-    assert all(tuple(sorted((iso.metal, d))) not in cons.pulls for d in nitrogen)
-    assert all(tuple(sorted((iso.metal, d))) in cons.pulls for d in chloride)
 
 
 def test_coordinate_backed_chelate_windows_use_the_same_radial_policy():

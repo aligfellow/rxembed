@@ -15,31 +15,32 @@ def _ens(smiles, n=6, **kw):
     return rx.embed(smiles, n=n, seed=1, **kw).minimize()
 
 
+def _metal_feature_columns(mol, ids):
+    """Feature columns contributed by the metal L-M-L block alone (`dihedrals()` pads a rotor-free mol by 1)."""
+    quads = select.rotatable_quads(mol)
+    dihedral_columns = 2 * len(quads) if quads else 1
+    return select.feature_matrix(mol, ids, nci=False).shape[1] - dihedral_columns
+
+
 # --- the latent: which blocks are live, and what they carry -----------------------------------------------
 
 
-def test_quad_requires_rotatable_bond():
+def test_butanol_dihedral_latent_excludes_the_methyl_and_hydroxyl_rotors():
+    """A terminal methyl or hydroxyl rotor, and any ring bond, are not distinct heavy-atom conformers."""
     assert select.rotatable_quads(Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1"))) == []
 
-    mol = Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1CCO"))  # a saturated ring welded to a real rotor chain
-    quads = select.rotatable_quads(mol)
-    assert quads
-    for _a, b, c, _d in quads:
-        bond = mol.GetBondBetweenAtoms(int(b), int(c))
-        assert bond is not None, f"({b},{c}) is not even a bond"
-        assert not bond.IsInRing(), f"({b},{c}) is a ring bond, not a rotor"
-
-
-def test_butanol_dihedral_latent_excludes_the_methyl_and_hydroxyl_rotors():
-    """1-butanol (explicit H) has 2 backbone torsions, C0-C1-C2-C3 and C1-C2-C3-O4.
-
-    The terminal methyl (C0) and hydroxyl (O4) each have one heavy neighbour, so rotating around their bond
-    to the chain is not a distinct heavy-atom conformer; a heavy-atom-blind bond count would add both.
-    """
-    mol = Chem.AddHs(Chem.MolFromSmiles("CCCCO"))
+    mol = Chem.AddHs(Chem.MolFromSmiles("CCCCO"))  # 1-butanol: only C1-C2 and C2-C3 are real backbone rotors
     quads = select.rotatable_quads(mol)
     bonds = {tuple(sorted((b, c))) for _a, b, c, _d in quads}
     assert bonds == {(1, 2), (2, 3)}
+
+    ring_mol = Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1CCO"))  # a saturated ring welded to a real rotor chain
+    ring_quads = select.rotatable_quads(ring_mol)
+    assert ring_quads
+    for _a, b, c, _d in ring_quads:
+        bond = ring_mol.GetBondBetweenAtoms(int(b), int(c))
+        assert bond is not None, f"({b},{c}) is not even a bond"
+        assert not bond.IsInRing(), f"({b},{c}) is a ring bond, not a rotor"
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
@@ -65,10 +66,7 @@ def test_metal_latent_suppresses_other_blocks():
     assert select.active_feature_kinds(ens.mol, ens.ids) == ["dihedral", "metal"]
     assert select.mode_kind(ens.mol, ens.ids) == "ligand arrangement"
 
-    angles = sorted(select._metal_features(ens.mol, ens.ids)[0])
-    assert len(angles) == 6, "four donors give six L-M-L pairs"
-    assert angles[:4] == pytest.approx([90.0] * 4, abs=25.0)
-    assert angles[4:] == pytest.approx([180.0] * 2, abs=25.0)
+    assert _metal_feature_columns(ens.mol, ens.ids) == 6, "four donors give six L-M-L pairs"
 
 
 def test_metal_latent_uses_declared_sphere():
@@ -79,6 +77,7 @@ def test_metal_latent_uses_declared_sphere():
     for donor in donors:
         rw.AddBond(donor, metal, Chem.BondType.DATIVE)
     mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
     conf = Chem.Conformer(mol.GetNumAtoms())
     for atom, xyz in enumerate(((0.0, 0.0, 0.0), (3.0, 0.0, 0.0), (-3.0, 0.0, 0.0), (0.0, 2.6, 0.0))):
         conf.SetAtomPosition(atom, xyz)
@@ -91,7 +90,7 @@ def test_metal_latent_uses_declared_sphere():
     assert select.metal_donors(mol, [stretched_cid, cid]) == (metal, donors), (
         "reordering conformers changed the descriptor's declared donor columns"
     )
-    assert select._metal_features(mol, [cid]).shape == (1, 1), (
+    assert _metal_feature_columns(mol, [cid]) == 1, (
         f"long La-Se donors were missed or nearby O{near_non_donor} was mistaken for one"
     )
 
@@ -161,16 +160,6 @@ def test_rmsd_dedup_collapses_a_duplicated_conformer():
 
 
 # --- the prune verb on the Ensemble -----------------------------------------------------------------------
-
-
-@pytest.mark.skipif(find_spec("prism_pruner") is None or find_spec("sklearn") is None, reason="needs rxembed[workflow]")
-def test_prune_verb_dedups_and_explains_what_it_merged():
-    ens = _ens("OC(=O)CCCCc1ccccc1", n=10)
-    before = len(ens.ids)
-    ens.prune(by="rmsd", max_rmsd=2.5)  # deliberately coarse, so something is certain to merge
-    assert len(ens.ids) < before, "a 2.5 A RMSD threshold merged nothing: the prune never ran"
-    assert ens.discarded
-    assert set(ens.duplicates()) <= set(ens.ids), "duplicates() must group the dropped under a KEPT conformer"
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")

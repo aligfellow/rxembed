@@ -1,28 +1,23 @@
 """Test XYZ graph perception and backend fallback behavior."""
 
-import csv
 import itertools
 import logging
 import sys
 from importlib.util import find_spec
-from pathlib import Path
 from types import SimpleNamespace
 
 import networkx as nx
 import pytest
 from rdkit import Chem
+from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
 from rxembed.metal_core import COORDINATION_METALS, canonical_metal_graph, reject_boron_cages
 from rxembed.pipeline import perceive
-from tests.conftest import EXAMPLES_DIR, TMQMG_DIR
+from tests.conftest import EXAMPLES_DIR
 
 _BIMP = str(EXAMPLES_DIR / "bimp.xyz")  # a metal-free TS with a stretched reacting core
-
-_CORPUS = Path(__file__).resolve().parents[2] / "benchmark/corpus"
-# `benchmark/` is gitignored and local-only (AGENTS.md), so a clean clone must skip, not error.
-needs_corpus = pytest.mark.skipif(not _CORPUS.is_dir(), reason="needs the local-only benchmark/corpus")
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
@@ -96,6 +91,11 @@ def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog)
     assert fallback.GetProp("_rxembedConnectivity") == "xyzgraph"
     assert fallback.GetBoolProp("_rxembedPerceptionFallback")
 
+
+def test_rank_orders_refuses_a_changed_or_broken_graph(monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise ValueError("no assignment")
+
     rw = Chem.RWMol()
     for atomic_number in (44, 7, 7):
         rw.AddAtom(Chem.Atom(atomic_number))
@@ -118,7 +118,6 @@ def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog)
         changed.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
         return (changed.GetMol(),)
 
-    caplog.clear()
     monkeypatch.setattr(perceive, "get_tmc_mol", drop_a_bond)
     with pytest.raises(ValueError, match="changed connectivity"):
         perceive._rank_orders(mol, 0)
@@ -443,6 +442,15 @@ def test_metal_read_at_charge_zero_warns_when_its_reading_suggests_a_missing_cha
 # --- choosing a perceiver -------------------------------------------------------------------------
 
 
+def _cisplatin_xyz(tmp_path):
+    """Write a cisplatin (Pt(NH3)2Cl2) geometry to `tmp_path`, exercising every metal-aware perceiver pair."""
+    iso = rx.metal("[NH3]->[Pt+2](<-[NH3])(<-[Cl-])<-[Cl-]", "square_planar")[0]
+    ens = rx.embed(iso, n=1, seed=1)
+    path = tmp_path / "cisplatin.xyz"
+    Chem.MolToXYZFile(ens.mol, str(path), confId=ens.ids[0])
+    return str(path)
+
+
 @pytest.mark.parametrize(
     ("connectivity", "bond_orders"),
     [
@@ -452,19 +460,15 @@ def test_metal_read_at_charge_zero_warns_when_its_reading_suggests_a_missing_cha
         ("xyz2mol", "xyz2mol"),
     ],
 )
-@needs_corpus
-def test_perceiver_pairs_read_complex(connectivity, bond_orders):
-    path = _CORPUS / "CisPlatin.xyz"
-    mol = perceive.read_xyz(str(path), 0, connectivity=connectivity, bond_orders=bond_orders)
+def test_perceiver_pairs_read_complex(connectivity, bond_orders, tmp_path):
+    mol = perceive.read_xyz(_cisplatin_xyz(tmp_path), 0, connectivity=connectivity, bond_orders=bond_orders)
     assert mol.GetNumAtoms() == 11
     assert mol.GetNumConformers() == 1
 
 
-@needs_corpus
-def test_xyzgraph_bond_orders_need_xyzgraph_connectivity():
-    path = _CORPUS / "CisPlatin.xyz"
+def test_xyzgraph_bond_orders_need_xyzgraph_connectivity(tmp_path):
     with pytest.raises(ValueError, match="connectivity='xyzgraph'"):
-        perceive.read_xyz(str(path), 0, connectivity="xyz2mol", bond_orders="xyzgraph")
+        perceive.read_xyz(_cisplatin_xyz(tmp_path), 0, connectivity="xyz2mol", bond_orders="xyzgraph")
 
 
 def test_bond_order_perception_does_not_accept_auto_mode():
@@ -720,58 +724,6 @@ def test_read_xyz_drops_a_bridgehead_bond_the_connectivity_backend_mis_bonded(mo
     assert after == ["S", "S"]
 
 
-def test_dithiophosphinate_bridgehead_p_loses_its_wrong_ni_bond(caplog):
-    mol = rx.parse_smiles(_DTP_NI, remove_hs=False)
-    metal, _before = _metal_neighbours(mol)
-
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        out = perceive._drop_bridgehead_bonds(mol)
-
-    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
-    assert sorted(after) == ["S", "S"]
-    assert "bridgehead" in caplog.text
-    assert "P1-" in caplog.text
-
-
-def test_kappa2_bh4_bridgehead_b_loses_its_wrong_ni_bond(caplog):
-    mol = rx.parse_smiles(_BH4_NI, remove_hs=False)
-    metal, _before = _metal_neighbours(mol)
-
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        out = perceive._drop_bridgehead_bonds(mol)
-
-    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
-    assert sorted(after) == ["H", "H"]
-    assert "bridgehead" in caplog.text
-
-
-def test_sigma_silane_keeps_its_one_metal_bound_neighbour():
-    mol = rx.parse_smiles(_SIH_NI, remove_hs=False)
-    metal, before = _metal_neighbours(mol)
-
-    out = perceive._drop_bridgehead_bonds(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-
-
-def test_phosphine_lone_pair_donor_keeps_its_m_p_bond():
-    mol = rx.parse_smiles(_PHOSPHINE_NI, remove_hs=False)
-    metal, before = _metal_neighbours(mol)
-
-    out = perceive._drop_bridgehead_bonds(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-
-
-def test_carboxylate_m_c_contact_is_left_for_the_reader():
-    mol = rx.parse_smiles(_CARBOXYLATE_NI, remove_hs=False)
-    metal, before = _metal_neighbours(mol)
-
-    out = perceive._drop_bridgehead_bonds(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-
-
 # Class B: a TRIGONAL bridgehead (exactly 3 non-metal sigma bonds) with no lone pair of its own.
 
 # A kappa2 carboxylate/dithiocarbamate written with the wrong M-C bond still present, using ring-closure
@@ -816,61 +768,7 @@ def _ring_bound_to_metal(symbols, bond_orders, charges, metal="Ni", metal_charge
     return mol, idx, m
 
 
-def test_kappa2_carboxylate_bridgehead_c_loses_its_wrong_ni_bond(caplog):
-    mol = rx.parse_smiles(_CARBOXYLATE_KAPPA2_NI, remove_hs=False)
-    metal, _before = _metal_neighbours(mol)
-
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        out = perceive._drop_bridgehead_bonds(mol)
-
-    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
-    assert sorted(after) == ["O", "O"]
-    assert "bridgehead" in caplog.text
-
-
-def test_kappa2_dithiocarbamate_bridgehead_c_loses_its_wrong_ni_bond(caplog):
-    mol = rx.parse_smiles(_DITHIOCARBAMATE_KAPPA2_NI, remove_hs=False)
-    metal, _before = _metal_neighbours(mol)
-
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        out = perceive._drop_bridgehead_bonds(mol)
-
-    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
-    assert sorted(after) == ["S", "S"]
-    assert "bridgehead" in caplog.text
-
-
-def test_allyl_face_keeps_all_three_metal_carbon_bonds():
-    mol, _idx, metal = _chain_bound_to_metal(["C", "C", "C"], [2, 1], [0, 0, -1])
-    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
-
-    out = perceive._drop_bridgehead_bonds(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-
-
-def test_cyclopentadienide_face_keeps_all_five_metal_carbon_bonds():
-    mol, _idx, metal = _ring_bound_to_metal(["C"] * 5, [2, 1, 2, 1, 1], [0, 0, 0, 0, -1])
-    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
-
-    out = perceive._drop_bridgehead_bonds(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-
-
-def test_imidazolyl_face_keeps_its_metal_carbon_bond():
-    # N1, C2, N3, C4, C5: C2 sits between the two ring nitrogens, exactly Class B's flanking-donor
-    # pattern, but N1/C2/N3 share a real (metal-free) ring, so condition 3 keeps the Ni-C2 bond.
-    mol, idx, metal = _ring_bound_to_metal(["N", "C", "N", "C", "C"], [1, 2, 1, 2, 1], [0, 0, 0, 0, 0])
-    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
-
-    out = perceive._drop_bridgehead_bonds(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
-    assert idx[1] in [n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()]  # C2 specifically
-
-
-def test_eta2_formaldehyde_carbon_is_unaffected():
+def _eta2_formaldehyde():
     rw = Chem.RWMol()
     c, o = rw.AddAtom(Chem.Atom("C")), rw.AddAtom(Chem.Atom("O"))
     rw.AddBond(c, o, Chem.BondType.DOUBLE)
@@ -880,14 +778,10 @@ def test_eta2_formaldehyde_carbon_is_unaffected():
     rw.AddBond(o, metal, Chem.BondType.DATIVE)
     mol = rw.GetMol()
     Chem.SanitizeMol(mol)
-    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
-
-    out = perceive._drop_bridgehead_bonds(mol)
-
-    assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
+    return mol
 
 
-def test_hydride_transfer_like_ru_h_carbon_contact_is_kept():
+def _hydride_transfer_ru_h_carbon():
     # A carbon bonded to a bridging H (the hydride-transfer contact) and a real O donor, plus the
     # erroneous Ru-C bond this rule could otherwise prune; the H flanking donor keeps it.
     rw = Chem.RWMol()
@@ -902,7 +796,62 @@ def test_hydride_transfer_like_ru_h_carbon_contact_is_kept():
     rw.AddBond(o, metal, Chem.BondType.DATIVE)
     mol = rw.GetMol()
     Chem.SanitizeMol(mol, catchErrors=True)
-    before = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
+    return mol
+
+
+@pytest.mark.parametrize(
+    ("smiles", "kept_symbols", "detail"),
+    [
+        pytest.param(_DTP_NI, ["S", "S"], "P1-", id="dithiophosphinate-P"),
+        pytest.param(_BH4_NI, ["H", "H"], None, id="kappa2-BH4-B"),
+        pytest.param(_CARBOXYLATE_KAPPA2_NI, ["O", "O"], None, id="kappa2-carboxylate-C"),
+        pytest.param(_DITHIOCARBAMATE_KAPPA2_NI, ["S", "S"], None, id="dithiocarbamate-C"),
+    ],
+)
+def test_bridgehead_donor_loses_its_wrong_metal_bond(caplog, smiles, kept_symbols, detail):
+    """A bridgehead donor (4+ sigma bonds, or 3 with no ring of its own) loses its spurious metal bond."""
+    mol = rx.parse_smiles(smiles, remove_hs=False)
+    metal, _before = _metal_neighbours(mol)
+
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        out = perceive._drop_bridgehead_bonds(mol)
+
+    after = [out.GetAtomWithIdx(n.GetIdx()).GetSymbol() for n in out.GetAtomWithIdx(metal).GetNeighbors()]
+    assert sorted(after) == kept_symbols
+    assert "bridgehead" in caplog.text
+    if detail:
+        assert detail in caplog.text
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: rx.parse_smiles(_SIH_NI, remove_hs=False),
+        lambda: rx.parse_smiles(_PHOSPHINE_NI, remove_hs=False),
+        lambda: rx.parse_smiles(_CARBOXYLATE_NI, remove_hs=False),
+        lambda: _chain_bound_to_metal(["C", "C", "C"], [2, 1], [0, 0, -1])[0],
+        lambda: _ring_bound_to_metal(["C"] * 5, [2, 1, 2, 1, 1], [0, 0, 0, 0, -1])[0],
+        # N1, C2, N3, C4, C5: C2 sits between the two ring nitrogens, exactly the bridgehead's flanking-donor
+        # pattern, but N1/C2/N3 share a real (metal-free) ring, so condition 3 keeps the Ni-C2 bond.
+        lambda: _ring_bound_to_metal(["N", "C", "N", "C", "C"], [1, 2, 1, 2, 1], [0, 0, 0, 0, 0])[0],
+        _eta2_formaldehyde,
+        _hydride_transfer_ru_h_carbon,
+    ],
+    ids=[
+        "sigma-silane",
+        "phosphine",
+        "kappa1-carboxylate-MC",
+        "allyl",
+        "cyclopentadienide",
+        "imidazolyl",
+        "eta2-formaldehyde",
+        "hydride-transfer-C",
+    ],
+)
+def test_non_bridgehead_donor_keeps_its_metal_bond(build):
+    """A donor with its own lone pair, or one member of a rigid haptic face, keeps its metal bond."""
+    mol = build()
+    metal, before = _metal_neighbours(mol)
 
     out = perceive._drop_bridgehead_bonds(mol)
 
@@ -920,20 +869,24 @@ def test_smiles_input_keeps_a_bridgehead_bond_canonical_metal_graph_no_longer_dr
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-@pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
-def test_read_drops_a_triazolate_cross_ring_contact():
-    """DEPZOR: each Fe-bound 1,2,4-triazolate has two ring carbons 2.095 A apart, just inside xyzgraph's C-C
-    cutoff. xyzgraph 1.6.14 bonds that contact anyway, since its strict three-ring check only rejects an
-    obtuse apex above 110 deg (mean-Z adjusted) and this one is 101.8 deg; a real three-ring cannot have an
-    obtuse apex at all, so `_right_angle_ring_chords` drops the bond and xyzgraph rebuilds without it.
-    """
-    charges = {
-        row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
-    }
-    mol = rx.read_xyz(str(TMQMG_DIR / "xyz" / "DEPZOR.xyz"), charge=charges["DEPZOR"], bond_orders="xyz2mol")
+def test_read_drops_a_triazolate_cross_ring_contact(tmp_path):
+    """A 1,2,4-triazole's two ring carbons sit 2.095 A apart, just inside xyzgraph's C-C cutoff.
 
-    assert mol.GetBondBetweenAtoms(0, 15) is None
-    assert mol.GetBondBetweenAtoms(34, 49) is None
-    rx.cxsmiles(mol)  # must not raise: no spurious point stereo on the freed ring carbons
-    for idx in (0, 15, 34, 49):
-        assert mol.GetAtomWithIdx(idx).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+    xyzgraph 1.6.14 bonds that contact anyway, since its strict three-ring check only rejects an obtuse
+    apex above 110 deg (mean-Z adjusted) and this one is 101.8 deg; a real three-ring cannot have an obtuse
+    apex at all, so `_right_angle_ring_chords` drops the bond and xyzgraph rebuilds without it.
+    """
+    mol = Chem.AddHs(Chem.MolFromSmiles("[nH]1ncnc1"))  # ring order N1-N2-C3-N4-C5, N4 flanked by both carbons
+    rdDistGeom.EmbedMolecule(mol, randomSeed=1)
+    rdForceFieldHelpers.MMFFOptimizeMolecule(mol)
+    c3, c5 = 2, 4
+    path = tmp_path / "triazole.xyz"
+    Chem.MolToXYZFile(mol, str(path))
+
+    out = rx.read_xyz(str(path), charge=0, bond_orders="xyz2mol")
+
+    assert out.GetBondBetweenAtoms(c3, c5) is None
+    assert Chem.MolToSmiles(out) == "[H]c1nc([H])n([H])n1"
+    Chem.AssignStereochemistry(out, cleanIt=True, force=True)  # must not raise or invent a chiral ring carbon
+    assert out.GetAtomWithIdx(c3).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+    assert out.GetAtomWithIdx(c5).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
