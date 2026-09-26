@@ -799,6 +799,7 @@ def test_local_donor_caps_do_not_collapse_the_ester():
     assert measured, "no seed embedded: the collapse guard measured nothing"
 
 
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_length_source_does_not_control_partial_freeze_walls():
 
     def walls(lengths):  # (metal, donor, substituent) windows, i.e. `orient_donor`'s, not the polyhedron's

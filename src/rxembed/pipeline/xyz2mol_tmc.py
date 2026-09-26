@@ -936,9 +936,11 @@ def get_tmc_mol(xyz_file, overall_charge, with_stereo=False, agostic=False, grap
     if not tmc_indices:
         raise ValueError("Found no TM in the input file. Please supply an xyz file with a TM")
     if graph is None and len(tmc_indices) > 1:
+        # metal_charges= cannot rescue this branch: read_xyz applies it after connectivity is already
+        # resolved, and this call has no connectivity yet (that is exactly what a perceived graph supplies).
         raise ValueError(
             "xyz2mol cannot allocate oxidation states between multiple metals from coordinates alone; "
-            "supply an already perceived graph or use read_xyz(..., metal_charges={atom_index: charge, ...})"
+            "supply an already perceived graph, or read this structure with xyzgraph"
         )
 
     adjacency = Chem.rdmolops.GetAdjacencyMatrix(mol)

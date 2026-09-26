@@ -506,6 +506,9 @@ just check     # lint + type + test
 
 `uv sync` alone is the full dev environment: the `dev` group pulls `rxembed[search,workflow]`.
 
+Tests gated on a local [tmQMg](https://github.com/hkneiding/tmQMg) clone skip unless
+`RXEMBED_TMQMG_DIR` points at its `data/` directory.
+
 - [`examples/`](examples/): from the bounds matrix to transition-metal catalysts.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md): how it fits together.
 - [`AGENTS.md`](AGENTS.md): how we change it.

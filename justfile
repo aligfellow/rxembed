@@ -2,8 +2,8 @@
 check: lint type test
 
 lint:
-    uv run ruff format src tests
-    uv run ruff check --fix src tests
+    uv run ruff format src tests benchmark
+    uv run ruff check --fix src tests benchmark
 
 type:
     uv run ty check src tests
@@ -11,16 +11,9 @@ type:
 test:
     uv run python -m pytest -v
 
-# Regression tests for the benchmark runner; benchmark/ is maintainer-local and gitignored, so a
-# clean checkout may not have it -- report that cleanly instead of failing.
+# Regression tests for the benchmark runner.
 bench-test:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ ! -f benchmark/test_run.py ]; then
-        echo "benchmark/ absent (maintainer-local); skipping bench-test"
-        exit 0
-    fi
-    uv run python -m pytest benchmark/test_run.py -v
+    uv run python -m pytest benchmark/test_run.py -q
 
 build:
     uv build
@@ -29,14 +22,10 @@ setup:
     uv sync
     uv run pre-commit install
 
-# Benchmark fixtures, first N pinned tmQMg IDs and issues; src=<tree>/src measures another tree
-bench n='100' dataset='../tmQMg' src='src':
+# Run a benchmark cohort; measure another tree with PYTHONPATH=<tree>/src just bench ... (the
+# results header records the exact source measured).
+bench cohort='fixtures' *args='':
     #!/usr/bin/env bash
     set -euo pipefail
     export PYTHONHASHSEED=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 UV_NO_SYNC=1
-    export PYTHONPATH={{quote(absolute_path(src))}}
-    mkdir -p benchmark/results
-    out=$(mktemp -d "benchmark/results/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
-    for cohort in fixtures sample issues; do
-        uv run python benchmark/run.py "$cohort" "$out" --size {{quote(n)}} --dataset {{quote(dataset)}}
-    done
+    uv run python benchmark/run.py {{cohort}} {{args}}

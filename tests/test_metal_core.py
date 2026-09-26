@@ -784,6 +784,7 @@ def test_surrogate_accepts_all_readable_metals():
     assert rejected == [], f"surrogate_metal() rejects structures the reader accepted: {rejected}"
 
 
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_ligands_reports_denticity_per_metal():
     mol = read_xyz(_MN_H2, metal_charges={0: 2, 1: 1})
     ligs = metal_core.ligands(mol)

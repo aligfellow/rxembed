@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import math
-import time
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -167,8 +166,8 @@ def _describe_groups(groups):
     return ", ".join(f"{count}x {failure}" for failure, count in groups.most_common())
 
 
-def _log_replacement_round(operation, index, kept, asked, started):
-    """Report one fresh-seed replacement round's budget and cost, for benchmark attribution."""
+def _log_replacement_round(operation, index, kept, asked):
+    """Report one fresh-seed replacement round's budget and cost."""
     logger.debug(
         "%s: replace round %d/%d, %d/%d kept",
         operation,
@@ -176,14 +175,6 @@ def _log_replacement_round(operation, index, kept, asked, started):
         _REPLACEMENT_ROUNDS,
         kept,
         asked,
-        extra={
-            "replacement": {
-                "round": index + 1,
-                "asked": asked,
-                "kept": kept,
-                "seconds": time.monotonic() - started,
-            }
-        },
     )
 
 
@@ -1307,14 +1298,13 @@ class Conformers:
         for batch_index in range(_REPLACEMENT_ROUNDS):
             if not left:
                 break
-            round_started = time.monotonic()
             count = _REPLACEMENT_FACTOR * len(left)
             trial_params = replace(params, seed=params.seed + 1 + batch_index)
             cons = self.cons.copy()
             mol, ids, _target = seed_conformers(Chem.Mol(source), cons, self.iso, count, trial_params)
             if not ids:
                 previous_signature = None
-                _log_replacement_round(operation, batch_index, 0, count, round_started)
+                _log_replacement_round(operation, batch_index, 0, count)
                 continue
             batch = Conformers(mol, ids, cons, self.iso, params=trial_params, _coord_state_prep=self._coord_state_prep)
             # A constrained replacement must use the same stiffness ladder as the original batch.  A single
@@ -1362,13 +1352,13 @@ class Conformers:
                     and signature == previous_signature
                 )
                 if crossed_every_seed or repeated_reason:
-                    _log_replacement_round(operation, batch_index, 0, count, round_started)
+                    _log_replacement_round(operation, batch_index, 0, count)
                     return left
                 previous_signature = signature
             else:
                 previous_signature = None
             batch._remove(batch_rejected)
-            _log_replacement_round(operation, batch_index, len(batch.ids), count, round_started)
+            _log_replacement_round(operation, batch_index, len(batch.ids), count)
             self.uff.surrogates.update(batch.uff.surrogates)
             self.uff.retyped.update(batch.uff.retyped)
             scores = {

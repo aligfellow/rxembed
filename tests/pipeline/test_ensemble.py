@@ -590,6 +590,7 @@ def test_replacement_carries_unrelaxed_status_to_the_original_id(monkeypatch):
     assert ens.unrelaxed == ens.ids
 
 
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_refinement_preserves_ensemble_records():
     class FixedCalculator(Calculator):
         def energy(self, mol, conf_id=-1):

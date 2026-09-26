@@ -532,8 +532,6 @@ def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
         # narrow/linked can prune every streamed order (e.g. a linear pocket has no hull edge at all), which
         # never reaches the per-candidate screen below and so never increments `unreachable` either.
         logger.warning("metal[%s]: no model-compatible arrangement; try lengths='input', fix= or screen=False", geom)
-    elif not out:
-        logger.warning("metal[%s]: exact symmetry enumeration produced no arrangement", geom)
     return out
 
 

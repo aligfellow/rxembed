@@ -1,0 +1,48 @@
+# Structures reported to misbehave in earlier runs; kept on the cohort so a fix stays fixed.
+# Named cases, expected chemistry (what right looks like, for reading a failure):
+#   ABARAX: Y(III) CN9 hexa-aza crown with three tethered phosphonate arms; tethers should
+#     keep enumeration small (a fixtures.csv case, not run here).
+#   SOSHOY: Zn, two kappa2 carboxylates + N,N chelate; long Zn-O2 2.43 A contact must survive
+#     perception (OCT, not TBP).
+#   MOQYAS: eta2 imine (side-on N=C) + Cp + two benzyl; tetrahedral with each haptic ligand
+#     as one site.
+#   YEBYIQ: square pyramid; the sulfoxide S=O->M oxygen contact is currently dropped.
+#   FOVFED: user-flagged reported case.
+#   QUJSOE: crown-style macrocycle; tethers should keep enumeration small.
+#   KIZNAI: eta7-C7H7 + dmpe; xyz2mol ligand-charge failure at read on this tree.
+#   FOPSOT: user-flagged challenging case.
+#   QEJHIX: Cr eta4 diene; E/Z of the two coordinated C=C must be recorded and recovered.
+#   ZUDWUQ (fixtures/sample): Ni inside a cyclo-As6 ring, hexagonal planar; one arrangement.
+#   RITCIG: Hf with four N donors plus a side-on eta2 C=O counted as ONE site, so square pyramidal
+#     (CN5). Seating C and O as two sites gives CN6, which is wrong.
+#   IFASAJ..VOVZOV: reported from notebook runs on 2026-09-23 and previously untracked here, so a
+#     fix could not stay fixed. RUVHIZ: cyclam + outer-sphere ClO4-, the M-N drop is fixed and its
+#     axial Ni-N is Jahn-Teller elongated (not modelled). ZOGWOH: metal hand alongside ligand hand.
+#     KUVQOK: agostic B-H, no M-B bond. VOVZOV: hybridisation, As6 analogue.
+# Named cases, cost class (for reading a slowdown; run.py itself never gates on these):
+#   FADNUT, VOVZOV: DG cannot embed a reader artefact; each fails after one search (FADNUT under
+#     35 s, VOVZOV under 3 s on a P-core).
+#   BUCKOA, FENNIX, IFASAJ, ZTDXCO: failing isomers spend 67-78% of the structure's time in
+#     fresh-seed replacement.
+#   WACXAC: validation-bound, not embed-bound.
+#   QUJSOE: also isomer-count-bound (166 isomers).
+MACDUQ MACHEE MACHUV MACPFE MACPUC MACQOX MACQUD MACTER MADKEI MADNIQ MADQAM MADQUG
+MADRAN MADREP MADRER MADROZ MADRUH MADVET MADVEV MADVUL MAFDUT MAFFAB VAJKEZ XOLYII
+TUHJEM UMEBET FIPKAT PIQHUS QICWIJ UVUMUU BAXFIQ JAYDIA EQOCEV FUPGAB XOYQEI VONNAP
+HOTXOD ZEYYEH JELGIR LOFXIO RALMOK FADNUT DULPUV PUFXUK YUSSUA YOMBIN WOPKET HAHDUP
+VADPAR ILEMOE PUMRAQ QUBGEC OJUWAR FESKET GELZAA QOWLOD MASYIR WIJVEQ UJUKER BUCKOA
+ALAHAX XAXYIG PIVPOB JIQZIV GUDYIO VOHDOL XAHRAZ QAHVOK IFIZOO HOLBOZ FIWNEG SICMEW
+CUBMOE EHIZAY SATJIJ LENTON LAHDUU VOXBEP TABSOF PIKRAD ZEJQOX EGUVOR LUGROU DUXQUJ
+HECQOW AFEDAS FENNIX PUMMIV KIZQER DIKVEY UFIPIJ XUXZIA NIQGAV
+WACXAC VADZOP XIYLEW RITCIG VAFXOP GAZRUX RARHUO
+JOCREZ AREPUK
+QIGNUP YEGNAA
+RURCUC TILFAW PAZXAQ VIFTOT IDEHII
+HIRGIA
+VALRAE EGALIK
+FIHTOH PESXUI UDOHAW ZUQFAS ZIDNUZ OKAGOZ OKAKIU
+ZOCWEV QIKGEY HEZDEV ELUQIL XUWHAA IGAWUL JAKNUE
+AMAVOA
+SOSHOY MOQYAS YEBYIQ FOVFED QUJSOE KIZNAI FOPSOT QEJHIX
+IFASAJ RUVHIZ ZOGWOH JIKYAD KUQPUJ QOBMUQ ICAJON CUBDOT DAVHOY EGUZIP KOKDOE KOSMAG NARTUY
+TEHSOQ WUSHEZ XIWYUX ZTDXCO ZULVOR KUVQOK VOVZOV EHUXEM SIJQIL

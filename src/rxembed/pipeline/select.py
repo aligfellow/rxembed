@@ -338,14 +338,18 @@ def apply(
         except ImportError as exc:
             raise ImportError("apply needs prism_pruner; pip install 'rxembed[workflow]'") from exc
 
-        mask = prune_by_moi(coords, atoms, moi_dev, en, energy_window)[1]
+        # a missing energy is float("inf") (Ensemble.prune); inf - inf is NaN, which no window admits, but
+        # numpy warns on the subtraction, so silence it here rather than at every caller
+        with np.errstate(invalid="ignore"):
+            mask = prune_by_moi(coords, atoms, moi_dev, en, energy_window)[1]
     elif method == "rmsd":
         try:
             from prism_pruner.pruner import prune_by_rmsd
         except ImportError as exc:
             raise ImportError("apply needs prism_pruner; pip install 'rxembed[workflow]'") from exc
 
-        mask = prune_by_rmsd(coords, atoms, max_rmsd, None, en, energy_window)[1]
+        with np.errstate(invalid="ignore"):
+            mask = prune_by_rmsd(coords, atoms, max_rmsd, None, en, energy_window)[1]
     elif method == "descriptor":
         quads = rotatable_quads(mol)
         feats = np.array([dihedrals(mol, i, quads) for i in ids_s])

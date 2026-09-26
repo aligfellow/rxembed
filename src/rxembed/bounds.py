@@ -10,7 +10,6 @@ from __future__ import annotations
 import itertools
 import logging
 import math
-import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 
@@ -489,10 +488,8 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
     try:
         for name, value in overrides.items():
             setattr(p, name, value)
-        started = time.monotonic()
         with rdBase.BlockLogs() if isolated_h else nullcontext():
             ids = list(rdDistGeom.EmbedMultipleConfs(work, search_count, p))
-        elapsed = time.monotonic() - started
         # Counts describe rejected native attempts, even in a successful search, not failed conformers.
         counts = p.GetFailureCounts() if p.trackFailures else ()
         failures = {
@@ -510,7 +507,6 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
             search_count,
             failures if p.trackFailures else "not tracked",
             "" if ids else "; random starts: EmbedParams(native=...), useRandomCoords=True",
-            extra={"dg": {"seconds": elapsed, "asked": search_count, "returned": len(ids), "rejects": failures}},
         )
         if any(cid < 0 for cid in ids):
             raise TimeoutError(

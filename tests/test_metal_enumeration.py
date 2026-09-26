@@ -1242,19 +1242,6 @@ def test_eta2_face_collapses_a_cn7_miscount_to_octahedral():
     assert all(len(iso.haptic) == 1 for iso in isos)
 
 
-def test_empty_isomer_enumeration_warns(caplog, monkeypatch):
-    import logging
-
-    # No chelate here (4 distinct monodentates), so narrow/linked stay empty and the generic message applies.
-    monkeypatch.setattr(metal_enumeration, "distinct_vertex_orderings", lambda *a, **kw: [])  # every candidate rejected
-    with caplog.at_level(logging.WARNING, logger="rxembed.metal"):
-        out = metal_enumeration.enumerate_isomers(Chem.AddHs(Chem.MolFromSmiles("Br[Pd](Cl)(N)O")), "square_planar")
-    assert not out, "the monkeypatch must leave the enumeration empty"
-    assert any("exact symmetry enumeration produced no arrangement" in r.getMessage() for r in caplog.records), (
-        caplog.text
-    )
-
-
 def test_empty_isomer_enumeration_from_a_pruned_pool_names_the_screen_remedy(caplog):
     """`linear` has no hull edge at all, so `chelate_edge_links` prunes every streamed order before the
     per-candidate reach screen ever runs; the warning must still name the `screen=False` remedy, not the

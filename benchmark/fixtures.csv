@@ -1,0 +1,101 @@
+id,origin,charge,focus,smiles
+ABUVUP,tmQMg,0,large chelate,CCN(CC)c1ccc2C=N(c3ccc([N+](=O)[O-])cc3)->[Ni+2]3(<-[O-]c2c1)<-[O-]c1cc(N(CC)CC)ccc1C=N->3c1ccc([N+](=O)[O-])cc1
+ASISAX,OIN,0,macrocycle perception,
+ASUVIV,tmQMg,0,multidentate,Cc12->[Ir+3]34567(<-n8ccccc8[B-]8(O)OB(O)O[B-](O)(c9ccccn->39)O->48)<-c1(C)c->5(C)[c-]->6(C)c->72C
+BEGLUU,tmQMg,0,macrocycle embedding,Cc1c2n3->[Ni+2]45<-n6c(c(C)c7ccc1[n-]->47)C=Cc6c(C)c1ccc(c(C)c3C=C2)[n-]->51
+BENVOG,OIN,0,slow macrocycle,
+Cis-PtCl2(en),OIN,0,cis chelate,
+CisPlatin,OIN,0,small cis,
+CuCN2,OIN,0,small CN2,
+DIXHOK,tmQMg,0,large chelate,COc1ccccc1P1(CN(C)CP(c2ccccc2OC)(c2ccccc2OC)->[Ni+2]<-1(<-[Cl-])<-[Cl-])c1ccccc1OC
+EJUJUP,tmQMg,0,high CN embedding,C=C1OC(OC)c23->[Cr]4567(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-c(c->4c->52)c->6c->731
+FeCO5,OIN,0,CN5 carbonyl,
+FeH2(CO)4,OIN,0,hydride,
+Ferrocene-halide-face,OIN,-2,haptic face,
+Ferrocene,OIN,-2,haptic symmetry,
+HgI3,OIN,0,small CN3,
+IROXET,tmQMg,0,perception crash,CC#N->[Rh+3]12(<-[Cl-])(<-[Cl-])<-[c-]3c(N=N->1c1ccccc1)cccc3N=N->2c1ccccc1
+JEGKOW,tmQMg,0,mixed donor square planar,CN12->[Rh+](<-[I-])(<-[C-]#[O+])<-P3(C)CN(CN(C1)C3)C2
+JOTJEK,tmQMg,0,kekulization crash,CC(C)(C)c1ccc(N2C=C3C=CC=C4S(=O)(=O)[O-]->[Pd+2]5(<-[C]2N34)<-[c-]2ccccc2CN->5(C)C)cc1
+KAXVOX,OIN,0,large,
+LEZWAO,tmQMg,0,large,C[Si-]1(C)CCP(c2ccccc2)(c2ccccc2)->[Pd+2]<-12<-[Si-](C)(C)CCP->2(c1ccccc1)c1ccccc1
+NAXDOI,tmQMg,0,haptic large,CC1=Cc23->[Mn+]456(<-[C-]#[O+])(<-[C-]#[O+])(<-c2[cH-]->4c->5c->63P(c2cc(C)cc(C)c2)c2cc(C)cc(C)c2)<-P(C1)(c1ccccc1)c1ccccc1
+OCUGIC,tmQMg,0,regression,CC(C)(C)C1C(C(C)(C)C)N(Cc2ccccc2)[C](->[Ag+]<-[Br-])N1Cc1ccccc1
+POJJOP,tmQMg,0,bound N stereo,Cc1ccc(N2Cc3ccccn3->[Pd+2]<-2(<-[Cl-])<-[Cl-])cc1
+PdCl2-R-BINAP,OIN,0,atropisomer,
+PdCl2-RR-BDNN,OIN,0,N stereo,
+PdCl2-RR-BDPP,OIN,0,P stereo,
+PdCl2-RR-DPDME,OIN,0,meso counterexample,
+PdCl2PhenPhosMe,OIN,0,mixed donor square planar,
+PtMeNH3ClBr-Cis,OIN,0,four donor cis,
+PtMeNH3ClBr-Trans,OIN,0,four donor trans,
+RIFGUJ,tmQMg,1,charged multiple N stereo,[O+]#[C-]->[Cu+]12<-N(Cc3ccccc3)C3CC(N->1Cc1ccccc1)CC(N->2Cc1ccccc1)C3
+ROGYAO,tmQMg,0,perception,CCC(C)c1ccc2ccc3ccc(C(C)CC)n4->[Pd+2](<-[Cl-])(<-[Cl-])<-n1c2c34
+ReF7,OIN,0,high CN7,
+Rh-RR-DIPAMP-Cl2,OIN,0,P stereo,
+Rh-Single-Chiral-Phosphine,OIN,0,single P stereo,
+TiCat1,OIN,-2,haptic achiral,
+TiCat2,OIN,-1,haptic extra donor,
+TiCat3,OIN,-2,haptic racemate,
+TiCat4,OIN,-2,haptic meso,
+TiCat5,OIN,-2,haptic enantiomer,
+TiCat6,OIN,-2,haptic enantiomer,
+TransPlatin,OIN,0,small trans,
+VOacac2,OIN,0,bis chelate,
+YESKOZ,tmQMg,0,meso axis counterexample,CSc1ccccc1C1=C2C=CC3=CC4=N5C(=C(C6=CC=C7C=C8C=CC1=N8[Zn]5(N23)(N67)n1ccccc1)c1ccccc1SC)C=C4
+ZUMNEC,tmQMg,0,tris chelate metal hand,c1ccc2[O-]->[Mo+6]34(<-[O-]c2c1)(<-[O-]c1ccccc1[O-]->3)<-[O-]c1ccccc1[O-]->4
+Zeises_salt,OIN,0,eta2,
+fac-Ir(ppy)3,OIN,0,fac chelate,
+mer-Ir(ppy)3,OIN,0,mer chelate,
+PdClBr-BINAP,OIN,0,atropisomer mixed halide,
+PdClCFMe-BINAP,OIN,0,atropisomer chiral carbon,
+HEBLOQ,tmQMg,0,Ag example,Cc1cc(C)c(N2CCN(c3c(C)cc(C)cc3C)[C]2->[Ag+]<-[Cl-])c(C)c1
+DOCPIW,tmQMg,0,Au example,C[n+]1nn(C23CC4CC(CC(C4)C2)C3)[c](->[Au]<-[Cl-])c1-c1ccccc1
+MAJFAG,tmQMg,0,Cd example,O=[N+]1[O-]->[Cd+2]2(<-[O-]1)(<-[O-][N+](=O)[O-]->2)(<-n1cc[nH]c1N=Nc1ccc(Cl)cc1)<-n1cc[nH]c1N=Nc1ccc(Cl)cc1
+JAKNUE,tmQMg,0,Co example,CC1C(C)=N(O)->[Co+]2(<-[CH2-]CCC#N)(<-N=1[O])(<-N([O])=C(C)C(C)=N->2O)<-n1ccn(C)c1C
+ABITAJ,tmQMg,0,Cr example,COC(=O)c12->[Cr]3456(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-c1c->3c->4(-c1cccc3cccc(C)c13)c->5c->62
+EGALIK,tmQMg,1,Cu example,CC(c1ccccc1)=N1Cc2ccccn2->[Cu+]<-12<-N(Cc1ccccn->21)=C(C)c1ccccc1
+ARITOK,tmQMg,0,Fe example,CCOC(c1ccccc1C)C1=C2C3=C->[Fe]<-3<-1<-2(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]
+GOCJIU,tmQMg,0,Hf example,Cc1c(C)c(C)c23->[Hf+4]456789%10%11(<-[Cl-])(<-[Cl-])<-c%12c->4c->5([Si](C)(C)[c-]->62c->7(C)c->8(C)c->93c1C)c->%10[cH-]->%11%12
+GEQXUW,tmQMg,0,Hg example,CN(C)c1ccccc1-c1cccc(-c2ccccn2)n1.[Cl-]->[Hg+2]<-[Cl-]
+IWOSIX,tmQMg,0,Ir example,c1ccc2-c3sc4ccccc4n3->[Ir+3]34(<-[O-]c2c1)(<-[c-]1ccccc1-c1ccccn->31)<-[c-]1ccccc1-c1ccccn->41
+SIDYIP,tmQMg,0,La example,C[Si](C)(C)c12->[La+3]3456789%10%11%12%13(<-c%14c->3c->4[cH-]->5c->6%14)(<-c(c->7[cH-]->81)c->92)(<-c1c->%10[cH-]->%11c->%12([Si](C)(C)C)c->%131)<-O1CCCC1
+HAJDUR,tmQMg,0,Mn example,C[Si](C)(C)c12->[Mn+]345(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-c1(Br)c->3(Br)[c-]->4([Si](C)(C)C)c->52Br
+AHEVIU,tmQMg,0,Mo example,CO->[Mo+6]12(<-[O-2])(<-[O-2])<-[O-]C(=NN->1=Cc1c([O-]->2)ccc2ccccc12)c1ccncc1
+FAVSAY,tmQMg,0,Nb example,CO1CCO(C)->[Nb+5]<-1(<-[Cl-])(<-[Cl-])(<-[Cl-])<-[N-2]n1c2ccccc2c2ccccc21
+BENDOP,tmQMg,0,Ni example,COc1ccc2C(=N->[Ni+2]3(<-N=C(c4ccccc4)c4ccc(OC)cc4[O-]->3)<-[O-]c2c1)c1ccccc1
+GAGSEO,tmQMg,1,Os example,CC(C)c12->[Os+2]34567(<-[Cl-])(<-c(c->31)c->4(C)c->5c->62)<-n1ccn(C)c1C(=O)C(=O)c1n(C)ccn->71
+BOJQUN,tmQMg,0,Pd example,CCN1(CC)C(C)(C)C=N(c2ccccc2)->[Pd+2]<-1(<-[Cl-])<-[Cl-]
+DORYAN,tmQMg,0,Pt example,COc1ccccc1CN1=Cc2ccccn2->[Pt+2]<-1(<-[Cl-])<-[Cl-]
+DAFFID,tmQMg,0,Re example,[O+]#[C-]->[Re+]1(<-[Cl-])(<-[C-]#[O+])(<-[C-]#[O+])<-n2ccccc2-c2n(-c3ccccc3)c3ccccc3n->12
+EGEGON,tmQMg,0,Rh example,CN1c2ccccc2C(=S(c2ccccc2)c2ccccc2)[C]1->[Rh+]123(<-[Cl-])<-C4=C->1CCC->2=C->3CC4
+BAYCAI,tmQMg,1,Ru example,CC(C)c12->[Ru+2]34567(<-[Cl-])(<-c(c->31)c->4(C)c->5c->62)<-N(=Cc1ccccn->71)c1ccc(C(=O)O)cc1
+EXADAI,tmQMg,0,Sc example,CC(C)(C)P(=O->[Sc+3]1234(<-[CH3-])(<-[CH3-])<-c5(C)c->1(C)c->2(C)[c-]->3(C)c->45C)(C(C)(C)C)C(C)(C)C
+KAGPAL,tmQMg,0,Ta example,C[N-](C)->[Ta+5]1(<-[N-](C)C)(<-[N-](C)C)(<-[N-](C)C)<-[n-]2ccc[n+]2[BH-](n2cccn2)[n+]2ccc[n-]->12
+MOCQIE,tmQMg,0,Tc example,CC1=N([O])->[Tc+4]23(<-[O-2])<-N(O)=C(C)C(C)(C)[N-]->2CC(C#N)C[N-]->3C1(C)C
+CAJJEC,tmQMg,0,Ti example,CC(C)C(C)(C)c12->[Ti+4]3456789(<-[Cl-])(<-[Cl-])(<-c(c->31)[cH-]->4c->52)<-c1c->6c->7(C(C)(C)C(C)C)c->8[cH-]->91
+EWOSAK,tmQMg,0,V example,COc1ccc(C2=NN3=Cc4cccc(OC)c4[O-]->[V+5]<-3(<-[O-2])(<-[O-]C)<-[O-]2)cc1
+ALODUB,tmQMg,0,W example,CC1=C(C)CP2(->[W](<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+])OC(c3ccccc3)=CC2(c2ccccc2)C1
+OFUNUZ,tmQMg,0,Y example,C=CC[N-]1N(=C[Si](C)(C)C)->[Y+3]<-123456789(<-c1(C)c->2(C)c->3(C)[c-]->4(C)c->51C)<-c1(C)c->6(C)c->7(C)[c-]->8(C)c->91C
+AFEDEV,tmQMg,0,Zn example,[Cl-]->[Zn+2]1(<-[Cl-])<-n2ccccc2-c2ccn(Cc3cccc4ccccc34)n->12
+CUSNIN,tmQMg,0,Zr example,[Cl-]->[Zr+4]123456789(<-[Cl-])<-c%10c->1(-c1ccc%11ccccc%11c1-c->21c->32ccccc->42c->52cccc[c-]->612)[cH-]->7c->81ccccc->9%101
+BABGET,tmQMg,-1,missing reference SMILES,Cc1ccc(S(=O)(=O)[N-]2CCN34CC[N-](S(=O)(=O)c5ccc(C)cc5)->[Zn+2]<-2<-3(<-O)<-[N-](CC4)S(=O)(=O)c2ccc(C)cc2)cc1
+ZIBGAS,tmQMg,1,diversity,C[Se]1CC[Se](C)->[Ag+]<-12<-[Se](C)CC[Se]->2C
+OWAHEB,tmQMg,0,diversity,CC(C)(C)P1(CC2CCCC3CP(->[Ir+]<-1<-[CH-]23)(C(C)(C)C)C(C)(C)C)C(C)(C)C
+ABARAX,tmQMg,0,missing reference SMILES,COP1(=O)[O-]->[Y+3]2345678<-[O-]P(=O)(OC)C(C)=N->2CCN->32CCN->4(CCN->5=C1C)CCN->6(CCN->7=C(C)P(=O)(OC)[O-]->8)CC2
+SOLHIK,tmQMg,1,diversity,C1CS2->[Ag+]34<-S(CCSCS->3CC2)CCS->4CS1
+FOGCIN,tmQMg,0,diversity,C[S+]1(=O)[CH2-]->[Pd+2]2(<-[CH2-]1)<-[CH2-][S+](C)(=O)[CH2-]->2
+WICHIZ,tmQMg,0,diversity,CCN(CC)C1=S->[Nb+3]234(<-S=S->2)(<-S=C([S-]->3)N(CC)CC)(<-S=C([S-]->4)N(CC)CC)<-[S-]1
+CUHXEJ,tmQMg,-1,diversity,[Br-]->[Pt+2]1(<-[Br-])(<-[Br-])<-C=C->1
+ZUDWUQ,tmQMg,0,diversity,CC(C)(C)[As]12->[Ni]3456<-[As]1(C(C)(C)C)[As]->3(C(C)(C)C)[As]->4(C(C)(C)C)[As]->5(C(C)(C)C)[As]->62C(C)(C)C
+ZACNOJ,tmQMg,0,diversity,CC(C)(C)P1(=[Se]->[Zn+2]2(<-[Se]=P([Se-]->2)(C(C)(C)C)C(C)(C)C)<-[Se-]1)C(C)(C)C
+RUKTOG,tmQMg,0,diversity,CP1(C)CP(C)(C)->[RuH2]<-12<-P(C)(C)CP->2(C)C
+ZUVDOJ,tmQMg,1,diversity,Brc1ccccc1I->[Ag+](<-Ic1ccccc1Br)(<-Ic1ccccc1Br)<-Ic1ccccc1Br
+WOKWUO,tmQMg,0,diversity,C[Si](C)(C)[C-]1(->[Zn+2]<-[C-]([Si](C)(C)C)([Si](C)(C)C)[Si](C)(C)CC[Si]1(C)C)[Si](C)(C)C
+KEFCIJ,tmQMg,0,diversity,S1c2ccccc2[As](c2ccccc2)(c2ccccc2)[Pd]21Sc1ccccc1[As]2(c1ccccc1)c1ccccc1
+AFAXAG,tmQMg,1,diversity,NC(N)=S->[Au+]<-S=C(N)N
+MISJAA,tmQMg,0,diversity,CS(C)->[Pt+4](<-[I-])(<-[I-])(<-[I-])(<-[I-])<-S(C)C
+XIHXUL,tmQMg,-1,diversity,[O-]P1(c2ccccc2)c2cccc3ccc[c-](->[Au+3]<-1(<-[I-])<-[I-])c23
+XEBYOT,tmQMg,1,diversity,C1#CCCN23->[Cu+]456<-C(#C->4CC2)CCN(CC1)CCS->5CCS->6CC3
+NUSPEW,tmQMg,-1,diversity,S1c2ccccc2[P]23c4ccccc4S[Re]45612(Sc1ccccc31)Sc1ccccc1[P]4(c1ccccc1S5)c1ccccc1[S-]6
+MnH,rxembed,0,bimetallic Mn Fe hydride,

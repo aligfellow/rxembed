@@ -1,5 +1,6 @@
 """`pipeline/select.py`: the per-conformer latent, the clustering over it, and the dedup prunes."""
 
+import warnings
 from importlib.util import find_spec
 
 import numpy as np
@@ -189,3 +190,15 @@ def test_multifragment_moi_warns_overmerge(caplog):
     with caplog.at_level("WARNING", logger="rxembed"):
         ens.prune(by="moi")
     assert any("over-merge" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.skipif(find_spec("prism_pruner") is None or find_spec("sklearn") is None, reason="needs rxembed[workflow]")
+def test_prune_ignores_a_conformer_with_no_energy():
+    """A missing energy is float('inf') (Ensemble.prune); inf - inf is NaN and must not warn (nor merge)."""
+    ens = _ens("CCCCO", n=4)
+    unscored = ens.ids[0]
+    del ens.energies[unscored]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        ens.prune()
+    assert unscored in ens.ids  # inside no energy window relative to itself: never merged away

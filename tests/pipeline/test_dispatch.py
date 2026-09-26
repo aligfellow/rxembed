@@ -1205,6 +1205,7 @@ def test_empty_identity_expansion_names_the_candidate_axis(monkeypatch):
         rx.embed("Cl[Pd](Cl)(N)N", metal="square_planar", n=1)
 
 
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_geometry_source_is_normalized_once_for_stereo(tmp_path):
     """An xyz input's helical twist keeps its hand through a constrained re-embed.
 

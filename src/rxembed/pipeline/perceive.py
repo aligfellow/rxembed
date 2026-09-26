@@ -565,7 +565,13 @@ def _with_fallback(path, charge, backend, allow_fallback=True):
         try:
             return fallback(path, charge), name
         except (ImportError, OSError, RuntimeError, ValueError) as second:
-            raise ValueError(f"{backend} {state}; {display} fallback also failed ({second})") from second
+            # Name the remedy whenever xyzgraph itself, not just this input, is the reason nothing worked.
+            hint = (
+                "; pip install 'rxembed[workflow]' for the xyzgraph reader"
+                if state == "unavailable" or isinstance(second, ImportError)
+                else ""
+            )
+            raise ValueError(f"{backend} {state}; {display} fallback also failed ({second}){hint}") from second
 
 
 def _assert_same_atoms(before, after):

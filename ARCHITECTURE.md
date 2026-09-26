@@ -167,5 +167,5 @@ depend on installed extras.
 | QA or input format | the owning `pipeline/` module |
 | package-managed optional dependency | `pyproject.toml` extra plus guarded point-of-use import |
 
-Keep chemistry rationale beside its owning code and measured results in the local `benchmark/`. Do not add
+Keep chemistry rationale beside its owning code and measured results in `benchmark/baseline.csv`. Do not add
 another package directory merely to mark a tier.
