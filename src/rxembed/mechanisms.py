@@ -161,7 +161,7 @@ class Distance(Mechanism):
 
 
 class Pull(Mechanism):
-    """Bias a modelled distance or angle toward its preferred value; FF-only."""
+    """Bias a modelled distance or angle toward its preferred value or window; FF-only."""
 
     @override
     def uff_terms(self, ff, cons, conf, stiffness):
@@ -170,8 +170,9 @@ class Pull(Mechanism):
                 continue
             if len(atoms) == DIST_ATOMS:
                 ff.AddDistanceConstraint(*atoms, target, target, TARGET_FC)
-            else:
-                ff.UFFAddAngleConstraint(*atoms, False, target, target, _ANGLE_TARGET_FC)
+            else:  # a (lo, hi) window pushes only from outside it, at the same soft constant
+                lo, hi = target if isinstance(target, tuple) else (target, target)
+                ff.UFFAddAngleConstraint(*atoms, False, lo, hi, _ANGLE_TARGET_FC)
         for atoms, (lo, hi) in cons.fixed.items():
             if len(atoms) == DIST_ATOMS and lo == hi:  # scalar distance fix; ranges use the strict wall above
                 ff.AddDistanceConstraint(*atoms, lo, hi, stiffness * FIX_DISTANCE_FC)

@@ -279,10 +279,15 @@ def test_canonical_slots_keep_identical_donor_links_with_their_assigned_slots():
         assert {rx.cxsmiles(iso) for iso in rx.metal(renumbered, "SPL", screen=False)} == expected
 
 
-def test_gold_amine_beside_a_hydrogen_bonded_diol_writes_one_hand_in_any_bond_order():
-    """The O-H~O contact hides the carbinyl centre from CIP, so only its raw tag carries the hand."""
-    source = Chem.AddHs(metal_smiles.parse_smiles("[Cl-]->[Au+]<-[NH2][C@@H]1CO[H]~[O-]C1 |Z:6|", remove_hs=False))
-    assert rx.metal(source)[0].stereo_label == "C3:CCW"
+def test_centre_cip_cannot_rank_writes_one_hand_in_any_bond_order(monkeypatch):
+    """A centre CIP cannot rank (DOCPIW's adamantyl C, a clathrochelate B cap) is written from its raw tag.
+
+    CIP is blinded here on a 2-butylamine so the centre carries a hydrogen, which the writer removes from a
+    bond slot that depends on the input order; a raw code that did not follow that edit wrote either hand.
+    """
+    monkeypatch.setattr(stereo, "_point_cip_codes", lambda _mol, _centers: {})
+    source = Chem.AddHs(metal_smiles.parse_smiles("[Cl-]->[Au+]<-[NH2][C@@H](C)CC", remove_hs=False))
+    assert rx.metal(source)[0].stereo_label == "C3:CW"
     texts, counts = set(), set()
     for seed in range(8):
         rng = random.Random(seed)
@@ -305,12 +310,13 @@ def test_gold_amine_beside_a_hydrogen_bonded_diol_writes_one_hand_in_any_bond_or
 
 
 @pytest.mark.parametrize("unbound_metal", [False, True])
-def test_zero_order_contact_preserves_native_cip_and_bond_identity(unbound_metal):
+def test_zero_order_contact_is_written_but_is_not_constitution(unbound_metal):
+    """Only the O~N contact tells C1's two CH2OH arms apart, so C1 is no stereocentre; the contact still round-trips."""
     mol = metal_smiles.parse_smiles("C[C@@H](CO)CO~N |Z:5|")
     if unbound_metal:
         mol = Chem.CombineMols(mol, metal_smiles.parse_smiles("[Zn+2]"))
     before = Chem.MolToCXSmiles(mol)
-    assert stereo.defined_stereo_label(mol) == "C1:S"
+    assert stereo.defined_stereo_label(mol) == ""
 
     text, at, _bonds, _unwritable = metal_smiles._write_dative(
         mol, stereo.defined_stereo_label(mol, metal_smiles.metal_indices(mol))
@@ -318,8 +324,8 @@ def test_zero_order_contact_preserves_native_cip_and_bond_identity(unbound_metal
     back = metal_smiles.parse_smiles(text)
 
     assert "Z:" in text
+    assert "@" not in text
     assert back.GetBondBetweenAtoms(at[5], at[6]).GetBondType() == Chem.BondType.ZERO
-    assert stereo.point_stereo(stereo.defined_stereo_label(back)) == {at[1]: "S"}
     assert metal_smiles.dative_smiles(back) == text
     assert metal_smiles.dative_smiles(Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))) == text
     assert Chem.MolToCXSmiles(mol) == before

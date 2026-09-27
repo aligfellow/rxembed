@@ -1057,6 +1057,33 @@ def test_side_on_eta2_ligand_embeds_geometry_clean():
     assert any(geom.check(ens.mol, c).ok() for c in ens.ids), "no geom.check-clean side-on conformer"
 
 
+def test_eta4_naphthalene_hinge_folds_its_fusion_carbons_off_the_metal():
+    """BAMROX: an eta4-bound naphthalene folds at its hinge, standing the unbound fusion carbons off Rh.
+
+    Without the hinge push the fusion carbons sit at 1.11 to 1.17x the Rh-C covalent sum (below the census p5
+    of 1.20 for a conjugated hinge); the push must clear that floor at every seed.
+    """
+    smi = "c1ccc([P]2(CCO[c]34->[Rh+]<-2567<-[cH]3[cH]->5[c]->6(OCC[P]->7(c2ccccc2)c2ccccc2)c2ccccc24)c2ccccc2)cc1"
+    iso = rx.metal(smi)[0]
+    r_rh_c = Chem.GetPeriodicTable().GetRcovalent(45) + Chem.GetPeriodicTable().GetRcovalent(6)
+    for seed in (42, 7, 1234, 2026, 99):
+        ens = rx.embed(iso, n=1, seed=seed)
+        mol, pos = ens.mol, ens.mol.GetConformer(ens.ids[0]).GetPositions()
+        rh = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "Rh")
+        face = {n.GetIdx() for n in mol.GetAtomWithIdx(rh).GetNeighbors() if n.GetSymbol() == "C"}
+        rings = [set(r) for r in Chem.GetSymmSSSR(metal_core.ligand_graph(mol))]  # metal-stripped: no false hinge at Rh
+        fusion_carbons = {
+            x.GetIdx()
+            for d in face
+            for x in mol.GetAtomWithIdx(d).GetNeighbors()
+            if x.GetIdx() not in face and any({d, x.GetIdx()} <= r for r in rings)
+        }
+        assert fusion_carbons, f"seed {seed}: no unbound fusion carbon beside the eta4 face"
+        for x in fusion_carbons:
+            ratio = float(np.linalg.norm(pos[x] - pos[rh])) / r_rh_c
+            assert ratio >= 1.20, f"seed {seed}: fusion carbon {x} at {ratio:.3f}x the Rh-C covalent sum"
+
+
 def test_haptic_face_and_sigma_donor_on_one_ligand_compile_without_a_virtual_bite_path():
     rw = Chem.RWMol()
     metal = rw.AddAtom(Chem.Atom(26))

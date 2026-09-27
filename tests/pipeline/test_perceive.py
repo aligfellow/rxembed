@@ -628,14 +628,17 @@ def test_bond_order_ranking_keeps_the_ligand_leg_of_a_hydride_bridge(monkeypatch
     assert contact.GetBeginAtomIdx() == 2
 
 
-def test_symmetric_nonmetal_shared_hydrogen_uses_a_zero_order_contact(monkeypatch):
+@pytest.mark.parametrize(("left", "right", "bridge"), [(7, 8, False), (5, 5, True)])
+def test_shared_hydrogen_keeps_a_zero_order_leg_only_to_an_atom_without_a_lone_pair(monkeypatch, left, right, bridge):
+    """N-H...O is a hydrogen bond and leaves the graph; B-H-B is a three-centre bond and keeps its second leg."""
     monkeypatch.setattr(perceive, "get_tmc_mol", lambda *_args, **kwargs: (kwargs["graph"][0],))
     outcomes = []
     for edges in (((1, 2), (3, 2)), ((3, 2), (1, 2))):
         rw = Chem.RWMol()
-        for atomic_number in (26, 7, 1, 8):
+        for atomic_number in (26, left, 1, right):
             atom = Chem.Atom(atomic_number)
             atom.SetNoImplicit(True)
+            atom.SetNumExplicitHs(2 if atomic_number == 5 else 0)  # terminal B-H of a borane
             rw.AddAtom(atom)
         for edge in edges:
             rw.AddBond(*edge, Chem.BondType.SINGLE)
@@ -647,11 +650,13 @@ def test_symmetric_nonmetal_shared_hydrogen_uses_a_zero_order_contact(monkeypatc
         mol.AddConformer(conf)
 
         ranked = perceive._rank_orders(mol, 0)
-        contacts = [bond for bond in ranked.GetAtomWithIdx(2).GetBonds() if bond.GetBondType() == Chem.BondType.ZERO]
-        ordinary = [bond for bond in ranked.GetAtomWithIdx(2).GetBonds() if bond.GetBondType() != Chem.BondType.ZERO]
-        outcomes.append((contacts[0].GetOtherAtomIdx(2), ordinary[0].GetOtherAtomIdx(2)))
+        legs = {bond.GetOtherAtomIdx(2): bond.GetBondType() for bond in ranked.GetAtomWithIdx(2).GetBonds()}
+        outcomes.append(legs)
 
     assert outcomes[0] == outcomes[1]
+    assert sorted(outcomes[0].values()) == (
+        [Chem.BondType.SINGLE, Chem.BondType.ZERO] if bridge else [Chem.BondType.SINGLE]
+    )
 
 
 def test_connectivity_sources_preserve_an_open_eta3_face(monkeypatch):
@@ -868,6 +873,26 @@ def test_smiles_input_keeps_a_bridgehead_bond_canonical_metal_graph_no_longer_dr
     assert sorted(n.GetIdx() for n in out.GetAtomWithIdx(metal).GetNeighbors()) == before
 
 
+# AREPUK's failure mode in miniature: a quinolin-8-yl kappa2-N,C chelate, its ring-junction C8a bonded
+# to both real donors (N1, the anionic ipso C8) directly, plus the wrong Pd-C8a contact a coordinate
+# reader can add. N1 shares the pyridine ring with C8a, C8 shares the benzo ring with C8a: two different
+# rings fused at C8a, not one ring holding every donor.
+_QUINOLINYL_PD = "c1c[c-]3c24n(->[Pd+2]<-3<-4)cccc2c1"
+
+
+def test_read_xyz_drops_the_ring_junction_of_a_four_membered_quinolinyl_chelate(monkeypatch):
+    """A ring-junction bridgehead prunes even through a carbon donor (regression for the AREPUK read)."""
+    selected = rx.parse_smiles(_QUINOLINYL_PD, remove_hs=False)
+    metal, before = _metal_neighbours(selected)
+    assert len(before) == 3  # N1, the real ipso C8, and the wrong C8a contact
+    monkeypatch.setattr(perceive, "_with_fallback", lambda *_args: (selected, "xyzgraph"))
+
+    result = perceive.read_xyz("unused.xyz", charge=Chem.GetFormalCharge(selected))
+
+    after = sorted(n.GetSymbol() for n in result.GetAtomWithIdx(metal).GetNeighbors())
+    assert after == ["C", "N"]
+
+
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_read_drops_a_triazolate_cross_ring_contact(tmp_path):
     """A 1,2,4-triazole's two ring carbons sit 2.095 A apart, just inside xyzgraph's C-C cutoff.
@@ -890,3 +915,38 @@ def test_read_drops_a_triazolate_cross_ring_contact(tmp_path):
     Chem.AssignStereochemistry(out, cleanIt=True, force=True)  # must not raise or invent a chiral ring carbon
     assert out.GetAtomWithIdx(c3).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
     assert out.GetAtomWithIdx(c5).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+
+
+# Coordinates excerpted verbatim from tmQMg's SORGAK.xyz: La, its thiolate S2, and the dioxazole ring
+# (O9, O10, N12, C46, its own H47) that folds C50 close enough for xyzgraph to bond La-C50 (3.02 A).
+# C46's second ring substituent (C43) is capped with H in place of extending the ligand further; this
+# is the smallest slice that keeps the fold and the ring intact.
+_SORGAK_BRIDGEHEAD_FRAGMENT = """9
+
+La    -0.1979   0.1255  -0.1040
+S      0.9839   1.6458  -2.2685
+O      1.8636  -0.8016  -1.5928
+O      4.0509  -0.4435  -1.0874
+N      3.4846   0.7917  -1.5000
+C      3.0189  -1.4340  -1.0183
+C      2.2489   0.5720  -1.8130
+H      3.3107  -2.3162  -1.6344
+H      2.7946  -1.7327   0.0057
+"""
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_read_drops_a_bridgehead_ring_carbon_flanked_by_only_one_ring_donor(caplog, tmp_path):
+    """A folded kappa2-S,O chelate: the bridgehead's ring donor (O) keeps a real ring face, but its
+    exocyclic thiolate (S) does not, so one shared ring is not a face and the La-C bond still drops.
+    """
+    path = tmp_path / "sorgak_fragment.xyz"
+    path.write_text(_SORGAK_BRIDGEHEAD_FRAGMENT)
+
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        mol = perceive.read_xyz(str(path), charge=1, connectivity="xyzgraph", bond_orders="xyz2mol")
+
+    metal = next(a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS)
+    kept = sorted(n.GetSymbol() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
+    assert kept == ["O", "S"]
+    assert "bridgehead" in caplog.text

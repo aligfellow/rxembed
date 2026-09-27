@@ -20,6 +20,7 @@ from .utils import (
     mirror_tag,
     remove_bond,
     repair_bond_stereo,
+    without_zero_bonds,
 )
 
 _MIN_POINT_BRANCHES = 3
@@ -297,7 +298,7 @@ def _point_cip_codes(mol, centers):
         cached = _CIP_CACHE.get(key)
         if cached is not None:
             return dict(cached)
-    probe = Chem.Mol(mol)
+    probe = Chem.Mol(without_zero_bonds(mol))
     for idx in centers:
         atom = probe.GetAtomWithIdx(idx)
         if atom.HasProp("_CIPCode"):
@@ -826,8 +827,9 @@ def _build_enumeration_graph(mol, exclude):
 
     Returns ``(work, cap_to_metal)``: cap index -> ``(metal atomic number, was donor->metal dative,
     replacement changed parity, metal index)``.
-    With no `exclude` there is nothing to disconnect, so `mol` is returned unchanged.
+    With no `exclude` there is nothing to disconnect, so the contact-free `mol` is returned.
     """
+    mol = without_zero_bonds(mol)
     if not exclude:
         return mol, {}
     # Disconnect each metal first: a metal-bound donor is a stereocentre only while bound, so RDKit would

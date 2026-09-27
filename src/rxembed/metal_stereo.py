@@ -17,7 +17,7 @@ from .metal_core import (
 )
 from .metal_polyhedron import DELTA, LAMBDA, handedness, orientation_parity, vertex_dirs
 from .stereo import apply_encoded_bond_stereo, coordination_locked_double_bonds
-from .utils import bond_removal_mirrors, mirror_tag
+from .utils import bond_removal_mirrors, mirror_tag, without_zero_bonds
 
 _FACE_EPS = 1e-8
 _HALF_TURN = 180
@@ -150,7 +150,7 @@ def donor_classes(mol, donors):
 
     Coordination identity follows graph automorphism, not one localized charge or bond-order assignment.
     """
-    ranked, at = remove_routine_hydrogens(mol, donors)
+    ranked, at = remove_routine_hydrogens(without_zero_bonds(mol), donors)
     classes = _root_classes(ranked, [at[donor] for donor in donors])
     return {donor: classes[at[donor]] for donor in donors}
 
@@ -165,7 +165,7 @@ def site_classes(mol, sites, haptic=None, coordination=()):
     occupied = [site for site in sites if site != VACANT]
     atoms = {atom for site in occupied for atom in (haptic.get(site) or (site,))}
     atoms.update(donor for donor, _metal, _atomic_num, _charge in coordination)
-    rw = Chem.RWMol(mol)
+    rw = Chem.RWMol(without_zero_bonds(mol))
     for donor, metal, atomic_num, _charge in coordination:
         if min(donor, metal) < 0 or max(donor, metal) >= mol.GetNumAtoms():
             continue

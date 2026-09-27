@@ -14,8 +14,8 @@ from rxembed.metal_polyhedron import CHELATE_SPAN_ANGLE, hull_edges, vertex_angl
 def _wide_narrow(dirs, pair):
     """Return a `narrow` mapping that forbids `pair` at every vertex angle >= CHELATE_SPAN_ANGLE.
 
-    Mirrors `metal_screen.narrow_span_pairs`'s per-angle form for a fixture that only cares that a pair
-    cannot span *some* wide angle, not which one.
+    Uses `distinct_vertex_orderings`'s per-angle `narrow` form directly, for a fixture that only cares
+    that a pair cannot span *some* wide angle, not which one.
     """
     angles = {round(vertex_angle(p, q), 6) for p, q in itertools.combinations(dirs, 2)}
     return {angle: frozenset({pair}) for angle in angles if angle >= CHELATE_SPAN_ANGLE}

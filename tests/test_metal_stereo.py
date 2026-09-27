@@ -161,6 +161,20 @@ def test_bis_dithiolene_lewis_forms_give_one_isomer_set():
         assert len({classes[s] for s in sulfurs}) == 1, "all four dithiolene sulfurs must be one site class"
 
 
+@pytest.mark.parametrize("sites", [[23, 2, 18, 12, 6], [23, 2, 6, 12, 18]])
+def test_tc_oxo_amine_oxime_hand_ignores_the_oxime_hydrogen_bond_contact(sites):
+    """MOCQIE's O-H~O contact closes no ring and ranks no atom, so the embedded geometry reads back its hand."""
+    contact = rx.parse_smiles(
+        "CC1=[N]2O[H]~[O-][N]3=C(C)C(C)(C)[N-]4C[C@H](C#N)C[N-](C1(C)C)->[Tc+5]<-2<-3<-4<-[O-2] |Z:4|"
+    )
+    rw = Chem.RWMol(contact)
+    rw.RemoveBond(4, 5)
+    free = rw.GetMol()
+    free.UpdatePropertyCache(strict=False)
+
+    assert Isomer(contact, "SPY", sites).chirality == Isomer(free, "SPY", sites).chirality != ""
+
+
 def test_face_winding_abstains_at_the_plane_and_is_scale_invariant():
     face_mol = Chem.MolFromSmiles("[c-]1(F)c(Br)ccc1")
     rw = Chem.RWMol(Chem.CombineMols(face_mol, Chem.MolFromSmiles("[Fe+2]")))

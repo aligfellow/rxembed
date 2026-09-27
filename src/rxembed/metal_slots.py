@@ -329,10 +329,10 @@ def distinct_vertex_orderings(
     `perms` overrides the candidate vertex orderings (default ``isomer_permutations(geometry)``); a ``fix=``
     enumeration passes the subset that keeps each frozen donor pinned to its input vertex, and a
     coordinate-derived ordering is retained first. `narrow` maps each polyhedron vertex angle to the
-    same-ligand donor-position pairs that cannot span it (`metal_screen.narrow_span_pairs`); `linked` prunes
-    same-ligand donor-position pairs held to a polyhedron hull edge (`chelate_edge_links`). Both apply only to
-    the streamed tethered pool (see `_forbidden_vertex_pairs`), dropping an order its rule forbids before the
-    cap below can raise on an orbit no completion of it could ever satisfy.
+    same-ligand donor-position pairs that cannot span it; `linked` prunes same-ligand donor-position pairs
+    held to a polyhedron hull edge (`chelate_edge_links`). Both apply only to the streamed tethered pool (see
+    `_forbidden_vertex_pairs`), dropping an order its rule forbids before the cap below can raise on an orbit
+    no completion of it could ever satisfy.
 
     Canonical vertex classes and same-ligand path lengths distinguish candidates under proper rotations. No
     graph heuristic proves conformational reachability, so feasibility remains the embedder's job.

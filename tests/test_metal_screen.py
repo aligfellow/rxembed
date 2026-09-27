@@ -10,7 +10,7 @@ import pytest
 from rdkit import Chem, DistanceGeometry
 
 import rxembed as rx
-from rxembed import metal_enumeration, metal_screen
+from rxembed import metal_screen
 from rxembed.bounds import ligand_reach
 from rxembed.constraints import Constraints
 from rxembed.mechanisms import law_of_cosines
@@ -165,41 +165,6 @@ def test_tris_dien_lanthanum_stays_under_the_orbit_cap():
     assert len(isomers) == 62
     with pytest.raises(ValueError, match="more than 1,000 distinct constitutional"):
         rx.metal(mol, screen=False)
-
-
-@pytest.mark.parametrize(
-    ("smiles", "count", "pruned_pairs"),
-    [
-        # 4, not 5: the all-equatorial seating (both dien bites on adjacent equatorial slots) forces the
-        # third equatorial pair to 180 deg -- a square-pyramidal reading, not trigonal_bipyramidal, at every
-        # point in its bite windows including the anchor -- so `metal_constraints.bounded_bites` refuses it
-        # ("chelate bites leave trigonal_bipyramidal") independently of this test's own pruning screen.
-        ("[Cl-]->[La+3]12(<-[Cl-])<-[NH2]CC[NH]->1CC[NH2]->2", 4, 2),
-        ("[Cl-]->[La+3]123(<-[Cl-])(<-[NH2]CC[NH2]->1)<-[NH2]CC[NH]->2CC[NH2]->3", 24, 6),
-    ],
-    ids=["tbp", "pbp"],
-)
-def test_narrow_span_pruning_loses_no_reachable_arrangement(monkeypatch, smiles, count, pruned_pairs):
-    """The pruned and unpruned tethered pools agree exactly: pruning removes only already-doomed orbits."""
-    mol = rx.parse_smiles(smiles)
-    real = metal_enumeration.narrow_span_pairs
-    seen = set()
-
-    def recording(*args, **kwargs):
-        result = real(*args, **kwargs)
-        seen.update((angle, pair) for angle, pairs in result.items() for pair in pairs)
-        return result
-
-    monkeypatch.setattr(metal_enumeration, "narrow_span_pairs", recording)
-    pruned = {rx.cxsmiles(iso) for iso in rx.metal(mol)}
-    assert len(pruned) == count
-    # The no-loss comparison below is vacuous unless the prune actually removed something.
-    assert len(seen) == pruned_pairs
-
-    monkeypatch.setattr(metal_enumeration, "narrow_span_pairs", lambda *args, **kwargs: frozenset())
-    unpruned = {rx.cxsmiles(iso) for iso in rx.metal(mol)}
-
-    assert unpruned == pruned
 
 
 def test_tethered_haptic_faces_reject_an_unreachable_trans_state():

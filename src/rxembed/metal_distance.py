@@ -15,7 +15,6 @@ from rdkit import Chem
 from rdkit.Chem import GetPeriodicTable
 
 from .metal_core import COORDINATION_METALS, ETA2, VACANT, frag_map, haptic_sites, ligand_degree, ligand_valence
-from .utils import CARBON_Z
 
 _PT = GetPeriodicTable()
 
@@ -69,8 +68,13 @@ _PAULING_EN = {
     46: 2.20, 47: 1.93, 48: 1.69, 51: 2.05, 52: 2.10, 53: 2.66, 57: 1.10, 72: 1.30, 73: 1.50, 74: 2.36, 75: 1.90,
     76: 2.20, 77: 2.20, 78: 2.28, 79: 2.54, 80: 2.00,
 }  # fmt: skip
-_AGOSTIC_ELONGATION = 0.55  # Å: an agostic C-H...M is a 3c-2e sigma-complex, not a hydride, so the fit's
-# 2-centre M-H cannot describe it. The tell is a metal-bound H whose other neighbour is carbon.
+# A metal-bound H whose other neighbour X is a ligand atom is a 3c-2e X-H...M bridge (agostic C-H, B-H-M), not
+# a hydride: the fit's two-centre M-H cannot describe it. X -> (M-H over the fitted two-centre M-H, X-H leg), Å,
+# census medians over every H the `rx.read_xyz` graph bonds to the metal and to an X it does not bond to the
+# metal, across tmQMg (74,547 structures) plus the fixtures: C 27 contacts in 24 structures, B 219 contacts in
+# 168 structures. The reader's own agostic filter censors this population: it declines to bond the longer
+# side-on C-H...M contacts, so the census covers the bridges a read graph declares, not every agostic contact.
+BRIDGE_H = {6: (0.152, 1.199), 5: (0.069, 1.333)}
 _SP_CONTRACTION = 0.128  # A: an sp donor (CO, isocyanide, nitrile, nitrosyl, acetylide) binds this much
 # shorter than the fit predicts, from high s-character in the sigma bond and pi back-donation into the empty pi*.
 _LIGAND_FREE_CONTRACTION = {  # Z -> (constant, metal-group slope), in A; fitted over the tmQM/Kulik census
@@ -180,8 +184,9 @@ def ml_distance(mol, metal, d, real_z, donor_set, charges=None, *, hyb, eta=None
             base -= intercept + slope * g
         elif eta == 0 and hyb.get(d) is Chem.HybridizationType.SP and ligand_degree(a) == 1:
             base -= _SP_CONTRACTION
-    if z_d == 1 and any(n.GetAtomicNum() == CARBON_Z for n in a.GetNeighbors()):  # agostic C-H...M, not a hydride
-        return base + _AGOSTIC_ELONGATION
+    bridge = next((BRIDGE_H[n.GetAtomicNum()] for n in a.GetNeighbors() if n.GetAtomicNum() in BRIDGE_H), None)
+    if z_d == 1 and bridge is not None:  # an X-H...M bridge, not a hydride
+        return base + bridge[0]
     return base
 
 

@@ -27,7 +27,7 @@ from .metal_core import (
     metal_indices,
     vertex_atom,
 )
-from .metal_distance import INPUT_HALF_WIDTH, delocalised_charges, ff_terms, ml_distance
+from .metal_distance import BRIDGE_H, INPUT_HALF_WIDTH, delocalised_charges, ff_terms, ml_distance
 from .metal_donor_orient import (
     COPLANAR_CAP,
     coplanar_donor,
@@ -54,7 +54,8 @@ _ML_SEED_HALF_WIDTH = 0.05  # Å: numerical room around an M-L seed target, not 
 _STRAIGHT = 180.0
 _SHELL_ATOL = 1e-6  # numerical tolerance for template coplanarity and sector closure
 # Slack on an otherwise-unconstrained compiled L-M-L angle row: wide enough for ordinary distortion, narrow
-# enough that metal_screen.narrow_span_pairs can prove a pair's whole orbit will fail this angle wall.
+# enough that metal_screen's per-candidate reach screen can still prove a compiled angle conflicts with the
+# native ligand reach.
 ANGLE_PAD = 8.0
 
 
@@ -156,6 +157,34 @@ def _centroid_constraints(sphere, dummy, qdel, hyb, c):
             add_distance(c.distances, dummy, a, r - 0.1, r + 0.1)
     c.phantoms = c.phantoms | {dummy}
     c.haptic[dummy] = tuple(ring)  # embed scaffolding: materialised transiently in the DG/UFF, stored in no real Mol
+    _hinge_push(sphere, ring, c)
+
+
+# deg: the hinge of a partly bound ring rehybridises toward sp3, so its unbound ring neighbour sits at the
+# tetrahedral angle from the metal. tmQMg census (2026-09-27) of M-h-x at 888 conjugated hinges of rings
+# bound through part of their atoms (400 structures): median 108.6, p5 85.6.
+_HINGE_ANGLE = math.degrees(math.acos(-1.0 / 3.0))
+
+
+def _hinge_push(sphere, face, c):
+    """Push each face atom's conjugated, non-donor ring neighbour toward the tetrahedral M-h-x angle.
+
+    The one-sided window lets a partly bound ring fold at its hinge instead of staying flat against the
+    metal, without dragging an in-plane side-on pair inward; an sp3 flap (COD, cyclohexadienyl) already folds
+    freely and is excluded by the conjugated-bond test.
+    """
+    mol, metal = sphere.mol, sphere.metal
+    stripped = _fact(sphere.context, "stripped", lambda: ligand_graph(mol))
+    rings = _fact(sphere.context, "ligand_rings", lambda: [frozenset(r) for r in Chem.GetSymmSSSR(stripped)])
+    face = set(face)
+    for ring in rings:
+        if not face < ring:
+            continue
+        for a in face:
+            for bond in mol.GetAtomWithIdx(a).GetBonds():
+                x = bond.GetOtherAtomIdx(a)
+                if x in ring and x not in sphere.real and bond.GetIsConjugated():
+                    c.pulls[(metal, a, x)] = (_HINGE_ANGLE, _STRAIGHT)
 
 
 LENGTHS = ("model", "input")
@@ -634,6 +663,15 @@ def _radial_windows(sphere, c):
                     eta=eta.get(d, 0),
                 ),
             )
+        # A bridging H's X-H leg is pulled to its bridged length (`BRIDGE_H`), in the FF only: a window would
+        # contradict the ligand's native 1-2 bound, which the enumeration screen keeps.
+        if mol.GetAtomWithIdx(d).GetAtomicNum() == 1:
+            for nb in mol.GetAtomWithIdx(d).GetNeighbors():
+                if nb.GetAtomicNum() in BRIDGE_H:
+                    x = nb.GetIdx()
+                    measured = sphere.pos is not None
+                    leg = np.linalg.norm(sphere.pos[x] - sphere.pos[d]) if measured else BRIDGE_H[nb.GetAtomicNum()][1]
+                    c.pulls[(min(x, d), max(x, d))] = float(leg)
         # Wall each donor substituent off the metal, the orientation hold a real energy cannot supply itself.
         # Length provenance is independent: measured M-L distances do not determine a partially free M-D-X axis.
         if sphere.donor_orientation:

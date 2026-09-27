@@ -856,29 +856,16 @@ def test_clathrochelate_keeps_its_measured_trigonal_prism():
     assert len(isomers) == 1
 
 
-def test_podand_pair_reach_prunes_the_same_set_the_full_screen_would_keep(monkeypatch):
-    """A CN6 bis-chelate (two 5-ring en backbones, bite well under 180 deg): the per-angle pair rule prunes
-    same-ligand pairs that cannot span a wide polyhedron vertex angle before generation, and must keep exactly
-    what the full per-candidate reach screen alone would keep (its no-loss argument, cheap to check directly).
-    """
-    smiles = "Cl[Co]12(Cl)(NCCN1)NCCN2"
-    pruned = {rx.cxsmiles(iso) for iso in rx.metal(smiles, "octahedral")}
-
-    monkeypatch.setattr(metal_enumeration, "narrow_span_pairs", lambda *_args: {})
-    unpruned = {rx.cxsmiles(iso) for iso in rx.metal(smiles, "octahedral")}
-
-    assert pruned == unpruned
-    assert pruned, "the fixture must enumerate at least one isomer, or the comparison proves nothing"
-
-
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 @pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
-def test_podand_pair_reach_prunes_under_the_cap():
-    """SORGAK: a La podand (a polyether chain plus a dioxazole ring and NCS), all ten donors constitutionally
-    distinct, so no ligand symmetry divides its orbit count and the plain assignment cap (1,000) is exceeded
-    at 2,270 orbits. Generalising the narrow-span rule from one angle to every polyhedron vertex angle
-    (`metal_screen.narrow_span_pairs`) prunes that down under the cap before generation, with no isomer lost
-    (the reach screen would have rejected every pruned orbit anyway). Runs a few minutes.
+def test_podand_reaches_the_cap_with_a_named_remedy():
+    """SORGAK: a La podand (a polyether chain, a folded kappa2-S,O dioxazole ring, and NCS).
+
+    Once the reader guard drops the dioxazole ring's spurious La-C bond (`pipeline.perceive`, one shared
+    ring donor is not a face), SORGAK reads CN9 with all nine donors constitutionally distinct: no ligand
+    symmetry divides its orbit count. `chelate_edge_links` still prunes before generation, but 1,210 orbits
+    survive it, over the 1,000 cap, so `rx.metal` refuses rather than silently enumerating a partial set;
+    the message must still name a remedy.
     """
     charges = {
         row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
@@ -889,11 +876,9 @@ def test_podand_pair_reach_prunes_under_the_cap():
         connectivity="xyzgraph",
         bond_orders="xyz2mol",
     )
-    reference = rx.cxsmiles(mol)
 
-    isomers = rx.metal(mol, lengths="model")
-
-    assert reference in {rx.cxsmiles(iso) for iso in isomers}
+    with pytest.raises(ValueError, match=r"more than 1,000 distinct constitutional.*rx\.embed.*rx\.metal"):
+        rx.metal(mol, lengths="model")
 
 
 def test_chelate_links_ignore_coordination_shortcuts():

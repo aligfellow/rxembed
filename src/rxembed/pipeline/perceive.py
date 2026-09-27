@@ -38,7 +38,7 @@ _BOND_ORDERS = {"xyzgraph", "xyz2mol"}
 _BRIDGEHEAD_SIGMA_MIN = 4  # a kappa2 chelate bridgehead (P, Si, B) bonds >=4 non-metal sigma neighbours
 _BRIDGEHEAD_DONORS_MIN = 2  # fewer is a sigma-silane/borane bridgehead (one metal-bound neighbour), not this rule
 _TRIGONAL_SIGMA = 3  # Class B's bridgehead: exactly 3 non-metal sigma bonds (carboxylate/amidinate C, N-B-N B)
-_TRIGONAL_NONDONOR_Z = {1, 6}  # H and C: a TS contact or a genuine eta-n face carbon, never this rule's donor
+_OPEN_FACE_Z = 6  # an open D-X-C path can be an eta3 allyl-type face, so a carbon donor keeps an open X bound
 logger = logging.getLogger("rxembed")
 
 
@@ -188,22 +188,21 @@ def _metal_free_rings(rw, metals):
 
 
 def _trigonal_donors_qualify(rw, x, donors, metals, rings):
-    """Return True when Class B's two extra conditions hold for a trigonal bridgehead's `donors`.
+    """Return True when a trigonal bridgehead's `donors` prove X chelate backbone, not a face atom.
 
-    Every donor must be a non-carbon heteroatom that itself has a lone pair (a formal-charge carbanion
-    never qualifies -- what keeps a Cp, indenyl, or pyrrolyl ring intact, since ring aromaticity puts a
-    delocalised charge on a ring carbon too). And X must not share a metal-free ring with a donor --
-    what keeps a phosphole, thiazole, or imidazolyl face intact, where the flanking donors are joined
-    to X by a real organic ring bond, not only by both separately reaching the same metal.
+    Every donor must hold a lone pair of its own; one ring holding X and every donor is a real face and
+    keeps the bond. Otherwise X's own rings decide: donors split across two rings fused at X (a ring
+    junction, e.g. AREPUK's quinolyl C17) prune whatever their element, since X's three sigma bonds are
+    all ring bonds and the metal sits in X's plane, where X has no orbital; an open path prunes only when
+    no donor is carbon, since a carbon donor there is as often an eta3 allyl-type face.
     """
     xi = x.GetIdx()
-    for d in donors:
-        atom = rw.GetAtomWithIdx(d)
-        if atom.GetAtomicNum() in _TRIGONAL_NONDONOR_Z or lone_pair_electrons(atom, metals) <= 0:
-            return False
-        if any(xi in ring and d in ring for ring in rings):
-            return False
-    return True
+    if any(lone_pair_electrons(rw.GetAtomWithIdx(d), metals) <= 0 for d in donors):
+        return False
+    if any(xi in ring and all(d in ring for d in donors) for ring in rings):
+        return False
+    junction = all(any(xi in ring and d in ring for ring in rings) for d in donors)
+    return junction or all(rw.GetAtomWithIdx(d).GetAtomicNum() != _OPEN_FACE_Z for d in donors)
 
 
 def _prune_donorless_bridgeheads(rw, metals):
@@ -219,16 +218,17 @@ def _prune_donorless_bridgeheads(rw, metals):
     Class B extends the same X-has-no-lone-pair test to a TRIGONAL bridgehead (exactly three sigma bonds
     to non-metal atoms: a carboxylate, amidinate, or dithiocarbamate C, or an N-B-N B). A geometric test
     cannot see this one -- xyzgraph 1.6.14's mis-bonded M-C sits at an ordinary M-C distance -- so it
-    needs two further graph-only conditions (`_trigonal_donors_qualify`) before X loses its bond: every
-    one of its metal-bound neighbours must itself be a non-carbon heteroatom with a lone pair, and X must
-    not share a metal-free ring with one of them. A sigma-only macrocycle (each ring member independently
+    needs further graph-only conditions (`_trigonal_donors_qualify`) before X loses its bond: every one
+    of its metal-bound neighbours must hold a lone pair, and X and its donors must not be readable as one
+    face. A sigma-only macrocycle (each ring member independently
     donating its own lone pair, e.g. a cyclo-As6 crown) is excluded by X's own lone-pair test, since each
     of its members is a real donor in its own right, not a bridgehead.
 
     A sigma-silane or sigma-borane bridgehead (eta2-Si-H, B-H: one metal-bound neighbour) fails the first
     test and is left as read -- it is not graph-provable this way. Logs one warning naming every removed
     bond. This guard mirrors xyzgraph's own `_prune_crosslinks` and can be dropped once a fixed xyzgraph
-    is installed.
+    is installed whose bridgehead prune also reaches a ring junction (a planar-closure residual of -0.04
+    to 0.00 A on every AREPUK output).
     """
     rings = _metal_free_rings(rw, metals) if metals else []
     bad = []
@@ -605,7 +605,8 @@ def _bridging_hydrogen_contacts(mol):
 
     xyz2mol allows hydrogen exactly one valence, so a hydrogen bridging a metal or shared between two nonmetal
     legs (proton transfer) keeps only its first leg by `hydrogen_neighbor_order`. Each other leg comes back
-    after the search as a dative bond to a metal or a zero-order contact to a nonmetal.
+    after the search as a dative bond to a metal or a zero-order contact to a nonmetal, unless `_rank_orders`
+    reads it as a hydrogen bond.
     """
     pos = mol.GetConformer().GetPositions()
     ranked = Chem.Mol(mol)
@@ -700,12 +701,29 @@ def _rank_orders(mol, charge, radicals=False):
         # Atom-for-atom, in order: the contacts below are restored by input atom index.
         _assert_same_atoms(mol, out)
         rw = Chem.RWMol(out)
+        rw.UpdatePropertyCache(strict=False)
+        metals = {atom.GetIdx() for atom in rw.GetAtoms() if atom.GetAtomicNum() in TRANSITION_METALS_NUM}
+        # A nonmetal leg to an atom with a lone pair is a hydrogen bond: the hydrogen keeps its one covalent bond
+        # and the acceptor keeps its lone pair. That is a noncovalent contact, which a caller states as one, so it
+        # stays out of the graph. A leg to an atom without one (B-H-B) is a three-centre bond and is kept.
+        hydrogen_bonds = {
+            frozenset((h, other))
+            for h, other, bond_type in contacts
+            if bond_type == Chem.BondType.ZERO and lone_pair_electrons(rw.GetAtomWithIdx(other), metals) >= 2  # noqa: PLR2004
+        }
         for h, other, bond_type in contacts:
-            if rw.GetBondBetweenAtoms(h, other) is None:
+            if frozenset((h, other)) in hydrogen_bonds:
+                logger.debug(
+                    "read_xyz: H%d...%s%d is a hydrogen bond, not a bond",
+                    h,
+                    rw.GetAtomWithIdx(other).GetSymbol(),
+                    other,
+                )
+            elif rw.GetBondBetweenAtoms(h, other) is None:
                 rw.AddBond(h, other, bond_type)
         rw.UpdatePropertyCache(strict=False)
         result = rw.GetMol()
-        before = {frozenset((b.GetBeginAtomIdx(), b.GetEndAtomIdx())) for b in mol.GetBonds()}
+        before = {frozenset((b.GetBeginAtomIdx(), b.GetEndAtomIdx())) for b in mol.GetBonds()} - hydrogen_bonds
         after = {frozenset((b.GetBeginAtomIdx(), b.GetEndAtomIdx())) for b in result.GetBonds()}
         if before != after:
             raise ValueError(f"xyz2mol changed connectivity: lost {before - after}, added {after - before}")

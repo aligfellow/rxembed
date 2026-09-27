@@ -55,7 +55,7 @@ from .metal_polyhedron import (
     read_slot_notes,
     resolve_geometry,
 )
-from .metal_screen import narrow_span_pairs, unreachable_span
+from .metal_screen import unreachable_span
 from .metal_slots import (
     SPAN_TOL,
     assignment_cap_error,
@@ -473,15 +473,8 @@ def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
     if screen_context is not None:
         screen_context["native_reach"] = native_reach  # metal_constraints.seated_bites' own fact, seeded once
     retained = _witnessed_retention(retained, request.observed_only, base, source, donors, haptic, native_reach)
-    # Prune same-ligand pairs the compiled screen would reject wholesale before the streamed tethered pool
-    # (metal_slots.distinct_vertex_orderings' uncapped else-branch) can raise its resource cap on them.
-    narrow = (
-        narrow_span_pairs(base_iso, source, padded, geom, haptic, request.lengths, native_reach, screen_context)
-        if native_reach is not None
-        else {}
-    )
     # A same-ligand chelate-backbone or direct-bond pair must sit on a polyhedron hull edge (a chemistry
-    # claim; see metal_slots.chelate_edge_links). Same gate as `narrow`: a single screened centre with no fix=.
+    # claim; see metal_slots.chelate_edge_links). Gated the same way: a single screened centre with no fix=.
     linked = chelate_edge_links(base, padded, haptic, distances) if native_reach is not None else frozenset()
     out, unreachable = [], 0
     raw_limit = _screen_limit(n, reach)
@@ -498,7 +491,6 @@ def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
         distances=distances,
         retained=retained,
         max_orbits=raw_limit,
-        narrow=narrow,
         linked=linked,
     ):
         od = [padded[k] for k in order]  # vertex -> donor atom, haptic centroid, or VACANT
@@ -528,9 +520,9 @@ def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
         logger.info(
             "metal[%s]: omitted %d arrangements the ligands cannot reach (screen=False keeps them)", geom, unreachable
         )
-    if not out and (unreachable or narrow or linked):
-        # narrow/linked can prune every streamed order (e.g. a linear pocket has no hull edge at all), which
-        # never reaches the per-candidate screen below and so never increments `unreachable` either.
+    if not out and (unreachable or linked):
+        # linked can prune every streamed order (e.g. a linear pocket has no hull edge at all), which never
+        # reaches the per-candidate screen below and so never increments `unreachable` either.
         logger.warning("metal[%s]: no model-compatible arrangement; try lengths='input', fix= or screen=False", geom)
     return out
 

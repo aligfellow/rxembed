@@ -124,6 +124,9 @@ which atoms are bonded and the bond orders. The two choices are separate:
   `bond_orders="xyz2mol"`. xyzgraph bond orders need xyzgraph connectivity.
 - `bond_orders="xyz2mol"` optimizes transition-metal valence. Keep the default when the input has reactive or
   multicentre bonds, such as a transition state or a bridging hydride.
+- With `bond_orders="xyz2mol"`, a hydrogen shared by two atoms keeps one covalent bond. Its second leg is left
+  out when it ends on an atom with a lone pair, since that is a hydrogen bond (hold one with `constrain`); a
+  B-H-B bridge keeps it as a zero-order contact.
 
 An XYZ file does not store a charge. `charge=0` is the default and means "assume neutral"; rxembed never
 infers the charge. Pass the real charge for an ion. At `charge=0`, `read_xyz` warns when a metal ends over its
@@ -347,7 +350,7 @@ indices in the complex.
 
 Dative SMILES keeps the connectivity; CXSMILES also keeps the selected metal arrangement.
 `dative_smiles(mol, cx=True)` keeps ligand E/Z and atropisomer stereo without metal slot notes. Zero-order
-contacts keep RDKit's CX `Z:` field in both.
+contacts keep RDKit's CX `Z:` field in both, but stereo labels and metal hands are read without them.
 
 ```python
 print(rx.dative_smiles(mn_confs.mol))
@@ -493,6 +496,8 @@ confs.measure((0, 5))
   and its charge are restored before any check or energy.
 - `rx.metal` enumerates the face and winding of a haptic ligand, not its rotation about the metal-centroid
   axis. The seeds may sample that rotation; `mc()` keeps each starting pose.
+- A ring bound through only some of its atoms (an eta4-arene, a bis-eta2 quinone) folds at its unbound hinge
+  toward the class-median tetrahedral angle, about 10 deg past its own crystal fold.
 - `mc()` holds poses softly, with about 0.1 Å drift. State a constraint that must hold through `mc()` as a
   distance, angle or dihedral.
 - g-xTB with solvent is `E_gxtb(gas) + [E_gfn2(solv) - E_gfn2(gas)]`, never a silent gas-phase energy.

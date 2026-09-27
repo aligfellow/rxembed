@@ -1,7 +1,6 @@
 """Screen enumerated coordination candidates against the ligands' native reach before embedding.
 
-`narrow_span_pairs` prunes same-ligand vertex pairs before generation; `unreachable_span` checks each generated
-candidate.
+`unreachable_span` checks each generated candidate for a native-reach conflict.
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ from .bounds import coordination_reach, coordination_reach_base
 from .constraints import FIX_DISTANCE_TOL, Constraints
 from .mechanisms import law_of_cosines, triangle_distances
 from .metal_constraints import (
-    ANGLE_PAD,
     CoordinationSphere,
     bounded_bites,
     compile_constraints,
@@ -25,7 +23,7 @@ from .metal_constraints import (
     resolve_lengths,
     seated_bites,
 )
-from .metal_core import VACANT, frag_map
+from .metal_core import VACANT
 from .metal_distance import delocalised_charges
 from .metal_donor_orient import FOLD_WINDOW, donation_axis, stripped_hybridisation
 from .metal_perceive import FIT_FLOOR
@@ -51,7 +49,7 @@ _CERTIFICATE_MEMO_KEY = "_certificate_memo"  # context scratch slot: _certified_
 
 
 def _radial_distance_windows(iso, mol, atoms, positions, base_distances=None, context=None):
-    """Return each donor atom's model M-donor distance window and hybridisation, shared by both screens.
+    """Return each donor atom's model M-donor distance window and hybridisation.
 
     `positions` is resolved by the caller: `unreachable_span` measures from `iso.length_mol`, which need
     not be `mol` itself. `context` reuses a caller's already-compiled hybridisation/charges (`compile_context`)
@@ -72,40 +70,6 @@ def _radial_distance_windows(iso, mol, atoms, positions, base_distances=None, co
             mol, metal, donor, real_z, donors, positions=positions, charges=charges, hyb=hyb
         )
     return radial, hyb
-
-
-def narrow_span_pairs(base_iso, source, padded, geom, haptic, lengths, native_reach, context=None):
-    """Return, per polyhedron vertex angle, the same-ligand donor-position pairs that cannot span it.
-
-    No-loss: a compiled angle row keeps a floor >= its vertex angle - ANGLE_PAD, so a pair whose shortest
-    triangle at that floor exceeds its native reach cannot sit there. Any path that could instead widen the row
-    (`metal_polyhedron.relaxed_shell`'s bite-corner image) only commits a witness whose span also fits the same
-    native reach within 1e-7. A census-bite pair is compiled at its bite, not its vertex angle, so below
-    CHELATE_SPAN_ANGLE it is left to the edge rule and the per-candidate screen.
-    """
-    base, metal = base_iso.graph, base_iso.metal
-    frag = frag_map(base)
-    real_slots = [i for i, donor in enumerate(padded) if donor != VACANT and donor not in haptic]
-    atoms = {padded[i] for i in real_slots}
-    positions, _ = resolve_lengths(source, lengths)
-    radial, _hyb = _radial_distance_windows(base_iso, source, atoms, positions, context=context)
-    dirs = POLYHEDRA[geom].vertex_dirs
-    angles = sorted({round(vertex_angle(p, q), 6) for p, q in itertools.combinations(dirs, 2)})
-    narrow = {}
-    for i, j in itertools.combinations(real_slots, 2):
-        a, b = padded[i], padded[j]
-        if frag[a] != frag[b] or base.GetBondBetweenAtoms(a, b) is not None:
-            continue
-        left, right = radial.distances[tuple(sorted((metal, a)))], radial.distances[tuple(sorted((metal, b)))]
-        x, y = sorted((a, b))
-        bite = chelate_bite_window(base, a, b, atoms) is not None
-        for angle in angles:
-            if bite and angle < CHELATE_SPAN_ANGLE:
-                continue
-            floor = (max(0.0, angle - ANGLE_PAD), 180.0)
-            if triangle_distances(left, right, floor)[0] > float(native_reach[x, y]) + SPAN_TOL:
-                narrow.setdefault(angle, set()).add(frozenset((i, j)))
-    return {angle: frozenset(pairs) for angle, pairs in narrow.items()}
 
 
 def _chelate_span_failure(iso, reach, radial, links, compiled=None, context=None):

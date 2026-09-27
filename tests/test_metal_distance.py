@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from importlib.util import find_spec
+
 import numpy as np
 import pytest
 from rdkit import Chem
@@ -23,6 +25,8 @@ _NITRIDO_OXO_DIAQUA_IONIC = "[N-3]->[Mo+7](<-[O-2])(<-[OH2])<-[OH2]"  # the same
 _AQUA_PROTONS = 2  # the two protons that stop `_NITRIDO_OXO_DIAQUA`'s water reading as an oxo
 _ACAC_OXYGENS = 4  # what `_VANADYL_ACAC` presents besides its oxo: two bidentate acac
 _OXYGEN, _MOLYBDENUM = 8, 42
+# Pt(II) with a phosphine-tethered agostic C-H: Pt is inside the bridge census (`BRIDGE_H`)
+_PT_AGOSTIC = "CC(C)(C)[P]1(C(C)(C)C)C(C)(C)C[H]->[Pt+2]<-1(<-[Br-])<-[c-]1cscn1"
 
 
 def _as_perceived(mol):
@@ -279,3 +283,13 @@ def test_haptic_backbone_stays_exempt_from_a_sigma_bridgehead_floor():
     metal_distance.nondonor_floors(mol, metal, 22, [left, right, nitrogen], cons)
 
     assert (metal, silicon) not in cons.floors
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_embedded_agostic_hydrogen_reads_back_bonded(tmp_path):
+    iso = rx.metal(_PT_AGOSTIC, "square_planar")[0]
+    ens = rx.embed(iso, n=1, seed=42)
+    path = tmp_path / "agostic.xyz"
+    Chem.MolToXYZFile(ens.mol, str(path), confId=ens.ids[0])
+    h = next(d for d in iso.donors if ens.mol.GetAtomWithIdx(d).GetAtomicNum() == 1)
+    assert rx.read_xyz(str(path)).GetBondBetweenAtoms(iso.metal, h) is not None

@@ -242,6 +242,25 @@ def remove_bond(rw, i, j) -> None:
     rw.RemoveBond(int(i), int(j))
 
 
+def without_zero_bonds(mol):
+    """Return `mol` without its zero-order contacts: the graph an identity ranking reads.
+
+    A zero-order contact (the XYZ reader's second leg of a shared proton, a CX ``Z:`` bond) is not constitution:
+    no geometry check holds it, and a re-read of the embedded geometry does not have it. RDKit is not consistent
+    about it either: SSSR skips it, while FastFindRings, CanonicalRankAtoms, the CIP labeller and
+    GetDistanceMatrix count it as an edge.
+    """
+    zero = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in mol.GetBonds() if b.GetBondType() == Chem.BondType.ZERO]
+    if not zero:
+        return mol
+    rw = Chem.RWMol(mol)
+    for i, j in zero:
+        remove_bond(rw, i, j)
+    out = rw.GetMol()
+    out.UpdatePropertyCache(strict=False)
+    return out
+
+
 def assign_stereo_from_3d(mol, conf_id: int = -1) -> None:
     """Assign 3D stereochemistry in the bond-order basis used by rxembed readers.
 

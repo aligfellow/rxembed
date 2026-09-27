@@ -198,8 +198,8 @@ def merge_pulls(a, b):
                 raise ValueError(f"pull {key}: expected a distance pair or angle triple")
             if len(key) == ANGLE_ATOMS:
                 key = min(key, key[::-1])
-                if not (np.isfinite(value) and 0 <= value <= _STRAIGHT):
-                    raise ValueError(f"pull {key}: expected a finite angle between 0 and 180 degrees")
+                if not all(np.isfinite(v) and 0 <= v <= _STRAIGHT for v in np.atleast_1d(value)):
+                    raise ValueError(f"pull {key}: expected finite angles between 0 and 180 degrees")
             if key in out and out[key] != value:
                 raise ValueError(f"compose: conflicting pulls on {key}; two sources claim one target")
             out[key] = value
