@@ -26,20 +26,9 @@ def test_overvalent_atom_raises():
         AC2BO(adjacency, [6] + [1] * (n - 1), 0)
 
 
-def test_porphyrin_sized_valence_search_is_refused_before_it_enumerates(monkeypatch):
-    """A bare 20-carbon ring offers 3**20 valence assignments; past the bound the search must not start."""
+def test_element_without_a_valence_model_is_named():
     import numpy as np
 
-    from rxembed.pipeline import xyz2mol_local
-
-    n = 20
-    adjacency = np.zeros((n, n), dtype=int)
-    for i in range(n):
-        adjacency[i, (i + 1) % n] = adjacency[(i + 1) % n, i] = 1
-
-    def enumerated(*_args):
-        raise AssertionError("the valence product was enumerated")
-
-    monkeypatch.setattr(xyz2mol_local.itertools, "product", enumerated)
-    with pytest.raises(ValueError, match="valence combinations"):
-        AC2BO(adjacency, [6] * n, 0, max_combinations=256)
+    adjacency = np.array([[0, 1], [1, 0]])
+    with pytest.raises(ValueError, match=r"no valence model for Ga \(atom 0\)"):
+        AC2BO(adjacency, [31, 6], 0)

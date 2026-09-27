@@ -15,6 +15,7 @@ from rxembed.constraints import Constraints
 from rxembed.metal_core import COORDINATION_METALS
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline import metrics
+from rxembed.utils import conjugated_quartets
 from tests.conftest import EXAMPLES_DIR
 
 _DFT = (
@@ -185,6 +186,22 @@ def test_eta2_planarity_flex_is_metal_local():
     assert any(v.kind == "planarity" for v in geom.planarity(mol, pos)), "non-metal sp2 wrongly flexed"
 
 
+def test_declared_side_on_pair_keeps_its_window_at_an_early_metal_distance():
+    """A declared eta2 N=N at 2.7 A from Ti is side-on; the 2.6 A cap guards only a perceived sphere."""
+    mol = _reference_conformer("C=C/N=N/C")
+    a, c, x, s = next(conjugated_quartets(mol))  # C=C-N=N: its twist is the side-on window's question
+    rdMolTransforms.SetDihedralDeg(mol.GetConformer(), a, c, x, s, 135.0)  # 45 deg off plane: past 30, within 60
+    rw = Chem.RWMol(mol)
+    ti = rw.AddAtom(Chem.Atom("Ti"))
+    pos = rw.GetConformer().GetPositions()
+    normal = np.cross(pos[s] - pos[x], pos[c] - pos[x])
+    height = (2.7**2 - (np.linalg.norm(pos[s] - pos[x]) / 2) ** 2) ** 0.5
+    rw.GetConformer().SetAtomPosition(ti, ((pos[x] + pos[s]) / 2 + height * normal / np.linalg.norm(normal)).tolist())
+
+    assert "conjugation" not in _kinds(geom.check(rw.GetMol(), 0, donors=[x, s]))
+    assert "conjugation" in _kinds(geom.check(rw.GetMol(), 0)), "a perceived pair beyond the cap is not side-on"
+
+
 def test_xh_bond_length_window_is_element_aware():
     mol = Chem.AddHs(Chem.MolFromSmiles("CP"))
     rdDistGeom.EmbedMolecule(mol, randomSeed=1)
@@ -254,6 +271,32 @@ _BREAKS = {
 def test_each_violation_kind_fires(kind):
     mol, kw = _BREAKS[kind]()
     assert kind in _kinds(geom.check(mol, 0, **kw))
+
+
+def _alanine_and_mirror():
+    mol = _reference_conformer("C[C@@H](C(=O)O)N")
+    mirror = Chem.Mol(mol)
+    mirror.GetConformer().SetPositions(-mirror.GetConformer().GetPositions())
+    return mol, mirror
+
+
+def test_xyz_path_reference_still_checks_stereo(tmp_path):
+    mol, mirror = _alanine_and_mirror()
+    path = str(tmp_path / "alanine.xyz")
+    Chem.MolToXYZFile(mol, path)
+
+    assert "stereo" in _kinds(geom.check(mirror, 0, reference=path))
+
+
+def test_stereo_check_reads_the_conformer_it_is_asked_for():
+    mol, mirror = _alanine_and_mirror()
+    both = Chem.Mol(mol)
+    inverted = Chem.Conformer(mirror.GetConformer())
+    inverted.SetId(5)
+    both.AddConformer(inverted)
+
+    assert "stereo" not in _kinds(geom.check(both, reference=mol)), "the default id is the first conformer"
+    assert "stereo" in _kinds(geom.check(both, 5, reference=mol))
 
 
 def test_kwarg_checks_accept_matching_geometry():
@@ -491,7 +534,7 @@ def _ruthenium(d_ruh=1.701, d_rucl=2.233):
 def test_declared_hydride_passes_without_covalent_ruler():
     mol, pos = _ruthenium()
     donors = [1, 2, 3, 4]
-    assert 1 in metal_perceive._spheres(mol, pos, donors)[0]
+    assert 1 in metal_perceive.spheres(mol, pos, donors)[0]
     assert not geom.hydrogens(mol, pos, donors=frozenset(donors))
     assert geom.check(mol, mol.GetConformer().GetId(), donors=donors).ok()
 
@@ -503,7 +546,7 @@ def test_undeclared_agostic_h_is_not_promoted_to_a_donor():
         [(0, 0, 0), (2.10, 0, 0), (1.85, 0, 0.9), (0, 2.341, 0), (0, -2.341, 0)],
     )
     donors = [1, 3, 4]
-    assert 2 not in metal_perceive._spheres(mol, pos, donors)[0]
+    assert 2 not in metal_perceive.spheres(mol, pos, donors)[0]
     assert not metal_perceive.metal_overbond(mol, pos, donors)
 
 

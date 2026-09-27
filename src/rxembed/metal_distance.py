@@ -14,7 +14,7 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import GetPeriodicTable
 
-from .metal_core import COORDINATION_METALS, ETA2, VACANT, frag_map, haptic_sites, ligand_degree, ligand_valence
+from .metal_core import COORDINATION_METALS, ETA2, frag_map, haptic_sites, ligand_degree, ligand_valence
 
 _PT = GetPeriodicTable()
 
@@ -54,12 +54,11 @@ _METAL_GROUP = {  # Z -> group (= d-electron count); the covalent radius already
     **{z: z - 18 for z in range(21, 31)},  # c3*g + c4*g^2 is the d-electron parabola, the part of the
     **{z: z - 36 for z in range(39, 49)},  # bond length the radii alone do not capture
     **{z: z - 68 for z in range(72, 81)},
-    57: 3,  # La and Lu are group 3 as coordination centres
-    71: 3,
+    57: 3,  # La is group 3 as a coordination centre
 }
 # La extrapolates past the fit's trained covalent-radius range (2.07 A against 1.20-1.75) and has no f-shell
-# term, so it is the worst-fit metal in the census, a median 0.117 A too long. Lu has no census pairs of its
-# own and inherits La's group.
+# term, so it is the worst-fit metal in the census, a median 0.117 A too long; still, its held-out tmQM MAE is
+# 0.164 A against 0.261 for the covalent sum.
 _UNFITTED = set()  # elements already warned about, so a corpus run reports each gap once, not per bond
 _PAULING_EN = {
     1: 2.20, 5: 2.04, 6: 2.55, 7: 3.04, 8: 3.44, 9: 3.98, 14: 1.90, 15: 2.19, 16: 2.58, 17: 3.16,
@@ -77,10 +76,11 @@ _PAULING_EN = {
 BRIDGE_H = {6: (0.152, 1.199), 5: (0.069, 1.333)}
 _SP_CONTRACTION = 0.128  # A: an sp donor (CO, isocyanide, nitrile, nitrosyl, acetylide) binds this much
 # shorter than the fit predicts, from high s-character in the sigma bond and pi back-donation into the empty pi*.
-_LIGAND_FREE_CONTRACTION = {  # Z -> (constant, metal-group slope), in A; fitted over the tmQM/Kulik census
-    1: (0.14589, 0.0),  # hydride
-    7: (0.35500, 0.0),  # nitrido
-    8: (0.67730, -0.04421),  # oxo
+# One value for every metal: a d0 metal needs less (median 0.071 A), but that cell is 165 of 49,410 tmQM pairs.
+_LIGAND_FREE_CONTRACTION = {  # Z -> (constant, metal-group slope), in A; held-out refit over 612,774 tmQM pairs
+    1: (0.14589, 0.0),  # hydride: held-out MAE 0.137 -> 0.032-0.034 A
+    7: (0.35500, 0.0),  # nitrido: the prior constant, since a refit worsened every split
+    8: (0.67730, -0.04421),  # oxo: held-out MAE 0.055 -> 0.038-0.040 A; only oxo earns the group slope
 }
 # A donor here has no ligand-side neighbour at all: aqua, ammine and agostic H all keep one and never enter.
 
@@ -93,8 +93,7 @@ def delocalised_charges(mol):
     the metal-cut graph (canonical ranking, bond orders and charges cleared): a carboxylate's O, acac's O and
     an amidinate's N share one charge, while a genuinely inequivalent pair (an oxo plus an acac O on one
     vanadium) keeps its own. Cutting the metal first makes the result the same with or without a bonded metal,
-    and re-merges a kappa1 carboxylate's two O. The charge may come back fractional. Returns `{}` if the
-    metal-cut graph cannot be ranked.
+    and re-merges a kappa1 carboxylate's two O. The charge may come back fractional.
     """
     metals = sorted((a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS), reverse=True)
     flat = Chem.RWMol(Chem.Mol(mol))
@@ -108,11 +107,8 @@ def delocalised_charges(mol):
         a.SetNoImplicit(True)
         a.SetIsAromatic(False)
     fm = flat.GetMol()
-    try:  # charge is achiral / isotope-blind; a pathological cut graph degrades to {} rather than aborting the embed
-        fm.UpdatePropertyCache(strict=False)
-        klass = list(Chem.CanonicalRankAtoms(fm, breakTies=False, includeChirality=False, includeIsotopes=False))
-    except Exception:
-        return {}
+    fm.UpdatePropertyCache(strict=False)
+    klass = list(Chem.CanonicalRankAtoms(fm, breakTies=False, includeChirality=False, includeIsotopes=False))
     members: dict = {}
     for local, parent in enumerate(keep):
         members.setdefault(klass[local], []).append(parent)
@@ -136,13 +132,14 @@ def ml_distance(mol, metal, d, real_z, donor_set, charges=None, *, hyb, eta=None
     `c0 + c1*r_M + c2*r_D + c3*group + c4*group^2 + c5*tanh(q x dEN) + c6*eta`, fitted over tmQM/Kulik.
     Falls back to the covalent radius sum outside the fitted tables.
 
-    Four departures from the published fit:
+    Five departures from the published fit:
 
     * charge is delocalised over the metal-cut graph, not the raw formal charge (`delocalised_charges`);
     * a neutral, non-haptic pnictogen (P/As/Sb) contracts to `_SOFT_DONOR_FRAC` (the fit has no dative term);
     * a donor with no ligand-side valence (hydride, nitrido, oxo) takes its own fitted contraction instead of
       a charge term (see `metal_core.ligand_valence`);
-    * a terminal, non-haptic sp donor binds `_SP_CONTRACTION` shorter (s-character plus pi back-donation).
+    * a terminal, non-haptic sp donor binds `_SP_CONTRACTION` shorter (s-character plus pi back-donation);
+    * an X-H...M bridging H adds its `BRIDGE_H` offset to the two-centre M-H.
 
     `eta` reuses a caller-precomputed hapticity (`_hapticity`) instead of regrouping `donor_set` per donor;
     M-L grows monotonically with it, so it enters the fit linearly as the donor-island size. Nothing here reads
@@ -168,7 +165,7 @@ def ml_distance(mol, metal, d, real_z, donor_set, charges=None, *, hyb, eta=None
         # rows were terminal; a bridge inherits this as an uncalibrated extrapolation because the stripped
         # surrogate cannot retain its metal-neighbour count.
         ligand_free = z_d in _LIGAND_FREE_CONTRACTION and not ligand_valence(a)
-        q = 0.0 if ligand_free else charges.get(d, a.GetFormalCharge())
+        q = 0.0 if ligand_free else charges[d]
         q = min(-q, 2.0) if q < 0 else 0.0  # anionic multiplicity, clamped; may be fractional (see docstring)
         c = _PHYS_COEF
         ionic = c[5] * math.tanh(q * (_PAULING_EN[z_d] - _PAULING_EN[real_z]))
@@ -190,54 +187,41 @@ def ml_distance(mol, metal, d, real_z, donor_set, charges=None, *, hyb, eta=None
     return base
 
 
-def ff_terms(mol, cons, spheres, *, frozen=(), fragments=None, topology=None):
-    """Set up the force field for every metal in `spheres`: the one place this happens.
+def ff_terms(mol, cons, metal, real_z, donors, *, frozen=(), fragments=None, topology=None):
+    """Set up the force field for one metal and its real coordinating atoms: the one place this happens.
 
     Fills three `Constraints` fields: `metals` (a bondless Li surrogate with weak native vdW and no bonded
     metal terms), `pulls` (a soft pull to the wall midpoint so a donor cannot ride its wall) and `floors`
-    (extra real-metal clearance). A metal held as an all-pairs rigid body (`cons.shapes`) already states every
-    internal distance and gets no pulls: pulling only its M-donor subset would tear the un-pulled donor-donor
-    pairs. An all-heavy donor network also gets no pull, left free to let its own bite geometry and the native
-    ligand force field pick compatible radial distances.
-
-    `spheres` is `{metal index: (real_z, [donor indices])}` for every metal, including a spectator that is
-    not the one being enumerated.
+    (extra real-metal clearance). An all-heavy donor network gets no pull, left free to let its own bite
+    geometry and the native ligand force field pick compatible radial distances.
     """
-    shape_held = set().union(*cons.shapes) if cons.shapes else set()  # metals whose sphere is an all-pairs body
-    frozen = set(cons.frozen) | set(frozen)
-    for m, (real_z, donors) in spheres.items():
-        real = [d for d in donors if d != VACANT]
-        if not real:
-            continue
-        cons.metals.add(m)
-        if m not in shape_held:  # a radial shell: pull independent donors off their walls
-            fragments = frag_map(mol) if fragments is None else fragments
-            by_fragment = {}
-            for donor in real:
-                by_fragment.setdefault(fragments.get(donor), []).append(donor)
-            # Release a radial midpoint only for an all-heavy donor network. An explicit H is a
-            # three-centre donor/connection, not a flexible chelate arm: keep its pull as a connectivity guard.
-            linked = {
-                donor
-                for group in by_fragment.values()
-                if len(group) > 1
-                and not (set(group) & frozen)
-                and all(mol.GetAtomWithIdx(donor).GetAtomicNum() != 1 for donor in group)
-                for donor in group
-            }
-            for d in real:
-                key = (min(m, d), max(m, d))
-                if key not in cons.distances:
-                    continue
-                if d in linked:
-                    continue
-                lo, hi = cons.distances[key]
-                cons.pulls[key] = 0.5 * (lo + hi)
-        nondonor_floors(mol, m, real_z, real, cons, topology=topology)
+    if not donors:
+        return
+    cons.metals.add(metal)
+    fragments = frag_map(mol) if fragments is None else fragments
+    by_fragment = {}
+    for donor in donors:
+        by_fragment.setdefault(fragments.get(donor), []).append(donor)
+    # Release a radial midpoint only for an all-heavy donor network. An explicit H is a three-centre
+    # donor/connection, not a flexible chelate arm: keep its pull as a connectivity guard.
+    linked = {
+        donor
+        for group in by_fragment.values()
+        if len(group) > 1
+        and not (set(group) & set(frozen))
+        and all(mol.GetAtomWithIdx(donor).GetAtomicNum() != 1 for donor in group)
+        for donor in group
+    }
+    for d in donors:
+        key = (min(metal, d), max(metal, d))
+        if key in cons.distances and d not in linked:
+            lo, hi = cons.distances[key]
+            cons.pulls[key] = 0.5 * (lo + hi)
+    nondonor_floors(mol, metal, real_z, donors, cons, topology=topology)
 
 
 def overbond_tier(mol, donors, i):
-    """Anti-overbond tier of non-donor atom `i` against a metal whose donor set is `donors`.
+    """Return the anti-overbond tier of non-donor atom `i` against a metal whose donor set is `donors`.
 
     The one place the second-sphere rule is written; `nondonor_floors` (force field), `coordination.metal_overbond`
     (gate) and `metrics.coordination_changed` (connectivity check) all key off this, so the three cannot drift.
@@ -255,7 +239,7 @@ def overbond_tier(mol, donors, i):
 
 
 def _tier_floor(z, tier, r_m, real_z):
-    """Minimum M...z distance for a non-donor at ``tier``: the value the FF wall and DG relief share.
+    """Return the minimum M...z distance for a non-donor at ``tier``: the value the FF wall and DG relief share.
 
     NEAR = the covalent guard (a 1,3 atom legitimately sits inside the vdW contact); OUTER includes the
     additional real-metal vdW-scale clearance; APEX = the bare covalent sum. The two callers (`floors`,
@@ -270,7 +254,7 @@ def _tier_floor(z, tier, r_m, real_z):
     return max(r_sum + _OVERBOND_MARGIN, _VDW_FLOOR_SCALE * (_PT.GetRvdw(real_z) + _PT.GetRvdw(z)))
 
 
-def nondonor_floors(mol, metal, real_z, donors, cons, *, topology=None):
+def nondonor_floors(mol, metal, real_z, real, cons, *, topology=None):
     """Record the minimum M...X for every at-risk non-donor heavy atom: the metal's steric identity.
 
     `OUTER` gets `_VDW_FLOOR_SCALE` vdW clearance; `NEAR` (1,3 through its donor, position fixed by the
@@ -280,21 +264,12 @@ def nondonor_floors(mol, metal, real_z, donors, cons, *, topology=None):
     Reach is measured through the donors, not the metal: the FF surrogate strips the M-donor bonds, so the
     metal's own topological distance to its ligands is otherwise infinite.
     """
-    real = [d for d in donors if d != VACANT]
-    if not real:
-        return
     topo = Chem.GetDistanceMatrix(mol) if topology is None else topology
     r_m = _PT.GetRcovalent(real_z)
     committed = {metal, *real}
-    # A floor is for a modelled atom, never a rigid-body member (an all-pairs body already states every internal
-    # distance, so an outside floor over-determines it and the relax tears the body) nor an atom whose M...X is
-    # already an explicit window (a frozen TS core, whose window is the truth). Same rule as ff_terms' pulls.
-    rigid = set().union(*cons.shapes) if cons.shapes else set()
     for a in mol.GetAtoms():
         i = a.GetIdx()
         if i in committed or a.GetAtomicNum() == 1:  # H is not what re-perception over-bonds
-            continue
-        if i in rigid or (min(metal, i), max(metal, i)) in cons.distances:
             continue
         hops = 1 + min(topo[d][i] for d in real)  # M -> donor -> ... -> X
         if hops > _FLOOR_REACH:

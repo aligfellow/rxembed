@@ -9,6 +9,10 @@ import rxembed as rx
 # Each amine N carries one acid and one carboxylate arm, and only one carboxylate binds Pt(II). Cutting the metal
 # leaves a C2-symmetric ligand; the complex has no such symmetry, so its four bound-N hand pairs are distinct.
 ONE_ARM_BOUND_PT = "OC(=O)CN1(CC(=O)[O-]->[Pt+2]12<-[Cl-])CCN->2(CC(=O)O)CC(=O)[O-]"
+# (Buta-1,3-diene)Fe(CO)3 and its isoprene analogue: an eta4 diene whose central bond rotates when free, so each
+# bound s-cis or s-trans form is an isomer. Isoprene's methyl makes its two s-cis faces distinct.
+BUTADIENE_FE_CO3 = "[O+]#[C-]->[Fe]123(<-[C-]#[O+])(<-[C-]#[O+])<-[CH2]=[CH]->1[CH]->2=[CH2]->3"
+ISOPRENE_FE_CO3 = "[O+]#[C-]->[Fe]123(<-[C-]#[O+])(<-[C-]#[O+])<-[CH2]=[C](C)->1[CH]->2=[CH2]->3"
 
 
 def ferrocene():

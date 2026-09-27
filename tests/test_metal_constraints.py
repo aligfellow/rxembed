@@ -19,7 +19,7 @@ import rxembed as rx
 from rxembed import metal_constraints, metal_core, stereo
 from rxembed.bounds import EmbedParams, bounds_matrix
 from rxembed.constraints import FIX_ANGLE_TOL, Constraints
-from rxembed.embed import _coordination_state_failure
+from rxembed.embed import Failure, _coordination_state_failure
 from rxembed.metal_constraints import (
     CoordinationSphere,
     _add_ligand_ez,
@@ -1006,7 +1006,7 @@ def test_late_graft_and_numeric_bite_disable_independent_target_preferences():
 
 def test_unnamed_spectator_donor_bond_disables_independent_bite_targets():
     iso = rx.metal("C=[N]1Cc2cccc[n]2->[Cu+]<-12<-[N](Cc1cccc[n]->21)=C", "tetrahedral")[0]
-    assert compile_constraints(iso, context=compile_context(iso.graph)) == iso.cons
+    assert compile_constraints(iso, context=compile_context(iso.graph, iso.donor_bonds)) == iso.cons
     spectator = iso.graph.GetNumAtoms()
     mol = Chem.CombineMols(iso.graph, Chem.MolFromSmiles("[C]"))
     Chem.GetSymmSSSR(mol)
@@ -1347,7 +1347,7 @@ def test_rejected_seeds_are_replaced_to_n_clean(monkeypatch):
         reason = workflow_failure(self, owner, cid)
         if not rejected and owner is self:
             rejected = True
-            return "test rejection"
+            return Failure("physical_geometry", "test rejection")
         return reason
 
     monkeypatch.setattr(type(ens), "_workflow_failure", reject_one_seed)
@@ -1422,14 +1422,13 @@ def test_coordinate_composes_with_fix_constrain_and_contacts():
 def test_coordinate_relieves_the_phantom_floor_it_creates(monkeypatch):
     from rxembed import bounds
 
-    tols, real = [], bounds._bounds
+    tols, real = [], bounds._smooth
 
-    def spy(mol, cons, params=None):
-        bm, tol = real(mol, cons, params)
-        tols.append(tol)
-        return bm, tol
+    def spy(bm):
+        tols.append(real(bm))
+        return tols[-1]
 
-    monkeypatch.setattr(bounds, "_bounds", spy)
+    monkeypatch.setattr(bounds, "_smooth", spy)
     iso = rx.metal("N->[Pt](Cl)Cl.CC(C)=O", "square_planar").select(index=0)  # one vacant site + free acetone
     o = next(a.GetIdx() for a in iso.mol.GetAtoms() if a.GetSymbol() == "O")
     ens = rx.embed(iso, coordinate=o, n=1)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import itertools
 import logging
+from collections import Counter
 from importlib.util import find_spec
 
 import numpy as np
@@ -407,6 +408,60 @@ def test_minimize_composes_isomer_template_and_fix():
     assert rx.cxsmiles(out.mol) == rx.cxsmiles(iso)
 
 
+def test_metal_geometry_without_the_stereo_extra_says_preservation_is_off(monkeypatch, caplog):
+    geometry = rx.embed(rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0], n=1, seed=1).mol
+
+    def missing(*_args, **_kwargs):
+        raise ImportError("signature needs xyzgraph; pip install 'rxembed[workflow]'")
+
+    monkeypatch.setattr(importlib.import_module("rxembed.pipeline.dispatch"), "signature", missing)
+    with caplog.at_level("WARNING", logger="rxembed"):
+        isomers = rx.metal(geometry, "square_planar")
+
+    assert all(iso.stereo_ref is None for iso in isomers)
+    assert "stereo preservation unavailable" in caplog.text
+    assert "rxembed[workflow]" in caplog.text
+
+
+def test_explicit_invert_on_a_helical_isomer_is_not_replaced_by_preserve(monkeypatch):
+    dispatch = importlib.import_module("rxembed.pipeline.dispatch")
+    ensemble = importlib.import_module("rxembed.pipeline.ensemble")
+    geometry = rx.embed(rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0], n=1, seed=1).mol
+    monkeypatch.setattr(dispatch, "signature", lambda *_args, **_kwargs: {"helical": Counter({"M": 1})})
+    iso = rx.metal(geometry, "square_planar")[0]
+    monkeypatch.setattr(ensemble, "signature", lambda *_args, **_kwargs: {"helical": Counter({"P": 1})})
+
+    ens = rx.embed(iso, n=1, seed=1, stereo="invert")
+
+    assert ens.n == 1
+    assert ens.stereo_filter[0] == "invert"
+
+
+def test_stereoisomer_cap_names_a_remedy_the_caller_has(monkeypatch, caplog):
+    monkeypatch.setattr(importlib.import_module("rxembed.pipeline.dispatch"), "_STEREO_CAP", 1)
+    with caplog.at_level("WARNING", logger="rxembed"):
+        rx.embed("CC(O)C(C)O", n=1, seed=1)
+
+    assert "stereo='free'" in caplog.text
+
+
+def test_metal_reads_an_ionic_xyz_at_its_total_charge(tmp_path):
+    salt = "[Cl-]->[Pt+2](<-[Cl-])(<-N)<-N.C[N+](C)(C)C"  # cisplatin beside a tetramethylammonium cation
+    path = tmp_path / "cisplatin_nme4.xyz"
+    Chem.MolToXYZFile(rx.embed(rx.metal(salt, "square_planar")[0], n=1, seed=1).mol, str(path))
+
+    assert rx.metal(str(path), "square_planar", charge=1)
+
+
+def test_auto_contacts_without_the_extra_name_the_extra(monkeypatch):
+    def missing(*_args, **_kwargs):
+        raise ImportError("analyzer needs xyzgraph; pip install 'rxembed[workflow]'")
+
+    monkeypatch.setattr(importlib.import_module("rxembed.pipeline.dispatch"), "auto_binding_modes", missing)
+    with pytest.raises(ImportError, match=r"rxembed\[workflow\]"):
+        rx.embed("CC(=O)O.CC(=O)O", contacts="auto", n=1, seed=1)
+
+
 def test_pipeline_enumerate_isomer_names_conflict():
     smiles = "CCCN[Pd](Cl)Cl"
     assert len(rx.metal(smiles, "square_planar")) > 0, "the pipeline verb must read this string"
@@ -465,7 +520,7 @@ def test_pipeline_embeds_stated_cxsmiles(monkeypatch):
         reason = workflow_failure(self, owner, cid)
         if not forced and owner is self:
             forced = True
-            return "forced rejection"
+            return core_embed.Failure("physical_geometry", "forced rejection")
         return reason
 
     monkeypatch.setattr(core_embed, "seed_conformers", tracked_seed)

@@ -1,7 +1,7 @@
 """Donor perception, and the orientation holds the stripped metal surrogate loses at the M-donor bond.
 
-The metal-stripped hybridisation ruler (`stripped_hybridisation`) and fold-census predicates (`donation_axis`,
-`inplane_sp2_donor`), plus the enforcement that puts those orientations back softly: `orient_donor` (one
+The metal-stripped hybridisation ruler (`stripped_hybridisation`) and fold-census predicate (`donation_axis`),
+plus the enforcement that puts those orientations back softly: `orient_donor` (one
 census wall per substituent) and `coplanar_donor` (the sp2-plane cap). The gate side
 (`metal_perceive.donor_orientation` / `donor_fold`) reads the same ruler, so they cannot drift.
 """
@@ -27,13 +27,15 @@ _COPLANAR_ANCHOR = 180.0  # deg: the external sector of a donor with two direct 
 
 # --- the chelate-ring hinge (`ring_hinge`, `cons.coplanar`) ----------------------------------------------
 _HINGE_CAP = {
-    4: 23.0,  # deg: crystal census max fold for a conjugated 4-membered chelate ring, 22.8 deg
-    5: 35.0,  # deg: crystal census p99 fold for a conjugated 5-membered chelate ring, 34.2 deg
+    4: 23.0,  # deg: max fold over a crystal census of 82 conjugated 4-membered chelate rings, 22.8 deg
+    5: 35.0,  # deg: p99 fold over a crystal census of 191 conjugated 5-membered chelate rings, 34.2 deg
 }
 
 # --- the donor-fold census: what `orient_donor` enforces and `metal_perceive.donor_orientation` gates ------
 # Crystal census percentiles of where a ligand points, keyed on (element, hyb): hybridisation alone admits a
 # folded carbonyl, and thiolate donates 23° off carboxylate. A class with n<6 abstains.
+# Census: 721 M-D-X donations over 121 tmQM and fixture crystals; floor = min(p0.5, class minimum) - 5 deg
+# (0 of 144 crystals flagged), ceiling = p99.5 + 5 deg capped at 180, median = p50.
 _SP, _SP2, _SP3 = Chem.HybridizationType.SP, Chem.HybridizationType.SP2, Chem.HybridizationType.SP3
 FOLD_WINDOW = {  # deg (floor, ceiling) per (element, hyb); floor gates, ceiling reports
     ("N", _SP2): (96.0, 180.0),
@@ -42,7 +44,7 @@ FOLD_WINDOW = {  # deg (floor, ceiling) per (element, hyb); floor gates, ceiling
     ("N", _SP3): (82.0, 158.4),
     ("C", _SP): (155.0, 180.0),
     ("O", _SP2): (90.0, 156.8),
-    ("S", _SP3): (91.0, 110.0),
+    ("S", _SP3): (91.0, 110.0),  # ceiling: the wall knee, crystal max 107.5; p99.5 + 5 (137.1) let S flatten
     ("C", _SP3): (104.0, 133.8),
     ("N", _SP): (140.0, 180.0),
     ("As", _SP3): (95.0, 131.3),
@@ -61,7 +63,8 @@ FOLD_MEDIAN = {  # deg: census median per class; `fold` = max |M-D-X - median|, 
 }
 # deg: the seed-bias floor for the embed's fold wall, tighter than the gate floor above. The gate never
 # false-flags a real crystal but sits 25-30 deg below typical donation, a dead band a fold hides in. Only
-# the wall may tighten: a tighter gate would flag real crystals.
+# the wall may tighten: a tighter gate would flag real crystals. Screened: this floor drove embedded folds to
+# about 0 with crystal M-D-X medians unmoved, where the gate floor as a wall only half-fixed them.
 _FOLD_WALL_FLOOR = {cls: min(lo + 12.0, FOLD_MEDIAN[cls] - 5.0) for cls, (lo, _hi) in FOLD_WINDOW.items()}
 # deg: half-width of a window centred on a donor's graph-derived M-D-X angle. A free sp2 donor centres on the
 # external bisector of the ligand's native internal angle (a fixed 120-degree centre pushes a five-membered
@@ -79,8 +82,6 @@ _MAX_SIGMA = {  # sigma bonds a class can carry: more is a hypervalent / mis-per
 }
 _CONJUGATING_LP = frozenset({7, 8})  # period-2 only: N/O planarise into an adjacent π system, a period-3 lone
 # pair does not (PPh3 is pyramidal). Letting P/S conjugate would type every triarylphosphine sp2.
-_PYRAMIDAL_SIGMA = 3
-_LONE_PAIR_ELECTRONS = 2
 
 
 # --- donor perception: the metal-stripped hybridisation ruler + the fold-census predicates ------------
@@ -109,19 +110,6 @@ def _pi_hybridisation(atom) -> Chem.HybridizationType | None:
     if atom.GetIsAromatic():
         return Chem.HybridizationType.SP2
     if atom.GetAtomicNum() in _CONJUGATING_LP:
-        # RDKit can label an anionic aryl/silyl N SP2 even when the graph has no explicit multiple-bond anchor.
-        # Do not turn that ambiguous Lewis form into a hard anti donor plane; a nearby pi bond still establishes
-        # the planar amidate-like case below.
-        if atom.GetFormalCharge() < 0 and atom.GetDegree() >= 2:  # noqa: PLR2004
-            pi_anchor = any(
-                bond.GetBondTypeAsDouble() >= 2  # noqa: PLR2004
-                for neighbour in atom.GetNeighbors()
-                for bridge in (neighbour, *neighbour.GetNeighbors())
-                if bridge.GetIdx() != atom.GetIdx()
-                for bond in bridge.GetBonds()
-            )
-            if not pi_anchor:
-                return Chem.HybridizationType.SP3
         for nb in atom.GetNeighbors():
             if nb.GetIsAromatic() or any(b.GetBondTypeAsDouble() >= 2 for b in nb.GetBonds()):  # noqa: PLR2004
                 return Chem.HybridizationType.SP2
@@ -147,7 +135,7 @@ def _stripped_graph(mol):
     return stripped
 
 
-def stripped_hybridisation(mol) -> dict[int, Chem.HybridizationType]:
+def stripped_hybridisation(mol, bound=None) -> dict[int, Chem.HybridizationType]:
     """Return agreed hybridisation assignments on the metal-stripped graph.
 
     An atom is absent (unknown, never gated) when the typer and the pi-count estimator disagree, or when it
@@ -164,7 +152,12 @@ def stripped_hybridisation(mol) -> dict[int, Chem.HybridizationType]:
     A terminal donor also needs exactly one ligand-side neighbour; hybridisation alone does not fix a
     donation axis. Expected holdout: RDKit calls a metal-bound `[CH-]` carbanion sp2 and the pi-count sp3;
     rxembed judges it as a pyramidal stereocentre elsewhere, through its chiral tag, not here.
+
+    `bound` maps each declared donor to the number of metals it binds. Rule 3 reads it, never the graph's own
+    metal bonds, so a stripped compile graph and a bonded conformer type the same donor alike. Sigma counts
+    use `GetTotalDegree`, so implicit and explicit hydrogens type alike.
     """
+    bound = {} if bound is None else bound
     stripped = _stripped_graph(mol)
     out: dict[int, Chem.HybridizationType] = {}
     for a in stripped.GetAtoms():
@@ -172,9 +165,9 @@ def stripped_hybridisation(mol) -> dict[int, Chem.HybridizationType]:
         nonbonding = lone_pair_electrons(a, ())  # no metal bond on this stripped graph
         if (
             pi_h == Chem.HybridizationType.SP2
-            and a.GetDegree() == _PYRAMIDAL_SIGMA
+            and a.GetTotalDegree() == 3  # noqa: PLR2004
             and a.GetAtomicNum() not in _CONJUGATING_LP
-            and nonbonding >= _LONE_PAIR_ELECTRONS
+            and nonbonding >= 2  # noqa: PLR2004  a lone pair
         ):
             rdkit_h = pi_h = Chem.HybridizationType.SP3
         # ring-conjugated sp2 by RDKit's aromaticity flag, not this atom's own lone pair (rule 2 above); carbon
@@ -184,30 +177,22 @@ def stripped_hybridisation(mol) -> dict[int, Chem.HybridizationType]:
         # a metal-bound heteroatom sp centre with 2 ligand sigma bonds cannot really be sp (rule 3 above)
         elif (
             rdkit_h == pi_h == _SP
-            and a.GetDegree() == 2  # noqa: PLR2004
+            and a.GetTotalDegree() == 2  # noqa: PLR2004
             and a.GetAtomicNum() != CARBON_Z
-            and any(nb.GetAtomicNum() in COORDINATION_METALS for nb in mol.GetAtomWithIdx(a.GetIdx()).GetNeighbors())
+            and bound.get(a.GetIdx(), 0)
         ):
             rdkit_h = pi_h = _SP2
         if rdkit_h != pi_h or rdkit_h not in _MAX_SIGMA:  # the estimators disagree, or it is not sp/sp2/sp3
             continue
-        if a.GetDegree() > _MAX_SIGMA[rdkit_h]:  # more sigma bonds than the class can carry: hypervalent
+        if a.GetTotalDegree() > _MAX_SIGMA[rdkit_h]:  # more sigma bonds than the class can carry: hypervalent
             continue
         out[a.GetIdx()] = rdkit_h
     return out
 
 
-def inplane_sp2_donor(mol, d, hyb=None) -> bool:
-    """Return whether donor `d` is sp2, and so holds the metal in its sigma plane.
-
-    No conjugation test: an isolated C=O or C=N donor is sp2 but not conjugated.
-    """
-    if hyb is None:
-        hyb = stripped_hybridisation(mol)
-    return hyb.get(d) == Chem.HybridizationType.SP2
-
-
-def donation_axis(mol, d, all_donors, sphere=None, *, hyb=None, network=True) -> list[int] | None:
+def donation_axis(
+    mol, d, all_donors, sphere=None, *, hyb=None, network=True, metals=1, stripped=None
+) -> list[int] | None:
     """Return donor `d`'s judgeable heavy substituents X, or `None` when it donates along no axis.
 
     Four donors have no M-D-X axis to judge: an H donor (hydride, sigma-complex, agostic) has no lone pair; a
@@ -220,15 +205,17 @@ def donation_axis(mol, d, all_donors, sphere=None, *, hyb=None, network=True) ->
     metal): "ask, but nothing to measure", distinct from `None` meaning "do not ask". Freeze ownership is
     applied later, over the complete M-D-X term, not here.
 
-    `sphere` is this metal's own donors, for the bite-bridgehead test, and defaults to `all_donors`. `network`
-    drops a backbone arm (R_pair) whose co-donor is calibrated and has fewer than 3 heavy substituents, so it
-    holds the arm itself, unless `d` qualifies the same way, since a ring of two small donors must keep one
-    walled arm. Enumeration disables it for its conservative outer-bound screen.
+    `sphere` is this metal's own donors, for the bite-bridgehead test, and defaults to `all_donors`. `metals` is
+    how many metals the caller declares `d` bound to, read instead of graph bonds so a stripped and a bonded
+    graph agree. `network` drops a backbone arm (R_pair) whose co-donor is calibrated and has fewer than 3 heavy
+    substituents, so it holds the arm itself, unless `d` qualifies the same way, since a ring of two small
+    donors must keep one walled arm. Enumeration disables it for its conservative outer-bound screen.
+    `stripped` reuses an already-built `ligand_graph`.
     """
     a = mol.GetAtomWithIdx(d)
     if a.GetAtomicNum() == 1:  # hydride / η²-H₂ / agostic H: no lone pair, so no donation axis
         return None
-    if sum(1 for nb in a.GetNeighbors() if nb.GetAtomicNum() in COORDINATION_METALS) > 1:  # bridging: set by the bridge
+    if metals > 1:  # bridging: the axis is set by the bridge
         return None
     sphere = all_donors if sphere is None else sphere
     if any(d in site and len(site) > 1 for site in haptic_sites(mol, sphere)):  # pi-face: metal is off-axis
@@ -236,7 +223,7 @@ def donation_axis(mol, d, all_donors, sphere=None, *, hyb=None, network=True) ->
     hyb = stripped_hybridisation(mol) if hyb is None else hyb
     if hyb.get(d) == _SP and ligand_degree(a) != 1:
         return None
-    backbone = _backbone_targets(mol, d, sphere) if network else {}
+    backbone = _backbone_targets(mol, d, sphere, stripped=stripped) if network else {}
     d_class = (mol.GetAtomWithIdx(d).GetSymbol(), hyb.get(d))
     return [
         nb.GetIdx()
@@ -253,18 +240,6 @@ def donation_axis(mol, d, all_donors, sphere=None, *, hyb=None, network=True) ->
         # A chelate bridgehead has no independent M-D-X angle even though it still needs anti-collapse repulsion.
         and sum(1 for x in sphere if mol.GetBondBetweenAtoms(nb.GetIdx(), int(x)) is not None) < APEX_DONORS
     ]
-
-
-def _is_chelated(mol, d, donor_set, metal) -> bool:
-    """Return True when another donor of ``metal`` is reachable from ``d`` through the ligand backbone.
-
-    With the M-donor bonds stripped, a chelate's two donors relate only through their backbone (a bond path that
-    never crosses the bond-less metal); a monodentate pair shares no such path. This is the structural split that
-    gates the centred sp2 window: the chelate ring pins the donor's plane, a lone monodentate donor does not.
-    """
-    return any(
-        (path := Chem.GetShortestPath(mol, int(d), int(dd))) and metal not in path for dd in donor_set if dd != d
-    )
 
 
 def _backbone_targets(mol, d, donor_set, *, stripped=None):
@@ -309,62 +284,49 @@ def _centred_sp2_window(mol, donor, neighbours):
     return centre - _CENTRED_PAD, min(180.0, centre + _CENTRED_PAD)
 
 
-def orient_donor(mol, metal, d, donor_set, cons, *, hyb=None, stripped=None):
+def orient_donor(mol, metal, d, donor_set, cons, *, hyb=None, stripped=None, metals=1):
     """Wall every donor substituent, heavy or proton, off the metal: the M-D-X bend the stripped bond lost.
 
-    One flat-bottomed angle wall per non-metal, non-apex substituent, keyed on the donor's (element, hyb)
-    census class (`_ORIENT_WALL`), written into `cons.angles` so it biases both the bounds matrix and the FF
-    (a DG-only wall measures worse than none). One loop covers sp end-on, pnictogen proton splay and
-    heavy-substituent fold together; a proton is a substituent too, which is what fixes an sp3 amine folding
-    its H onto the metal over the lone pair.
+    One flat-bottomed angle wall per substituent, keyed on the donor's (element, hyb) census class
+    (`_ORIENT_WALL`), written into `cons.angles` so it biases both the bounds matrix and the FF (a DG-only wall
+    measures worse than none). The heavy substituents are exactly the ones `donation_axis` lets the gate judge,
+    so enforcement and gate share one abstention list; a proton is walled too, which is what fixes an sp3 amine
+    folding its H onto the metal over the lone pair. An uncalibrated class (estimators disagree, or n<6)
+    abstains, exactly as the gate does.
 
-    An uncalibrated class (estimators disagree, or n<6) abstains, exactly as the gate does. A heavy apex
-    substituent (bonded to 2+ donors) is a geometrically forced bite apex, never walled. Freeze ownership is
-    resolved later, over the complete term. `coplanar_donor` is the sibling out-of-plane cap; `stripped`
-    reuses an already-built `ligand_graph`, shared across every donor of one candidate.
+    A free C or N sp2 donor with two ligand heavy neighbours (no backbone to another donor) centres its window
+    on the native ligand bisector (`_centred_sp2_window`). Freeze ownership is resolved later, over the
+    complete term. `metals` and `stripped` pass through to `donation_axis`. `coplanar_donor` is the sibling
+    out-of-plane cap.
     """
     hyb = stripped_hybridisation(mol) if hyb is None else hyb
     a = mol.GetAtomWithIdx(d)
-    sym, hybrid = a.GetSymbol(), hyb.get(d)
-    if hybrid == _SP and ligand_degree(a) != 1:
-        return  # The terminal-sp wall cannot orient two opposing ligand-side substituents.
-    window = _ORIENT_WALL.get((sym, hybrid))
-    if window is None:  # estimators disagree or the class is uncalibrated (n < 6): the gate abstains, so does this
+    cls = (a.GetSymbol(), hyb.get(d))
+    window = _ORIENT_WALL.get(cls)
+    heavy = donation_axis(mol, d, donor_set, hyb=hyb, metals=metals, stripped=stripped) if window else None
+    if heavy is None:  # uncalibrated, or no donation axis (hydride, bridge, haptic face, nonterminal sp)
         return
-    backbone = _backbone_targets(mol, d, donor_set, stripped=stripped)
-    heavy = [nb.GetIdx() for nb in a.GetNeighbors() if nb.GetAtomicNum() > 1]
+    ligand = [
+        nb.GetIdx() for nb in a.GetNeighbors() if nb.GetAtomicNum() > 1 and nb.GetAtomicNum() not in COORDINATION_METALS
+    ]
     if (
-        sym in ("C", "N")
-        and hybrid == _SP2
-        and len(heavy) == 2  # noqa: PLR2004  the centred window's math needs exactly two neighbours
-        and not _is_chelated(mol, d, donor_set, metal)
+        cls in {("C", _SP2), ("N", _SP2)}
+        and len(ligand) == 2  # noqa: PLR2004  the centred window's math needs exactly two neighbours
+        and not _backbone_targets(mol, d, donor_set, stripped=stripped)  # a chelate already pins the axis
     ):
-        window = _centred_sp2_window(mol, d, heavy)
-    for nb in a.GetNeighbors():
-        z = nb.GetAtomicNum()
-        if z in COORDINATION_METALS:  # the M-D bond is stripped by now, but the surrogate keeps the fiction:
-            continue  # never wall M
-        if nb.GetIdx() in donor_set:
-            continue  # the polyhedron and chelate bite own D-M-D; an M-D-D wall contradicts that angle
-        other = backbone.get(nb.GetIdx())
-        if (
-            other is not None
-            and (mol.GetAtomWithIdx(other).GetSymbol(), hyb.get(other)) in _ORIENT_WALL
-            and (_heavy_substituent_count(mol, other) < 3)  # noqa: PLR2004
-        ):
-            # R_pair, as in `donation_axis`; `d` is already known calibrated (the window above).
-            if _heavy_substituent_count(mol, d) >= 3:  # noqa: PLR2004
-                continue
-        if z > 1 and sum(1 for x in donor_set if mol.GetBondBetweenAtoms(nb.GetIdx(), x) is not None) >= APEX_DONORS:
-            continue  # a heavy APEX substituent (bonded to >= 2 donors): a geometrically forced bite apex
-        cons.angles.setdefault((metal, d, nb.GetIdx()), window)
+        window = _centred_sp2_window(mol, d, ligand)
+    heavy = set(heavy)
+    for nb in a.GetNeighbors():  # neighbour order, so the walls reach the FF in a stable order
+        x = nb.GetIdx()
+        if x in heavy or (nb.GetAtomicNum() == 1 and x not in donor_set):
+            cons.angles.setdefault((metal, d, x), window)
 
 
 def coplanar_donor(mol, metal, d, donor_set, cons, *, hyb=None):
     """Cap an sp2 donor's metal at its own sp2 plane: the improper the stripped M-donor bond removed.
 
     Records a soft flat-bottomed dihedral cap (+/- `COPLANAR_CAP` deg about an in-plane well) in
-    `cons.coplanar`, applied in bounds and FF. `inplane_sp2_donor` decides who qualifies. The plane comes
+    `cons.coplanar`, applied in bounds and FF. Only an sp2 donor qualifies. The plane comes
     from the donor's heavy-neighbour count:
 
     * one heavy neighbour (carboxylate O, thione S): a proper dihedral M-D-C-X against C's heaviest other
@@ -378,10 +340,12 @@ def coplanar_donor(mol, metal, d, donor_set, cons, *, hyb=None):
     class, and the FF torsion alone holds an uncalibrated one.
     """
     hyb = stripped_hybridisation(mol) if hyb is None else hyb
-    if not inplane_sp2_donor(mol, d, hyb):
+    if hyb.get(d) != _SP2:  # no conjugation test: an isolated C=O or C=N donor is sp2 but not conjugated
         return  # only an sp2 donor has an in-plane sigma lone pair to hold the metal to
     a = mol.GetAtomWithIdx(d)
-    heavy = [nb.GetIdx() for nb in a.GetNeighbors() if nb.GetAtomicNum() > 1]
+    heavy = [
+        nb.GetIdx() for nb in a.GetNeighbors() if nb.GetAtomicNum() > 1 and nb.GetAtomicNum() not in COORDINATION_METALS
+    ]
     if len(heavy) == 1:  # one heavy neighbour: proper dihedral against C's heaviest substituent
         if hyb.get(heavy[0]) != Chem.HybridizationType.SP2:  # the neighbour must itself be sp2 (a real plane to hold)
             return

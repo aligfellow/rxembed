@@ -222,6 +222,20 @@ def test_side_on_eta2_donor_is_exempt():
         assert not v, f"FALSE POSITIVE on a side-on η²; {[str(x) for x in v]}"
 
 
+def test_a_partial_declaration_perceives_the_other_metal_of_a_bridged_dimer():
+    """Declaring one metal of a Pd2(mu-Cl)2Cl4 dimer judges that metal only; the other keeps its own ligands."""
+    rw = Chem.RWMol()
+    for z in (46, 46, 17, 17, 17, 17, 17, 17, 6):
+        rw.AddAtom(Chem.Atom(z))
+    mol = rw.GetMol()
+    pos = np.array(
+        [[-1.75, 0, 0], [1.75, 0, 0], [0, 1.65, 0], [0, -1.65, 0], [-3.4, 1.6, 0], [-3.4, -1.6, 0], [3.4, 1.6, 0]]
+    )
+    pos = np.vstack([pos, [3.4, -1.6, 0], [-1.75, 0, 2.0]])  # B's last terminal Cl, then a carbon crushed onto A
+    got = coord.metal_overbond(mol, pos, {0: {2, 3, 4, 5}})
+    assert [(v.kind, v.atoms) for v in got] == [("metal_overbond", (0, 8))]
+
+
 def test_organic_molecule_is_a_strict_no_op():
     mol = Chem.AddHs(Chem.MolFromSmiles("CC(=O)Nc1ccccc1O"))
     rdDistGeom.EmbedMolecule(mol, randomSeed=1)

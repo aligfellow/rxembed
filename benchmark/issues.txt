@@ -6,19 +6,42 @@
 #     perception (OCT, not TBP).
 #   MOQYAS: eta2 imine (side-on N=C) + Cp + two benzyl; tetrahedral with each haptic ligand
 #     as one site.
-#   YEBYIQ: square pyramid; the sulfoxide S=O->M oxygen contact is currently dropped.
+#   YEBYIQ: Zn square pyramid of Cl, three N and one sulfonyl S=O->Zn oxygen; the long O contact must
+#     stay in the sphere.
 #   FOVFED: user-flagged reported case.
 #   QUJSOE: crown-style macrocycle; tethers should keep enumeration small.
-#   KIZNAI: eta7-C7H7 + dmpe; xyz2mol ligand-charge failure at read on this tree.
+#   KIZNAI: Nb eta7-C7H7 + dmpe + CO; the C7 ring is one site, so four sites in all.
 #   FOPSOT: user-flagged challenging case.
-#   QEJHIX: Cr eta4 diene; E/Z of the two coordinated C=C must be recorded and recovered.
+#   QEJHIX: Cr eta4 2,3-dimethylbutadiene, s-trans P (C1-C2-C3-C4 +118 deg); the class must be recorded and
+#     recovered, and an s-cis output fails validate:cx.
 #   ZUDWUQ (fixtures/sample): Ni inside a cyclo-As6 ring, hexagonal planar; one arrangement.
 #   RITCIG: Hf with four N donors plus a side-on eta2 C=O counted as ONE site, so square pyramidal
 #     (CN5). Seating C and O as two sites gives CN6, which is wrong.
-#   IFASAJ..VOVZOV: reported from notebook runs on 2026-09-23 and previously untracked here, so a
-#     fix could not stay fixed. RUVHIZ: cyclam + outer-sphere ClO4-, the M-N drop is fixed and its
-#     axial Ni-N is Jahn-Teller elongated (not modelled). ZOGWOH: metal hand alongside ligand hand.
-#     KUVQOK: agostic B-H, no M-B bond. VOVZOV: hybridisation, As6 analogue.
+#   IFASAJ..VOVZOV: reported from notebook runs. RUVHIZ: cyclam + outer-sphere ClO4-; all four Ni-N
+#     stay bonded, and its axial Ni-N Jahn-Teller elongation is not modelled. ZOGWOH: metal hand
+#     alongside ligand hand. KUVQOK: agostic B-H, no M-B bond. VOVZOV: hybridisation, As6 analogue.
+#   QAHFOV..ASINUO: user-named structures. A user label states the expected chemistry; otherwise the
+#     note gives the ligands and the sphere rx.metal(observed_only=True) reads, not a verdict on it.
+#     QAHFOV: Ni(II) with two dithiocarbamates, each kappa2-S,S (user label); square planar S4.
+#     LAPQIC: W with a kappa2-C,C W-C-P-C ring and three tert-butoxides; the W...P cross-ring contact
+#       is not a bond (user label).
+#     PIXMEO: Rh(I) Cl + three P donors; two P are linked by a P-O-P ether with no P-P bond (user
+#       label), so they are two sites, not one eta2 face.
+#     BAYHUF: Fe(II) Me3-tacn + a silanedithiolate S,S; reads five-coordinate.
+#     WIRGOV: Au(III) two iodides + a diselenophosphate Se,Se; reads square planar.
+#     VUDTUL: Ni Se,P chelate + an SiMe3/PMe3 ylide; reads its C-C as one side-on eta2 site.
+#     USUQAB: Zr Cp with two SiMe2-NtBu amide arms + an iminoacyl; reads its C=N as one eta2 site.
+#     AMEJUX: Hg(II)Cl2 (Hg-Cl 2.37 A) with both pyrazolyl N of a bis(pyrazolyl)methane at 2.65 A;
+#       reads linear HgCl2 with the N unbound.
+#     POPVAT: Os(VI) nitrido on a tetraaryl corrole N4; reads square pyramidal.
+#     ZITSIH: Fe(II) boron-capped tris-dioximate clathrochelate; reads trigonal prismatic N6.
+#     RUVHOF: [Zn(cyclam)Cl]+; reads square pyramidal with coordination-locked N-H stereocentres.
+#     GOCDAH: Fe(II) bis(N,N,N pyrazolyl-pyridine-triazolate); reads a mer octahedron with a metal hand.
+#     GACMUU: Ni(II)Cl2 + a tripodal N,N,N picolylamine; reads five-coordinate.
+#     DEPZOR: GOCDAH's ligand family with 3,5-dichlorophenyl arms; reads the same mer octahedron.
+#     BAYKOD: Fe(II)Cl2 + a chiral cyclohexanediamine bis(picolyl) N4; reads a cis octahedron with
+#       locked amine N stereocentres beside the ligand's C stereocentres.
+#     ASINUO: [Mo(Cp*)(CO)2(P(OMe)3)(hydroxycarbene)]+; reads a piano stool with Cp* as one site.
 # Named cases, cost class (for reading a slowdown; run.py itself never gates on these):
 #   FADNUT, VOVZOV: DG cannot embed a reader artefact; each fails after one search (FADNUT under
 #     35 s, VOVZOV under 3 s on a P-core).
@@ -46,3 +69,5 @@ AMAVOA
 SOSHOY MOQYAS YEBYIQ FOVFED QUJSOE KIZNAI FOPSOT QEJHIX
 IFASAJ RUVHIZ ZOGWOH JIKYAD KUQPUJ QOBMUQ ICAJON CUBDOT DAVHOY EGUZIP KOKDOE KOSMAG NARTUY
 TEHSOQ WUSHEZ XIWYUX ZTDXCO ZULVOR KUVQOK VOVZOV EHUXEM SIJQIL
+QAHFOV LAPQIC PIXMEO BAYHUF WIRGOV VUDTUL USUQAB AMEJUX POPVAT ZITSIH RUVHOF GOCDAH GACMUU DEPZOR
+BAYKOD ASINUO

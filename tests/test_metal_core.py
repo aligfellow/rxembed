@@ -133,6 +133,25 @@ def test_delocalised_charge_canonicalization_requires_rdkit_resonance_proof():
     assert [atom.GetFormalCharge() for atom in out.GetAtoms()] == before
 
 
+def test_canonical_charge_move_keeps_an_azaborolyl_eta5_face_whole():
+    """WAPJAY/WAPJEC in miniature: moving the ring's -1 off B to a carbon de-aromatizes it, so it stays on B.
+
+    The carbon form reads as a C3 allyl face plus sigma N and B, a CN5 complex with the wrong isomers.
+    """
+    ligand = Chem.MolFromSmiles("Cn1c(C)cc[b-]1C")  # 1,2-azaborolyl, B-methyl and N-methyl
+    rw = Chem.RWMol(Chem.CombineMols(ligand, Chem.MolFromSmiles("[Co+2]")))
+    metal = rw.GetNumAtoms() - 1
+    ring = [atom.GetIdx() for atom in ligand.GetAtoms() if atom.IsInRing()]
+    for atom in ring:
+        rw.AddBond(atom, metal, Chem.BondType.DATIVE)
+    mol = rw.GetMol()
+    mol.UpdatePropertyCache(strict=False)
+
+    out = metal_core.canonical_metal_graph(mol)
+
+    assert metal_core.haptic_sites(out, ring) == [tuple(ring)]
+
+
 def _metal_neighbours(mol):
     metal = next(a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in metal_core.COORDINATION_METALS)
     return metal, sorted(n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
@@ -810,3 +829,21 @@ def test_ligands_reports_denticity_per_metal():
 def test_ligands_refuses_a_molecule_with_no_metal():
     with pytest.raises(ValueError, match="no metal centre"):
         metal_core.ligands(Chem.AddHs(Chem.MolFromSmiles("CCO")))
+
+
+@pytest.mark.parametrize(
+    ("smiles", "partner", "joined"),
+    [("[H]O[H].[Cl-]", 3, False), ("[H][BH3-].[BH3]", 2, True)],
+    ids=["water-chloride-hydrogen-bond", "diborane-like-three-centre-bridge"],
+)
+def test_zero_order_hydrogen_contact_joins_a_ligand_only_as_a_three_centre_bond(smiles, partner, joined):
+    params = Chem.SmilesParserParams()
+    params.removeHs = False
+    rw = Chem.RWMol(Chem.MolFromSmiles(smiles, params))
+    rw.AddBond(0, partner, Chem.BondType.ZERO)
+    mol = rw.GetMol()
+
+    frag = metal_core.frag_map(mol)
+
+    assert (frag[0] == frag[partner]) is joined
+    assert (metal_core.ligand_distance_matrix(mol)[0][partner] == 1) == joined

@@ -1,24 +1,14 @@
 """Test donor-to-polyhedron seating and arrangement labels."""
 
-import itertools
 from collections import Counter
+from dataclasses import replace
 
 import pytest
 from rdkit import Chem
 
 import rxembed as rx
 from rxembed import metal_slots as slots
-from rxembed.metal_polyhedron import CHELATE_SPAN_ANGLE, hull_edges, vertex_angle, vertex_dirs
-
-
-def _wide_narrow(dirs, pair):
-    """Return a `narrow` mapping that forbids `pair` at every vertex angle >= CHELATE_SPAN_ANGLE.
-
-    Uses `distinct_vertex_orderings`'s per-angle `narrow` form directly, for a fixture that only cares
-    that a pair cannot span *some* wide angle, not which one.
-    """
-    angles = {round(vertex_angle(p, q), 6) for p, q in itertools.combinations(dirs, 2)}
-    return {angle: frozenset({pair}) for angle in angles if angle >= CHELATE_SPAN_ANGLE}
+from rxembed.metal_polyhedron import hull_edges, vertex_dirs
 
 
 def test_square_pyramidal_150_degree_pair_is_trans():
@@ -42,73 +32,44 @@ def test_three_plus_one_square_planar_has_no_false_cis_trans_label():
 )
 def test_ordering_dedup_respects_donor_symmetry(smiles, donors, expected):
     mol = Chem.MolFromSmiles(smiles)
-    assert len(slots.distinct_vertex_orderings(mol, donors, "square_planar")) == expected
-
-
-@pytest.mark.parametrize(
-    ("smiles", "donors", "geometry"),
-    [
-        ("NCCN.[Cl-].[Br-].[I-]", [0, 3, 4, 5, 6], "trigonal_bipyramidal"),
-        ("NCCN.[F-].[Cl-].[Br-].[I-]", [0, 3, 4, 5, 6, 7], "octahedral"),
-    ],
-    ids=("tbp", "octahedral"),
-)
-def test_narrow_drops_only_the_orderings_placing_the_pair_on_a_wide_vertex_pair(smiles, donors, geometry):
-    """`narrow` removes exactly the streamed orders placing donor positions 0/1 >= CHELATE_SPAN_ANGLE apart.
-
-    All 5-6 donor classes here are distinct, so each constitutional identity has one raw representative and
-    dropping it cannot be silently replaced by a donor-symmetric stand-in (unlike the equivalent-halide case).
-    """
-    mol = Chem.MolFromSmiles(smiles)
-    dirs = vertex_dirs(geometry)
-    narrow = _wide_narrow(dirs, frozenset((0, 1)))
-
-    unpruned = slots.distinct_vertex_orderings(mol, donors, geometry)
-    pruned = slots.distinct_vertex_orderings(mol, donors, geometry, narrow=narrow)
-
-    expected = [
-        order for order in unpruned if vertex_angle(dirs[order.index(0)], dirs[order.index(1)]) < CHELATE_SPAN_ANGLE
-    ]
-    assert pruned == expected
-    assert len(pruned) < len(unpruned), f"{geometry}: narrow pair is never wide here"
+    assert len(slots.distinct_vertex_orderings(slots.SeatingProblem(mol, donors, "square_planar"))) == expected
 
 
 def test_linked_drops_only_the_orderings_placing_the_pair_off_a_hull_edge():
     """`linked` removes exactly the streamed orders placing donor positions 0/1 off a polyhedron hull edge.
 
-    A square-antiprism top-face diagonal (109 deg) is well under `CHELATE_SPAN_ANGLE` (135), so `narrow`
-    would never catch it; the edge rule catches it because it is a diagonal, not because it is wide.
+    A square-antiprism top-face diagonal (109 deg) is caught because it is not a hull edge, not because it is
+    wide.
     """
     mol = Chem.MolFromSmiles("NCCN.[F-].[Cl-].[Br-].[I-].[H][At].[Se]")
     donors = [0, 3, 4, 5, 6, 7, 8, 9]
     geometry = "square_antiprism"
     dirs = vertex_dirs(geometry)
     edges = hull_edges(tuple(map(tuple, dirs)))
-    linked = frozenset({frozenset((0, 1))})
+    problem = slots.SeatingProblem(mol, donors, geometry)
 
-    unpruned = slots.distinct_vertex_orderings(mol, donors, geometry, max_orbits=6000)
-    pruned = slots.distinct_vertex_orderings(mol, donors, geometry, linked=linked, max_orbits=6000)
+    unpruned = slots.distinct_vertex_orderings(problem, max_orbits=6000)
+    pruned = slots.distinct_vertex_orderings(replace(problem, linked={frozenset((0, 1))}), max_orbits=6000)
 
     expected = [order for order in unpruned if frozenset((order.index(0), order.index(1))) in edges]
     assert pruned == expected
     assert len(pruned) < len(unpruned), f"{geometry}: linked pair never lands off an edge here"
 
 
-def test_explicit_perms_bypass_narrow_and_linked():
+def test_explicit_perms_bypass_the_edge_rule():
     """An explicit `perms` (a `fix=` pool, or `observed_only`'s one retained order) is authoritative and
-    never dropped by the forbidden-pair filter, even when it lands on a forbidden vertex pair; streamed
-    (generated) orders are still pruned.
+    never dropped by the edge rule, even off a hull edge; streamed (generated) orders are still pruned.
     """
     mol = Chem.MolFromSmiles("NCCN.[Cl-].[Br-].[I-]")
     donors = [0, 3, 4, 5, 6]
     geometry = "trigonal_bipyramidal"
-    dirs = vertex_dirs(geometry)
-    unpruned = slots.distinct_vertex_orderings(mol, donors, geometry)
-    bad = next(o for o in unpruned if vertex_angle(dirs[o.index(0)], dirs[o.index(1)]) >= CHELATE_SPAN_ANGLE)
-    narrow = _wide_narrow(dirs, frozenset((0, 1)))
+    edges = hull_edges(tuple(map(tuple, vertex_dirs(geometry))))
+    unpruned = slots.distinct_vertex_orderings(slots.SeatingProblem(mol, donors, geometry))
+    bad = next(o for o in unpruned if frozenset((o.index(0), o.index(1))) not in edges)
+    linked = slots.SeatingProblem(mol, donors, geometry, linked=frozenset({frozenset((0, 1))}))
 
-    assert bad not in slots.distinct_vertex_orderings(mol, donors, geometry, narrow=narrow)
-    assert slots.distinct_vertex_orderings(mol, donors, geometry, perms=(bad,), narrow=narrow) == [bad]
+    assert bad not in slots.distinct_vertex_orderings(linked)
+    assert slots.distinct_vertex_orderings(linked, perms=(bad,)) == [bad]
 
 
 def test_high_coordination_cap_precedes_permutation_generation(monkeypatch):
@@ -116,7 +77,7 @@ def test_high_coordination_cap_precedes_permutation_generation(monkeypatch):
 
     monkeypatch.setattr(slots, "isomer_permutations", lambda _geometry: pytest.fail("permutations were generated"))
     with pytest.raises(ValueError, match=r"more than 1,000 distinct constitutional.*rx\.embed.*rx\.metal"):
-        slots.distinct_vertex_orderings(mol, list(range(10)), "BSA")
+        slots.distinct_vertex_orderings(slots.SeatingProblem(mol, list(range(10)), "BSA"))
 
 
 def test_high_coordination_does_not_disguise_one_observed_order_as_enumeration():
@@ -124,21 +85,21 @@ def test_high_coordination_does_not_disguise_one_observed_order_as_enumeration()
     donors = list(range(10))
 
     with pytest.raises(ValueError, match="exact enumeration is required"):
-        slots.distinct_vertex_orderings(mol, donors, "BSA", retained=donors)
+        slots.distinct_vertex_orderings(slots.SeatingProblem(mol, donors, "BSA"), retained=donors)
 
 
 @pytest.mark.parametrize("counts", [(9, 1), (8, 2)])
 def test_high_coordination_counts_constitutional_classes_before_the_cap(counts):
     mol = Chem.MolFromSmiles(".".join(["[F-]"] * counts[0] + ["[Cl-]"] * counts[1]))
 
-    assert slots.distinct_vertex_orderings(mol, list(range(10)), "BSA")
+    assert slots.distinct_vertex_orderings(slots.SeatingProblem(mol, list(range(10)), "BSA"))
 
 
 def test_high_coordination_identical_monodentates_keep_the_constant_time_shortcut():
     mol = Chem.MolFromSmiles(".".join(["[F-]"] * 10))
     donors = list(range(10))
 
-    assert slots.distinct_vertex_orderings(mol, donors, "BSA") == [tuple(donors)]
+    assert slots.distinct_vertex_orderings(slots.SeatingProblem(mol, donors, "BSA")) == [tuple(donors)]
 
 
 def test_observed_orbit_precedes_canonical_enumeration():
@@ -146,7 +107,7 @@ def test_observed_orbit_precedes_canonical_enumeration():
     donors = list(range(4))
     retained = [2, 1, 0, 3]
 
-    orderings = slots.distinct_vertex_orderings(mol, donors, "square_planar", retained=retained)
+    orderings = slots.distinct_vertex_orderings(slots.SeatingProblem(mol, donors, "square_planar"), retained=retained)
 
     assert orderings[0] == tuple(retained)
 

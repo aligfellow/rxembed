@@ -25,7 +25,7 @@ from rxembed.metal_polyhedron import POLYHEDRA, hull_edges, record, vertex_dirs
 from rxembed.metal_stereo import chelate_links, donor_classes, realised_chirality, site_classes
 from rxembed.pipeline import geom_check as geom
 from tests.conftest import TMQMG_DIR
-from tests.metal_fixtures import ferrocene, one_arm_bound_pt
+from tests.metal_fixtures import BUTADIENE_FE_CO3, ferrocene, one_arm_bound_pt
 
 _MA2B2 = "CCCN[Pd](Cl)(Cl)NCCC"  # square-planar MA2B2 -> the cis / trans pair
 _ASYMMETRIC_NN_NI = "O=C1[O-]->[Ni+2]2(<-[CH-](c3ccccc3)N1c1ccccc1)<-[N](O)=C(c1ccccn1)c1cccc[n]->21"
@@ -323,6 +323,13 @@ def test_frozen_high_coordination_refuses_a_factorial_free_site_pool():
         rx.metal(mol, "BSA", fix=[donors[0]])
 
 
+def test_fix_pins_frozen_donors_when_the_polyhedron_has_vacant_sites():
+    """Freezing N, Pt, Cl and Br of a square-planar complex on an octahedron leaves only iodide to seat."""
+    source = rx.embed(rx.metal("[NH3]->[Pt+2](<-[Cl-])(<-[Br-])<-[I-]", "SPL")[0], n=1, seed=42, threads=1).mol
+
+    assert len(rx.metal(source, "octahedral", fix=[0, 1, 2, 3])) == 3
+
+
 def test_monodentate_imine_ez_is_retained_without_mutating_the_variant_graph():
     mol = rx.parse_smiles("CC=[NH]->[Pt+2](<-[Cl-])(<-[Br-])<-[I-]")
     bond = mol.GetBondBetweenAtoms(1, 2)
@@ -485,6 +492,19 @@ def test_bound_amine_hands_are_enumerated_only_on_request():
     assert len(set(identities)) == len(identities) == 4
 
 
+def test_geometry_enumerates_every_diene_class_and_keeps_its_own_on_request():
+    """A bound diene's class is enumerated like the arrangement; observed_only or {'locked': 'preserve'} keeps it."""
+    s_trans = next(iso for iso in rx.metal(BUTADIENE_FE_CO3, "TET") if set(iso.haptic_winding.values()) == {"P"})
+    mol = rx.embed(s_trans, n=1, seed=7).mol
+
+    def classes(**kwargs):
+        return sorted(next(iter(iso.haptic_winding.values())) for iso in rx.metal(mol, "TET", **kwargs))
+
+    assert classes() == ["M", "P", "c"]
+    assert classes(observed_only=True) == classes(stereo={"locked": "preserve"}) == ["P"]
+    assert classes(stereo={"locked": "invert"}) == ["M"]
+
+
 def test_asymmetric_nn_complex_keeps_both_substrate_orientations_per_stereoisomer():
     mol = Chem.AddHs(Chem.MolFromSmiles(_ASYMMETRIC_NN_NI))
     by_stereo = {}
@@ -571,8 +591,9 @@ def test_dodecahedral_bipyridyl_screen_rejects_unspanned_whole_ligand_assignment
     conformer.SetAtomPosition(metal, (0.0, 0.0, 0.0))
     directions = np.asarray(POLYHEDRA["dodecahedral"].vertex_dirs, float)
     for slot, donor in enumerate(donors):
-        # Deliberately exceed native bipyridyl reach only when these radii are requested.
-        radius = 3.0 if mol.GetAtomWithIdx(donor).GetAtomicNum() == 7 else 1.9
+        # Deliberately exceed native bipyridyl reach, beyond publication's M-L slack, only when these radii
+        # are requested: at 3.0 A the lower window edge sat within 0.01 A of reach.
+        radius = 3.1 if mol.GetAtomWithIdx(donor).GetAtomicNum() == 7 else 1.9
         conformer.SetAtomPosition(donor, tuple(radius * directions[slot]))
     for atom in mol.GetAtoms():
         if atom.GetIdx() not in {metal, *donors}:
@@ -757,11 +778,12 @@ def test_agostic_tether_reach_is_atom_order_invariant_and_allows_a_longer_arm(sc
     assert len(rx.metal(rx.parse_smiles(_MA2B2), "SPL", screen=screen)) == 2
 
 
-def test_pocop_pincer_nickel_keeps_only_the_trans_state():
-    smiles = "COC(=O)c1cc2O[P](C(C)C)(C(C)C)->[Ni+2]3(<-[Cl-])<-[c-]2c(O[P]->3(C(C)C)C(C)C)c1"
+_POCOP_NI = "COC(=O)c1cc2O[P](C(C)C)(C(C)C)->[Ni+2]3(<-[Cl-])<-[c-]2c(O[P]->3(C(C)C)C(C)C)c1"
 
-    screened = rx.metal(smiles, "square_planar")
-    unrestricted = rx.metal(smiles, "square_planar", screen=False)
+
+def test_pocop_pincer_nickel_keeps_only_the_trans_state():
+    screened = rx.metal(_POCOP_NI, "square_planar")
+    unrestricted = rx.metal(_POCOP_NI, "square_planar", screen=False)
 
     assert len(screened) == 1
     assert screened[0].label == "trans"
@@ -769,34 +791,42 @@ def test_pocop_pincer_nickel_keeps_only_the_trans_state():
     _assert_embeds_as(screened[0])
 
 
-def test_observed_tethered_screen_keeps_the_matching_assignment(monkeypatch):
-    """The tether's own reach screen sets the real per-call orbit limit, not the module-wide MAX_EXHAUSTIVE_ORBITS:
-    this donor network's tether admits only one arrangement, so an exact-fit cap of 1 must still admit it.
-    """
-    smiles = "COC(=O)c1cc2O[P](C(C)C)(C(C)C)->[Ni+2]3(<-[Cl-])<-[c-]2c(O[P]->3(C(C)C)C(C)C)c1"
-    source = rx.embed(rx.metal(smiles, "square_planar")[0], n=1, seed=42, threads=1).mol
-    monkeypatch.setattr(metal_enumeration, "_screen_limit", lambda *_args: 1)
+def test_a_failed_ligand_reach_warns_that_no_arrangement_is_screened(monkeypatch, caplog):
+    """Without native reach the pincer keeps its unreachable cis state, so the result must say it is unscreened."""
+    import logging
 
-    isomers = rx.metal(source, "square_planar")
+    def inconsistent(_mol):
+        raise ValueError("native ligand reach bounds are inconsistent")
 
-    assert len(isomers) == 1
-    assert isomers[0].label == "trans"
+    monkeypatch.setattr(metal_enumeration, "ligand_reach", inconsistent)
+    with caplog.at_level(logging.WARNING, logger="rxembed.metal"):
+        assert len(rx.metal(_POCOP_NI, "square_planar")) == 2
+    assert "native ligand reach failed (native ligand reach bounds are inconsistent)" in caplog.text
+
+
+def test_screened_chelate_with_vacant_sites_enumerates_every_site_arrangement():
+    """En, Cl and Br on a pentagonal bipyramid leave three vacant sites, so the raw pool exceeds 4!."""
+    assert len(rx.metal("[NH2]1CC[NH2]->[Mo+3]<-1(<-[Cl-])<-[Br-]", "PBP", stereo="free")) == 30
 
 
 _EN_LA_HEXACHLORO_SQA = "[Cl-]->[La+3]1(<-[Cl-])(<-[Cl-])(<-[Cl-])(<-[Cl-])(<-[Cl-])<-[NH2]CC[NH2]->1"
 
 
-def test_chelate_edge_rule_keeps_every_isomer_on_a_hull_edge():
+def test_chelate_edge_rule_keeps_every_isomer_on_a_hull_edge(caplog):
     """En's two N donors sit on a square-antiprism hull edge in every screened isomer, never a diagonal.
 
     `screen=False` reaches more: the edge rule (like the reach screen) is a model claim, not a proof that a
-    wider placement is unreachable in principle.
+    wider placement is unreachable in principle, so it says when it acts.
     """
+    import logging
+
     mol = rx.parse_smiles(_EN_LA_HEXACHLORO_SQA)
     edges = hull_edges(tuple(map(tuple, vertex_dirs("square_antiprism"))))
     en_donors = {atom.GetIdx() for atom in mol.GetAtoms() if atom.GetSymbol() == "N"}
 
-    screened = rx.metal(mol, "SQA")
+    with caplog.at_level(logging.INFO, logger="rxembed.metal"):
+        screened = rx.metal(mol, "SQA")
+    assert "held 1 chelate pair(s) to polyhedron edges (screen=False lifts it)" in caplog.text
     for iso in screened:
         pair = frozenset(vertex for vertex, donor in enumerate(iso.vertices) if donor in en_donors)
         assert pair in edges, f"{iso.label}: en placed on a non-edge vertex pair {sorted(pair)}"
@@ -900,17 +930,29 @@ def test_enumeration_screen_requires_a_boolean(enumerate_isomers):
         enumerate_isomers(rx.parse_smiles(_MA2B2), screen=None)
 
 
-def test_explicit_bond_change_bypasses_ground_state_reach_screen():
+@pytest.mark.parametrize("stereo", ["bogus", {"point": "presrve"}, {"pointt": "racemic"}])
+def test_core_enumeration_rejects_an_unknown_stereo_mode(stereo):
+    with pytest.raises(ValueError, match="unknown stereo mode"):
+        rx.enumerate_isomers(rx.parse_smiles(_MA2B2), stereo=stereo)
+
+
+def test_explicit_bond_change_bypasses_ground_state_reach_screen(caplog):
+    import logging
+
     smiles = "CC(C)(C)[P]1(C(C)(C)C)C(C)(C)C[H]->[Pd+2]<-1(<-[Br-])<-[c-]1cscn1"
     mol = rx.parse_smiles(smiles)
     hydrogen = next(a for a in mol.GetAtoms() if a.GetAtomicNum() == 1)
     carbon = next(a for a in hydrogen.GetNeighbors() if a.GetAtomicNum() == 6)
 
-    assert len(rx.metal(mol, "SPL", fix={(carbon.GetIdx(), hydrogen.GetIdx()): 2.0})) == 3
+    with caplog.at_level(logging.INFO, logger="rxembed.metal"):
+        assert len(rx.metal(mol, "SPL", fix={(carbon.GetIdx(), hydrogen.GetIdx()): 2.0})) == 3
+    assert "fix= is set, so neither the reach screen nor the edge rule applies" in caplog.text
 
 
 @pytest.mark.parametrize("screen", [True, False])
-def test_multimetal_numeric_fix_bypasses_ground_state_reach_screen(screen):
+def test_multimetal_numeric_fix_bypasses_ground_state_reach_screen(screen, caplog):
+    import logging
+
     smiles = "CC(C)(C)[P]1(C(C)(C)C)C(C)(C)C[H]->[Pd+2]<-1(<-[Br-])<-[c-]1cscn1"
     first = rx.embed(rx.metal(smiles, "SPL")[0], n=1, seed=42, threads=1).mol
     second = rx.embed(rx.metal("N->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]", "SPL")[0], n=1, seed=42, threads=1).mol
@@ -920,13 +962,18 @@ def test_multimetal_numeric_fix_bypasses_ground_state_reach_screen(screen):
     )
     carbon = next(a for a in hydrogen.GetNeighbors() if a.GetAtomicNum() == 6)
 
-    ordinary = rx.metal(combined, center="all", stereo="free", screen=screen)
+    with caplog.at_level(logging.INFO, logger="rxembed.metal"):
+        ordinary = rx.metal(combined, center="all", stereo="free", screen=screen)
     assert len(ordinary) == (2 if screen else 3)
     assert len({rx.cxsmiles(iso) for iso in ordinary}) == len(ordinary)
-    isomers = rx.metal(
-        combined, center="all", stereo="free", fix={(carbon.GetIdx(), hydrogen.GetIdx()): 2.0}, screen=screen
-    )
+    assert ("multi-metal sphere has no reach certificate or edge rule" in caplog.text) == screen
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="rxembed.metal"):
+        isomers = rx.metal(
+            combined, center="all", stereo="free", fix={(carbon.GetIdx(), hydrogen.GetIdx()): 2.0}, screen=screen
+        )
     assert len(isomers) == 3
+    assert ("fix= is set" in caplog.text) == screen
 
 
 @pytest.mark.parametrize("geometry", [None, "square_planar"])
@@ -1324,8 +1371,8 @@ def test_bounded_bite_box_still_embeds_the_reference_isomer(tmqmg_id, geometry):
     assert accepted
 
 
-def _valrae_reference():
-    """Load VALRAE's crystal-matching reference isomer: square_pyramidal, a near-tie input vs TBP."""
+def _boryl_pincer_iridium_reference():
+    """Load the crystal-matching isomer of an Ir(III) PBP boryl pincer dichloride (tmQMg VALRAE)."""
     charges = {
         row["id"]: int(row["charge"]) for row in csv.DictReader((TMQMG_DIR / "tmQMg_properties_and_targets.csv").open())
     }
@@ -1343,15 +1390,13 @@ def _valrae_reference():
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 @pytest.mark.skipif(not TMQMG_DIR.is_dir(), reason="needs a local tmQMg clone")
 @pytest.mark.parametrize("seed", range(1, 21))
-def test_valrae_near_tie_reference_embeds_at_every_seed(seed):
-    """VALRAE's reference sits at a near-tie input (square_pyramidal vs trigonal_bipyramidal, gap < `_FIT_MARGIN`).
+def test_near_tie_boryl_pincer_iridium_embeds_at_every_seed(seed):
+    """The boryl pincer's square pyramid reads within `_FIT_MARGIN` of a trigonal bipyramid (tmQMg VALRAE).
 
-    Rule B accepts the output whenever the requested shape reads within `_FIT_MARGIN` of the best, instead
-    of the pre-rule-B gate retrying until a clear square_pyramidal survives, which failed outright at 4 of
-    the first 5 seeds. Which of the two reads as the outright best is not this test's contract; a face-rule
-    embed reads square_pyramidal outright at every one of these seeds, where an unfolded one only tied it.
+    The acceptance gate takes the requested shape whenever it reads within `_FIT_MARGIN` of the best, so the
+    reference embeds at every seed. Which of the two reads as the outright best is not this test's contract.
     """
-    ref = _valrae_reference()
+    ref = _boryl_pincer_iridium_reference()
     assert ref.geometry == "square_pyramidal"
     ensemble = rx.embed(ref, n=1, seed=seed, threads=1)
     assert ensemble.n == 1

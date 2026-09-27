@@ -17,7 +17,7 @@ import numpy as np
 from rdkit import Chem, DistanceGeometry, rdBase
 from rdkit.Chem import rdDistGeom, rdMolDescriptors
 
-from .constraints import DIST_ATOMS, FIX_DISTANCE_TOL
+from .constraints import DIST_ATOMS, metal_distance_tolerance
 from .mechanisms import MECHANISM_ORDER, DGContext, triangle_angles, triangle_distances
 from .metal_core import COORDINATION_METALS, materialise_phantoms
 from .relax import bonding_failure
@@ -26,7 +26,6 @@ from .utils import atom_label
 logger = logging.getLogger("rxembed.bounds")  # under the "rxembed" tree `set_verbose` configures
 
 DEFAULT_SEED = 0xF00D  # the one embed seed default; a probe may state its own, but never *no* seed
-_SMOOTH_LOOSE = 0.1  # smoothing beyond this means the constraints are genuinely contradictory, not merely tight
 MAX_SEED_COUNT = 250  # bound one RDKit DG search; stereo selection reuses this ceiling in small serial batches
 
 
@@ -45,17 +44,15 @@ def _smooth(bm, max_tol=0.4):
 
     Positive tolerance permits RDKit to repair crossed bounds, including ligand internals, by raising the
     upper bound to the lower. It is a fraction of the upper bound, not a distance. Each retry starts from
-    the original matrix; `_feasible_bounds` names the repaired pair by diffing it against that original.
+    the original matrix.
     """
     back = bm.copy()
     tol = 0.0
     while not DistanceGeometry.DoTriangleSmoothing(bm, tol):
         tol = 1.2 * tol + 0.02
         if tol > max_tol:
-            raise RuntimeError("triangle smoothing failed")
+            raise RuntimeError("triangle smoothing failed: the bounds contradict each other; loosen fix=/constrain=")
         bm[:] = back
-    if tol > _SMOOTH_LOOSE:  # `_feasible_bounds` owns the user-facing narrative and names the pair there
-        logger.debug("smoothing repaired a %.0f%% bound crossover", tol * 100.0)
     return tol
 
 
@@ -103,7 +100,7 @@ class EmbedParams:
         if self.knowledge is not None and not isinstance(self.knowledge, bool):
             raise TypeError("knowledge must be True, False or None")
         if int(self.seed) < 0:
-            raise ValueError(f"seed={self.seed}: a negative seed draws from RDKit's global RNG and is not reproducible")
+            raise ValueError(f"seed={self.seed}: a negative seed is not reproducible; give a seed >= 0")
         if self.native is None:
             return
         if not isinstance(self.native, rdDistGeom.EmbedParameters):
@@ -134,9 +131,11 @@ def resolve_params(params, seed, threads):
         kwargs = {k: v for k, v in (("seed", seed), ("threads", threads)) if v is not None}
         return EmbedParams(**kwargs)
     if not isinstance(params, EmbedParams):
-        raise TypeError("wrap it: EmbedParams(native=...)")
+        raise TypeError(
+            f"params= takes EmbedParams, got {type(params).__name__}; wrap an RDKit object as EmbedParams(native=...)"
+        )
     if seed is not None or threads is not None:
-        raise ValueError("pass them inside params: dataclasses.replace(params, seed=...)")
+        raise ValueError("seed=/threads= and params= both set sampling; use dataclasses.replace(params, seed=...)")
     return params
 
 
@@ -175,16 +174,12 @@ def _chain_upper(bm, path):
 def ligand_reach(mol):
     """Close native ligand bounds with torsion-independent three-bond upper limits for enumeration.
 
-    Native 1-4/1-5 bounds include conformational preferences. Removing them also loses useful free-torsion
-    reach, which triangle smoothing alone cannot recover. Project that consequence from one unmodified
-    1-2/1-3 basis before smoothing. A ring-closed path keeps RDKit's native 1-4 lower bound: unlike an
-    acyclic chain, its closure is a graph constraint rather than a free torsion (NITWIY). The native 1-4
-    upper bound only carries over when the central bond is aromatic; RDKit derives any other ring bond's
-    1-4 upper bound from an sp2-sp2 cis template regardless of ring size (`_getShareRingBond14Type`), which
-    is a hybridisation preference, not a ring constraint, and otherwise underestimates a saturated-ring
-    torsion (JOYDIK: a thiourea S...S reach twisted by a diazepane ring). This is a model upper bound,
-    not proof of whole-ligand realizability; embedding still retains RDKit's torsion knowledge.
-    Unsupported local projections abstain.
+    Native 1-4/1-5 bounds encode conformational preferences, so each three-bond upper limit is projected from
+    the unmodified 1-2/1-3 basis instead; a path it cannot project abstains. A ring-closed path keeps RDKit's
+    1-4 lower bound, a graph constraint rather than a free torsion (NITWIY), and its 1-4 upper bound only
+    across an aromatic bond: RDKit takes any other ring bond's from an sp2-sp2 cis template
+    (`_getShareRingBond14Type`), which underestimates a saturated-ring torsion (JOYDIK). The result is a
+    model upper bound, not proof that the whole ligand is realisable.
     """
     with rdBase.BlockLogs():
         basis = rdDistGeom.GetMoleculeBoundsMatrix(mol, set14bounds=False, set15bounds=False, doTriangleSmoothing=False)
@@ -202,7 +197,7 @@ def ligand_reach(mol):
         else:
             reach[a, b] = min(reach[a, b], _chain_upper(basis, path))
     if not DistanceGeometry.DoTriangleSmoothing(reach):
-        raise ValueError("native ligand reach bounds are inconsistent")
+        raise ValueError("native ligand reach bounds are inconsistent; check the ligand graph's bonds and charges")
     return reach
 
 
@@ -247,16 +242,11 @@ def _fragment_components(mol, cons):
 def fragment_contacts(mol, cons, bm):
     """Return ``{(i, j): (floor, ceiling)}`` keeping every free cross-component heavy pair in contact range.
 
-    RDKit's own bounds matrix already gives a far pair a lower bound at the van der Waals sum, including a
-    pair split across fragments, but leaves the upper bound at its raw "no information" default for any pair
-    with no bonded path between them -- true of every cross-component pair. Nothing then stops distance
-    geometry placing a free component arbitrarily far away. Fragments repel at their van der Waals floors
-    and stay within contact range: every cross-component pair gets the same ceiling, RDKit's own floor for
-    that pair plus each side's own reach (its largest known intra-component span) plus contact slack. No
+    RDKit leaves a pair with no bonded path at its raw "no information" upper bound, so nothing stops distance
+    geometry placing a free component arbitrarily far away. Every cross-component pair gets one ceiling:
+    RDKit's own van der Waals floor, plus each side's largest intra-component span, plus contact slack. No
     pair is singled out, so a fragment settles wherever distance geometry puts it, a vacant metal site if
-    one fits, otherwise anywhere within that shared range. This is the one rule for keeping free components
-    together; any caller that must re-bound them after releasing other holds (`Ensemble.mc`'s explore pass)
-    uses it too, rather than a probe conformer and a single chosen pair.
+    one fits. This is the one rule for keeping free components together.
     """
     components = _fragment_components(mol, cons)
     if components is None:
@@ -306,21 +296,18 @@ def coordination_reach_base(mol, reach, metals):
 
 
 def coordination_reach(mol, cons, reach, *, native=None):
-    """Intersect compiled targets with native ligand reach, without repairing incompatible model priors.
+    """Intersect compiled targets with native ligand reach into an enumeration outer bound, repairing nothing.
 
-    An enumeration outer bound, not the embedding matrix: native ligand 1-2/1-3 intervals and free-torsion
-    upper reach are kept, nonbonded floors come only from `cons`, and the publication tolerance is added to
-    real metal-distance windows so the screen cannot reject their accepted boundary. Every angle projects
-    from the same closed side intervals, so dictionary order cannot change a leg. Virtual-centroid rows are
-    omitted: a native interval is only a seed prior, and a hard centroid equality there could turn an
-    accepted ligand distortion into a false exclusion; the caller already excludes externally constrained
-    graphs, so the omission cannot strengthen this bound.
+    Nonbonded floors come only from `cons`, and each real metal-distance window is widened by its publication
+    tolerance, so the screen cannot reject a boundary publication accepts. Every angle projects from the same
+    smoothed side intervals, so dictionary order cannot change a leg. Haptic-centroid rows are omitted: a hard
+    centroid equality could turn an accepted ligand distortion into a false exclusion.
     """
     matrix = coordination_reach_base(mol, reach, cons.metals) if native is None else native.copy()
     for atoms, (lo, hi) in cons.distances.items():
         if cons.haptic.keys() & set(atoms):
             continue
-        tolerance = FIX_DISTANCE_TOL if cons.metals.intersection(atoms) else 0.0
+        tolerance = metal_distance_tolerance(atoms, cons) if cons.metals.intersection(atoms) else 0.0
         _put(matrix, atoms, (max(0.0, lo - tolerance), hi + tolerance))
     for atoms, floor in cons.floors.items():
         if cons.haptic.keys() & set(atoms):
@@ -345,9 +332,6 @@ def _write(mol, cons, params=None):
     The phase order is the algorithm, and this is the only place it is stated; each mechanism
     (`mechanisms.py`) says what it writes, never when. RELIEVE must precede COMMIT so an explicit
     window always beats a floor relief; POST must follow it so the coplanar bound can read committed legs.
-
-    Separate from `_bounds` because smoothing repairs in place: `_feasible_bounds` needs the matrix as
-    written, before repair, to diff against the smoothed result.
     """
     # `seed_conformers` temporarily adds dative M-L edges so RDKit sees a labelled donor's full CIP basis and a
     # terminal sp donor's linear axis. Remove only edges owned by a selected metal's explicit M-L distance, on a
@@ -385,12 +369,6 @@ def _write(mol, cons, params=None):
     return ctx
 
 
-def _bounds(mol, cons, params=None):
-    """Edit RDKit's bounds matrix with every constraint; return ``(matrix, settled tolerance)``."""
-    bm = _write(mol, cons, params).bm
-    return bm, _smooth(bm)  # SMOOTH; the settled tolerance travels with the matrix
-
-
 def _feasible_bounds(mol, cons, params=None):
     """Build smoothed seed bounds and report the pair implicated in any repair.
 
@@ -400,11 +378,12 @@ def _feasible_bounds(mol, cons, params=None):
     shortest-path closure, which this function does not compute. The repair only shapes seeds, so it warns
     only when the named pair is the caller's own `fix`/`constrain` distance.
     """
-    bm, tol = _bounds(mol, cons, params)
+    ctx = _write(mol, cons, params)
+    bm, written = ctx.bm, ctx.bm.copy()
+    tol = _smooth(bm)
     if tol <= 0.0:
         return bm, tol  # no triangle contradiction detected; full embedding and validation are still required
-    ctx = _write(mol, cons, params)  # rebuild the pre-smoothing matrix to diff the repair against
-    diff = np.abs(np.asarray(bm, float) - ctx.bm)
+    diff = np.abs(np.asarray(bm, float) - written)
     changed = np.triu(np.maximum(diff, diff.T), 1)  # either bound moving counts, so fold lower onto upper
     stated = [(min(i, j), max(i, j)) for i, j in ctx.pairs]
     named = max(stated, key=lambda p: changed[p], default=None)
@@ -438,7 +417,7 @@ def _bring_real_confs(mol, work, ids):
 def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attempts=0):
     """Generate ``n`` new conformers with native RDKit parameters and edited bounds."""
     work = materialise_phantoms(mol, cons.haptic)  # transient centroid dummies for a haptic face; `mol` else
-    constrained = bool(cons.distances or cons.angles or cons.planes or cons.coplanar)
+    edits_bounds = bool(cons.distances or cons.angles or cons.planes or cons.coplanar)
     search_count = int(n)
     embed_params = params.native
     seed, threads = params.seed, params.threads
@@ -456,7 +435,7 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
         p.maxIterations = int(max_attempts)
         p.trackFailures = True
     multi_fragment = len(Chem.GetMolFrags(work)) > 1
-    if embed_params is not None or constrained or multi_fragment:
+    if embed_params is not None or edits_bounds or multi_fragment:
         # Always replace a supplied object's matrix: it may belong to a previous candidate or helper graph.
         # These switches affect only our matrix edits. UFF and publication retain the complete Constraints.
         dg = (
@@ -530,10 +509,10 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
 def seed_count(mol, constrained=False):
     """Return the RDKit DG seed count, scaled by rotatable-bond count rather than a flat default.
 
-    A constrained run gets ~1.6x more, because openconf's pose-frozen search is rotor-only and under-samples
-    unless handed more distinct starting points. An unconstrained ``.mc()`` re-seeds and replaces these.
+    A constrained run gets about 1.6x more, because its seeds are pose-frozen and any later rotor search can
+    only spread from the distinct starting points it is handed. The multipliers are unmeasured.
     """
     r = rdMolDescriptors.CalcNumRotatableBonds(mol)
     if constrained:
         return min(MAX_SEED_COUNT, max(40, 10 * r))
-    return min(150, max(24, 6 * r))  # cf. openconf max(20, 3*r); a touch more for biased seeds
+    return min(150, max(24, 6 * r))

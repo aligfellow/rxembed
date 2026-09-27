@@ -364,6 +364,25 @@ def test_equivalent_chelate_arms_do_not_create_donor_point_stereo():
     assert (n_unassigned, total, unresolved) == (0, 1, 0)
 
 
+@pytest.mark.parametrize(
+    ("smiles", "unresolved"),
+    [
+        ("Cc1ccc2c(c1)CN1Cc3cc(C)ccc3N(C1)C2", 1),
+        ("ClN1CC1C", 1),
+        ("COc1ccc2nccc(C(O)C3CC4CCN3CC4C=C)c2c1", 0),
+    ],
+    ids=[
+        "troger-base-chiral-cage",
+        "n-chloro-2-methylaziridine-three-ring",
+        "quinine-carbon-bridgehead-holds-the-cage",
+    ],
+)
+def test_stable_nitrogen_is_reported_only_when_its_hand_is_free(smiles, unresolved):
+    # RDKit holds a bridgehead or three-ring N but cannot measure a three-carrier N from 3D, so a free hand is
+    # reported. A bridgehead N's hand is the cage's, which the quinuclidine's carbon bridgehead already carries.
+    assert stereo.enumerate_unassigned(_mol(smiles))[3] == unresolved
+
+
 @pytest.mark.parametrize("symbol", ["P", "As"])
 def test_three_coordinate_pnictogen_is_reported_unresolved_instead_of_enumerated(symbol):
     variants, n_unassigned, total, unresolved = stereo.enumerate_unassigned(_mol(f"F[{symbol}](Cl)C"))
@@ -457,6 +476,13 @@ def test_eta2_alkene_is_not_coordination_locked():
     assert set(_labels(mol, exclude=metals)) == {"C1=C2:E", "C1=C2:Z"}
 
 
+def test_metallacyclopentene_central_double_bond_is_the_diene_class_not_ez():
+    """Drawn as a sigma2,pi metallacyclopentene, a diene's central C=C is its s-cis/s-trans class, not E/Z."""
+    mol, metals = _with_metals("C[C]1->2=[C]->3(C)[CH2-]->[Zr+2]23<-[CH2-]1")
+    assert frozenset((1, 2)) in stereo.coordination_locked_double_bonds(mol, metals)
+    assert stereo.unassigned_centres(mol, exclude=metals) == []
+
+
 @pytest.mark.parametrize(
     ("smiles", "expected"),
     [
@@ -538,15 +564,24 @@ def test_coordinate_free_ez_is_enumerated_only_when_resonance_stable(capfd):
     assert "Pre-condition Violation" not in capfd.readouterr().err
 
 
-def test_inferred_ez_abstains_when_resonance_search_hits_its_cap(monkeypatch):
-    mol = _mol(r"F/C=C/Cl")
-    bond = next(bond.GetIdx() for bond in mol.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE)
+def test_inferred_ez_abstains_when_resonance_search_hits_its_cap(monkeypatch, caplog):
     monkeypatch.setattr(stereo, "_RESONANCE_EZ_CAP", 0)
+    for smiles, kept in ((r"C/C=C/C", True), (r"C/C=C/C=O", False)):  # an isolated alkene; one in a conjugated group
+        mol = _mol(smiles)
+        bond = mol.GetBondBetweenAtoms(1, 2).GetIdx()
+        for structural in (False, True):
+            caplog.clear()
+            assert stereo._resonance_stable_ez(mol, [bond], set(), structural=structural) == ([bond] if kept else [])
+            assert ("1=2 left unassigned" in caplog.text) is not kept
+            assert stereo._resonance_stable_ez(mol, [bond], {bond}, structural=structural) == [bond]
 
-    assert stereo._resonance_stable_ez(mol, [bond], set()) == []
-    assert stereo._resonance_stable_ez(mol, [bond], {bond}) == [bond]
-    assert stereo._resonance_stable_ez(mol, [bond], set(), structural=True) == []
-    assert stereo._resonance_stable_ez(mol, [bond], {bond}, structural=True) == [bond]
+
+def test_propenyl_ez_is_enumerated_beside_six_carboxylates():
+    # Six independent carboxylates give 64 resonance forms, past the search cap; the isolated C=C is in none.
+    carboxylates = "C(C(=O)[O-])C(C(=O)[O-])C(C(=O)[O-])C(C(=O)[O-])C(C(=O)[O-])C(=O)[O-]"
+    mol = Chem.AddHs(_mol("CC=CCC" + carboxylates))
+
+    assert (1, 2) in stereo.unassigned_centres(mol)
 
 
 def test_coordinate_free_donor_imine_in_a_large_chelate_keeps_ez():
@@ -627,3 +662,13 @@ def test_same_element_metal_bridge_uses_the_full_ligand_spheres():
     )
     assert [label for _, label in variants] == [""]
     assert (n_unassigned, total, unresolved) == (0, 1, 0)
+
+
+@pytest.mark.parametrize("order", [[0, 1, 2, 3, 4], [4, 3, 2, 1, 0], [3, 4, 2, 1, 0]])
+def test_cx_encoded_e_applies_as_e_in_any_atom_order(order):
+    mol = Chem.RenumberAtoms(_mol("CC=C(Cl)Br |atomProp:1._rxEZ0.E:2._rxEZ0.E|"), order)
+
+    stereo.apply_encoded_bond_stereo(mol)
+
+    bond = mol.GetBondBetweenAtoms(order.index(1), order.index(2))
+    assert stereo.bond_stereo_code(mol, bond.GetIdx()) == "E"

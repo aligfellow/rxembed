@@ -153,8 +153,9 @@ def test_haptic_sp_atom_skips_sigma_contraction():
     donors = {a, b}
     assert metal_distance.ligand_degree(mol.GetAtomWithIdx(a)) == 1, "isolate hapticity from the terminal-donor guard"
     assert metal_distance._hapticity(mol, a, donors) == 2
-    sp = metal_distance.ml_distance(mol, metal, a, 26, donors, {}, hyb={a: Chem.HybridizationType.SP})
-    sp2 = metal_distance.ml_distance(mol, metal, a, 26, donors, {}, hyb={a: Chem.HybridizationType.SP2})
+    q = metal_distance.delocalised_charges(mol)
+    sp = metal_distance.ml_distance(mol, metal, a, 26, donors, q, hyb={a: Chem.HybridizationType.SP})
+    sp2 = metal_distance.ml_distance(mol, metal, a, 26, donors, q, hyb={a: Chem.HybridizationType.SP2})
     assert sp == sp2, "the sigma-only SP contraction reached a multi-atom haptic face"
 
 
@@ -169,8 +170,9 @@ def test_sigma_sp_contraction_requires_a_terminal_ligand_axis(smiles, terminal):
         donor = mol.GetAtomWithIdx(metal).GetNeighbors()[0].GetIdx()
         donors = {donor}
         assert metal_distance._hapticity(mol, donor, donors) == 0
-        sp = metal_distance.ml_distance(mol, metal, donor, 78, donors, {}, hyb={donor: Chem.HybridizationType.SP})
-        sp2 = metal_distance.ml_distance(mol, metal, donor, 78, donors, {}, hyb={donor: Chem.HybridizationType.SP2})
+        q = metal_distance.delocalised_charges(mol)
+        sp = metal_distance.ml_distance(mol, metal, donor, 78, donors, q, hyb={donor: Chem.HybridizationType.SP})
+        sp2 = metal_distance.ml_distance(mol, metal, donor, 78, donors, q, hyb={donor: Chem.HybridizationType.SP2})
         if terminal:
             assert sp < sp2, "a terminal sp donor should contract relative to sp2"
         else:
@@ -210,7 +212,7 @@ def test_coordinate_backed_chelate_windows_use_the_same_radial_policy():
     }
     cons = rx.Constraints(distances=distances)
 
-    metal_distance.ff_terms(mol, cons, {metal: (46, [n_left, n_right, chloride, bromide])})
+    metal_distance.ff_terms(mol, cons, metal, 46, [n_left, n_right, chloride, bromide])
 
     assert (metal, n_left) not in cons.pulls
     assert (metal, n_right) not in cons.pulls
@@ -218,7 +220,7 @@ def test_coordinate_backed_chelate_windows_use_the_same_radial_policy():
     assert cons.pulls[(metal, bromide)] == pytest.approx(2.2)
     mol.RemoveAllConformers()
     without_coordinates = rx.Constraints(distances=distances)
-    metal_distance.ff_terms(mol, without_coordinates, {metal: (46, [n_left, n_right, chloride, bromide])})
+    metal_distance.ff_terms(mol, without_coordinates, metal, 46, [n_left, n_right, chloride, bromide])
     assert cons == without_coordinates
 
 

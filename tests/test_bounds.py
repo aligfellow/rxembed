@@ -15,7 +15,7 @@ from rdkit.Chem import rdDistGeom
 from rxembed import bounds as bnd
 from rxembed import mechanisms as mech
 from rxembed import metal_core
-from rxembed.constraints import FIX_DISTANCE_TOL, Constraints, add_distance
+from rxembed.constraints import ML_WINDOW_TOL, Constraints, add_distance
 
 
 def _graph(smiles):
@@ -287,7 +287,7 @@ def test_compiled_reach_uses_shared_legs_and_only_stated_floors():
     native = bnd.coordination_reach_base(mol, reach, cons.metals)
     np.testing.assert_array_equal(matrix, bnd.coordination_reach(mol, cons, reach, native=native))
     # Acute minimum is inside the length interval, using the same radial tolerance as publication.
-    assert matrix[2, 1] == pytest.approx((2.0 - FIX_DISTANCE_TOL) / 2)
+    assert matrix[2, 1] == pytest.approx((2.0 - ML_WINDOW_TOL) / 2)
     assert matrix[4, 0] == 1.5
     assert np.isinf(matrix[0, 4])
     assert matrix[4, 1] == 0
@@ -304,7 +304,7 @@ def test_compiled_reach_encloses_accepted_radial_boundary_without_changing_targe
     cons = Constraints(metals={0}, distances={(0, 1): (2.0, 2.0), (0, 2): (2.0, 2.0)}, angles={(1, 0, 2): (90.0, 90.0)})
     original = cons.copy()
     conf = Chem.Conformer(3)
-    radius = 2.0 + side * 0.75 * FIX_DISTANCE_TOL
+    radius = 2.0 + side * 0.75 * ML_WINDOW_TOL  # inside publication's slack for a model M-L window
     conf.SetPositions(np.array(((0.0, 0.0, 0.0), (radius, 0.0, 0.0), (0.0, radius, 0.0))))
     mol.AddConformer(conf)
     assert _structural_failure(mol, 0, cons) is None
@@ -449,7 +449,7 @@ def test_private_native_bounds_rebuild_ring_perception(smiles, donors):
 
 
 # ---------------------------------------------------------------------------------------------------------
-# _bounds / _feasible_bounds: the edit, and what happens when it cannot be satisfied
+# _feasible_bounds: the edit, and what happens when it cannot be satisfied
 # ---------------------------------------------------------------------------------------------------------
 
 
@@ -458,7 +458,7 @@ def test_matrix_is_edited_not_replaced():
     before = _matrix(mol)
     assert before[1][0] > 1.0, "the C0-C1 lower bound is RDKit's own bond window: the premise"
 
-    after, tol = bnd._bounds(mol, Constraints(distances={(0, 2): (2.5, 2.6)}))
+    after, tol = bnd._feasible_bounds(mol, Constraints(distances={(0, 2): (2.5, 2.6)}))
     assert (after[0][2], after[2][0]) == pytest.approx((2.6, 2.5))
     assert tol == 0.0
     assert (after[0][1], after[1][0]) == (before[0][1], before[1][0]), "a bonded pair was rewritten"
@@ -467,7 +467,7 @@ def test_matrix_is_edited_not_replaced():
 @pytest.mark.parametrize(
     ("build", "hidden"),
     [
-        (lambda: bnd._bounds(_graph("C[S-]"), Constraints(distances={(0, 1): (1.7, 1.9)})), "UFFTYPER"),
+        (lambda: bnd._feasible_bounds(_graph("C[S-]"), Constraints(distances={(0, 1): (1.7, 1.9)})), "UFFTYPER"),
         (
             # the hydride's own construction warns too; `partial` builds it at collection time, so only the
             # seeding call itself is under test. This fragment only embeds with a random start, so ask for
@@ -694,8 +694,8 @@ def _rule_mol(smi):
 
 
 def _edited(mol, cons):
-    """The edited bounds matrix alone; `_bounds` also returns the tolerance it settled at."""
-    bm, _tol = bnd._bounds(mol, cons)
+    """The edited bounds matrix alone; `_feasible_bounds` also returns the tolerance it settled at."""
+    bm, _tol = bnd._feasible_bounds(mol, cons)
     return bm
 
 

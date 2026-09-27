@@ -15,7 +15,7 @@ from rdkit.Chem.rdMolTransforms import GetAngleDeg, GetBondLength, SetBondLength
 
 import rxembed as rx
 from rxembed import bounds as bnd
-from rxembed.constraints import FIX_ANGLE_TOL, FIX_DISTANCE_TOL, Constraints, resolve_core
+from rxembed.constraints import FIX_ANGLE_TOL, FIX_DISTANCE_TOL, ML_WINDOW_TOL, Constraints, resolve_core
 from rxembed.embed import BASE_STIFFNESS, Conformers, Failure, embed, fold_substrate, minimize
 from rxembed.metal_core import COORDINATION_METALS, VACANT, donor_chirality_sign, metal_indices, state_with_winding
 from rxembed.metal_enumeration import enumerate_isomers
@@ -333,7 +333,7 @@ def test_structural_failure_reports_excess_below_display_precision():
     """An M-L excess below display precision (0.0004 A) is still reported, not rounded away to zero."""
     mol = Chem.MolFromSmiles("[He].[He]")
     conf = Chem.Conformer(2)
-    conf.SetPositions(np.array(((0, 0, 0), (2.1 + emb._ML_WINDOW_TOL + 0.0004, 0, 0))))
+    conf.SetPositions(np.array(((0, 0, 0), (2.1 + ML_WINDOW_TOL + 0.0004, 0, 0))))
     mol.AddConformer(conf)
     cons = Constraints(metals={0}, distances={(0, 1): (2.0, 2.1)})
 
@@ -708,12 +708,10 @@ def test_high_force_candidate_and_stable_coordination_use_kind_not_message_wordi
     reworded_ml = Failure("ml_distance", "a completely reworded M-L overshoot message")
     assert emb._high_force_candidate(reworded_ml)
     assert not emb._high_force_candidate(Failure("structural_constraint", "M-L distance (0, 1): 2.2 A"))
-    assert not emb._high_force_candidate("M-L distance (0, 1): not a Failure")
 
     reworded_shape = Failure("coordination_shape", "a completely reworded shape mismatch message")
     assert emb._stable_coordination_failure(reworded_shape)
     assert not emb._stable_coordination_failure(Failure("metal_state", "coordination state at M0 is nonplanar"))
-    assert not emb._stable_coordination_failure("coordination state at M0: not a Failure")
 
 
 def test_stiffness_ladder_retries_only_the_unresolved_conformer(monkeypatch):
@@ -732,8 +730,9 @@ def test_stiffness_ladder_retries_only_the_unresolved_conformer(monkeypatch):
             record.statuses.update(dict.fromkeys(ids, 0))
         return np.zeros(len(ids))
 
-    def injected_failure(_self, cid, _iso=None):
-        return "heavy-atom bonding/clash failure" if cid == victim and latest[cid] == BASE_STIFFNESS else None
+    def injected_failure(_self, cid):
+        missed = Failure("structural_constraint", "missed structural constraint")
+        return missed if cid == victim and latest[cid] == BASE_STIFFNESS else None
 
     monkeypatch.setattr(emb, "restrained_uff", marked_uff)
     monkeypatch.setattr(Conformers, "_geometry_failure", injected_failure)
@@ -850,7 +849,7 @@ def test_finite_gate_valid_max_iteration_endpoint_is_retained(monkeypatch):
         return np.zeros(len(conf_ids))
 
     monkeypatch.setattr(emb, "restrained_uff", stalled_uff)
-    monkeypatch.setattr(Conformers, "_geometry_failure", lambda _self, _cid, _iso=None: None)
+    monkeypatch.setattr(Conformers, "_geometry_failure", lambda _self, _cid: None)
     confs._relax_constrained(BASE_STIFFNESS, max_iters=10)
 
     assert calls == [10]
@@ -1096,7 +1095,7 @@ def test_relax_retry_rejects_an_inverted_donor_hand(monkeypatch, caplog):
         return np.zeros(len(conf_ids))
 
     monkeypatch.setattr(emb, "restrained_uff", reflect)
-    monkeypatch.setattr(Conformers, "_geometry_failure", lambda _self, _cid, _iso=None: None)
+    monkeypatch.setattr(Conformers, "_geometry_failure", lambda _self, _cid: None)
     with caplog.at_level(logging.DEBUG, logger="rxembed"):
         confs._relax_constrained(BASE_STIFFNESS, 10)
 
@@ -1128,7 +1127,7 @@ def test_relax_retry_can_recover_a_donor_hand_at_a_stronger_rung(monkeypatch):
         return np.zeros(len(conf_ids))
 
     monkeypatch.setattr(emb, "restrained_uff", flip_once)
-    monkeypatch.setattr(Conformers, "_geometry_failure", lambda _self, _cid, _iso=None: None)
+    monkeypatch.setattr(Conformers, "_geometry_failure", lambda _self, _cid: None)
 
     confs._relax_constrained(BASE_STIFFNESS, 10)
 
@@ -1146,7 +1145,7 @@ def test_relax_failure_keeps_the_first_physical_reason_when_donor_hand_also_chan
     monkeypatch.setattr(
         Conformers,
         "_geometry_failure",
-        lambda _self, _cid, _iso=None: Failure("bonding", "heavy-atom bonding/clash failure"),
+        lambda _self, _cid: Failure("bonding", "heavy-atom bonding/clash failure"),
     )
     monkeypatch.setattr(
         emb,
@@ -1184,9 +1183,7 @@ def test_trajectory_keeps_only_the_accepted_stiffness(monkeypatch):
     monkeypatch.setattr(
         Conformers,
         "_geometry_failure",
-        lambda _self, _cid, _iso=None: (
-            Failure("structural_constraint", "injected failure") if len(attempts) < 2 else None
-        ),
+        lambda _self, _cid: Failure("structural_constraint", "injected failure") if len(attempts) < 2 else None,
     )
     frames = []
     confs._relax_constrained(BASE_STIFFNESS, _frames=frames)
@@ -1831,6 +1828,24 @@ def test_replacement_stops_when_every_seed_crosses_to_another_seating(monkeypatc
     result = owner._replace_failed([victim], BASE_STIFFNESS, 1)
 
     assert len(calls) == 1, "a crossed seating is a different arrangement, not worth a further batch"
+    assert result == [victim]
+
+
+def test_replacement_crossing_stop_reads_this_batchs_ladder_not_an_earlier_one(monkeypatch):
+    """A batch whose ladder tore a bond, not a shape, is not a batch whose every seed crossed its seating."""
+    wrong_shape = Failure("coordination_shape", "coordination state at M0 is nonplanar", atoms=(0,))
+    crossed = Failure("seating_crossed", "coordination state at M0 crossed its donor-slot seating", atoms=(0,))
+    tear = Failure("bonding", "bond C3-C6 stretched to 2.50 A", atoms=(3, 6))
+    owner, victim, calls = _replacement_owner(
+        monkeypatch,
+        accept=lambda self, *_a, **_k: {crossed: list(self.ids)},
+        relax_failures={_REPLACEMENT_VICTIM: wrong_shape},  # the original ladder's reason, not this batch's
+        ladder=tear,
+    )
+
+    result = owner._replace_failed([victim], BASE_STIFFNESS, 1)
+
+    assert len(calls) == 2, "the batch tore the same bond twice; an earlier shape failure must not stop it at one"
     assert result == [victim]
 
 

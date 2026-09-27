@@ -122,7 +122,7 @@ def conjugated_quartets(mol, exclude=frozenset()):
     """Yield each ``(a, c, x, s)`` quartet whose A=C-X-S dihedral measures a conjugation plane.
 
     A single, non-ring bond X-C (X in N/O, C bearing a double bond to A) where X carries a substituent S. The
-    sole perception both ``geometry.conjugation`` and ``ConjugationCap`` read, so they cannot name different
+    sole perception both ``pipeline.geom_check`` and ``ConjugationCap`` read, so they cannot name different
     atoms. ``exclude`` drops a quartet whose X or C is a frozen / metal atom, as the gate does.
     """
     for b in mol.GetBonds():
@@ -176,6 +176,18 @@ def lone_pair_electrons(atom, metals):
     return _PT.GetNOuterElecs(atom.GetAtomicNum()) - atom.GetFormalCharge() - (atom.GetTotalValence() - to_metal)
 
 
+def hydrogen_bond(hydrogen, partner, metals) -> bool:
+    """Return whether a hydrogen's extra contact to `partner` is a hydrogen bond rather than a bond.
+
+    A partner that keeps a lone pair (X-H...Y) accepts the hydrogen noncovalently, so the contact is an NCI a
+    caller states, not constitution. A partner without one (B-H-B) shares the hydrogen's pair in a three-centre
+    bond, and a metal partner makes a bridging hydride; both are bonding.
+    """
+    return (
+        hydrogen.GetAtomicNum() == 1 and partner.GetIdx() not in metals and lone_pair_electrons(partner, metals) >= 2  # noqa: PLR2004  one lone pair
+    )
+
+
 def bond_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     """Return the a-b-c angle in degrees, or NaN when a leg has zero length."""
     u, w = a - b, c - b
@@ -206,25 +218,19 @@ def mirror_tag(tag):
     return _MIRRORED.get(tag, tag)
 
 
-def bond_removal_mirrors(atom, partner) -> bool:
+def bond_removal_mirrors(atom, partner, degrees=(_TETRAHEDRAL_DEGREE,)) -> bool:
     """Return whether removing the bond to `partner` changes `atom`'s tetrahedral-tag parity.
 
     RDKit's CW/CCW tag is relative to ``atom.GetBonds()`` order. Removing slot ``p`` changes that basis by
     ``n - 1 - p`` swaps, so an odd count needs the tag mirrored. Call this on the graph that still has the
     bond, even before a tag exists; the same correction applies inversely when grafting one. A plain
-    ``AddBond`` needs no correction, since RDKit appends the new bond last. Defined only at degree four:
-    higher degrees are left unchanged, and lower degrees have no representable tetrahedral chirality.
+    ``AddBond`` needs no correction, since RDKit appends the new bond last. Defined by default only at degree
+    four: higher degrees are left unchanged, and lower degrees have no representable tetrahedral chirality.
+    Replacing the neighbour by an appended one moves the same slot, and a lone pair holds the fourth position
+    of a degree-three centre, so that caller passes ``degrees=(3, 4)``.
     """
     partners = [b.GetOtherAtomIdx(atom.GetIdx()) for b in atom.GetBonds()]
-    if len(partners) != _TETRAHEDRAL_DEGREE or partner not in partners:
-        return False
-    return (len(partners) - 1 - partners.index(partner)) % 2 == 1
-
-
-def bond_replacement_mirrors(atom, partner) -> bool:
-    """Return whether replacing a tetrahedral neighbour by an appended one changes tag parity."""
-    partners = [b.GetOtherAtomIdx(atom.GetIdx()) for b in atom.GetBonds()]
-    if len(partners) not in (3, 4) or partner not in partners:
+    if len(partners) not in degrees or partner not in partners:
         return False
     return (len(partners) - 1 - partners.index(partner)) % 2 == 1
 
@@ -233,7 +239,7 @@ def remove_bond(rw, i, j) -> None:
     """Remove a bond while preserving the geometry named by degree-four tetrahedral tags.
 
     RDKit does not update chiral tags on bond removal, so a direct `RemoveBond` can silently invert a
-    centre's handedness; every stereochemistry-sensitive edit uses this wrapper instead.
+    centre's handedness; an edit whose tags must survive uses this wrapper instead.
     """
     for a, other in ((int(i), int(j)), (int(j), int(i))):
         atom = rw.GetAtomWithIdx(a)
@@ -267,8 +273,8 @@ def assign_stereo_from_3d(mol, conf_id: int = -1) -> None:
     RDKit's 3D writer omits a donor-originating dative bond from the centre's neighbour basis, while its CIP
     and SMILES readers include it: the same sulfoxide geometry parses as CIP R but assigns from raw 3D as
     CIP S. Mirror a degree-four tag when that difference changes its parity, then refresh CIP labels.
-    Higher-degree tags are left unchanged, since the parity rule does not hold there. All production 3D
-    assignments use this wrapper.
+    Higher-degree tags are left unchanged, since the parity rule does not hold there. `stereo` calls RDKit
+    directly on its metal-free enumeration graph, which leaves a ligand-internal dative bond unrebased.
     """
     Chem.AssignStereochemistryFrom3D(mol, confId=conf_id)
     rebased = False

@@ -129,6 +129,22 @@ def test_validate_cx_flags_the_wrong_expected_cx(ref, tmp_path):
     assert result[1] == "validate:cx"
 
 
+# (Buta-1,3-diene)Fe(CO)3: once bound, the diene's s-cis and s-trans (P, M) forms are three isomers.
+_BUTADIENE_FE_CO3 = "[O+]#[C-]->[Fe]123(<-[C-]#[O+])(<-[C-]#[O+])<-[CH2]=[CH]->1[CH]->2=[CH2]->3"
+
+
+def test_validate_cx_rejects_an_s_cis_diene_written_for_its_s_trans_isomer(tmp_path):
+    isomers = {next(iter(iso.haptic_winding.values())): iso for iso in rx.metal(_BUTADIENE_FE_CO3, "TET")}
+    ens = rx.embed(isomers["c"], n=1, seed=7)
+    mol = Chem.Mol(ens.mol, False, ens.ids[0])
+    xyz = _written(mol, tmp_path)
+    for token, stage in (("c", ""), ("P", "validate:cx")):
+        result = run._validate(
+            _scaled(mol, 1.05), mol, ens, ens.ids[0], isomers[token], rx.cxsmiles(isomers[token]), 0, xyz
+        )
+        assert result[1] == stage
+
+
 def test_validate_geometry_flags_a_reported_violation(ref, tmp_path):
     mol = _scaled(ref, 1.05)
     iso = rx.metal(mol, observed_only=True)[0]

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from collections import Counter
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 
@@ -38,6 +39,7 @@ from .metal_donor_orient import (
 from .metal_perceive import rank_shapes, shape_reading
 from .metal_polyhedron import (
     CHELATE_SPAN_ANGLE,
+    FLOAT_CACHE,
     IMPROPER_VERTICES,
     POLYHEDRA,
     Polyhedron,
@@ -109,7 +111,8 @@ def _site_span(matrix, left, right):
 def _site_height(radius, member_lengths):
     """Estimate centroid distance using ``|M-c|^2 = mean(|M-member|^2) - R^2``.
 
-    Retain the existing 0.5 A scaffold floor; it is not a feasibility proof for fitted member distances.
+    The 0.5 A floor keeps a degenerate face's centroid off the metal; it is not a feasibility proof for fitted
+    member distances.
     """
     mean_squared_length = float(np.mean(np.square(member_lengths)))
     return float(np.sqrt(max(mean_squared_length - radius * radius, 0.25)))
@@ -190,11 +193,16 @@ def _hinge_push(sphere, face, c):
 LENGTHS = ("model", "input")
 
 
-def compile_context(mol):
-    """Return RDKit-derived data shared by repeated candidate constraint compilations."""
+def compile_context(mol, donor_bonds):
+    """Return RDKit-derived data shared by repeated candidate constraint compilations.
+
+    `donor_bonds` are the declared ``(donor, metal)`` pairs every candidate shares.
+    """
+    bound = Counter(d for d, _metal in donor_bonds)
     return {
         "fragments": frag_map(mol),
-        "hybridisation": stripped_hybridisation(mol),
+        "bound": bound,
+        "hybridisation": stripped_hybridisation(mol, bound),
         "charges": delocalised_charges(mol),
         "bounds": bounds_matrix(mol),
         "topology": Chem.GetDistanceMatrix(mol),
@@ -278,6 +286,7 @@ def compile_constraints(iso, *external, params=None, force_field=True, context=N
     params = EmbedParams() if params is None else params
     context = {} if context is None else context
     mol = iso.graph
+    _fact(context, "bound", lambda: Counter(d for d, _metal in iso.donor_bonds))
     base = iso.base_cons.copy(donor_orientation=params.donor_orientation, conjugation=params.conjugation)
     built = []
     if iso.constrained_metals:
@@ -317,22 +326,6 @@ def compile_constraints(iso, *external, params=None, force_field=True, context=N
     return out
 
 
-def _add_native_pair_floors(cons, mol, pairs, bounds=None):
-    """Keep unowned nonbonded pairs above RDKit's native lower bounds during restrained UFF."""
-    pairs = {
-        tuple(sorted(pair))
-        for pair in pairs
-        if mol.GetBondBetweenAtoms(*pair) is None
-        and tuple(sorted(pair)) not in cons.distances
-        and not graft_owns(pair, cons.frozen)
-    }
-    if not pairs:
-        return
-    bounds = bounds_matrix(mol) if bounds is None else bounds
-    for left, right in pairs:
-        cons.floors[(left, right)] = max(cons.floors.get((left, right), 0.0), float(bounds[right, left]))
-
-
 def _add_donor_angle_floors(cons, mol, bounds=None):
     """Keep constrained donor substituents inside RDKit's native 1-3 lower bounds during UFF."""
     pairs = set()
@@ -359,7 +352,16 @@ def _add_donor_angle_floors(cons, mol, bounds=None):
         for donor, left, right in pairs
         if (left, donor, right) not in cons.angles and (right, donor, left) not in cons.angles
     }
-    _add_native_pair_floors(cons, mol, pairs, bounds)
+    unowned = {
+        pair
+        for pair in pairs
+        if mol.GetBondBetweenAtoms(*pair) is None and pair not in cons.distances and not graft_owns(pair, cons.frozen)
+    }
+    if not unowned:
+        return
+    bounds = bounds_matrix(mol) if bounds is None else bounds
+    for left, right in unowned:  # keep each unowned 1-3 pair above RDKit's native lower bound during UFF
+        cons.floors[(left, right)] = max(cons.floors.get((left, right), 0.0), float(bounds[right, left]))
 
 
 def _add_point_umbrellas(cons, mol, stereo_label, donor_bonds):
@@ -429,9 +431,8 @@ def _bite_reach(left, right, span):
     """Return the donor-donor angle range (degrees) two fixed model M-D legs support at a `span` (Å) range.
 
     `triangle_angles` encloses angle by interval side lengths; a fixed leg is passed as a degenerate
-    (x, x) interval. It can return ``None`` when the legs and span ranges admit no triangle at all (never
-    observed at these near-point legs, but the fixed-leg law of cosines this replaces never rejected either,
-    so fall back to it rather than lose the row).
+    (x, x) interval. Where the legs and span ranges admit no triangle at all (never observed at these
+    near-point legs), the fixed-leg law of cosines gives the row instead.
     """
     angles = triangle_angles((left, left), (right, right), span)
     if angles is None:
@@ -582,7 +583,7 @@ def _corner_key(corner):
     return tuple(sorted((tuple(sorted(pair)), float(target)) for pair, target in corner.items()))
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=FLOAT_CACHE)
 def _reads_as_name_cached(directions, corner_key, name):
     """Return whether `corner_key`'s bite targets relax to a shell that still reads as `name`.
 
@@ -600,7 +601,7 @@ def _shrunk_windows(windows, anchor, t):
     return {pair: (lo + t * (anchor[pair] - lo), hi - t * (hi - anchor[pair])) for pair, (lo, hi) in windows.items()}
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=FLOAT_CACHE)
 def _bounded_bites_cached(directions, name, key):
     anchor = {pair: min(max(ideal, lo), hi) for pair, (lo, hi), _reach, ideal in key}
     windows = {pair: (lo, hi) for pair, (lo, hi), _reach, _ideal in key}
@@ -630,9 +631,11 @@ def _radial_windows(sphere, c):
     sites = haptic_sites(mol, sphere.real)
     eta = {d: len(site) for site in sites if len(site) >= ETA2 for d in site}
     qdel = _fact(context, "charges", lambda: delocalised_charges(mol))
-    # A Lewis charge is an artefact, so spread it.
-    # The model uses ligand-only classes for either input bond convention. Input lengths do not need typing.
-    hyb = _fact(context, "hybridisation", lambda: stripped_hybridisation(mol))
+    # A Lewis charge is an artefact, so spread it. The length model and the orientation walls read ligand-only
+    # classes for either input bond convention.
+    # donor -> declared metal count, read by rule 3 and the bridge exemption; a lone sphere's donors bind its metal
+    bound = _fact(context, "bound", lambda: Counter(sphere.real))
+    hyb = _fact(context, "hybridisation", lambda: stripped_hybridisation(mol, bound))
     # `orient_donor` rebuilds this per donor unless it is handed one already built; share it across the sphere.
     stripped = _fact(context, "stripped", lambda: ligand_graph(mol)) if sphere.donor_orientation else None
     for d in sphere.vertices:
@@ -641,8 +644,6 @@ def _radial_windows(sphere, c):
         if d in sphere.haptic:  # a centroid vertex: pin its whole ring, not a single donor (no orient/coplanar)
             _centroid_constraints(sphere, d, qdel, hyb, c)
             continue
-        if hyb is None:  # Measured lengths still need graph-derived donor orientation, shared across the sphere.
-            hyb = stripped_hybridisation(mol)
         key = (min(metal, d), max(metal, d))
         if key in sphere.overrides:
             add_distance(c.distances, metal, d, *sphere.overrides[key])
@@ -675,7 +676,7 @@ def _radial_windows(sphere, c):
         # Wall each donor substituent off the metal, the orientation hold a real energy cannot supply itself.
         # Length provenance is independent: measured M-L distances do not determine a partially free M-D-X axis.
         if sphere.donor_orientation:
-            orient_donor(mol, metal, d, sphere.real, c, hyb=hyb, stripped=stripped)
+            orient_donor(mol, metal, d, sphere.real, c, hyb=hyb, stripped=stripped, metals=bound[d])
             # cap an sp2 donor's metal at the donor's own sp2 plane: the improper the stripped bond removed.
             coplanar_donor(mol, metal, d, sphere.real, c, hyb=hyb)
     if sphere.donor_orientation:
@@ -687,8 +688,8 @@ def _radial_windows(sphere, c):
 def _bonded_donor_windows(sphere, c):
     """Return this geometry's ideal and stated angle rows, widening a bonded donor pair to fit its own bond.
 
-    A model-length donor pair joined by a real bond gets both M-D windows widened wherever the compiled
-    angle would pull that bond past RDKit's native upper bound.
+    A model-length donor pair joined by a real bond gets both M-D upper bounds scaled until, at the ideal
+    angle, the two legs can stretch that bond to RDKit's native upper bound.
     """
     mol, metal, od, poly, context = sphere.mol, sphere.metal, sphere.vertices, sphere.poly, sphere.context
     pairs = list(itertools.combinations(range(len(od)), 2))
@@ -699,7 +700,6 @@ def _bonded_donor_windows(sphere, c):
             {frozenset((i, j)): a for i, j, a in poly.resolved_angles},
         )
     ideal_angles, angle_rows = (dict(values) for values in context[angle_key])
-    stated_pairs = set(angle_rows)
     expanded = {}
     if sphere.pos is None:
         for i, j in pairs:
@@ -728,10 +728,10 @@ def _bonded_donor_windows(sphere, c):
                 expanded[right_key] = max(expanded.get(right_key, 0.0), right_window[1] * scale)
     for key, upper in expanded.items():
         c.distances[key] = (c.distances[key][0], upper)
-    return ideal_angles, angle_rows, stated_pairs
+    return ideal_angles, angle_rows
 
 
-def _fill_angle_rows(sphere, ideal_angles, angle_rows, bites, stated_pairs):
+def _fill_angle_rows(sphere, ideal_angles, angle_rows, bites):
     """Extend the stated angle rows to cover a planar shell's remaining pairs and every graft-owned pair.
 
     A planar shell needs every pair held, or the pairs left out of the sparse ideal-angle subset pucker out
@@ -739,6 +739,7 @@ def _fill_angle_rows(sphere, ideal_angles, angle_rows, bites, stated_pairs):
     to have something for the bite window to narrow later.
     """
     od = sphere.vertices
+    stated_pairs = set(angle_rows)
     if sphere.poly.planar:
         angle_rows.update({pair: angle for pair, angle in ideal_angles.items() if pair not in angle_rows})
     else:
@@ -843,29 +844,12 @@ def _assign_angle_rows(sphere, angle_rows, bites, corner_images, mid_angles, c):
                     hi = max(hi, min(union[1], _contact_angle(mol, metal, od[i], od[j], c.distances)))
             c.angles[key] = (lo, hi)
         # Every other in-window FF term is a flat-bottomed wall, so this pull is a row's only restoring force.
-        # Pulling only the rows the shell moves lets a competing reading win (DULPUV).
+        # Pulling only the rows the shell moves lets a competing reading win.
         if mid_angles is not None:
             canonical = min(key, key[::-1])
             c.pulls.pop(canonical, None)
             c.pulls.pop(canonical[::-1], None)
             c.pulls[canonical] = float(mid_angles[i, j])
-
-
-def _apply_force_field(sphere, c):
-    """Set the force field for this sphere's real coordinating atoms, excluding any haptic centroid dummy."""
-    # NB an η² π bond needs no hold of its own: the face is a centroid vertex, so one axial pull plus the cone
-    # pins both π atoms at the face radius. Two separate M-donor pulls tore C≡C from 1.2 to 1.7 Å.
-    haptic = sphere.haptic
-    coord = [d for d in sphere.vertices if d != VACANT and d not in haptic]
-    coord += [a for site in haptic.values() for a in site]  # real coordinating atoms; centroid keys are reserved
-    ff_terms(  # coordinating atoms, so nondonor_floors never floors a ring atom
-        sphere.mol,
-        c,
-        {sphere.metal: (sphere.real_z, coord)},
-        frozen=sphere.frozen,
-        fragments=sphere.context.get("fragments"),
-        topology=sphere.context.get("topology"),
-    )
 
 
 def coordination(sphere, force_field=True):
@@ -882,13 +866,27 @@ def coordination(sphere, force_field=True):
     """
     c = Constraints()
     _radial_windows(sphere, c)
-    ideal_angles, angle_rows, stated_pairs = _bonded_donor_windows(sphere, c)
+    ideal_angles, angle_rows = _bonded_donor_windows(sphere, c)
     bites = seated_bites(sphere, ideal_angles, c.distances, angle_rows)
-    _fill_angle_rows(sphere, ideal_angles, angle_rows, bites, stated_pairs)
+    _fill_angle_rows(sphere, ideal_angles, angle_rows, bites)
     bites, corner_images, mid_angles = _chelate_bite_images(sphere, ideal_angles, bites)
     _assign_angle_rows(sphere, angle_rows, bites, corner_images, mid_angles, c)
     if force_field:
-        _apply_force_field(sphere, c)
+        # The real coordinating atoms, never a centroid key, so nondonor_floors never floors a face atom. An η²
+        # pi bond needs no hold of its own: one axial pull plus the cone pins both atoms at the face radius, where
+        # two separate M-donor pulls tore C≡C from 1.2 to 1.7 Å.
+        coord = [d for d in sphere.vertices if d != VACANT and d not in sphere.haptic]
+        coord += [a for site in sphere.haptic.values() for a in site]
+        ff_terms(
+            sphere.mol,
+            c,
+            sphere.metal,
+            sphere.real_z,
+            coord,
+            frozen=sphere.frozen,
+            fragments=sphere.context.get("fragments"),
+            topology=sphere.context.get("topology"),
+        )
     _add_umbrella(c, sphere.metal, sphere.vertices, sphere.poly)
     return _drop_graft_owned(c, sphere.frozen, sphere.haptic)
 

@@ -13,7 +13,7 @@ from importlib.util import find_spec
 import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDepictor, rdDistGeom
+from rdkit.Chem import rdDepictor, rdDistGeom, rdMolTransforms
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
@@ -27,7 +27,7 @@ from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.perceive import _drop_bridgehead_bonds, read_xyz
 from rxembed.utils import remove_bond
 from tests.conftest import EXAMPLES_DIR
-from tests.metal_fixtures import one_arm_bound_pt
+from tests.metal_fixtures import BUTADIENE_FE_CO3, ISOPRENE_FE_CO3, one_arm_bound_pt
 
 _MN_H2 = str(EXAMPLES_DIR / "mn-h2.xyz")  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
 _MNH = str(EXAMPLES_DIR / "mnh.xyz")  # the corresponding Mn hydride minimum
@@ -60,6 +60,7 @@ _ENUMERATION_FIXTURES = [
     ("[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])(<-N)<-O", "trigonal_bipyramidal"),
     ("[O+]#[C-]->[Co+3](<-[F-])(<-[Cl-])(<-[Br-])(<-N)<-O", "octahedral"),
     ("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "octahedral"),
+    (ISOPRENE_FE_CO3, "tetrahedral"),  # an eta4 diene: two s-cis faces and the s-trans P/M pair
 ]
 _ENUMERATION_FIXTURE_IDS = [
     "MA2B2",
@@ -71,6 +72,7 @@ _ENUMERATION_FIXTURE_IDS = [
     "TBP-all-distinct",
     "OH-all-distinct",
     "OH-all-distinct-PH3",
+    "eta4-diene",
 ]
 
 
@@ -1302,6 +1304,51 @@ def test_coordinate_free_haptic_winding_enumerates_both_hands():
         assert {next(iter(_haptic_windings(embedded.mol, iso, cid).values())) for cid in embedded.ids} == set(
             iso.haptic_winding.values()
         )
+
+
+@pytest.mark.parametrize(
+    ("smiles", "tokens"),
+    [
+        (BUTADIENE_FE_CO3, ["M", "P", "c"]),
+        (ISOPRENE_FE_CO3, ["+", "-", "M", "P"]),
+        ("[O+]#[C-]->[Fe]123(<-[C-]#[O+])(<-[C-]#[O+])<-[CH]4=[CH]->1[CH]->2=[CH]->3CC4", [""]),
+    ],
+    ids=["butadiene-mirror-symmetric-s-cis", "isoprene-two-s-cis-faces", "cyclohexadiene-ring-held-s-cis"],
+)
+def test_bound_diene_s_cis_and_s_trans_forms_are_isomers(smiles, tokens):
+    """A bound diene is s-cis, named by its face or `c` when a mirror relates both, or s-trans P or M."""
+    isomers = rx.metal(smiles)
+    assert sorted("".join(iso.haptic_winding.values()) for iso in isomers) == tokens
+    for iso in isomers:
+        (back,) = rx.metal(rx.cxsmiles(iso))
+        assert rx.cxsmiles(back) == rx.cxsmiles(iso)
+
+
+def test_butadiene_iron_tricarbonyl_embeds_each_class_and_reads_it_back():
+    """Each class embeds as itself and reads back from its coordinates in any atom order; a mirror swaps P and M."""
+    isomers = {next(iter(iso.haptic_winding.values())): iso for iso in rx.metal(BUTADIENE_FE_CO3, "TET")}
+    texts = {token: rx.cxsmiles(iso) for token, iso in isomers.items()}
+    torsion = {"c": (-90, 90), "P": (90, 180), "M": (-180, -90)}
+
+    def read(mol):
+        return rx.cxsmiles(rx.metal(mol, "TET", observed_only=True)[0])
+
+    for token, iso in isomers.items():
+        (path,) = iso.haptic.values()  # the SMILES numbers the diene C1-C4 in chain order
+        ensemble = rx.embed(iso, n=2, seed=7)
+        for cid in ensemble.ids:
+            mol = Chem.Mol(ensemble.mol, False, int(cid))
+            low, high = torsion[token]
+            assert low < rdMolTransforms.GetDihedralDeg(mol.GetConformer(), *path) < high
+            assert read(mol) == texts[token]
+        assert (
+            read(Chem.RenumberAtoms(mol, random.Random(7).sample(range(mol.GetNumAtoms()), mol.GetNumAtoms())))
+            == (texts[token])
+        )
+        conf = mol.GetConformer()
+        for atom, (x, y, z) in enumerate(conf.GetPositions()):
+            conf.SetAtomPosition(atom, Point3D(-x, y, z))
+        assert read(mol) == texts[{"c": "c", "P": "M", "M": "P"}[token]]
 
 
 @pytest.mark.parametrize(

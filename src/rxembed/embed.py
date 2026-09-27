@@ -27,6 +27,7 @@ from .constraints import (
     canonical_key,
     compose,
     constraint_value,
+    metal_distance_tolerance,
     out_of_plane,
     out_of_plane_row,
     resolve_atom,
@@ -69,6 +70,7 @@ from .metal_stereo import (
     chelate_links,
     donor_classes,
     equivalent_site_assignments,
+    face_orientations,
     face_winding,
     realised_chirality,
     site_classes,
@@ -84,7 +86,7 @@ from .stereo import (
 )
 from .utils import atom_label
 
-logger = logging.getLogger("rxembed")  # configured by rxembed.set_verbose
+logger = logging.getLogger(__name__)  # under the "rxembed" tree `set_verbose` configures
 
 
 class EmbeddingError(ValueError):
@@ -138,6 +140,7 @@ _REMEDY = {
     "requested_stereo": ("stereo='free'", _ISOMER),
     "locked_stereo": ("rx.metal(..., stereo={'locked': 'racemic'})", _ISOMER),
     "seeding": (_LOOSER_FIX, _LOOSER_CONSTRAIN, _ISOMER),
+    "uff": ("a different relaxation backend",),
 }
 
 
@@ -186,7 +189,7 @@ def _headline(groups, iso, cons):
 
 def _high_force_candidate(reason):
     """Allow the expensive stiffness tail only for a correct shape missing an M-L wall by a small amount."""
-    return isinstance(reason, Failure) and reason.kind == "ml_distance"
+    return reason.kind == "ml_distance"
 
 
 _STABLE_SHAPE_KINDS = {"coordination_shape", "seating_crossed"}
@@ -195,19 +198,19 @@ _STABLE_SHAPE_KINDS = {"coordination_shape", "seating_crossed"}
 def _stable_coordination_failure(reason):
     """Return whether an endpoint settled into another labelled coordination shape or donor-slot seating.
 
-    Both are a wrong basin, converged or not: `restrained_uff` stops strengthening angle and dihedral walls at
-    1x, so no higher stiffness rung can move the donors onto the requested polyhedron. Only a fresh DG seed
-    can; handedness and structural failures stay on the escalation ladder.
+    Such an endpoint waits for a fresh DG seed rather than climbing the stiffness ladder. The reason is a
+    measured cost, not a mechanism: angular walls stop strengthening at 1x, yet stiffer distance walls still
+    move angles. Over the fixtures (first three isomers, n=2, seeds 1234 and 7; 2026-09-27) climbing rescued
+    1 of 50 shape-failing seeds, at about four extra UFF passes each.
     """
-    return isinstance(reason, Failure) and reason.kind in _STABLE_SHAPE_KINDS
+    return reason.kind in _STABLE_SHAPE_KINDS
 
 
 _EPS = 1e-6  # near-zero norm floor for the graft axis
+# Unmeasured: neither tolerance cites a measurement in git history or project memory. Measure the p99 overshoot
+# of accepted conformers before changing either.
 _STRUCT_CAP_SLACK = 2.0  # deg: finite-force settling tolerance on coplanarity and umbrella caps
 _SHAPE_TEAR_TOL = 0.10  # A beyond a rigid body's own 0.1 A all-pairs windows
-# A model M-L window is a fitted target, so FIX_DISTANCE_TOL's 0.001 A would only measure UFF convergence. On
-# RITCIG's limiting pair the residual falls as C/fc with C = 0.56 A: 0.01 A needs the 100x rung, 0.001 A fc ~ 560.
-_ML_WINDOW_TOL = 0.01  # A: physical slack for a model-derived (not user-fixed) M-L window
 
 
 def _real_graph(mol, iso):
@@ -246,7 +249,7 @@ def _structural_failure(mol, cid, cons, iso=None):
             continue
         # `cons.fixed` is the one record of a user-stated exact distance (fix=/template=); anything else
         # reaching this loop is a model-derived M-L window (constrain= is already excluded via contacts[0]).
-        tol = FIX_DISTANCE_TOL if atoms in cons.fixed else _ML_WINDOW_TOL
+        tol = metal_distance_tolerance(atoms, cons)
         value = constraint_value(pos, atoms, cons.haptic, window)
         if not within_window(value, window, tol):
             accepted = window[0] - tol, window[1] + tol
@@ -352,7 +355,7 @@ def _centre_observed(pos, prep):
     """Return `(points, observed)` for one centre's occupied sites, or the `Failure` explaining why not.
 
     `points` is `{slot: 3D position}`; `observed` stacks their unit directions from the metal in the same
-    order as `prep.occupied`. Split out of `_centre_state_failure` to keep its own branching flat.
+    order as `prep.occupied`.
     """
     state, poly, centre = prep.state, prep.poly, prep.centre
     vertices, haptic, donors = prep.vertices, prep.haptic, prep.donors
@@ -402,7 +405,7 @@ def _shape_code(geometry):
     return getattr(POLYHEDRA.get(geometry), "code", None) or geometry
 
 
-def _centre_state_failure(pos, mol, cid, prep, lines=None, requests=None):
+def _centre_state_failure(pos, prep, lines=None, requests=None):
     """Return the first reason one metal centre's conformer geometry misses its prepped polyhedron.
 
     Appends this centre's accepted shape record to `lines` (see `SHAPE_PROP`) and its requested geometry to
@@ -414,7 +417,7 @@ def _centre_state_failure(pos, mol, cid, prep, lines=None, requests=None):
     if isinstance(result, Failure):
         return result
     _points, observed = result
-    # Rule B: the requested shape is accepted within `_FIT_MARGIN` of the best reading (`shape_reading`);
+    # The requested shape is accepted within `_FIT_MARGIN` of the best reading (`shape_reading`);
     # a vacant site is read against the occupied coordination number. This residual doubles as `unrestricted_fit`
     # and, when constitutionally equivalent, `equivalent_fit` below: one ranking, not a repeat exhaustive search.
     vacant = len(occupied) < len(prep.vertices)
@@ -464,7 +467,7 @@ def _coordination_state_failure(mol, cid, iso, states=None):
     pos = mol.GetConformer(int(cid)).GetPositions()
     lines, requests = [], {}
     for prep in states:
-        if reason := _centre_state_failure(pos, mol, cid, prep, lines, requests):
+        if reason := _centre_state_failure(pos, prep, lines, requests):
             return reason
     if lines:
         mol.GetConformer(int(cid)).SetProp(SHAPE_PROP, " | ".join(lines))
@@ -558,7 +561,7 @@ def graft_frozen(mol, conf_ids, frozen, ref):
         _ssd, transform = rdAlignment.GetAlignmentTransform(emb, core)
         transform = np.asarray(transform)
         fitted = core @ transform[:3, :3].T + transform[:3, 3]  # rotate input core onto the embedded one
-        for i, p in zip(frozen, fitted, strict=False):
+        for i, p in zip(frozen, fitted, strict=True):
             conf.SetAtomPosition(i, p.tolist())
 
 
@@ -586,11 +589,8 @@ def fold_substrate(base, sub, graft_ref, *, protect_arrangement=True):
     pinned = sorted(sphere & set(graft_ref)) if protect_arrangement else []
     if len(pinned) > 1:
         raise ValueError(
-            f"the coordinate graft (fix={{i: (x,y,z)}} / template=) pins coordination-sphere atoms {pinned}: "
-            f"the graft restores them to their exact reference coordinates after the embed, so it, not the "
-            f"coordination geometry, would decide how they sit, and you would get the reference's arrangement "
-            f"under this isomer's label. Graft at most one sphere atom (a core over ligand backbone atoms "
-            f"composes fine), or embed the reference geometry itself as the source."
+            f"the coordinate graft pins coordination-sphere atoms {pinned}, imposing the reference's arrangement "
+            f"on this isomer; graft at most one sphere atom, or embed the reference geometry itself"
         )
     sphere_d = set(base.distances)
     soft_d, soft_angular = sub.contacts
@@ -605,8 +605,8 @@ def fold_substrate(base, sub, graft_ref, *, protect_arrangement=True):
     )
     if overlap:
         raise ValueError(
-            f"constrain= overlaps structural coordination term(s) {overlap}: a soft bias cannot replace the "
-            f"selected metal state. Keep the structural term, or use fix= for an explicit rigid override."
+            f"constrain= overlaps structural coordination term(s) {overlap}, and a soft bias cannot replace the "
+            f"selected metal state; drop them from constrain=, or use fix= for a rigid override"
         )
     return compose(base, sub)
 
@@ -728,10 +728,14 @@ def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
     ligand_stereo = bool(iso and (has_point_stereo or bond_stereo(iso.stereo_label) or axis_stereo(iso.stereo_label)))
     needs_selection = bool(targets or ligand_stereo)
     hands = sum(bool(state.hand) for state, _vertices, _haptic, _winding in targets)
-    windings = sum(len(winding) for _state, _vertices, _haptic, winding in targets)
     winding_ranks, eta2_ranks = _winding_ranks(mol, targets)
+    # A seed realises one of each stated face's configurations.
+    faces = math.prod(
+        len(face_orientations(mol, haptic[dummy], winding_ranks[state.atom]))
+        for state, _vertices, haptic, winding in targets
+        for dummy in winding
+    )
     stereo_bonds = stereo_donor_bonds(mol, iso)
-    max_attempts = 30 if has_point_stereo else 0
     reflectable = _reflection_is_free(mol, iso, cons, targets, stereo_bonds)
     carried = list(stereo_bonds)
     if iso is not None:
@@ -765,25 +769,26 @@ def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
         for donor, tag in tags.items():
             mol.GetAtomWithIdx(donor).SetChiralTag(tag)
     if not needs_selection:
-        ids = seed_coordinates(mol, cons, target, params, enforce_chirality=True, max_attempts=max_attempts)
+        ids = seed_coordinates(mol, cons, target, params)
         if ref_core is not None:
             graft_frozen(mol, ids, frozen, ref_core)  # restore the exact frozen core
     else:
         kept = Chem.Mol(mol)
         kept.RemoveAllConformers()
         pool = _REPLACEMENT_FACTOR * target
-        # A spare-success margin for independent binary metal states; a free reflection needs no margin.
-        bits = hands + windings
-        trials = target if reflectable else 2**bits * (target + 2 * (math.isqrt(target - 1) + 1))
+        # A spare-success margin for independent metal states; a free reflection needs no margin.
+        trials = target if reflectable else 2**hands * faces * (target + 2 * (math.isqrt(target - 1) + 1))
         budget = max(target, min(MAX_SEED_COUNT, max(2 * trials, seed_count(mol, constrained=True))))
+        # RDKit's chirality post-check also tests the sphere's donor-donor windows, which only the relax ladder
+        # meets, so enforcing it with ligand point stereo would reject seeds no batch could ever pass. The attempt
+        # cap and the unpruned multi-centre search are unmeasured choices.
+        hard_chirality = not has_point_stereo
+        max_attempts = 30 if has_point_stereo else 0
+        trial_prune = -1 if len(targets) > 1 else params.prune_rms
         used = attempt = generated = 0
         while kept.GetNumConformers() < target and used < budget:
             need = target - kept.GetNumConformers()
             batch_n = min(_REPLACEMENT_FACTOR * need, pool, budget - used)
-            # RDKit's chirality post-check also tests the sphere's donor-donor windows, which only the relax
-            # ladder meets, so enforcing it here would reject seeds no batch could ever pass.
-            hard_chirality = not has_point_stereo
-            trial_prune = -1 if len(targets) > 1 else params.prune_rms
             trial = replace(params, seed=params.seed + attempt, prune_rms=trial_prune)
             ids = seed_coordinates(
                 mol, cons, batch_n, trial, enforce_chirality=hard_chirality, max_attempts=max_attempts
@@ -938,7 +943,7 @@ class Conformers:
             self._coord_state_prep[iso] = _coordination_state_prep(iso)
         return self._coord_state_prep[iso]
 
-    def _restored_mol(self, cid=None):
+    def restored_mol(self, cid=None):
         """Return tracked conformers, or one requested conformer, on the restored public graph."""
         if cid is None:
             mol = Chem.Mol(self._mol)  # never mutate the working surrogate
@@ -965,7 +970,7 @@ class Conformers:
     @property
     def mol(self):
         """Return the tracked conformers on a copy with the real metal graph restored."""
-        return self._restored_mol()
+        return self.restored_mol()
 
     def _store_trajectory(self, frames):
         """Store accepted cleanup frames on the restored public graph."""
@@ -1050,11 +1055,11 @@ class Conformers:
 
     def _required_failure(self, failures):
         """Return the requested failure kinds among `failures`; any one makes acceptance raise when underfilled."""
-        return {failure.kind for failure in failures if isinstance(failure, Failure)} & self._required_kinds
+        return {failure.kind for failure in failures} & self._required_kinds
 
-    def _geometry_failure(self, cid, iso=None):
+    def _geometry_failure(self, cid):
         """Return the first failed core publication contract, or ``None``."""
-        active = self.iso if iso is None else iso
+        active = self.iso
         if misses := self._fixed_geometry_misses(cid):
             _excess, atoms, actual, _lo, _hi, _tol, unit = max(misses, key=lambda miss: miss[0])
             graph = _real_graph(self._mol, active)
@@ -1196,9 +1201,7 @@ class Conformers:
                 # A metal restraint that already tears an internal ligand bond cannot be repaired by
                 # increasing that restraint.  Keep organic constrained retries and fresh metal seeds;
                 # only the competing metal objective is terminal here.
-                and not (
-                    self.iso is not None and isinstance(reason, Failure) and reason.kind in {"bonding", "rigid_body"}
-                )
+                and not (self.iso is not None and reason.kind in {"bonding", "rigid_body"})
             ]
             rejected = {cid: reason for cid, reason in failed.items() if cid not in pending}
             restored.update(rejected)
@@ -1279,15 +1282,10 @@ class Conformers:
     ):
         """Replace failed conformers from bounded fresh seed batches; return ids not replaced.
 
-        Replacements keep the original ids. Each batch receives a constraint copy because embedding may add
-        encounter bounds or move phantom indices. ``validator`` may add pipeline publication checks after the
-        core contract; it never controls how a replacement is generated or relaxed. The search stops early
-        when every seed of one batch crossed to another donor-slot seating, or when two consecutive batches
-        are rejected in full for the same set of non-shape reasons at the same atoms: a fresh seed cannot
-        change a structural basin a batch has already shown it lands in twice. A wrong labelled shape never
-        stops this way, only a fresh seed can rescue it, and its residual is a near-tie call a later seed can
-        still cross.
-        Rank settled survivors by their endpoint scores; keep unscored fallbacks in generation order.
+        Replacements keep the original ids, best endpoint score first. ``validator`` adds pipeline publication
+        checks after the core contract. The search stops early when every seed of one batch crossed to another
+        donor-slot seating, or when two consecutive batches fail in full for the same non-shape reasons at the
+        same atoms; a wrong labelled shape never stops it, because a later seed can still cross its near-tie.
         """
         params = self.params if params is None else params
         if params is None:
@@ -1300,13 +1298,14 @@ class Conformers:
                 break
             count = _REPLACEMENT_FACTOR * len(left)
             trial_params = replace(params, seed=params.seed + 1 + batch_index)
-            cons = self.cons.copy()
-            mol, ids, _target = seed_conformers(Chem.Mol(source), cons, self.iso, count, trial_params)
+            mol, ids, _target = seed_conformers(Chem.Mol(source), self.cons, self.iso, count, trial_params)
             if not ids:
                 previous_signature = None
                 _log_replacement_round(operation, batch_index, 0, count)
                 continue
-            batch = Conformers(mol, ids, cons, self.iso, params=trial_params, _coord_state_prep=self._coord_state_prep)
+            batch = Conformers(
+                mol, ids, self.cons, self.iso, params=trial_params, _coord_state_prep=self._coord_state_prep
+            )
             # A constrained replacement must use the same stiffness ladder as the original batch.  A single
             # base-force pass can reject a seed that a higher rung would satisfy, while silently making fresh
             # seeds weaker than the batch they replace.
@@ -1339,13 +1338,10 @@ class Conformers:
                 crossed_every_seed = (
                     len(accepted) == 1
                     and next(iter(accepted))[0] == "seating_crossed"
-                    and any(_stable_coordination_failure(reason) for reason in self.relax_failures.values())
+                    and any(_stable_coordination_failure(reason) for reason in batch.relax_failures.values())
                 )
-                # A wrong labelled shape is excluded here: only a fresh seed can rescue it (see
-                # _stable_coordination_failure), and its residual is a near-tie judgement call that a
-                # later batch's seed can still cross, unlike a structural tear at the same atoms. A batch can
-                # fail for more than one reason at once; the stop only needs every one of them to be a known,
-                # non-shape site repeating from the batch before.
+                # A batch can fail for more than one reason at once; the stop needs every one of them to be a
+                # known, non-shape site repeating from the batch before.
                 repeated_reason = (
                     bool(signature)
                     and all(kind not in _STABLE_SHAPE_KINDS and atoms for kind, atoms in signature)
@@ -1475,10 +1471,7 @@ class Conformers:
             required |= self._required_failure(failures)
             failed = {cid for rejected in failures.values() for cid in rejected}
             missed = [
-                cid
-                for failure, rejected in failures.items()
-                if isinstance(failure, Failure) and failure.kind == "numeric_fix"
-                for cid in rejected
+                cid for failure, rejected in failures.items() if failure.kind == "numeric_fix" for cid in rejected
             ]
             self._report_missed_fixes(missed, operation)
             self._remove(failed)
@@ -1536,7 +1529,7 @@ class Conformers:
                     error_summary(err),
                 )
                 return None
-            self.energies = {i: float(v) for i, v in zip(self.ids, e, strict=False)}
+            self.energies = {i: float(v) for i, v in zip(self.ids, e, strict=True)}
             self.unrelaxed = [i for i in self.ids if not max_iters or self.uff.statuses.get(i, 1) != 0]
             return e
         self.unrelaxed = []
@@ -1546,10 +1539,10 @@ class Conformers:
         """Relax every conformer in place with restrained UFF; return ``self``.
 
         `stiffness` scales restraint penalties, not native UFF (see `relax.restrained_uff`). A constrained run
-        retries missed geometry, a stated haptic face, or a wrong metal state with up to three bounded
-        fresh-seed batches, then restores whatever still fails into `.unrelaxed`. An untypeable graph keeps
-        its embedded geometry with no energy; a finite max-iterations endpoint that still satisfies the
-        structural contract is kept too, just marked unrelaxed.
+        climbs the stiffness ladder, then replaces conformers that miss the publication contract from up to
+        three fresh-seed batches when it has seed parameters (an `embed()` result does; `minimize()` of a
+        given geometry does not), and drops what still fails. An untypeable graph keeps its embedded geometry
+        with no energy; an unconverged endpoint that meets the contract is kept and listed in `.unrelaxed`.
 
         `.energies` ranks settled results within one species only; a restored or unconverged conformer has
         none. `pipeline.Ensemble.minimize()` adds further acceptance gates on top.
@@ -1597,7 +1590,7 @@ class Conformers:
     def dump(self, path):
         """Write the tracked conformers to `path` as a multi-frame .xyz; return the path."""
         if not self.ids:  # a 0-byte file that reads as a successful write is the worst possible outcome
-            raise ValueError("nothing to dump: this result has no conformers (the embed produced none)")
+            raise ValueError("nothing to dump: this result has no conformers; embed again with another seed=")
         with open(path, "w") as f:
             f.write(self.xyz())
         return path
@@ -1644,10 +1637,8 @@ def _check_bare_mol(mol):
     metals = metal_indices(mol)
     if metals:
         raise ValueError(
-            f"atom(s) {metals} are metal centres: a metal is embedded through a SURROGATE, because neither "
-            f"the bounds matrix nor UFF describes one directly. Route the complex through "
-            f"Isomer(mol, geometry, sites) or enumerate_isomers(mol, geometry), which own that surrogate and "
-            f"the coordination model with it"
+            f"atom(s) {metals} are metal centres, which embed only through an Isomer's surrogate; pass "
+            f"Isomer(mol, geometry, sites) or an isomer from enumerate_isomers(mol, geometry)"
         )
 
 

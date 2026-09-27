@@ -43,19 +43,27 @@ def test_sigma_hole_kinds_require_a_polarisable_heavy_donor(kind, silent, audibl
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
-def test_acceptor_quality_prefers_localised_lone_pair():
-    """One donor, three competing acceptors: the ranked modes must put the strongest base first."""
-    mol = _mol("CO.CN(C)CC(=O)c1ccccn1")  # methanol donor; an amine, a ketone, and a ring N to accept it
-    amine = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "N" and not a.GetIsAromatic())
-    ketone = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "O" and a.GetDegree() == 1)
-    aromatic = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "N" and a.GetIsAromatic())
+def test_cation_pi_needs_an_aromatic_ring():
+    """A saturated ring has no pi face; the aromatic ring of the same size does."""
+    assert not nci.candidate_contacts(_mol("C1CCCCC1.[NH4+]"), kinds=("CATPI",)), "cyclohexane is not a pi ring"
+    assert nci.candidate_contacts(_mol("c1ccccc1.[NH4+]"), kinds=("CATPI",)), "benzene is a pi ring"
 
-    modes = list(nci.auto_binding_modes(mol).values())
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
+@pytest.mark.parametrize(
+    ("smiles", "stronger_first"),
+    [
+        pytest.param("CO.CN(C)CC(=O)c1ccccn1", [(3, 7), (13, 7)], id="amine-and-pyridine-over-ketone"),
+        pytest.param("CO.CC(=NC)CCC(C)=O", [(4, 10)], id="imine-over-ketone"),
+        pytest.param("CO.CC(=O)Cn1ccnc1", [(9, 4), (4, 6)], id="pyridine-type-over-ketone-over-pyrrole-type"),
+    ],
+)
+def test_acceptor_quality_prefers_localised_lone_pair(smiles, stronger_first):
+    """A methanol donor ranks an N lone pair outside any pi system above a carbonyl O, and one inside below it."""
+    modes = list(nci.auto_binding_modes(_mol(smiles)).values())
     accepted = [next(iter(m.distances))[0] for m in modes]
-
-    assert accepted.index(amine) < accepted.index(ketone) < accepted.index(aromatic), (
-        "a strong localised base must outrank a carbonyl O, and both a ring N"
-    )
+    for strong, weak in stronger_first:
+        assert accepted.index(strong) < accepted.index(weak), f"acceptor {strong} must outrank {weak}: {accepted}"
 
 
 # --- enumeration ------------------------------------------------------------------------------------------
@@ -95,3 +103,17 @@ def test_multipoint_mode_outranks_single_contacts():
     modes = list(nci.auto_binding_modes(_mol(_ACID_DIMER)).values())
     assert len(modes[0].distances) >= len(modes[-1].distances)
     assert len(modes[0].distances) > 1, "the acid dimer's two-point grip was not enumerated"
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
+def test_truncated_mode_enumeration_warns(monkeypatch, caplog):
+    monkeypatch.setattr(nci, "_MAX_ASSIGNMENTS", 1)
+    with caplog.at_level("WARNING", logger="rxembed"):
+        nci.auto_binding_modes(_mol(_ACID_DIMER))
+
+    assert "may miss the best grip" in caplog.text
+
+
+def test_unknown_contact_kind_is_refused_by_name():
+    with pytest.raises(ValueError, match="HBX"):
+        nci.candidate_contacts(_mol(_ACID_PYRIDINE), kinds=("HBX",))

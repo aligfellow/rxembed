@@ -5,9 +5,9 @@ directly; `embed._donor_facing_failure` also reads `donor_orientation` inside th
 only logs it at DEBUG. They look into the coordination sphere, which every `geometry` check excludes because a
 dative distance is not covalent: `metal_overbond` asks whether an atom reached bonding distance,
 `donor_orientation` whether a ligand still donates along its axis, and `donor_fold` reports the metric behind
-the same walk. The rest is the sphere perception both resolve on. `pipeline.geom_check` also reads its
-`coordinating_atoms` leaf for side-on and coordinated-carbon exemptions, and `pipeline.select` for a wrapped
-metal with no bonds.
+the same walk. The rest is the sphere perception both resolve on. `pipeline.geom_check` also reads `spheres`
+for its side-on, coordinated-carbon and cis-donor exemptions, and `pipeline.select` reads `coordinating_atoms`
+for a wrapped metal with no bonds.
 
 The shape reading (`classify_geometry`, `shape_gap`) names the polyhedron a sphere's coordinates fit best; the
 acceptance gate, enumeration and CX writing all read a sphere through it.
@@ -19,13 +19,15 @@ donation-axis rules. Shared coordinate math and ``Violation`` live in ``utils``.
 from __future__ import annotations
 
 import logging
+from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import numpy as np
 from rdkit import Chem
 
 from .constraints import graft_owns
-from .metal_core import COORDINATION_METALS, EPS_LEN, VACANT
+from .metal_core import COORDINATION_METALS, EPS_LEN, VACANT, ligand_graph
 from .metal_distance import (
     APEX,
     DONOR_COLLAPSE_RATIO,
@@ -49,7 +51,7 @@ _PT = Chem.GetPeriodicTable()
 _COORD_FACTOR = 1.3  # a heavy atom within this x covalent-sum of a metal is a coordinating donor
 
 
-def metal_overbond(mol, pos, donors=None, margin: float | None = None) -> list[Violation]:
+def metal_overbond(mol, pos, donors=None) -> list[Violation]:
     """Return atoms that have collapsed onto a metal; over-short is the direction other gates miss.
 
     Every other gate excludes metals, so a crushed atom is otherwise invisible. A donor is floored only
@@ -59,11 +61,11 @@ def metal_overbond(mol, pos, donors=None, margin: float | None = None) -> list[V
 
     `donors` is the intended set, and the caller must pass it: perceiving it here is circular, since a
     collapsed atom would enter the radius, re-classify as a donor, and get asked the donor's looser question
-    instead of its own. `donors=None` falls back to perception only for a genuinely unknown sphere.
+    instead of its own. Pass ``{metal: donors}`` to declare only some metals (see `spheres`); `donors=None`
+    falls back to perception only for a genuinely unknown sphere.
     """
-    margin = OUTER_REPORT_MARGIN if margin is None else margin
     out: list[Violation] = []
-    for m, sphere in _spheres(mol, pos, donors).items():
+    for m, sphere in spheres(mol, pos, donors).items():
         rm = _PT.GetRcovalent(mol.GetAtomWithIdx(m).GetAtomicNum())
         for a in mol.GetAtoms():
             i = a.GetIdx()
@@ -77,9 +79,9 @@ def metal_overbond(mol, pos, donors=None, margin: float | None = None) -> list[V
                 continue  # an undeclared H: a beta-agostic contact reaches this distance and is not an over-bond
             else:
                 tier = overbond_tier(mol, sphere, i)
-                if tier == APEX:  # a haptic-backed scaffold is fixed by its face geometry
+                if tier == APEX:  # a bite apex or haptic backbone is fixed by its donors' own windows
                     continue
-                floor, what = (NEAR_REPORT_RATIO * r_sum if tier == NEAR else r_sum + margin), "non-donor"
+                floor, what = (NEAR_REPORT_RATIO * r_sum if tier == NEAR else r_sum + OUTER_REPORT_MARGIN), "non-donor"
             d = float(np.linalg.norm(pos[i] - pos[m]))
             if d < floor:
                 out.append(
@@ -111,7 +113,7 @@ class DonorAngle:
 
     @property
     def cls(self) -> tuple[str, Chem.HybridizationType]:
-        """The census class this donation is judged against: ``(donor element, hybridisation)``."""
+        """Return the census class this donation is judged against: ``(donor element, hybridisation)``."""
         return (self.element, self.hyb)
 
 
@@ -126,7 +128,7 @@ class FoldReport:
 
     @property
     def fold(self) -> float:
-        """Max |M-D-X - class median| over every judged donation (0.0 when nothing was judged).
+        """Return the max |M-D-X - class median| over every judged donation (0.0 when nothing was judged).
 
         Needs no reference structure: it asks the geometry about itself, so unlike an RMSD-to-crystal metric
         it works in generation mode.
@@ -135,7 +137,7 @@ class FoldReport:
 
     @property
     def planarity(self) -> float:
-        """Max deg the metal lies out of a conjugated donor's ligand plane (0.0 if none); report only."""
+        """Return the max deg the metal lies out of a conjugated donor's ligand plane (0.0 if none); report only."""
         return max((a.planarity for a in self.angles if a.planarity is not None), default=0.0)
 
     @property
@@ -151,7 +153,7 @@ class FoldReport:
         """Format the fold / planarity maxima and the unjudged donors."""
         return (
             f"fold {self.fold:.1f}° (max |M-D-X - class median|, n={len(self.angles)}), "
-            f"planarity {self.planarity:.1f}° out of plane (report-only; real crystals reach 87.6°), "
+            f"planarity {self.planarity:.1f}° out of plane (report-only), "
             f"{len(self.outside_window)} outside the census window, {len(self.unknown)} donor(s) unclassified"
         )
 
@@ -174,10 +176,9 @@ def donor_orientation(mol, pos, donors=None, frozen=frozenset()) -> list[Violati
     This reads the M-D-X angle instead, which folding collapses. The floor per class is the census 0.5th
     percentile minus 5 deg, keyed on (element, hybridisation) since a thiolate donates at 103 deg where a
     carboxylate donates at 126 deg. A floor violation flags an unusual angle, not proven folding or inversion:
-    a tetrahedral donor can sit inside its carrier hull below this floor, and real crystals do (WOKWUO's
-    Zn-bound C(SiMe3)3 donor reads 101 deg against its 104 deg floor, measured on the benchmark fixtures and
-    the tmQMg sample). `embed._donor_facing_failure` logs it at DEBUG and never rejects. `donor_fold` reports
-    the rest.
+    a tetrahedral donor can sit inside its carrier hull below this floor, and real crystals do (a Zn-bound
+    C(SiMe3)3 donor reads 101 deg against its 104 deg floor). `embed._donor_facing_failure` logs it at DEBUG
+    and never rejects. `donor_fold` reports the rest.
 
     Exemptions follow `donation_axis` (no axis to judge), plus one more here: an M-D-X unit wholly inside the
     frozen core takes its orientation from the reference TS, not this gate. A donor the two estimators
@@ -211,14 +212,15 @@ def _donor_walk(mol, pos, donors=None, frozen=frozenset()) -> tuple[list[DonorAn
     The single source of truth for both the gate (``donor_orientation``) and the metric (``donor_fold``), so the
     two can never disagree about what was measured. See ``donor_orientation`` for the exemptions.
     """
-    spheres = _spheres(mol, pos, donors)
-    all_donors = {d for s in spheres.values() for d in s}  # every metal's donors: the co-donor exclusion set
-    hyb = stripped_hybridisation(mol)
+    by_metal = spheres(mol, pos, donors)
+    bound = Counter(d for s in by_metal.values() for d in s)  # donor -> metal count; its keys are the co-donors
+    hyb = stripped_hybridisation(mol, bound)
+    stripped = ligand_graph(mol)
     out: list[DonorAngle] = []
     unknown: list[int] = []
-    for m, sphere in spheres.items():
+    for m, sphere in by_metal.items():
         for d in sorted(sphere):
-            subs = donation_axis(mol, d, all_donors, sphere=sphere, hyb=hyb)
+            subs = donation_axis(mol, d, bound, sphere=sphere, hyb=hyb, metals=bound[d], stripped=stripped)
             if subs is None:  # hydride, bridging or haptic: the donation question does not apply
                 continue
             cls = (mol.GetAtomWithIdx(d).GetSymbol(), hyb[d]) if d in hyb else None  # None when estimators disagree
@@ -247,7 +249,7 @@ def _donor_walk(mol, pos, donors=None, frozen=frozenset()) -> tuple[list[DonorAn
 
 
 def _planarity_dev(mol, pos, *, hyb, m, d, x) -> float | None:
-    """Deg the metal lies out of a conjugated donor's ligand plane, or None when the D-X bond is not conjugated.
+    """Return the deg the metal lies out of a conjugated donor's ligand plane, or None if D-X is not conjugated.
 
     A carboxylate or pyridine plane rotated into the coordination sphere with an acceptable M-D-X angle.
     Report only: it can never gate. The census p95 is 54.8 deg and real crystals reach 87.6 deg out of plane.
@@ -270,7 +272,7 @@ def _planarity_dev(mol, pos, *, hyb, m, d, x) -> float | None:
 def coordinating_atoms(mol, pos, m, declared=frozenset()) -> set[int]:
     """Return non-metal atoms inside metal ``m``'s coordination shell (``_COORD_FACTOR`` x covalent-sum).
 
-    A heavy atom at coordination distance is unambiguously a donor. A hydrogen is not, since a hydride and an
+    A heavy atom at coordination distance counts as a donor. A hydrogen does not, since a hydride and an
     agostic C-H sit at the same M-H distance, so an H counts only when in ``declared``: the sole way an H
     enters a sphere; the element screen never overrides a declaration.
     """
@@ -285,16 +287,25 @@ def coordinating_atoms(mol, pos, m, declared=frozenset()) -> set[int]:
     return out
 
 
-def _spheres(mol, pos, donors=None) -> dict[int, set[int]]:
-    """``{metal: its coordination sphere}``: intended donors where known, perceived where not.
+def declared_donors(donors, m) -> set[int]:
+    """Return the donors declared for metal `m`: from a ``{metal: donors}`` mapping, or one flat collection."""
+    if isinstance(donors, Mapping):
+        return {int(d) for d in donors.get(m, ())}
+    return set() if donors is None else {int(d) for d in donors}
 
-    Resolved per metal, because in a bimetallic complex the caller usually knows only the reacting centre's
-    sphere and the other must fall back to perception rather than flag its own ligands. A known donor that has
-    left the shell is dropped; `coordination_changed` is what gates that.
+
+def spheres(mol, pos, donors=None) -> dict[int, set[int]]:
+    """Return ``{metal: its coordination sphere}``: declared donors where declared, perceived where not.
+
+    `donors` is ``{metal: donor atoms}``, or one flat collection declared for every metal. Resolved per metal,
+    because in a bimetallic complex the caller may know only the reacting centre's sphere; an undeclared metal
+    falls back to perception rather than flag its own ligands. A flat collection cannot say which metal a
+    bridging donor was declared for, so a partial declaration needs the mapping. A declared donor that has left
+    the shell is dropped; `coordination_changed` is what gates that.
     """
-    known = set() if donors is None else {int(d) for d in donors}
     out: dict[int, set[int]] = {}
     for m in (a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS):
+        known = declared_donors(donors, m)
         shell = coordinating_atoms(mol, pos, m, known)  # `known` also admits a declared hydride the element screen
         out[m] = (known & shell) or shell  # would drop; else `known & shell` silently loses it
     return out
@@ -307,11 +318,11 @@ APICAL_MIN = 3  # a face of this many atoms caps a face (a piano stool); an eta2
 # FIT_FLOOR is where no shape fits: above this residual, `classify_geometry` still returns the argmin, but
 # it is a name, not a reading. The acceptance gate compares a requested shape's own residual with this
 # floor, not with the argmin.
-FIT_FLOOR = 0.45  # Procrustes residual
+FIT_FLOOR = 0.45  # Procrustes residual; 45 corpus centres read median 0.069, 90th percentile 0.30
 
 # _FIT_MARGIN is the resolution of a shape reading: two shapes within it of each other tie, for the input,
 # for the acceptance gate (`shape_reading`, rule B), and for `observed_only`. A near-tie input then reads
-# the same way at every seed instead of a seed lottery.
+# the same way at every seed instead of a seed lottery (measured on VALRAE and TILFAW).
 _FIT_MARGIN = 0.01
 
 # Å RMS out-of-plane of {metal + vertices} above which a sphere is not planar: the accept gate on a
@@ -512,7 +523,7 @@ def geometry_for(n_donors, has_apical=False):
     return g
 
 
-def coplanar(pos, metal, donors, tol=COPLANAR_TOL, haptic=None):
+def coplanar(pos, metal, donors, haptic=None):
     """Return True if the metal and its coordination vertices lie in one plane.
 
     The feasibility test for a declared planar record: a bite squeezing the in-plane angles is still planar,
@@ -523,4 +534,4 @@ def coplanar(pos, metal, donors, tol=COPLANAR_TOL, haptic=None):
     ring_atoms = {a for ring in (haptic or {}).values() for a in ring}
     verts = [pos[d] for d in donors if d not in ring_atoms]  # each sigma/eta2 donor is its own vertex
     verts += [np.mean([pos[a] for a in ring], axis=0) for ring in (haptic or {}).values()]  # each face -> centroid
-    return _plane_rms(pos[metal], verts) <= tol
+    return _plane_rms(pos[metal], verts) <= COPLANAR_TOL

@@ -143,19 +143,12 @@ def test_unknown_dedup_method_names_choices():
         select.apply(ens.mol, ens.ids, [ens.energies[i] for i in ens.ids], method="cluster")
 
 
-def test_none_mode_still_sorts_by_energy():
-    ens = _ens("CCCCO", n=4)
-    energies = [3.0, 1.0, 2.0, 0.0]
-    ids, _ = select.apply(ens.mol, ens.ids, energies[: len(ens.ids)], method="none")
-    assert ids == sorted(ens.ids, key=lambda i: energies[i])[: len(ids)]
-
-
 @pytest.mark.skipif(find_spec("prism_pruner") is None or find_spec("sklearn") is None, reason="needs rxembed[workflow]")
 def test_rmsd_dedup_collapses_a_duplicated_conformer():
     ens = _ens("CCCCO", n=4)
     cid = ens.ids[0]
     dup = ens._mol.AddConformer(Chem.Conformer(ens._mol.GetConformer(cid)), assignId=True)
-    ids, _ = select.apply(ens._mol, [*ens.ids, dup], [*[ens.energies[i] for i in ens.ids], ens.energies[cid]])
+    ids = select.apply(ens._mol, [*ens.ids, dup], [*[ens.energies[i] for i in ens.ids], ens.energies[cid]])
     assert dup not in ids or cid not in ids, "an exact duplicate survived the RMSD prune"
     assert select.nearest_kept(ens._mol, [cid], [dup])[dup] == (cid, 0.0)
 

@@ -17,6 +17,7 @@ The two coordination-sphere gates it calls live in the core's ``rxembed.metal_pe
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -25,7 +26,7 @@ from rdkit.Numerics import rdAlignment
 
 from rxembed.constraints import constraint_value, within_window
 from rxembed.metal_core import COORDINATION_METALS, metal_indices
-from rxembed.metal_perceive import SHAPE_PROP, coordinating_atoms, donor_orientation, metal_overbond
+from rxembed.metal_perceive import SHAPE_PROP, declared_donors, donor_orientation, metal_overbond, spheres
 from rxembed.utils import (
     CARBON_Z,
     SP2_DEGREE,
@@ -44,10 +45,11 @@ _XH_TOL = 0.2  # Å slack over an X-H covalent-radius sum (P-H/Si-H/S-H run long
 # A non-bonded 1-3 pair has fused when its separation drops to the covalent sum: a ring closed by the relax,
 # not the graph. Bonded 1-3 pairs are excluded, being legitimately this close.
 _FUSE_RATIO = 1.0
-_SIDEON_SYM = 0.5  # A: max |d(M,a) - d(M,b)| for a pi pair to count as symmetric side-on (else donor + backbone)
-# Absolute, not a covalent-sum ratio like the `coordinating_atoms` shell: no ratio keeps GODNOD's eta2 C=S (1.233x) and
-# rejects COJKAO's Pd...S=O (1.226x); 2.6 A separates them by 0.27 A.
-_SIDEON_MAX = 2.6  # A: both eta2 atoms must bind within this; beyond it a pi atom is backbone, not a donor.
+# Perceived spheres only, where a backbone atom inside the shell can pose as a side-on donor. _SIDEON_SYM is the
+# max |d(M,a) - d(M,b)| of a symmetric side-on pair. _SIDEON_MAX is fitted to two structures, one eta2 C=S kept
+# and one Pd...S=O contact rejected, which no covalent-sum ratio separates; it has no census behind it.
+_SIDEON_SYM = 0.5  # A
+_SIDEON_MAX = 2.6  # A
 
 
 # --- the result -------------------------------------------------------------
@@ -182,14 +184,21 @@ def hydrogens(
 
 
 def clashes(
-    mol, pos, *, heavy_vdw: float = 0.7, hh_floor: float = 1.5, xh_cov: float = 1.1, exclude=frozenset()
+    mol,
+    pos,
+    *,
+    heavy_vdw: float = 0.7,
+    hh_floor: float = 1.5,
+    xh_cov: float = 1.1,
+    exclude=frozenset(),
+    donors=None,
 ) -> list[Violation]:
     """No non-bonded pair (excluding 1-3 angle pairs) in steric overlap.
 
     Thresholds differ by kind so real non-covalent contacts (H-bonds, halogen/π) are not flagged: heavy-heavy
     at `heavy_vdw` x sum-of-vdW; H...H below `hh_floor` Å; an H buried in a heavy atom at `xh_cov` x
     sum-of-covalent (a 1.8 Å H-bond passes, a buried H caught). ``exclude`` atoms (a frozen/reacting core) are
-    skipped.
+    skipped. ``donors`` is the stated coordination sphere (see `metal_perceive.spheres`).
     """
     excluded = set()
     for b in mol.GetBonds():
@@ -207,7 +216,7 @@ def clashes(
                 ):
                     continue  # test H-X-H collapse only where X is not an excluded reacting/coordination centre
                 excluded.add((min(nb[a], nb[c]), max(nb[a], nb[c])))
-    excluded |= _coordination_pairs(mol, pos)  # cis donors of one metal are 1-3 through it, not a clash
+    excluded |= _coordination_pairs(mol, pos, donors)  # cis donors of one metal are 1-3 through it, not a clash
     z = [a.GetAtomicNum() for a in mol.GetAtoms()]
     out = []
     n = mol.GetNumAtoms()
@@ -233,10 +242,9 @@ def over_compression(mol, pos, exclude=frozenset(), ratio: float = _FUSE_RATIO) 
     """Non-bonded 1-3 pairs crushed to bonding distance: a phantom ring no other gate catches.
 
     A 1-3 pair is normally held apart by its bridging angle, so ``clashes`` excludes it and
-    ``metrics.connectivity`` never reports it. But a hard relax can fold that angle until the terminals
-    fuse: a coordinated ester's O-C-O collapsing ~122->56° fuses its O to 1.27 Å, below ``bonding_failure``'s
-    ~0.9 Å fusion floor. The discriminator against a genuine small ring (epoxide, cyclopropane) is the
-    graph, not the angle: a bonded pair never enters this test.
+    ``metrics.connectivity`` never reports it. A hard relax can still fold that angle until the terminals sit
+    at bonding distance, above ``bonding_failure``'s fusion floor. The discriminator against a genuine small
+    ring (epoxide, cyclopropane) is the graph, not the angle: a bonded pair never enters this test.
     """
     out: list[Violation] = []
     for mid_atom in mol.GetAtoms():
@@ -399,9 +407,12 @@ def check_constraints(mol, pos, spec, dist_slack: float = 0.15, ang_slack: float
 
 
 def stereo_violations(mol, pos, reference, conf_id: int = -1) -> list[Violation]:
-    """No stereocentre inverted vs ``reference`` (CIP tags from 3D)."""
+    """No stereocentre inverted vs ``reference`` (CIP tags from 3D).
+
+    Both sides are read on `mol`'s own graph, so a bond-less reference (an ``.xyz`` path) still has labels.
+    """
     got = _cip(mol, conf_id)
-    want = _cip(reference)
+    want = _cip(mol, conf_id, as_positions(reference))
     out = []
     for idx, tag in want.items():
         if got.get(idx) != tag:
@@ -447,14 +458,14 @@ def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=No
     exclude = set(frozen) if frozen is not None else set()
     exclude |= set(metals)  # dative, not vdW
     exclude = frozenset(exclude)
-    coord_c = _coordinating_carbons(mol, pos)  # dative, not covalent: an organic valence rule would false-flag it
+    coord_c = _coordinating_carbons(mol, pos, donors)  # dative, not covalent: an organic sp2 rule would false-flag it
     v: list[Violation] = []
     v += bond_lengths(mol, pos, exclude=exclude)
     v += hydrogens(mol, pos, exclude=exclude, donors=frozenset(donors or ()))
-    v += clashes(mol, pos, exclude=exclude)
+    v += clashes(mol, pos, exclude=exclude, donors=donors)
     v += over_compression(mol, pos, exclude=exclude)
     v += planarity(mol, pos, exclude=exclude | coord_c)
-    v += conjugation(mol, pos, exclude=exclude, flex=_eta2_pi_atoms(mol, pos) | coord_c)
+    v += conjugation(mol, pos, exclude=exclude, flex=_eta2_pi_atoms(mol, pos, donors) | coord_c)
     v += metal_overbond(mol, pos, donors)  # the two gates that look INTO the sphere, unlike every check above
     v += donor_orientation(mol, pos, donors, frozen or frozenset())
     if frozen is not None and reference is not None:
@@ -475,56 +486,47 @@ def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=No
 _EPS = 1e-9  # numerical floor for a degenerate cross-product / near-zero norm
 
 
-def _eta2_pi_atoms(mol, pos) -> set[int]:
-    """Return atoms in a genuine side-on η² unit: a π-bonded pair binding one metal symmetrically.
+def _eta2_pi_atoms(mol, pos, donors=None) -> set[int]:
+    """Return atoms in a side-on η² unit: two bonded donors of one metal (the adjacent-donor site rule).
 
-    A side-on π ligand binds *through* its π bond, so the metal sits above the bond and legitimately pulls the
-    sp2 atoms a little out of plane, a real feature rather than broken geometry, so these atoms get a wider
-    planarity/conjugation window.
-
-    The signal is a pi-bonded pair both near the metal and at roughly equal metal distance: side-on is symmetric.
-    Equal-distance rejects a false positive the flat 1.3x shell lets through: an alpha-diimine's imine C drifts
-    inside the shell behind its sigma-donor N, but that N/C pair is lopsided, not side-on.
+    A side-on ligand binds through its π bond, so the metal legitimately pulls the pair a little out of plane:
+    a real feature, which gets the wider conjugation window. A declared sphere states the rule exactly. A
+    perceived sphere also holds backbone atoms inside the shell, such as an alpha-diimine's imine C behind its
+    sigma-donor N, so there the pair must also be π-bonded, bind symmetrically and sit within `_SIDEON_MAX`.
     """
-    metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS]
     out: set[int] = set()
-    for a, b in _coordination_pairs(mol, pos):
-        bond = mol.GetBondBetweenAtoms(a, b)
-        if bond is None or bond.GetBondTypeAsDouble() < 2:  # noqa: PLR2004  double/triple needed for side-on pi
-            continue
-        for m in metals:  # symmetric binding: both atoms at ~equal distance from the same metal
-            da, db = float(np.linalg.norm(pos[m] - pos[a])), float(np.linalg.norm(pos[m] - pos[b]))
-            if abs(da - db) <= _SIDEON_SYM and max(da, db) <= _SIDEON_MAX:
-                out.update((a, b))
-                break
+    for m, sphere in spheres(mol, pos, donors).items():
+        # `spheres` falls back to perception only when none of this metal's declared donors is in its shell
+        declared = not sphere.isdisjoint(declared_donors(donors, m))
+        for a, b in itertools.combinations(sorted(sphere), 2):
+            bond = mol.GetBondBetweenAtoms(a, b)
+            if bond is None:
+                continue
+            if not declared:
+                da, db = float(np.linalg.norm(pos[m] - pos[a])), float(np.linalg.norm(pos[m] - pos[b]))
+                if bond.GetBondTypeAsDouble() < 2 or abs(da - db) > _SIDEON_SYM or max(da, db) > _SIDEON_MAX:  # noqa: PLR2004
+                    continue
+            out.update((a, b))
     return out
 
 
-def _coordinating_carbons(mol, pos) -> set[int]:
-    """Return carbons in a metal's coordination shell, which get the wider planarity window.
+def _coordinating_carbons(mol, pos, donors=None) -> set[int]:
+    """Return carbons in a metal's coordination sphere, which get the wider planarity window.
 
     A carbanion / carbene / eta2 carbon legitimately pyramidalises out of the flat sp2 plane RDKit assigns it,
     so judging it by the strict sp2 rule reports a defect that is not one.
     """
-    metals = (a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS)
     return {
-        i for m in metals for i in coordinating_atoms(mol, pos, m) if mol.GetAtomWithIdx(i).GetAtomicNum() == CARBON_Z
+        i
+        for sphere in spheres(mol, pos, donors).values()
+        for i in sphere
+        if mol.GetAtomWithIdx(i).GetAtomicNum() == CARBON_Z
     }
 
 
-def _coordination_pairs(mol, pos) -> set[tuple[int, int]]:
-    """Return donor-donor index pairs of each metal (a heavy atom in the `coordinating_atoms` shell).
-
-    These are 1-3 pairs through the metal: cis coordination partners at the bite distance, not a steric
-    clash. The metal-donor bonds are stripped on the rxembed surrogate, so donors are found geometrically.
-    """
-    out: set[tuple[int, int]] = set()
-    for m in (a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS):
-        donors = sorted(coordinating_atoms(mol, pos, m))
-        for x in range(len(donors)):
-            for y in range(x + 1, len(donors)):
-                out.add((donors[x], donors[y]))
-    return out
+def _coordination_pairs(mol, pos, donors=None) -> set[tuple[int, int]]:
+    """Return the donor pairs of each metal: 1-3 pairs through the metal at the bite distance, not a clash."""
+    return {pair for sphere in spheres(mol, pos, donors).values() for pair in itertools.combinations(sorted(sphere), 2)}
 
 
 def _plane_offset(center: np.ndarray, neighbors: np.ndarray) -> float:
@@ -544,11 +546,13 @@ def _attr(obj, name, default):
     return getattr(obj, name, default)
 
 
-def _cip(mol, conf_id: int = -1) -> dict[int, str]:
+def _cip(mol, conf_id: int = -1, positions=None) -> dict[int, str]:
     m = Chem.Mol(mol)
+    if positions is not None:
+        m.GetConformer(conf_id).SetPositions(np.asarray(positions, float))
     # through `utils`: the CIP labeller counts a dative bond leaving the centre and RDKit's 3D writer does
     # not, so reading a label off a raw write mirrors the R/S at every dative-bonded donor.
-    assign_stereo_from_3d(m, conf_id if conf_id >= 0 else m.GetNumConformers() - 1)
+    assign_stereo_from_3d(m, conf_id)
     out = {}
     for atom in m.GetAtoms():
         if atom.HasProp("_CIPCode"):

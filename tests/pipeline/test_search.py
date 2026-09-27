@@ -28,6 +28,7 @@ def test_failed_search_clears_stale_energies(monkeypatch):
         raise RuntimeError("failed")
 
     monkeypatch.setattr(search, "available", lambda: True)
+    monkeypatch.setattr(search, "config", lambda **kw: None)
     monkeypatch.setattr(search, "search", fail)
     ens = rx.embed("CCCC", n=2, seed=1).minimize()
     assert ens.energies
@@ -43,18 +44,20 @@ def test_failed_search_clears_stale_energies(monkeypatch):
 
 
 @pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
-def test_unknown_passthrough_field_is_refused_by_name(caplog):
-    ens = rx.embed("CCCC", n=1, seed=1)
-    with caplog.at_level("WARNING", logger="rxembed"):
+def test_unknown_passthrough_field_raises_before_the_ensemble_changes():
+    ens = rx.embed("CCCC", n=1, seed=1).minimize()
+    before = dict(ens.energies)
+
+    with pytest.raises(TypeError, match="not_a_field"):
         ens.mc(preset="rapid", not_a_field=1)
 
-    assert "not_a_field" in caplog.text
+    assert ens.energies == before
 
 
 @pytest.mark.skipif(find_spec("openconf") is None, reason="openconf not installed")
 def test_constrained_search_rejects_low_mode(monkeypatch, caplog):
     ens = rx.embed("CCCCCCO", n=1, seed=1, fix={(0, 6): 4.0})
-    real_config = search._config
+    real_config = search.config
     captured = []
 
     def spy(*args, **kw):
@@ -62,7 +65,7 @@ def test_constrained_search_rejects_low_mode(monkeypatch, caplog):
         captured.append(cfg)
         return cfg
 
-    monkeypatch.setattr(search, "_config", spy)
+    monkeypatch.setattr(search, "config", spy)
     with caplog.at_level("WARNING", logger="rxembed"):
         ens.mc(preset="ensemble", low_mode=True)
 

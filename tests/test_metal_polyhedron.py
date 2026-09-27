@@ -16,6 +16,7 @@ from rxembed.metal_perceive import _plane_rms, rank_shapes
 from rxembed.metal_polyhedron import (
     _ALIASES,
     POLYHEDRA,
+    _cross3,
     _fit_trace,
     canonical_slots,
     describe,
@@ -334,3 +335,9 @@ def test_square_pyramid_apex_fan_keeps_its_base_planar():
     tet = POLYHEDRA["tetrahedral"].vertex_dirs
     cycle = {frozenset((0, 1)): 80.5, frozenset((1, 2)): 89.0, frozenset((2, 3)): 80.5, frozenset((3, 0)): 89.0}
     assert relaxed_shell(tet, cycle) is None
+
+
+def test_cross3_is_bit_identical_to_numpy_cross():
+    rng = np.random.default_rng(0)
+    a, b = rng.normal(size=(2, 20_000, 3))
+    assert np.array_equal(_cross3(a, b), np.cross(a, b))

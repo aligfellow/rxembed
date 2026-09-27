@@ -7,6 +7,7 @@ branch. This is the only module that touches xyzgraph's NCI detection.
 
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from functools import partial
@@ -18,10 +19,12 @@ from rdkit import Chem
 
 from rxembed.bounds import probe_conformer
 from rxembed.metal_core import frag_map, metal_indices
-from rxembed.utils import CARBON_Z, atom_label
+from rxembed.utils import atom_label
 
 if TYPE_CHECKING:
     from xyzgraph.nci import NCIAnalyzer
+
+logger = logging.getLogger("rxembed")
 
 
 def _graph(mol: Chem.Mol, conf_id: int = -1) -> nx.Graph:
@@ -43,7 +46,12 @@ def _graph(mol: Chem.Mol, conf_id: int = -1) -> nx.Graph:
     for i in g.nodes:
         g.nodes[i]["valence"] = sum(g[i][j]["bond_order"] for j in g.neighbors(i))
         g.nodes[i]["agg_charge"] = float(g.nodes[i]["formal_charge"])
-    g.graph["aromatic_rings"] = [tuple(map(int, r)) for r in Chem.GetSymmSSSR(mol)]
+    # Only aromatic rings are pi rings: xyzgraph trusts this list verbatim. Perceive on a copy, since
+    # SymmSSSR rewrites the caller's RingInfo.
+    rings = Chem.Mol(mol)
+    g.graph["aromatic_rings"] = [
+        tuple(map(int, r)) for r in Chem.GetSymmSSSR(rings) if all(rings.GetAtomWithIdx(i).GetIsAromatic() for i in r)
+    ]
     return g
 
 
@@ -60,9 +68,7 @@ def analyzer(mol: Chem.Mol) -> NCIAnalyzer:
 _HB_DONOR_Z = {7, 8, 16}  # N O S: polar H-bond donor heavies; a charge-assisted
 # H-bond is promoted from IONIC only off one of these (a
 # C-H on an iminium/tropylium cation is not a real donor)
-_ACCEPTOR_Z = {7, 8, 9}  # N O F: lone-pair H-bond acceptors (for M-H; the
-# (1.6,2.2) window is tuned for these; S/Cl need a
-# longer window, to add later)
+_ACCEPTOR_Z = {7, 8, 9}  # N O F: the lone-pair acceptors an M-H contact seeks (its window assumes a period-2 acceptor)
 
 # A sigma-hole needs a polarisable heavy donor, so the element list is the physics, not a convenience:
 # F has no usable hole and O/N are the acceptors, not the donors.
@@ -95,22 +101,24 @@ class ContactKind:
     anchor: str = "heavy"
 
 
-# One row per contact type. Ring values are centroid heights, expanded to atom windows downstream.
+# One row per contact type. Ring values are centroid heights, expanded to atom windows downstream. No row's
+# distance or orientation window has a census or reproducible measurement behind it: each is a seed bias for
+# `rx.embed(contacts=)`, marked unmeasured, until a per-pair census of optimised contacts replaces it.
 KINDS = {
     k.name: k
     for k in [
-        ContactKind("HB", "atom", (1.6, 2.2), orient=(140.0, 180.0), apex="donor", anchor="donor_h"),
-        ContactKind("XB", "atom", (2.5, 3.1), orient=(160.0, 180.0), apex="sigma"),  # GFN-FF-surviving on I...pyridine
-        ContactKind("ChB", "atom", (3.0, 3.6), orient=(155.0, 180.0), apex="sigma"),
-        ContactKind("PnB", "atom", (3.0, 3.6), orient=(155.0, 180.0), apex="sigma"),
-        ContactKind("IONIC", "atom", (2.6, 3.8)),
-        ContactKind("CATLP", "atom", (2.6, 3.4)),
-        ContactKind("CHPI", "ring", 3.0, anchor="ring_h"),
-        ContactKind("HBPI", "ring", 3.0, anchor="ring_h"),
-        ContactKind("CATPI", "ring", 3.5, anchor="ring_ion"),  # generic: GFN-FF optima span 1.55-4.41 A by cation
-        ContactKind("ANPI", "ring", 3.5, anchor="ring_ion"),
-        ContactKind("HALPI", "ring", 3.5, anchor="ring_ion"),
-        ContactKind("MH", "hydride", (1.6, 2.2), orient=(140.0, 180.0), apex="metal", anchor="hydride"),
+        ContactKind("HB", "atom", (1.6, 2.2), orient=(140.0, 180.0), apex="donor", anchor="donor_h"),  # unmeasured
+        ContactKind("XB", "atom", (2.5, 3.1), orient=(160.0, 180.0), apex="sigma"),  # unmeasured; same for Cl, Br, I
+        ContactKind("ChB", "atom", (3.0, 3.6), orient=(155.0, 180.0), apex="sigma"),  # unmeasured
+        ContactKind("PnB", "atom", (3.0, 3.6), orient=(155.0, 180.0), apex="sigma"),  # unmeasured
+        ContactKind("IONIC", "atom", (2.6, 3.8)),  # unmeasured
+        ContactKind("CATLP", "atom", (2.6, 3.4)),  # unmeasured
+        ContactKind("CHPI", "ring", 3.0, anchor="ring_h"),  # unmeasured
+        ContactKind("HBPI", "ring", 3.0, anchor="ring_h"),  # unmeasured
+        ContactKind("CATPI", "ring", 3.5, anchor="ring_ion"),  # unmeasured; one height for every cation
+        ContactKind("ANPI", "ring", 3.5, anchor="ring_ion"),  # unmeasured
+        ContactKind("HALPI", "ring", 3.5, anchor="ring_ion"),  # unmeasured
+        ContactKind("MH", "hydride", (1.6, 2.2), orient=(140.0, 180.0), apex="metal", anchor="hydride"),  # unmeasured
     ]
 }
 
@@ -165,7 +173,7 @@ def _atom_over_ring(pos, atom, ring, d_centroid):
     out = []
     for k in ring:
         dk = (d_centroid**2 + float(np.linalg.norm(pos[k] - c)) ** 2) ** 0.5
-        out.append((min(atom, k), max(atom, k), round(dk - 0.3, 2), round(dk + 0.3, 2)))
+        out.append((min(atom, k), max(atom, k), round(dk - 0.3, 2), round(dk + 0.3, 2)))  # +/-0.3 A: unmeasured
     return out
 
 
@@ -178,19 +186,23 @@ def candidate_contacts(mol, kinds=tuple(KINDS), inter_fragment=True, seed=0xC0FF
     (deterministically, `seed`) only when the input has none, since its geometry decides the sigma-hole
     apex, the M-H nearest acceptor, and ring radii.
     """
+    unknown = [name for name in kinds if name not in KINDS]
+    if unknown:
+        raise ValueError(f"unknown contact kind(s) {unknown}; choose from {list(KINDS)}")
     work = Chem.Mol(mol)
     if work.GetNumConformers() == 0:
         # `seed` differs from the embed default on purpose: moving it would move every found contact.
-        work = probe_conformer(mol, seed) or work
+        work = probe_conformer(mol, seed)
+        if work is None:
+            raise ValueError("candidate_contacts could not embed a probe conformer; pass a Mol with a conformer")
     pos = work.GetConformer().GetPositions()
     an = analyzer(work)
     frag = frag_map(work)
     handler = {"atom": _atom_contacts, "ring": _ring_contacts, "hydride": _metal_hydride_contacts}
     out, seen = {}, set()
     for name in kinds:
-        kind = KINDS.get(name)
-        if kind is not None:
-            out.update(handler[kind.family](work, an, pos, frag, seen, inter_fragment, kind))
+        kind = KINDS[name]
+        out.update(handler[kind.family](work, an, pos, frag, seen, inter_fragment, kind))
     return out
 
 
@@ -266,25 +278,20 @@ def _acc_key(c):
 def _acceptor_quality(mol, ak):
     """Return the relative H-bond basicity of an acceptor (higher = better), used only to rank modes.
 
-    A grip onto a genuinely basic lone pair beats one onto a spent one: an amine/imine/iminophosphorane N
-    (very basic) accepts strongly; a carbonyl/phosphoryl O or thione S accepts well; but an amide/
-    (thio)urea/aromatic N accepts poorly (delocalised into the adjacent pi system, it is the very N that is
-    itself a good H-bond donor).
+    A nitrogen lone pair is spent when it is part of a pi system: in the sextet of a three-connected aromatic N
+    (pyrrole type), or delocalised into a conjugated neighbour when the N has no pi bond of its own (amide,
+    aniline, enamine). An N with its own pi bond (pyridine, imine, nitrile) keeps an in-plane lone pair and,
+    like an amine, accepts strongly. O, S and halide acceptors rank between.
     """
     if ak[0] != "atom":
         return 1
     a = mol.GetAtomWithIdx(ak[1])
-    if a.GetAtomicNum() == 7:  # noqa: PLR2004  nitrogen
-        if a.GetIsAromatic():
-            return 0  # pyrrole/amide-like aromatic N: lone pair in ring
-        for nb in a.GetNeighbors():  # amide / amidine / (thio)urea: N-C(=O/=S/=N)
-            if nb.GetAtomicNum() == CARBON_Z and any(
-                b.GetBondTypeAsDouble() >= 2 and b.GetOtherAtom(nb).GetAtomicNum() in (7, 8, 16)  # noqa: PLR2004
-                for b in nb.GetBonds()
-            ):
-                return 0
-        return 2  # amine / imine / iminophosphorane N: strong base
-    return 1  # O / S / halide lone-pair acceptor: decent
+    if a.GetAtomicNum() != 7:  # noqa: PLR2004  nitrogen
+        return 1
+    if a.GetIsAromatic():
+        return 0 if a.GetTotalDegree() == 3 else 2  # noqa: PLR2004  three-connected: lone pair in the sextet
+    own_pi = any(b.GetBondTypeAsDouble() >= 2 for b in a.GetBonds())  # noqa: PLR2004  double or triple
+    return 0 if not own_pi and any(b.GetIsConjugated() for b in a.GetBonds()) else 2
 
 
 def _accepts(c, count, cap):
@@ -302,7 +309,10 @@ def _seat(c, count, delta):
     count[_acc_key(c)][cls] += delta
 
 
-def _maximal_assignments(by_near, cap, hard_cap=256):
+_MAX_ASSIGNMENTS = 256  # a count bound on the enumeration, not a score bound: hitting it warns
+
+
+def _maximal_assignments(by_near, cap):
     """Enumerate every maximal donor->acceptor assignment of the anchor contacts.
 
     Each donor (a `by_near` group of its mutually-exclusive contacts) takes one contact whenever an acceptor
@@ -311,9 +321,12 @@ def _maximal_assignments(by_near, cap, hard_cap=256):
     ``[(near, [contacts]), ...]``. Reciprocal 2-cycles are resolved afterwards (``_resolve_reciprocal``).
     """
     out = []
+    truncated = False
 
     def bt(i, chosen, count):
-        if len(out) >= hard_cap:
+        nonlocal truncated
+        if len(out) >= _MAX_ASSIGNMENTS:
+            truncated = True
             return
         if i == len(by_near):
             out.append(list(chosen))
@@ -330,6 +343,11 @@ def _maximal_assignments(by_near, cap, hard_cap=256):
             _seat(c, count, -1)
 
     bt(0, [], defaultdict(lambda: [0, 0]))
+    if truncated:  # depth-first, so the kept assignments favour the first donors' first acceptors
+        logger.warning(
+            "nci_modes: stopped at %d assignments and may miss the best grip; pick contacts= from rx.nci_candidates",
+            _MAX_ASSIGNMENTS,
+        )
     return out
 
 
@@ -491,9 +509,9 @@ def _metal_hydride_contacts(work, an, pos, frag, seen, inter_fragment, kind):
 
     Nearest N/O/F acceptor in another fragment (so a substrate with many heteroatoms doesn't spawn a
     contradictory pile). Structural detection (a terminal H on a coordination centre), not SMARTS, so it
-    works on an xyz-perceived Mol too. Dev-stage simplification: an M-H is always a donor (the metal is the 'donor
-    heavy', orientation M-H...A linear); the di-hydrogen-bond and S/Cl-acceptor cases are left for later.
-    xyzgraph does not type these, so they are *seeded* but not *re-detected* by binding_modes().
+    works on an xyz-perceived Mol too. An M-H is always the donor, held linear M-H...A with the metal as the
+    donor heavy atom; a dihydrogen bond and S or Cl acceptors are not modelled. xyzgraph does not type these,
+    so they are seeded but not re-detected by binding_modes().
     """
     out = {}
     metals = metal_indices(work)

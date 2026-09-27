@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 from dataclasses import dataclass, field
 
@@ -21,20 +22,12 @@ logger = logging.getLogger("rxembed.relax")
 MAX_ITERS = 2000  # the one restrained-UFF iteration cap: every relax entry point defaults from this name
 _PT = GetPeriodicTable()
 _MAIN_GROUP_Z = frozenset(range(3, 89)) - COORDINATION_METALS  # every main-group element, d/f-block excluded
-# The main-group element directly above `z` in the same column: same valence electron count, one row up.
-# Omitted where that element is not unique (there is none, or the column skips a row, as group 13-18 do
-# between period 2 and period 4).
+# The main-group element one row up with the same valence electron count; period 2 has none.
 _LIGHTER_CONGENER = {
-    z: above[0]
+    z: y
     for z in _MAIN_GROUP_Z
-    if len(
-        above := [
-            y
-            for y in _MAIN_GROUP_Z
-            if _PT.GetRow(y) == _PT.GetRow(z) - 1 and _PT.GetNOuterElecs(y) == _PT.GetNOuterElecs(z)
-        ]
-    )
-    == 1
+    for y in _MAIN_GROUP_Z
+    if _PT.GetRow(y) == _PT.GetRow(z) - 1 and _PT.GetNOuterElecs(y) == _PT.GetNOuterElecs(z)
 }
 
 
@@ -104,6 +97,19 @@ def _valence_pressure(mol, idx):
     return atom.HasValenceViolation(), excess, atom.GetDegree()
 
 
+def _rehybridise(rw, atoms):
+    """Return a copy of `rw` with `atoms`' hybridisation re-derived from their current bonds alone."""
+    for idx in atoms:
+        atom = rw.GetAtomWithIdx(idx)
+        atom.SetNoImplicit(True)
+        atom.SetHybridization(Chem.HybridizationType.UNSPECIFIED)
+    mid = rw.GetMol()
+    mid.UpdatePropertyCache(strict=False)
+    with rdBase.BlockLogs():
+        Chem.SanitizeMol(mid, Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION, catchErrors=True)
+    return Chem.RWMol(mid)
+
+
 def _uff_core_graphs(mol, frozen):
     """Yield private FF graphs with implicated frozen-core bonds made dative.
 
@@ -125,28 +131,17 @@ def _uff_core_graphs(mol, frozen):
     # Try one edge first. If several atoms violate valence, retype only enough low-pressure neighbours at each
     # centre to remove its excess valence; this stays linear instead of enumerating 2**N subsets.
     choices = [[edge] for edge in directed]
-    by_start = {}
-    for edge in directed:
-        by_start.setdefault(edge[0], []).append(edge)
     combined = []
-    for start, edges in by_start.items():
-        needed = max(1, int(_valence_pressure(mol, start)[1]))
-        combined.extend(sorted(edges, key=lambda edge: _valence_pressure(mol, edge[1]))[:needed])
+    for start in dict.fromkeys(start for start, _end in directed):
+        edges = sorted((edge for edge in directed if edge[0] == start), key=lambda e: _valence_pressure(mol, e[1]))
+        combined += edges[: max(1, int(_valence_pressure(mol, start)[1]))]
     if len(combined) > 1:
         choices.append(combined)
     for chosen in choices:
         rw = Chem.RWMol(mol)
         for start, end in chosen:
             rw.RemoveBond(start, end)
-        for a in {a for edge in chosen for a in edge}:
-            atom = rw.GetAtomWithIdx(a)
-            atom.SetNoImplicit(True)
-            atom.SetHybridization(Chem.HybridizationType.UNSPECIFIED)
-        mid = rw.GetMol()
-        mid.UpdatePropertyCache(strict=False)
-        with rdBase.BlockLogs():
-            Chem.SanitizeMol(mid, Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION, catchErrors=True)
-        rw = Chem.RWMol(mid)
+        rw = _rehybridise(rw, {a for edge in chosen for a in edge})
         for start, end in chosen:
             rw.AddBond(start, end, Chem.BondType.DATIVE)
         out = rw.GetMol()
@@ -195,14 +190,10 @@ def _ff_surrogate(mol, metals, phantoms=()):
     rw = Chem.RWMol(mol)  # copies the conformers
     for begin, end in partial:
         rw.RemoveBond(begin, end)  # UFF requires positive bond order; a partial contact carries no bond energy
-    for m in metals:
-        a = rw.GetAtomWithIdx(int(m))
-        a.SetAtomicNum(FF_SURROGATE)
-        a.SetNoImplicit(True)
-        a.SetFormalCharge(0)
-    for p in phantoms:  # a haptic centroid dummy: kept for its restraints, but zero energy terms (see UFF_GHOST)
-        a = rw.GetAtomWithIdx(int(p))
-        a.SetAtomicNum(UFF_GHOST)
+    # A haptic centroid dummy keeps its restraints but gets no energy terms (see UFF_GHOST).
+    for idx, z in [*((m, FF_SURROGATE) for m in metals), *((p, UFF_GHOST) for p in phantoms)]:
+        a = rw.GetAtomWithIdx(int(idx))
+        a.SetAtomicNum(z)
         a.SetNoImplicit(True)
         a.SetFormalCharge(0)
     out = rw.GetMol()
@@ -231,13 +222,10 @@ def _uff_missing_atoms(mol, phantoms):
 def _rejected_charge_states(mol):
     """Return atoms whose formal charge is a bookkeeping artefact UFF's typer ignores.
 
-    An ionic-dative donor SMILES (AGENTS.md) can draw a lone-pair donation as a charge-separated double or
-    triple bond, e.g. a dithiocarbene ``[C-2]=[S+]``. UFF's per-element type table does not vary with formal
-    charge for this bonding pattern, so the charge buys nothing and the type is silently wrong for what is
-    really a donor-weakened bond. The larger-magnitude partner balances the donor's dative arrow; the
-    smaller-magnitude partner carries the leftover bookkeeping charge and is the one worth re-deriving
-    (re-deriving the larger-magnitude partner instead fits worse). An equal-magnitude pair, such as an
-    amidinium, is an ordinary delocalised charge, not an artefact, and is left as UFF typed it.
+    An ionic-dative donor SMILES can draw a lone-pair donation as a charge-separated double or triple bond,
+    such as a dithiocarbene ``[C-2]=[S+]``. Of an unequal pair, the smaller-magnitude partner carries the
+    leftover charge and is re-derived (re-deriving the other fits worse); an equal pair, such as an amidinium,
+    is ordinary delocalised charge and keeps its UFF type.
     """
     out = set()
     for bond in mol.GetBonds():
@@ -254,29 +242,20 @@ def _rejected_charge_states(mol):
 
 
 def _neutralise_charge_states(rw, indices):
-    """Neutralise a rejected formal charge and re-derive hybridisation from sigma-bond degree.
+    """Return a copy of `rw` with rejected formal charges neutralised and hybridisation re-derived.
 
-    A double or triple bond into an `indices` atom is read as single while RDKit derives
-    hybridisation, so the pi character the charge was drawn to balance does not skew the type UFF
-    picks from the bonding pattern alone; the original bond order is then restored. Mirrors
-    `_uff_core_graphs`'s two-phase sanitize for a dative-fixed core. Returns a new RWMol; `rw` is
-    not mutated in place past the point RDKit needs a fresh Mol to sanitize.
+    A double or triple bond into an `indices` atom reads as single while RDKit derives hybridisation, so the
+    pi character the charge was drawn to balance does not skew the UFF type; the bond order is then restored.
     """
     restore = []
     for idx in indices:
         atom = rw.GetAtomWithIdx(idx)
         atom.SetFormalCharge(0)
-        atom.SetNoImplicit(True)
-        atom.SetHybridization(Chem.HybridizationType.UNSPECIFIED)
         for bond in atom.GetBonds():
             if bond.GetBondType() in (Chem.BondType.DOUBLE, Chem.BondType.TRIPLE):
                 restore.append((bond.GetIdx(), bond.GetBondType()))
                 bond.SetBondType(Chem.BondType.SINGLE)
-    mid = rw.GetMol()
-    mid.UpdatePropertyCache(strict=False)
-    with rdBase.BlockLogs():
-        Chem.SanitizeMol(mid, Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION, catchErrors=True)
-    rw = Chem.RWMol(mid)
+    rw = _rehybridise(rw, indices)
     for bond_idx, bond_type in restore:
         rw.GetBondWithIdx(bond_idx).SetBondType(bond_type)
     return rw
@@ -291,14 +270,15 @@ def _uff_surrogate_graph(mol, cons):
     rw = Chem.RWMol(mol)
     if rejected:
         rw = _neutralise_charge_states(rw, rejected)
-    replacements = {idx: (z, z) for idx in rejected for z in (mol.GetAtomWithIdx(idx).GetAtomicNum(),)}
+    replacements = {idx: (mol.GetAtomWithIdx(idx).GetAtomicNum(),) * 2 for idx in rejected}
     for idx in missing:
         atom = rw.GetAtomWithIdx(idx)
         real_z = atom.GetAtomicNum()
         surrogate_z = _LIGHTER_CONGENER.get(real_z)
         if surrogate_z is None and real_z == 5:  # noqa: PLR2004  boron
-            # RDKit has no type for some isolated, hypervalent boron forms.  Carbon is only
-            # a private fallback here; boron-hydrogen and boron-boron networks remain unsupported.
+            # UFF has no linear boron type. One measured structure reaches this (fixtures, tmQMg sample and
+            # issues): VALRAE's neutral sp boryl, whose anionic charge xyz2mol places on a ring carbon, so an
+            # isoelectronic rule keyed on formal charge (B- -> C) loses it. B-H and B-B networks stay unsupported.
             if atom.GetTotalNumHs() or any(
                 neighbor.GetAtomicNum() == 5  # noqa: PLR2004  boron
                 for neighbor in atom.GetNeighbors()
@@ -333,9 +313,7 @@ def _uff_surrogate_graph(mol, cons):
                 return None
             radius_delta = sum(
                 _PT.GetRcovalent(real_z) - _PT.GetRcovalent(surrogate_z)
-                for atom in (i, j)
-                for real_z, surrogate_z in (replacements.get(atom, (0, 0)),)
-                if real_z
+                for real_z, surrogate_z in (replacements[atom] for atom in (i, j) if atom in replacements)
             )
             target = params[1] + radius_delta
             distances[(i, j)] = (target, target)
@@ -343,20 +321,13 @@ def _uff_surrogate_graph(mol, cons):
 
 
 def _select_uff_graph(work, cons, frozen):
-    """Select the least invasive private graph that RDKit can type."""
-    if _uff_typeable(work, cons.phantoms) and not _rejected_charge_states(work):
-        return work, cons, (), {}
-    for candidate, retyped in _uff_core_graphs(work, frozen):
+    """Select the least invasive private graph RDKit can type: native, then dative-core, then element surrogates."""
+    for candidate, retyped in itertools.chain([(work, ())], _uff_core_graphs(work, frozen)):
         if _uff_typeable(candidate, cons.phantoms) and not _rejected_charge_states(candidate):
             return candidate, cons, retyped, {}
-    fallback = _uff_surrogate_graph(work, cons)
-    if fallback is not None:
-        target, effective_cons, replacements = fallback
-        return target, effective_cons, (), replacements
-    for candidate, retyped in _uff_core_graphs(work, frozen):
-        fallback = _uff_surrogate_graph(candidate, cons)
-        if fallback is not None:
-            target, effective_cons, replacements = fallback
+    for candidate, retyped in itertools.chain([(work, ())], _uff_core_graphs(work, frozen)):
+        if (surrogate := _uff_surrogate_graph(candidate, cons)) is not None:
+            target, effective_cons, replacements = surrogate
             return target, effective_cons, retyped, replacements
     missing = set(_uff_missing_atoms(work, cons.phantoms)) | _rejected_charge_states(work)
     _raise_uff_typing_error(work, sorted(missing))
@@ -442,21 +413,21 @@ def restrained_uff(
                     status, frames = ff.MinimizeTrajectory(1, maxIts=max_iters)
                     trajectory = rdtrajectory.Trajectory(3, target.GetNumAtoms(), frames)
                     out.snapshots[cid] = [
-                        np.array(
-                            [
-                                [snapshot.GetPoint3D(i).x, snapshot.GetPoint3D(i).y, snapshot.GetPoint3D(i).z]
-                                for i in range(mol.GetNumAtoms())
-                            ]
-                        )
-                        for snapshot in (trajectory.GetSnapshot(i) for i in range(len(trajectory)))
+                        np.array([list(snapshot.GetPoint3D(i)) for i in range(mol.GetNumAtoms())])
+                        for snapshot in map(trajectory.GetSnapshot, range(len(trajectory)))
                     ]
                 if max_iters:  # A single point has no optimizer convergence status.
                     out.statuses[cid] = int(status)
                 # Explicit coordinates clear native distance caches left by a rejected line-search trial.
                 energy = ff.CalcEnergy(ff.Positions())
             except RuntimeError as error:
-                error_type = UFFTypingError if stage == "force-field construction" else UFFOptimizationError
-                raise error_type(f"UFF {stage} failed: {error_summary(error)}") from error
+                typing = stage == "force-field construction"
+                error_type, remedy = (
+                    (UFFTypingError, "use a different relaxation backend")
+                    if typing
+                    else (UFFOptimizationError, "try another seed=")
+                )
+                raise error_type(f"UFF {stage} failed: {error_summary(error)}; {remedy}") from error
             energies.append(energy)
             if target is not mol:  # copy only real atoms off the metal/phantom/fixed-core FF graph
                 conf.SetPositions(target.GetConformer(cid).GetPositions()[: mol.GetNumAtoms()])

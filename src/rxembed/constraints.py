@@ -168,7 +168,7 @@ def _merge_exclusive(name, a, b):
     """Merge two dicts, refusing a key collision, for fields where two claims cannot be reconciled."""
     clash = {k for k in b if k in a and a[k] != b[k]}
     if clash:
-        raise ValueError(f"compose: conflicting {name} on {sorted(clash)}; two sources claim one key")
+        raise ValueError(f"compose: conflicting {name} on {sorted(clash)}; give each key one value")
     return {**a, **b}
 
 
@@ -201,7 +201,7 @@ def merge_pulls(a, b):
                 if not all(np.isfinite(v) and 0 <= v <= _STRAIGHT for v in np.atleast_1d(value)):
                     raise ValueError(f"pull {key}: expected finite angles between 0 and 180 degrees")
             if key in out and out[key] != value:
-                raise ValueError(f"compose: conflicting pulls on {key}; two sources claim one target")
+                raise ValueError(f"compose: conflicting pulls on {key}; give each target one value")
             out[key] = value
     return out
 
@@ -339,6 +339,9 @@ logger = logging.getLogger("rxembed.constraints")  # under the "rxembed" tree `s
 _FIX_PAD = 0.02  # numbers-fix distance half-window (Angstrom)
 _FIX_ANG_PAD = 2.0  # numbers-fix angular half-window (degrees)
 FIX_DISTANCE_TOL = 0.001  # Angstrom: scalar fix input and output agree to three decimal places
+# A model M-L window is a fitted target, so FIX_DISTANCE_TOL's 0.001 A would only measure UFF convergence. On
+# RITCIG's limiting pair the residual falls as C/fc with C = 0.56 A: 0.01 A needs the 100x rung, 0.001 A fc ~ 560.
+ML_WINDOW_TOL = 0.01  # Angstrom: slack on a model-derived (not user-fixed) M-L window
 FIX_ANGLE_TOL = 0.005  # angle/dihedral degrees: below two-decimal reporting precision without float equality
 _CON_PAD = 0.1  # constrain distance half-window when a scalar target is given
 _CON_ANG_PAD = 5.0  # constrain angular half-window
@@ -347,6 +350,11 @@ _MIN_SHAPE_ATOMS = 3  # below this a core has only a distance to pin, not an ori
 DIST_ATOMS = 2  # a distance key names two atoms
 ANGLE_ATOMS = 3  # an angle key names three atoms
 DIHEDRAL_ATOMS = 4  # a dihedral key names four atoms
+_FIX_FIELD = {
+    DIST_ATOMS: ("distances", _FIX_PAD),
+    ANGLE_ATOMS: ("angles", _FIX_ANG_PAD),
+    DIHEDRAL_ATOMS: ("dihedrals", _FIX_ANG_PAD),
+}
 
 
 def _site_point(positions, haptic, atom):
@@ -403,6 +411,11 @@ def plane_torsion_cap(cap, angle):
     return 90.0 if ratio >= 1.0 else math.degrees(math.asin(ratio))
 
 
+def metal_distance_tolerance(atoms, cons):
+    """Return the slack publication, and every screen it bounds, allows a metal distance window."""
+    return FIX_DISTANCE_TOL if atoms in cons.fixed else ML_WINDOW_TOL
+
+
 def within_window(value, window, slack=0.0):
     """Return whether a finite measured value lies within a window and tolerance."""
     lo, hi = window
@@ -413,13 +426,10 @@ _SHOWN_HITS = 4  # how many ambiguous matches to name before trailing off
 
 
 def resolve_atom(mol, ref):
-    """Resolve an atom reference (an int index, or a SMARTS matching one atom) to an index; a query helper."""
+    """Resolve an atom index, or the first atom of a SMARTS with exactly one match (`match`), to an index."""
     if isinstance(ref, (int, np.integer)):
         return int(ref)
-    hit = mol.GetSubstructMatch(Chem.MolFromSmarts(ref))
-    if not hit:
-        raise ValueError(f"SMARTS {ref!r} matched nothing")
-    return hit[0]
+    return match(mol, ref)[0]
 
 
 def match(mol, smarts):
@@ -431,10 +441,10 @@ def match(mol, smarts):
     """
     query = Chem.MolFromSmarts(smarts)
     if query is None:
-        raise ValueError(f"SMARTS {smarts!r} did not parse")
+        raise ValueError(f"SMARTS {smarts!r} did not parse; check its syntax with Chem.MolFromSmarts")
     hits = mol.GetSubstructMatches(query)
     if not hits:
-        raise ValueError(f"SMARTS {smarts!r} matched nothing")
+        raise ValueError(f"SMARTS {smarts!r} matched nothing; check it against this molecule's atoms")
     if len(hits) > 1:
         raise ValueError(
             f"SMARTS {smarts!r} matched {len(hits)} times ({hits[:_SHOWN_HITS]}...); "
@@ -564,30 +574,16 @@ def _apply_fix(mol, fix, cons, coord_fix, has_geometry):
                 coord_fix[int(key)] = _as_coord(val)
             else:  # tuple key -> a scalar target or explicit allowed range
                 idx = _index_tuple(key)
-                if len(idx) == DIST_ATOMS:
-                    pair = (min(idx), max(idx))
-                    requested = _window(val, 0.0, key)
-                    if pair in cons.fixed and cons.fixed[pair] != requested:
-                        raise ValueError(f"fix= gives conflicting values for distance {pair}")
-                    add_distance(cons.distances, *idx, *_seed_window(requested, _FIX_PAD))
-                    cons.fixed[pair] = requested
-                    written.add(pair)
-                elif len(idx) == ANGLE_ATOMS:
-                    requested = _window(val, 0.0, key, angle=True)
-                    if idx in cons.fixed and cons.fixed[idx] != requested:
-                        raise ValueError(f"fix= gives conflicting values for angle {idx}")
-                    cons.angles[idx] = _seed_window(requested, _FIX_ANG_PAD)
-                    cons.fixed[idx] = requested
-                    written.add(idx)
-                elif len(idx) == DIHEDRAL_ATOMS:
-                    requested = _window(val, 0.0, key, dihedral=True)
-                    if idx in cons.fixed and cons.fixed[idx] != requested:
-                        raise ValueError(f"fix= gives conflicting values for dihedral {idx}")
-                    cons.dihedrals[idx] = _seed_window(requested, _FIX_ANG_PAD)
-                    cons.fixed[idx] = requested
-                    written.add(idx)
-                else:
+                if len(idx) not in _FIX_FIELD:
                     raise ValueError(f"fix number key {key!r} needs 2 (distance), 3 (angle) or 4 (dihedral) atoms")
+                name, pad = _FIX_FIELD[len(idx)]
+                idx = (min(idx), max(idx)) if len(idx) == DIST_ATOMS else idx
+                requested = _window(val, 0.0, key, angle=len(idx) == ANGLE_ATOMS, dihedral=len(idx) == DIHEDRAL_ATOMS)
+                if cons.fixed.get(idx, requested) != requested:
+                    raise ValueError(f"fix= gives conflicting values for {idx}; state it once")
+                getattr(cons, name)[idx] = _seed_window(requested, pad)
+                cons.fixed[idx] = requested
+                written.add(idx)
         return written
     # a list/tuple/set of atom indices -> hold at the source's own coords (graft)
     if not has_geometry:
@@ -669,7 +665,7 @@ def reference_positions(reference):
         path = os.fspath(reference)
         mol = Chem.MolFromXYZFile(path)
         if mol is None:
-            raise ValueError(f"could not read coordinates from {path!r}")
+            raise ValueError(f"could not read coordinates from {path!r}; give an .xyz file path")
         return mol.GetConformer().GetPositions()
     arr = np.asarray(reference, float)
     if arr.ndim == 2 and arr.shape[1] == 3:  # noqa: PLR2004  a 2D (N, 3) array
@@ -716,11 +712,7 @@ def template_to_fix(template, fix=None, own=None, target=None):
             )
         mapping = dict(zip(target_match, reference_match, strict=True))
     if not mapping:
-        raise ValueError(
-            "template= was given an empty atom map, which would graft nothing and embed as if no template "
-            "were passed. If a SMARTS built the map, it matched nothing on one side; rxembed.match raises "
-            "where GetSubstructMatch returns () silently."
-        )
+        raise ValueError("template= was given an empty atom map, which grafts nothing; map at least one atom")
     positions = reference_positions(reference)
     coords = {}
     for ti, ri in mapping.items():
@@ -802,11 +794,10 @@ def _drop_determined_by_graft(cons, coord_fix, keys):
 
 
 def _warn_underdetermined(cons, coord_fix, n_fix_d):
-    """Advisory (invariant 5): two shared-atom fix distances over exactly 3 atoms leave the angle free.
+    """Warn when two fix distances sharing an atom over exactly 3 atoms leave their angle free.
 
     The classic mis-fix is an SN2 pinned as ``fix={(f, c): d1, (c, cl): d2}`` with no ``(f, c, cl)`` angle,
-    which comes out bent rather than the linear TS the user meant. A richer network (more than 3 atoms, or
-    any coords or angles) is left alone as a deliberate distance web. Advisory, not fatal.
+    which comes out bent rather than linear. A richer network (more atoms, coordinates or angles) is left alone.
     """
     if coord_fix or cons.angles or cons.dihedrals or n_fix_d < DIST_ATOMS:
         return

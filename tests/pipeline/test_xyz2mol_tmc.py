@@ -95,6 +95,30 @@ def test_titanium_is_never_read_above_its_four_valence_electrons():
         get_tmc_mol(None, 4, graph=(mol, coords))  # same ligands, asked to give up two more electrons
 
 
+@pytest.mark.parametrize("element", ["Sn", "Ge", "Pb"])
+def test_trimethylstannyl_platinum_trichloride_reads_a_closed_shell_stannyl_anion(element):
+    """Every metal-ligand bond is cut before ligand perception, whatever the donor element.
+
+    An element list had left the Pt-Sn bond uncut, so the stannyl never got ligand perception and read as a
+    neutral Sn on Pt(I).
+    """
+    source = Chem.MolFromSmiles(f"C[{element}](C)(C)[Pt](Cl)(Cl)Cl", sanitize=False)
+    source.UpdatePropertyCache(strict=False)
+    source = Chem.AddHs(source)
+    assert rdDistGeom.EmbedMolecule(source, randomSeed=7, useRandomCoords=True) == 0
+    for atom in source.GetAtoms():
+        atom.SetNoImplicit(True)
+
+    out, _coords = get_tmc_mol(None, -2, graph=(source, source.GetConformer().GetPositions()))
+
+    assert [(a.GetSymbol(), a.GetFormalCharge()) for a in out.GetAtoms() if a.GetAtomicNum() > 9] == [
+        (element, -1),
+        ("Pt", 2),
+        *[("Cl", -1)] * 3,
+    ]
+    assert not any(a.GetNumRadicalElectrons() for a in out.GetAtoms())
+
+
 def test_bis_silylamido_cyclopentadienyl_zirconium_chloride_reads_as_zirconium_four():
     """USUQAB's constrained-geometry ligand: a Cp ring with two Me2Si-NMe arms, all seven atoms on Zr.
 
@@ -190,23 +214,26 @@ def test_over_cap_borole_ring_charge_is_rescued_by_its_neutral_form():
     assert boron.GetFormalCharge() == 0
 
 
-def _bis_borole_titanium_trichloride():
-    """Ti between two eta5-borole rings (B + 4 CH each, above and below) with three chlorides in the waist."""
+def _bis_borole_titanium_trichloride(chlorides=3, lower_boron_substituent=1):
+    """Ti between two eta5-borole rings (B + 4 CH each, above and below) with `chlorides` in the waist.
+
+    `lower_boron_substituent` is the atomic number on the lower ring's boron, in place of its hydrogen.
+    """
     rw = Chem.RWMol()
     titanium = rw.AddAtom(Chem.Atom(22))
     points = {titanium: (0.0, 0.0, 0.0)}
-    for side in (1, -1):
+    for side, substituent in ((1, 1), (-1, lower_boron_substituent)):
         ring = [rw.AddAtom(Chem.Atom(5))] + [rw.AddAtom(Chem.Atom(6)) for _ in range(4)]
         for a, b in zip(ring, ring[1:] + ring[:1], strict=True):
             rw.AddBond(a, b, Chem.BondType.SINGLE)
         for i, atom in enumerate(ring):
             angle = 2 * math.pi * i / len(ring)
             points[atom] = (1.2 * math.cos(angle), 1.2 * math.sin(angle), 2.0 * side)
-            hydrogen = rw.AddAtom(Chem.Atom(1))
+            hydrogen = rw.AddAtom(Chem.Atom(substituent if i == 0 else 1))
             rw.AddBond(atom, hydrogen, Chem.BondType.SINGLE)
             points[hydrogen] = (2.2 * math.cos(angle), 2.2 * math.sin(angle), 2.3 * side)
             rw.AddBond(titanium, atom, Chem.BondType.SINGLE)
-    for i in range(3):
+    for i in range(chlorides):
         chlorine = rw.AddAtom(Chem.Atom(17))
         rw.AddBond(titanium, chlorine, Chem.BondType.SINGLE)
         points[chlorine] = (2.4 * math.cos(2 * math.pi * i / 3), 2.4 * math.sin(2 * math.pi * i / 3), 0.0)
@@ -230,6 +257,20 @@ def test_two_borole_rings_on_titanium_trichloride_are_both_read_neutral():
     assert [a.GetFormalCharge() for a in out.GetAtoms() if a.GetAtomicNum() == 5] == [0, 0]
     assert not any(a.GetNumRadicalElectrons() for a in out.GetAtoms())
     assert out.GetProp("_rxembedChargeRescue").startswith("Ti+7 is over its 4 valence electrons")
+
+
+def test_rescued_ring_on_borole_fluoroborole_titanium_chloride_does_not_follow_atom_order():
+    """Either borole dianion alone neutralised brings Ti+5 to Ti+3; which ring is chosen must not follow file order."""
+    source, _coords = _bis_borole_titanium_trichloride(chlorides=1, lower_boron_substituent=9)
+    readings = set()
+    for seed in range(4):
+        order = list(range(source.GetNumAtoms()))
+        random.Random(seed).shuffle(order)
+        mol = Chem.RenumberAtoms(source, order)
+        out, _coords = get_tmc_mol(None, 0, graph=(mol, mol.GetConformer().GetPositions()))
+        assert out.GetProp("_rxembedChargeRescue").endswith("read Ti+3 with 1 ligand charge(s) changed")
+        readings.add(Chem.MolToSmiles(out))
+    assert len(readings) == 1
 
 
 def test_titanium_tetrachloride_takes_one_chloride_electron_per_charge_past_titanium_four():
@@ -783,7 +824,7 @@ def test_amido_donor_charge_keeps_a_chelates_oxime_nitrogen_sp2(tmp_path):
     # a bis(dimethylglyoximato) Tc(V) chelate: two amido N donors, two oxime N=C(-O(H)) donors
     smiles = (
         "CC1=[N]([O-])->[Tc+5]23(<-[O-2])<-[N](O)=C(C)C(C)(C)[N-]->2C[C@@H](C#N)C[N-]->3C1(C)C "
-        "|atomProp:2.atomNote.s1:4.atomNote.SPY-lambda:5.atomNote.s0:6.atomNote.s4:13.atomNote.s3:19.atomNote.s2|"
+        "|atomProp:2.atomNote.s1:4.atomNote.SPY-delta:5.atomNote.s0:6.atomNote.s4:13.atomNote.s3:19.atomNote.s2|"
     )
     ensemble = rx.embed(smiles, n=1, seed=42)
     path = tmp_path / "mocqie.xyz"

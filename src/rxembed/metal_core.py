@@ -14,7 +14,7 @@ from rdkit import Chem, rdBase
 from rdkit.Geometry import Point3D
 
 from .metal_polyhedron import SLOT_BOND_PROP
-from .utils import bond_removal_mirrors, flat_ranks, remove_bond, repair_bond_stereo
+from .utils import bond_removal_mirrors, flat_ranks, hydrogen_bond, remove_bond, repair_bond_stereo
 
 logger = logging.getLogger("rxembed.metal")  # spelled out, not __name__ ("rxembed.metal_core"): this is
 #   the name `set_verbose` configures and every caplog filter in the suite matches.
@@ -108,8 +108,8 @@ def state_with_winding(state, vertices, winding):
 
 
 def frag_map(mol):
-    """Map each atom index -> its fragment id (same ligand = same fragment)."""
-    return {a: fi for fi, f in enumerate(Chem.GetMolFrags(mol)) for a in f}
+    """Map each atom index -> its fragment id (same ligand = same fragment); a hydrogen bond joins nothing."""
+    return {a: fi for fi, f in enumerate(Chem.GetMolFrags(ligand_graph(mol, ()))) for a in f}
 
 
 def vertex_atom(haptic, v):
@@ -328,24 +328,34 @@ def ligand_graph(mol, metals=None):
     The one strip every consumer routes through: `remove_bond` mirrors a chiral tag when removing a bond
     flips its carrier's parity, so a stereo-reading consumer and a topology-only one see the same graph.
     ``metals`` defaults to every coordination-metal atom in ``mol``; pass an explicit subset to strip only
-    those centres.
+    those centres. A zero-order hydrogen bond (`hydrogen_bond`) is stripped as well, since it is not ligand
+    topology, while a three-centre B-H-B contact stays.
     """
-    metals = (
-        {a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS} if metals is None else metals
-    )
+    present = set(metal_indices(mol))
+    metals = present if metals is None else metals
     rw = Chem.RWMol(mol)
+    zero = [bond for bond in rw.GetBonds() if bond.GetBondType() == Chem.BondType.ZERO]
+    if zero:
+        rw.UpdatePropertyCache(strict=False)  # lone-pair counts read valence
+    contacts = [
+        (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+        for bond in zero
+        if hydrogen_bond(bond.GetBeginAtom(), bond.GetEndAtom(), present)
+        or hydrogen_bond(bond.GetEndAtom(), bond.GetBeginAtom(), present)
+    ]
     for m in metals:
         for nb in [n.GetIdx() for n in rw.GetAtomWithIdx(int(m)).GetNeighbors()]:
             remove_bond(rw, int(m), nb)
+    for i, j in contacts:
+        if rw.GetBondBetweenAtoms(i, j) is not None:
+            remove_bond(rw, i, j)
     out = rw.GetMol()
     out.ClearComputedProps()
     return out
 
 
 def ligand_distance_matrix(mol):
-    """Return graph distances after removing coordination-centre edges."""
-    if not metal_indices(mol):
-        return Chem.GetDistanceMatrix(mol)
+    """Return graph distances on `ligand_graph`."""
     return Chem.GetDistanceMatrix(ligand_graph(mol))
 
 
@@ -446,6 +456,32 @@ def collapse_haptic(mol, donors):
     return materialise_phantoms(mol, haptic), [*vertices, *haptic], haptic
 
 
+_DIENE_FACE = 4  # atoms in an eta4 diene face: two bonds either side of the central bond
+_RIGID_RING = 8  # RDKit's FindPotentialStereo ring size: a smaller ring fixes a bond's configuration
+
+
+def torsion_path(mol, face):
+    """Return a face's atoms in path order when it is an open four-atom chain about a rotatable central bond.
+
+    Such a face, an eta4 diene or heterodiene, is s-cis or s-trans once bound, so a rotamer of the free ligand
+    becomes an isomer of the complex. The central bond rotates unless a ligand ring smaller than eight atoms
+    holds it; the metal never closes that ring. Returns ``None`` for any other face.
+    """
+    if len(face) != _DIENE_FACE:
+        return None
+    inside = set(face)
+    neighbours = {a: [n.GetIdx() for n in mol.GetAtomWithIdx(a).GetNeighbors() if n.GetIdx() in inside] for a in face}
+    if sorted(map(len, neighbours.values())) != [1, 1, 2, 2]:  # the only four-atom graph with these degrees is a path
+        return None
+    path = [min(a for a in face if len(neighbours[a]) == 1)]
+    while len(path) < _DIENE_FACE:
+        path.append(next(a for a in neighbours[path[-1]] if a not in path))
+    ligand = ligand_graph(mol)
+    Chem.GetSymmSSSR(ligand)
+    size = ligand.GetRingInfo().MinBondRingSize(ligand.GetBondBetweenAtoms(path[1], path[2]).GetIdx())
+    return None if 0 < size < _RIGID_RING else path
+
+
 class Ligand(NamedTuple):
     """One ligand of a metal complex, as a standalone Mol plus which of its atoms coordinate."""
 
@@ -520,7 +556,9 @@ def _canonicalise_delocalised_charge(mol):
     rest of the molecule is needed, since Kekulization is a polynomial matching, not a form-by-form
     enumeration. The commit must reuse the validated, still-frozen molecule the proof produced: copying only
     the two charges onto an unfrozen working copy lets `SanitizeMol` recompute implicit H on its own and
-    silently pick a different, sometimes unkekulizable count instead of the pattern the proof found.
+    silently pick a different, sometimes unkekulizable count instead of the pattern the proof found. A form
+    RDKit no longer perceives as aromatic is skipped: `haptic_sites` reads a face from that aromaticity, and a
+    representation move must not change it (an azaborolyl's -1 moved off its ring B splits the eta5 face).
     """
     rw = Chem.RWMol(mol)
     metals = {atom.GetIdx() for atom in rw.GetAtoms() if atom.GetAtomicNum() in COORDINATION_METALS}
@@ -560,6 +598,8 @@ def _canonicalise_delocalised_charge(mol):
                         Chem.SanitizeMol(probe)
                 except Chem.MolSanitizeException:
                     continue
+                if not all(probe.GetAtomWithIdx(atom).GetIsAromatic() for atom in component):
+                    continue
                 rw = Chem.RWMol(probe)  # adopt the validated mol itself, not a re-derivation of its charges
                 moved = True
                 break
@@ -581,7 +621,7 @@ def canonical_metal_graph(mol):
     Runs before any donor is read, on every metal graph however it arrived (an XYZ read, a parsed SMILES, or
     rxembed's own bond restore after a swap). A bridgehead M-X bond with no donor orbital of its own is a
     separate, connectivity-only fault the XYZ reader fixes first; see
-    `pipeline.perceive._prune_donorless_bridgeheads`.
+    `pipeline.perceive._drop_bridgehead_bonds`.
     """
     rw = Chem.RWMol(mol)
     rw.UpdatePropertyCache(strict=False)

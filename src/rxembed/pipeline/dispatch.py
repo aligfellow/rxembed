@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from collections import Counter
 from dataclasses import dataclass
 
@@ -42,10 +41,6 @@ from .stereo_check import signature
 
 logger = logging.getLogger("rxembed")
 
-_STEREO_MODES = {"unassigned", "racemic", "separate", "free", "preserve", "all", "invert"}
-_STEREO_KINDS = {"point", "ez", "axial", "planar", "helical", "locked", "default"}
-_STEREO_FILTERS = {"free", "preserve", "invert", "racemic"}
-
 
 @dataclass
 class _Candidate:
@@ -71,22 +66,6 @@ def _default_stereo(source, stereo):
     return "all" if has_geometry else "unassigned"
 
 
-def _validate_stereo(stereo):
-    """Reject unknown global or per-kind stereo modes at every public door."""
-    if isinstance(stereo, str) and stereo in _STEREO_MODES:
-        return
-    if (
-        isinstance(stereo, dict)
-        and all(kind in _STEREO_KINDS or re.fullmatch(r"[A-Z][a-z]?\d+", str(kind)) for kind in stereo)
-        and all(mode in _STEREO_FILTERS for mode in stereo.values())
-    ):
-        return
-    raise ValueError(
-        f"unknown stereo mode {stereo!r}; use one of {sorted(_STEREO_MODES)} or "
-        f"{{kind: mode}} with modes {sorted(_STEREO_FILTERS)}"
-    )
-
-
 def _validate_relax(max_iters, trajectory=False, n=None):
     """Require a positive restrained-UFF iteration cap and a trajectory request for exactly one conformer."""
     if not isinstance(trajectory, bool):
@@ -108,8 +87,6 @@ def _normalize(source, charge=0):
         mol = source
     elif isinstance(source, str) and source.lower().endswith(".xyz"):
         mol = read_xyz(source, charge)
-        if mol is None:
-            raise ValueError(f"could not read {source}")
     else:
         mol = parse_smiles(source)
     has_geom = mol.GetNumConformers() > 0
@@ -243,6 +220,8 @@ def _contact_modes(source, contacts, params):
     disc = source.mol if isinstance(source, Isomer) else source
     try:
         modes = auto_binding_modes(disc, seed=params.seed)
+    except ImportError:  # a missing extra names its own remedy
+        raise
     except Exception as err:
         raise ValueError(
             f"contacts='auto' could not discover binding modes ({type(err).__name__}: {err}); "
@@ -270,7 +249,8 @@ def _stereo_filter(source, charge, stereo):
         # source also owns its planar face, so it is the state metadata here too, not preserved.
         if source.haptic:
             ref = {kind: labels for kind, labels in ref.items() if kind != "planar"}
-        stereo = "preserve"
+        if not isinstance(stereo, dict) and stereo != "invert":  # an enumeration default means keep the input
+            stereo = "preserve"
     if ref is None and not isinstance(source, Isomer) and source.GetNumConformers():
         try:
             ref = signature(source, charge=charge)
@@ -279,8 +259,9 @@ def _stereo_filter(source, charge, stereo):
             ref = None
     if not ref:
         return None
-    # For a geometry input, preserve only a metallocene's planar chirality, the part the embed cannot keep:
-    # axial reads differently every rotamer on a labile bond, and point R/S is the embed's own job.
+    # An enumerating mode keeps only planar chirality, which the embed cannot re-enumerate: axial reads
+    # differently every rotamer on a labile bond, and point R/S is the embed's own job. Any other mode is the
+    # filter itself.
     if stereo in ("racemic", "separate"):
         spec = {"planar": "preserve", "default": "free"} if "planar" in set(ref) else None
     else:
@@ -291,32 +272,30 @@ def _stereo_filter(source, charge, stereo):
 _STEREO_CAP = 32  # max stereoisomers embedded per source before truncating (a loud-logged safety valve)
 
 
-def _stereo_variants(source, stereo, cap=_STEREO_CAP):
+def _stereo_variants(source, stereo):
     """Return source variants and whether organic stereo was expanded.
 
     Geometry inputs and metal complexes remain one source. Coordinate-free organic graphs expand undefined
     stereochemistry before every other candidate axis.
     """
-    if stereo not in ("unassigned", "racemic", "separate"):
+    if (
+        stereo not in ("unassigned", "racemic", "separate")
+        or isinstance(source, Isomer)
+        or source.GetNumConformers() > 0
+        or metal_index(source) is not None
+    ):
         return [(source, "")], False
-    if isinstance(source, Isomer):
-        return [(source, "")], False
-    if source.GetNumConformers() > 0:
-        return [(source, "")], False
-    if metal_index(source) is not None:
-        return [(source, "")], False
-    expanded = enumerate_unassigned(source, cap=cap, include="all" if stereo == "racemic" else ())
+    expanded = enumerate_unassigned(source, cap=_STEREO_CAP, include="all" if stereo == "racemic" else ())
     variants, n_unassigned, total, unresolved = expanded
     if n_unassigned == 0:
         return [(source, "")], False
     labels = ", ".join(lbl or "achiral" for _, lbl in variants)
-    if total > cap:
+    if total > _STEREO_CAP:
         logger.warning(
-            "stereo=%r: %d stereocentre(s) -> %d isomers, capped to %d (raise cap=): [%s]",
+            "stereo=%r: embedding %d of %d isomers; assign the stereo in the SMILES or pass stereo='free': [%s]",
             stereo,
-            n_unassigned,
-            total,
             len(variants),
+            total,
             labels,
         )
     else:
@@ -365,7 +344,16 @@ def _resolve_template(template, fix, own=None, target=None):
 
 
 def enumerate_isomers(
-    mol, geometry=None, center=None, fix=None, stereo=None, lengths="model", *, screen=True, observed_only=False
+    mol,
+    geometry=None,
+    center=None,
+    fix=None,
+    stereo=None,
+    lengths="model",
+    *,
+    charge=0,
+    screen=True,
+    observed_only=False,
 ):
     """Enumerate all distinct coordination isomers as ready-to-embed `Isomer` objects (metal surrogated).
 
@@ -374,26 +362,18 @@ def enumerate_isomers(
     xyzgraph) the ``stereo='preserve'`` gate compares against. See `rxembed.metal_enumeration.enumerate_isomers` for
     `geometry` / `center` / `fix` / `stereo` / `lengths` / `screen` / `observed_only`. A geometry is nameable in full
     (``'octahedral'``) or by its 3-letter code (``'OCT'``), case-insensitively. The `Isomer` stores the registry
-    name and `.summary()` prints the compact code.
+    name and `.summary()` prints the compact code. ``charge`` is the total charge used to perceive an ``.xyz`` path.
     """
     stereo = _default_stereo(mol, stereo)
-    _validate_stereo(stereo)
-    if isinstance(mol, str):
-        # A path goes through perception so `rx.metal('complex.xyz', center=...)` works and not just
-        # `rx.embed`; it is needed anyway to retain a spectator metal. A SMILES goes through `parse_smiles`
-        # for a clear error on a bad string rather than a cryptic `AddHs(None)`.
-        if mol.lower().endswith(".xyz"):
-            mol = read_xyz(mol, 0)
-        else:
-            mol = parse_smiles(mol)
+    metal_enumeration.validate_stereo(stereo)
+    mol = _normalize(mol, charge)[0]
     reject_metal_bonds(mol)
-    mol = Chem.AddHs(mol, addCoords=bool(mol.GetNumConformers()))
     ref_sig = None  # chirality fingerprint of the input geometry (real metals), letting stereo='preserve'
     if mol.GetNumConformers() > 0:  # hold a spectator's planar/axial/helical handedness
         try:
             ref_sig = signature(mol, native=False)  # _stereo_filter only reads planar/helical
-        except Exception:
-            ref_sig = None
+        except ImportError as err:
+            logger.warning("stereo preservation unavailable for the input geometry: %s", err)
     return metal_enumeration.enumerate_isomers(
         mol,
         geometry,
@@ -588,7 +568,7 @@ def embed(
     _validate_relax(max_iters, trajectory, n)
     params = resolve_params(params, seed, threads)
     stereo = _default_stereo(source, stereo)
-    _validate_stereo(stereo)
+    metal_enumeration.validate_stereo(stereo)
     if not isinstance(source, Isomer):
         source = _normalize(source, charge)[0]
     own_mol = source.mol if isinstance(source, Isomer) else source

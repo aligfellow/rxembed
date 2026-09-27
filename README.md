@@ -129,7 +129,8 @@ which atoms are bonded and the bond orders. The two choices are separate:
   B-H-B bridge keeps it as a zero-order contact.
 
 An XYZ file does not store a charge. `charge=0` is the default and means "assume neutral"; rxembed never
-infers the charge. Pass the real charge for an ion. At `charge=0`, `read_xyz` warns when a metal ends over its
+infers the charge. Pass the real charge for an ion; `rx.embed`, `rx.metal` and `rx.minimize` take the same
+`charge=` for an `.xyz` path. At `charge=0`, `read_xyz` warns when a metal ends over its
 valence electron count, negative or with an odd electron count, since that is how an ion read as neutral
 usually looks. For several metals whose split the total charge does not fix, name each metal's charge by atom
 index, for example `metal_charges={0: 2, 1: 1}`.
@@ -262,7 +263,7 @@ bound = rx.embed(pocket, coordinate="[OX1]", n=10)
 
 | `stereo=` | effect |
 |---|---|
-| omitted | a SMILES enumerates only its undefined stereo; a geometry keeps what it measures |
+| omitted | a SMILES enumerates only its undefined stereo; a geometry keeps what it measures, except a diene's class |
 | `"racemic"` | enumerate every configurable element, defined ones included |
 | `"separate"` | `rx.embed` only: as omitted, but return a `list[EnsembleSet]`, one per configuration |
 | `"free"` | no enumeration; the seed decides |
@@ -283,6 +284,14 @@ measured = rx.metal(path)
 n_hands = rx.metal(path, stereo={"N5": "racemic"})
 locked_hands = rx.metal(path, stereo={"locked": "racemic"})
 ```
+
+A bound diene whose central bond can rotate, as in (butadiene)Fe(CO)3, is s-cis or s-trans, and binding makes
+each an isomer. The face's slot note records it: `c` for s-cis when a mirror relates the diene's two faces, `+`
+or `-` for the face a less symmetric s-cis diene binds, and `P` or `M` for the sign of an s-trans diene's
+C1-C2-C3-C4 torsion, as in `s3P`. `rx.metal` enumerates every class, from a geometry too, as it does the
+arrangement. `{"locked": "preserve"}` or `observed_only=True` keeps the measured class, which `rx.embed` of the
+geometry also rebuilds. s-trans binding is rare (10 of 358 open-chain η4 dienes in tmQMg), so compare the classes
+with a real energy.
 
 A geometry input with several metals enumerates them together; `center="Mn"` enumerates only Mn and keeps the
 other spheres as they are. Atropisomer CXSMILES (`wU`/`wD`, reported as `M`/`P`) round-trips with metal arrangements.

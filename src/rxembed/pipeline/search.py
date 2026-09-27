@@ -28,7 +28,7 @@ def available() -> bool:
     return importlib.util.find_spec("openconf") is not None
 
 
-def _config(preset, seed, max_out, low_mode, config, constrained, **openconf_kw):
+def config(preset, seed, max_out, low_mode, config, constrained, **openconf_kw):
     """Resolve the openconf ConformerConfig from preset + single-knob overrides + passthrough field kwargs.
 
     ``openconf_kw`` are arbitrary ``ConformerConfig`` fields (from ``mc(**kwargs)``) applied verbatim; an
@@ -37,7 +37,7 @@ def _config(preset, seed, max_out, low_mode, config, constrained, **openconf_kw)
     try:
         from openconf.config import preset_config
     except ImportError as exc:
-        raise ImportError("_config needs openconf; pip install 'rxembed[search]'") from exc
+        raise ImportError("config needs openconf; pip install 'rxembed[search]'") from exc
 
     cfg = config if config is not None else preset_config(preset)
     over = dict(openconf_kw)  # passthrough openconf ConformerConfig fields (kwargs win over the preset)
@@ -53,11 +53,11 @@ def _config(preset, seed, max_out, low_mode, config, constrained, **openconf_kw)
     return dataclasses.replace(cfg, **over) if over else cfg
 
 
-def search(mol, cons, *, preset="ensemble", seed=None, max_out=None, low_mode=None, config=None, **openconf_kw):
-    """Run openconf → new conformer ids on `mol` (atom order preserved; energies recomputed by refine).
+def search(mol, cons, cfg):
+    """Run openconf with the resolved `cfg` and return the conformer ids it added to `mol` (atom order kept).
 
-    Pose-constrained iff any atoms are held (`cons.constrained_atoms()`). ``openconf_kw`` are passthrough
-    ``ConformerConfig`` field overrides. Returns the list of added conformer ids.
+    Pose-constrained iff any atoms are held (`cons.constrained_atoms()`); resolve `cfg` with `config` under the
+    same flag.
     """
     try:
         import openconf
@@ -65,7 +65,6 @@ def search(mol, cons, *, preset="ensemble", seed=None, max_out=None, low_mode=No
         raise ImportError("search needs openconf; pip install 'rxembed[search]'") from exc
 
     held = sorted(cons.constrained_atoms())
-    cfg = _config(preset, seed, max_out, low_mode, config, constrained=bool(held), **openconf_kw)
     if held:
         ens = openconf.generate_conformers_from_pose(mol, held, config=cfg)
     else:

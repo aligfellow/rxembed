@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import math
 from collections import Counter, deque
+from dataclasses import dataclass
 
 import numpy as np
 from rdkit import Chem
@@ -52,13 +53,7 @@ def _check_assignment_cap(geometry, counts, rotations, limit=None):
 
 
 def chelate_bite_window(mol, a, b, donors=()):
-    """Return the ring-size census bite window, or ``None`` outside a 4-6 membered donor-free backbone.
-
-    Existence and census test only: `metal_constraints.seated_bites` is the sole caller that also needs the
-    native ligand reach triangle, and it builds that itself (`mechanisms.triangle_angles`) around this census.
-    `chelate_edge_links` and the long-arc skip in `metal_screen._chelate_span_failure` read only this
-    existence test.
-    """
+    """Return the ring-size census bite window, or ``None`` outside a 4-6 membered donor-free backbone."""
     if not 0 <= a < mol.GetNumAtoms() or not 0 <= b < mol.GetNumAtoms():
         return None  # a haptic centroid is a coordination site, not an atom with a ligand-backbone path
     path = Chem.GetShortestPath(mol, a, b)
@@ -83,18 +78,12 @@ def chelate_bite_window(mol, a, b, donors=()):
 def chelate_edge_links(mol, padded, haptic=None, distances=None):
     """Return same-ligand donor-position pairs the edge rule holds to a polyhedron hull edge.
 
-    A chemistry claim, not a no-loss rule: a `chelate_bite_window`-linked pair (a 2-4 bond, 4-6 membered
-    chelate backbone) stays on a hull edge, after the through-donor exclusion below. A directly-bonded pair
-    (a 3-membered M-a-b ring, held apart at only ~50-70 deg) is added on geometric grounds: its bite is
-    tighter still, so it cannot span a non-edge vertex pair either. Haptic face atoms never count as a link
-    endpoint and always block a backbone path between two others. Escapes: `screen=False`,
-    `observed_only=True`, a stated CX arrangement (`rx.metal(rx.cxsmiles(mol))`), and `fix=` all bypass this
-    rule, same as the pair rule it is folded into.
-
-    Through-donor exclusion: when a third donor `c` sits astride the a-b backbone (`d(a,c) + d(c,b) ==
-    d(a,b)` on the plain graph distance), the a-b link is dropped as redundant; the shorter a-c and c-b links
-    still hold. Without it, a tridentate whose outer amides reach the metal only via a coordinated central
-    donor atom would wrongly force those two outer donors onto a hull edge as well as the centre.
+    A measured claim, not a proof: a pair on a 4-6 membered chelate backbone (`chelate_bite_window`) or a
+    directly bonded pair (a tighter 3-membered ring) sits on a hull edge in all but 3 of 3,373 tmQMg
+    reference centres. Haptic face atoms are never endpoints and block backbone paths. A pair with a third
+    donor on a shortest graph path between them is dropped; the shorter links through that donor still hold.
+    `chelate_bite_window` already rejects a pair whose only short route runs through a donor, so this
+    exclusion acts only when an equally short donor-free route also exists.
     """
     haptic = haptic or {}
     frag = frag_map(mol)
@@ -155,8 +144,8 @@ def _octahedral_triad(mol, od, haptic=None):
     return None
 
 
-def order_label(mol, donors, geometry, order, haptic=None):
-    """Build the isomer label from the ideal polyhedron; no conformer needed.
+def order_label(mol, od, geometry, haptic=None):
+    """Build the isomer label of vertex-ordered donors `od` from the ideal polyhedron; no conformer needed.
 
     Vacant vertices are ignored. Octahedral with a donor triad is mer/fac (one trans pair in the triad means
     mer, none means fac); otherwise cis/trans, judged on the minority same-element donor pair, which is the
@@ -164,11 +153,8 @@ def order_label(mol, donors, geometry, order, haptic=None):
     pair.
     """
     dirs = vertex_dirs(geometry)
-    if dirs is None:
-        return f"isomer{order}"
-    if not POLYHEDRA[geometry].geometric_isomerism:
-        return ""  # no cis/trans distinction for this geometry
-    od = [donors[k] for k in order]
+    if dirs is None or not POLYHEDRA[geometry].geometric_isomerism:
+        return ""  # no polyhedron, or no cis/trans distinction for this geometry
     if geometry == "octahedral":
         tri = _octahedral_triad(mol, od, haptic)
         if tri is not None:
@@ -231,39 +217,17 @@ def input_ordering(mol, metal, donors, geometry, haptic=None, coordination=(), *
     return canonical
 
 
-def _forbidden_vertex_pairs(dirs, narrow, linked):
-    """Return the wide and non-edge vertex-pair sets that `narrow` and `linked` each forbid a donor pair on.
+def _seat_pruned_orderings(dirs, rotations, linked):
+    """Backtrack donor-to-vertex placements, rejecting a branch once a linked pair sits off a hull edge.
 
-    Used by `_seat_pruned_orderings` (early-reject generator) and by `_drop_forbidden_orderings`, the
-    sweep-then-filter oracle `test_metal_slots.py` keeps for the equivalence test.
-    """
-    pairs = [(i, j) for i in range(len(dirs)) for j in range(i + 1, len(dirs))]
-    wide = [(i, j, narrow[angle]) for i, j in pairs if (angle := round(vertex_angle(dirs[i], dirs[j]), 6)) in narrow]
-    edges = hull_edges(tuple(map(tuple, dirs))) if linked else frozenset()
-    off_edge = [(i, j) for i, j in pairs if frozenset((i, j)) not in edges] if linked else ()
-    return wide, off_edge
-
-
-def _seat_pruned_orderings(dirs, rotations, narrow, linked):
-    """Backtrack donor-to-vertex placements, rejecting a branch once a forbidden pair is fully seated.
-
-    Replaces generating the full `isomer_permutations` sweep and filtering it afterwards for a tethered or
-    haptic enumeration with non-empty `narrow` or `linked`. Both rules are a conjunction of independent
-    per-vertex-pair predicates (`_forbidden_vertex_pairs`), so testing a pair as soon as its later vertex is
-    placed is sound (a violated pair stays violated) and complete (every pair is tested exactly once).
+    The edge rule is a conjunction of independent vertex-pair predicates, so testing a pair as soon as its
+    later vertex is placed is sound (a violated pair stays violated) and complete (every pair is tested once).
     Placing vertices in order 0, 1, ..., n-1 reproduces `itertools.permutations`' lexicographic order with the
-    dead subtrees skipped, so the result matches sweep-then-filter element for element, once both apply the
-    same proper-rotation-orbit check at the leaf (see test_metal_slots.py's equivalence test). Lives beside
-    the prune rules it enforces (metal_slots), not metal_polyhedron, which only supplies `dirs`.
+    dead subtrees skipped, and the leaf applies the same proper-rotation-orbit check as the full sweep.
     """
     n = len(dirs)
-    wide, off_edge = _forbidden_vertex_pairs(dirs, narrow, linked)
-    checks = [[] for _ in range(n)]  # checks[vertex] = [(earlier_vertex, forbidden_donor_pairs), ...]
-    for i, j, forbidden in wide:
-        checks[j].append((i, forbidden))
-    for i, j in off_edge:
-        checks[j].append((i, linked))
-
+    edges = hull_edges(tuple(map(tuple, dirs)))
+    off_edge = [[i for i in range(j) if frozenset((i, j)) not in edges] for j in range(n)]  # earlier vertices
     order = [-1] * n
     used = [False] * n
 
@@ -274,7 +238,7 @@ def _seat_pruned_orderings(dirs, rotations, narrow, linked):
                 yield seated
             return
         for donor in range(n):
-            if used[donor] or any(frozenset((order[i], donor)) in forbidden for i, forbidden in checks[vertex]):
+            if used[donor] or any(frozenset((order[i], donor)) in linked for i in off_edge[vertex]):
                 continue
             order[vertex], used[donor] = donor, True
             yield from backtrack(vertex + 1)
@@ -310,41 +274,42 @@ def _class_orders(donors, classes):
         yield tuple(next(picks[label]) for label in string)
 
 
-def distinct_vertex_orderings(
-    mol,
-    donors,
-    geometry,
-    perms=None,
-    haptic=None,
-    *,
-    classes=None,
-    distances=None,
-    retained=None,
-    max_orbits=None,
-    narrow=None,
-    linked=frozenset(),
-):
+@dataclass(frozen=True)
+class SeatingProblem:
+    """Describe one sphere's donors to seat on a polyhedron and the graph facts that tell seatings apart.
+
+    `donors` is VACANT-padded to the polyhedron size, with each haptic face as its centroid key in `haptic`.
+    `classes` and `distances` default to `site_classes` and `ligand_distance_matrix` of `mol`. `linked` holds
+    same-ligand donor-position pairs to a polyhedron hull edge (`chelate_edge_links`).
+    """
+
+    mol: Chem.Mol
+    donors: tuple | list
+    geometry: str
+    haptic: dict | None = None
+    classes: dict | None = None
+    distances: np.ndarray | None = None
+    linked: frozenset = frozenset()
+
+
+def distinct_vertex_orderings(problem, perms=None, *, retained=None, max_orbits=None):
     """Enumerate distinct coordination isomers under exact graph and polyhedron symmetries.
 
     `perms` overrides the candidate vertex orderings (default ``isomer_permutations(geometry)``); a ``fix=``
     enumeration passes the subset that keeps each frozen donor pinned to its input vertex, and a
-    coordinate-derived ordering is retained first. `narrow` maps each polyhedron vertex angle to the
-    same-ligand donor-position pairs that cannot span it; `linked` prunes same-ligand donor-position pairs
-    held to a polyhedron hull edge (`chelate_edge_links`). Both apply only to the streamed tethered pool (see
-    `_forbidden_vertex_pairs`), dropping an order its rule forbids before the cap below can raise on an orbit
-    no completion of it could ever satisfy.
+    coordinate-derived ordering is retained first. The edge rule (`problem.linked`) prunes the streamed
+    tethered pool only, dropping an order it forbids before the cap below can raise on an orbit no completion
+    of it could ever satisfy.
 
     Canonical vertex classes and same-ligand path lengths distinguish candidates under proper rotations. No
     graph heuristic proves conformational reachability, so feasibility remains the embedder's job.
     """
+    mol, donors, geometry, haptic = problem.mol, problem.donors, problem.geometry, problem.haptic
     dirs = vertex_dirs(geometry)
-    if dirs is None:
-        return perms
-    narrow = narrow or {}
     frag = frag_map(mol)  # same ligand = same fragment
     limit = MAX_EXHAUSTIVE_ORBITS if max_orbits is None else int(max_orbits)
     tethered = has_tether(donors, frag, haptic)
-    classes = site_classes(mol, donors, haptic) if classes is None else classes
+    classes = site_classes(mol, donors, haptic) if problem.classes is None else problem.classes
     # Separate equivalent monodentates have one arrangement in every geometry, so skip the factorial pool.
     if (
         perms is None
@@ -363,16 +328,14 @@ def distinct_vertex_orderings(
         _check_assignment_cap(geometry, list(Counter(classes[d] for d in donors).values()), rotations, limit)
         perms = itertools.chain((tuple(range(len(donors))),), _class_orders(donors, classes))
     # An explicit `perms` (a `fix=` pool, or `observed_only`'s single retained order) is authoritative:
-    # the caller already chose it, so neither rule's forbidden-vertex-pair screen applies to it.
+    # the caller already chose it, so the edge rule does not apply to it.
     elif perms is None:
         perms = (
-            isomer_permutations(geometry)
-            if not narrow and not linked
-            else _seat_pruned_orderings(dirs, rotations, narrow, linked)
+            _seat_pruned_orderings(dirs, rotations, problem.linked) if problem.linked else isomer_permutations(geometry)
         )
     if retained is not None:
         perms = itertools.chain((retained,), (order for order in perms if order != retained))
-    dmat = (ligand_distance_matrix(mol) if distances is None else distances) if tethered else None
+    dmat = (ligand_distance_matrix(mol) if problem.distances is None else problem.distances) if tethered else None
     pairs = [(p, q) for p in range(len(dirs)) for q in range(p + 1, len(dirs))] if tethered else ()
 
     site = {VACANT: ("vacant",)} | {d: ("donor", classes[d]) for d in donors if d != VACANT}

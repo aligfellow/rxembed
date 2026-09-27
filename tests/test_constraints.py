@@ -14,6 +14,7 @@ from rxembed.constraints import (
     compose_soft,
     constraint_value,
     match,
+    resolve_atom,
     resolve_core,
     template_to_fix,
 )
@@ -558,6 +559,16 @@ def test_match_rejects_ambiguous_pattern():
         match(mol, "[Br]")
     with pytest.raises(ValueError, match="did not parse"):
         match(mol, "[not a smarts")
+
+
+def test_resolve_atom_rejects_an_ambiguous_or_unparsable_smarts():
+    """2-chlorobenzyl chloride: `[Cl]` names both chlorines, so no single atom may be picked silently."""
+    mol = Chem.AddHs(Chem.MolFromSmiles("Clc1ccccc1CCl"))
+    with pytest.raises(ValueError, match="matched 2 times"):
+        resolve_atom(mol, "[Cl]")
+    with pytest.raises(ValueError, match="did not parse"):
+        resolve_atom(mol, "[not a smarts")
+    assert resolve_atom(mol, "[Cl]C[c]") == 8
 
 
 @pytest.mark.parametrize(

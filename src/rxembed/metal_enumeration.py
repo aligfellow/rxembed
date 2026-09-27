@@ -30,6 +30,7 @@ from .metal_core import (
     strip_phantoms,
     surrogate_all_metals,
     surrogate_metal,
+    torsion_path,
 )
 from .metal_isomer import (
     Isomer,
@@ -58,13 +59,14 @@ from .metal_polyhedron import (
 from .metal_screen import unreachable_span
 from .metal_slots import (
     SPAN_TOL,
+    SeatingProblem,
     assignment_cap_error,
     chelate_edge_links,
     distinct_vertex_orderings,
     has_tether,
     input_ordering,
 )
-from .metal_stereo import chelate_links, chirality_of, donor_classes, face_has_orientation, site_classes
+from .metal_stereo import MIRROR_WINDING, chelate_links, chirality_of, donor_classes, face_orientations, site_classes
 from .stereo import (
     apply_point_stereo,
     assign_atrop_from_3d,
@@ -85,22 +87,7 @@ from .stereo import (
 )
 from .utils import mirror_tag
 
-_MULTI_METAL = 2
 _SCREEN_SITES = 8  # Keep the finite raw pool bounded before applying whole-network reach screening.
-
-
-def _screen_limit(site_count, reach):
-    """Bound the raw tethered pool before applying the normal limit to surviving candidates."""
-    if reach is not None and site_count <= _SCREEN_SITES:
-        return math.factorial(site_count)
-    return None
-
-
-def _keep_screened_candidate(out, candidate, geometry):
-    """Append one surviving screened candidate without exceeding the public orbit bound."""
-    out.append(candidate)
-    if len(out) > MAX_EXHAUSTIVE_ORBITS:
-        raise assignment_cap_error(geometry)
 
 
 def _ligand_stereo_request(mol, stereo):
@@ -189,16 +176,24 @@ def _geometry_stereo_variants(mol, variants, stereo, modes, exact):
 
 
 def _haptic_stereo_mode(stereo, has_geometry):
-    """Resolve the haptic orientation mode from one public stereo request."""
+    """Resolve ``(face-side mode, diene-class mode)`` from one public stereo request.
+
+    A bound diene's s-cis/s-trans class (`metal_core.torsion_path`) is a coordination-locked element that
+    ``stereo={'locked': ...}`` sets. Unlike a locked donor hand, a geometry enumerates it by default, as it
+    does the arrangement: over the benchmark fixtures, issues and first 100 sample IDs that adds 7 isomers on
+    3 dienes, where enumerating locked donor hands adds 580 on 27 structures.
+    """
     if isinstance(stereo, dict):
-        return stereo.get("planar", stereo.get("default", "preserve" if has_geometry else "racemic"))
-    if stereo == "unassigned":
-        return "unassigned"
-    if stereo in ("racemic", "separate"):
-        return "racemic"
-    if stereo in ("all", "preserve", "invert"):
-        return "preserve" if stereo == "all" else stereo
-    return "free"
+        side = stereo.get("planar", stereo.get("default", "preserve" if has_geometry else "racemic"))
+    elif stereo in ("unassigned", "preserve", "invert"):
+        side = stereo
+    elif stereo in ("racemic", "separate"):
+        side = "racemic"
+    else:
+        side = "preserve" if stereo == "all" else "free"
+    if isinstance(stereo, dict) and "locked" in stereo:
+        return side, stereo["locked"]
+    return side, "racemic" if has_geometry and side != "free" else side
 
 
 def _ligand_stereo_variants(mol, stereo):
@@ -335,7 +330,7 @@ def _select_geometries(base, m, donors, haptic, geometry, n):
         if g not in POLYHEDRA:
             hint = "; pass a list of names, e.g. ['square_planar', 'tetrahedral']" if g == "all" else ""
             raise ValueError(
-                f"unknown geometry {g!r}; available: {sorted(k for k in POLYHEDRA if k != 'None')} "
+                f"unknown geometry {g!r}; available: {sorted(POLYHEDRA)} "
                 f"(or a code: {sorted(p.code for p in POLYHEDRA.values() if p.code)}){hint}"
             )
     if measured is not None:
@@ -345,15 +340,19 @@ def _select_geometries(base, m, donors, haptic, geometry, n):
     return geoms
 
 
-def _pinned_orders(frozen_v, free_v, free_di, sites):
-    """Yield every vertex order that keeps each frozen donor at its vertex and permutes the free donors."""
-    for fp in itertools.permutations(free_di):
-        order = [None] * sites
-        for vertex, donor_index in frozen_v.items():
+def _pinned_orders(frozen_v, free_v, free_di, padded):
+    """Yield every vertex order that keeps each frozen donor at its vertex and seats the free donors.
+
+    Vacant padding is interchangeable, so only the real free donors are permuted over the free vertices.
+    """
+    real = [di for di in free_di if padded[di] != VACANT]
+    vacant = [di for di in free_di if padded[di] == VACANT]
+    for seats in itertools.permutations(free_v, len(real)):
+        order = [None] * len(padded)
+        for vertex, donor_index in (*frozen_v.items(), *zip(seats, real, strict=True)):
             order[vertex] = donor_index
-        for vertex, donor_index in zip(free_v, fp, strict=False):
-            order[vertex] = donor_index
-        yield order
+        empty = iter(vacant)
+        yield [next(empty) if donor_index is None else donor_index for donor_index in order]
 
 
 def _frozen_permutations(base, m, padded, geom, frozen_donors, haptic=None, coordination=()):
@@ -370,7 +369,7 @@ def _frozen_permutations(base, m, padded, geom, frozen_donors, haptic=None, coor
     frozen_v = {v: di for v, di in enumerate(base_order) if padded[di] in frozen_donors}
     free_v = [v for v in range(sites) if v not in frozen_v]
     free_di = [di for di in range(len(padded)) if padded[di] not in frozen_donors]
-    count = math.factorial(len(free_di))
+    count = math.perm(len(free_v), sum(padded[di] != VACANT for di in free_di))
     if count > MAX_EXHAUSTIVE_ORBITS:
         raise ValueError(
             f"metal[{geom}]: fix= leaves exactly {count:,} free-site arrangements to scan "
@@ -383,7 +382,7 @@ def _frozen_permutations(base, m, padded, geom, frozen_donors, haptic=None, coor
         len(frozen_v),
         count,
     )
-    return _pinned_orders(frozen_v, free_v, free_di, sites)
+    return _pinned_orders(frozen_v, free_v, free_di, padded)
 
 
 @dataclass(frozen=True)
@@ -397,7 +396,7 @@ class _Request:
     lengths: str
     screen: bool
     observed_only: bool
-    haptic_mode: str
+    haptic_mode: tuple
     source: Chem.Mol | None = None  # the real-atom graph every candidate shares
     fix_cons: Constraints | None = None
     graft_ref: dict | None = None
@@ -423,6 +422,31 @@ def _witnessed_retention(retained, observed_only, base, source, donors, haptic, 
     return retained if witnessed else None
 
 
+def _screen_reach(request, base_iso, geom):
+    """Return a tethered sphere's ligand reach, native reach and compile context, each None where unscreened.
+
+    Every path that leaves a screened request unscreened says so: a fix= and a multi-metal sphere, which keeps
+    only the prior span tests, at INFO, and a reach failure as a warning.
+    """
+    if not request.screen:
+        return None, None, None
+    if request.fix:
+        logger.info("metal[%s]: fix= is set, so neither the reach screen nor the edge rule applies", geom)
+        return None, None, None
+    try:
+        reach = ligand_reach(base_iso.graph)
+    except (ValueError, RuntimeError) as exc:
+        logger.warning("metal[%s]: native ligand reach failed (%s); no arrangement is screened", geom, exc)
+        return None, None, None
+    if len(base_iso.centres) != 1:
+        logger.info("metal[%s]: a multi-metal sphere has no reach certificate or edge rule; span tests only", geom)
+        return reach, None, None
+    native_reach = coordination_reach_base(request.source, reach, {base_iso.metal})
+    context = compile_context(request.source, base_iso.donor_bonds)
+    context["native_reach"] = native_reach  # metal_constraints.seated_bites' own fact, seeded once
+    return reach, native_reach, context
+
+
 def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
     """Enumerate every distinct `Isomer` of one polyhedron `geom` (frozen core held, spectators retained)."""
     base, m = base_iso.graph, base_iso.metal
@@ -440,7 +464,7 @@ def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
     roles = base_iso.roles
     perms = None
     # Pin each frozen donor at its input vertex, then generate every free-donor arrangement.
-    if frozen_donors and sites == n:
+    if frozen_donors:
         perms = _frozen_permutations(base, m, padded, geom, frozen_donors, haptic, roles)
     real_donors = base_iso.donors
     tethered = has_tether(padded, frag_map(base), haptic)
@@ -460,39 +484,20 @@ def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
         # The measured order is an explicit user choice, not an approximation to exhaustive enumeration.
         # Passing it as the permutation stream avoids constructing an oversized constitutional orbit pool.
         perms = (tuple(retained),)
-    reach = None
-    if tethered and request.screen and not fix_cons.constrained_atoms():
-        try:
-            reach = ligand_reach(base)
-        except (ValueError, RuntimeError):
-            logger.debug("metal[%s]: native ligand reach unavailable; retaining all arrangements", geom)
-    native_reach = (
-        coordination_reach_base(source, reach, {m}) if reach is not None and len(base_iso.centres) == 1 else None
-    )
-    screen_context = compile_context(source) if native_reach is not None else None
-    if screen_context is not None:
-        screen_context["native_reach"] = native_reach  # metal_constraints.seated_bites' own fact, seeded once
+    reach, native_reach, screen_context = _screen_reach(request, base_iso, geom) if tethered else (None, None, None)
     retained = _witnessed_retention(retained, request.observed_only, base, source, donors, haptic, native_reach)
     # A same-ligand chelate-backbone or direct-bond pair must sit on a polyhedron hull edge (a chemistry
     # claim; see metal_slots.chelate_edge_links). Gated the same way: a single screened centre with no fix=.
     linked = chelate_edge_links(base, padded, haptic, distances) if native_reach is not None else frozenset()
+    if linked:
+        logger.info("metal[%s]: held %d chelate pair(s) to polyhedron edges (screen=False lifts it)", geom, len(linked))
     out, unreachable = [], 0
-    raw_limit = _screen_limit(n, reach)
+    raw_limit = math.factorial(sites) if reach is not None and sites <= _SCREEN_SITES else None
     # Reading a ring's winding depends on the input geometry, not on which vertex a donor lands at,
     # so it is the same for every candidate below.
     winding = measured_haptic_windings(source, m, real_donors, haptic)
-    for order in distinct_vertex_orderings(
-        base,
-        padded,
-        geom,
-        perms=perms,
-        haptic=haptic,
-        classes=classes,
-        distances=distances,
-        retained=retained,
-        max_orbits=raw_limit,
-        linked=linked,
-    ):
+    problem = SeatingProblem(base, tuple(padded), geom, haptic, classes, distances, linked)
+    for order in distinct_vertex_orderings(problem, perms, retained=retained, max_orbits=raw_limit):
         od = [padded[k] for k in order]  # vertex -> donor atom, haptic centroid, or VACANT
         links = chelate_links(base, od, haptic, distances) if tethered else ()
         hand = chirality_of(base, geom, od, haptic, roles, classes=classes, links=links)
@@ -515,7 +520,9 @@ def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
                 logger.debug("metal[%s]: omit arrangement: %s", geom, failure)
                 unreachable += 1
                 continue
-        _keep_screened_candidate(out, candidate, geom)
+        out.append(candidate)
+        if len(out) > MAX_EXHAUSTIVE_ORBITS:
+            raise assignment_cap_error(geom)
     if unreachable:
         logger.info(
             "metal[%s]: omitted %d arrangements the ligands cannot reach (screen=False keeps them)", geom, unreachable
@@ -553,15 +560,11 @@ def stated_slots(mol, metal):
 def stated_arrangement(mol, center=None):
     """Return the stated ``(geometry, sites, chirality, haptic winding)`` on `mol`, or ``None``.
 
-    The reading half of `metal_smiles.cxsmiles`. It lives here, not there, because it reads RDKit atom
-    properties on a `Mol`, an arrangement, which is this module's subject rather than a string. By the time a
-    `Mol` carries an arrangement, `metal_smiles.parse_smiles` has already kept the block's indices addressing
-    the atoms they were written for, so `enumerate_isomers` can seat it directly instead of enumerating.
-    ``None`` means there is nothing to seat: a plain SMILES.
-
-    A vacant vertex has no donor, so a coordination pocket survives the round trip.
+    The reading half of `metal_smiles.cxsmiles`: `enumerate_isomers` seats a stated arrangement directly
+    instead of enumerating. ``None`` means a plain SMILES. A vacant vertex has no donor, so a coordination
+    pocket survives the round trip.
     """
-    # One key for both notes, so the VALUE says which it is: a slot is `s<n>` with an optional winding sign
+    # One key for both notes, so the VALUE says which it is: a slot is `s<n>` with an optional face token
     # (`metal_polyhedron` owns that grammar, since it owns the slots), and anything else on a noted atom is
     # the metal's geometry code.
     noted = {a.GetIdx(): a.GetProp("atomNote") for a in mol.GetAtoms() if a.HasProp("atomNote")}
@@ -572,10 +575,7 @@ def stated_arrangement(mol, center=None):
     if metal not in geom:
         return None
     geometry, separator, chirality = noted[metal].partition("-")
-    try:
-        name = resolve_geometry(geometry)
-    except ValueError:
-        return None  # atomNote is general CXSMILES metadata; an unrelated note on a metal is not our arrangement
+    name = resolve_geometry(geometry)
     if separator and chirality not in {"delta", "lambda"}:
         raise ValueError(f"the arrangement on this string has unknown metal chirality {chirality!r}")
     slots = stated_slots(mol, metal)
@@ -587,7 +587,10 @@ def stated_arrangement(mol, center=None):
             windings[slot] = winding
         sites.setdefault(slot, atom_idx)  # a haptic face writes one slot on every ring atom; the first seen names it
     if name not in POLYHEDRA:
-        raise ValueError(f"the arrangement on this string names {name!r}, which is not a polyhedron rxembed has")
+        raise ValueError(
+            f"the metal atomNote names {name!r}, which is not a polyhedron rxembed has; remove the note or use "
+            "a polyhedron name or code"
+        )
     return name, sites, chirality, windings
 
 
@@ -602,8 +605,9 @@ def _stated_windings(iso, windings):
         face = iso.haptic.get(donor)
         if face is None:
             raise ValueError(f"slot s{slot}{winding} states haptic winding, but that slot is not a haptic face")
-        if not face_has_orientation(iso.graph, face, ranks):
-            raise ValueError(f"slot s{slot}{winding} states orientation on a mirror-symmetric face")
+        if winding not in (tokens := face_orientations(iso.graph, face, ranks)):
+            allowed = f"only {'/'.join(tokens)}" if tokens else "none, being a mirror-symmetric face"
+            raise ValueError(f"slot s{slot}{winding} states a configuration this face lacks; it has {allowed}")
         stated[donor] = winding
     return stated
 
@@ -708,18 +712,24 @@ def _with_fix(iso, fix):
     )
 
 
-def _winding_variants(iso, state):
-    """Return the symmetry-distinct assignments of one state's undefined haptic windings."""
+def _face_modes(graph, haptic, modes):
+    """Map each haptic face to its mode in `modes` (see `_haptic_stereo_mode`): a diene face takes the second."""
+    return {face: modes[1] if torsion_path(graph, atoms) else modes[0] for face, atoms in haptic.items()}
+
+
+def _winding_variants(iso, state, faces):
+    """Return the symmetry-distinct assignments of one state's undefined haptic windings among `faces`."""
     vertices, haptic, stored, donors = materialized_state(iso, state)
-    ranks = donor_classes(iso.graph, donors)
-    faces = [
-        dummy for dummy, face in haptic.items() if dummy not in stored and face_has_orientation(iso.graph, face, ranks)
-    ]
+    faces = [dummy for dummy in haptic if dummy in faces and dummy not in stored]
     if not faces:
         return [state]
+    ranks = donor_classes(iso.graph, donors)
+    choices = {dummy: tokens for dummy in faces if (tokens := face_orientations(iso.graph, haptic[dummy], ranks))}
+    if not choices:
+        return [state]
     variants, seen = [], set()
-    for signs in itertools.product("+-", repeat=len(faces)):
-        winding = stored | dict(zip(faces, signs, strict=True))
+    for tokens in itertools.product(*choices.values()):
+        winding = stored | dict(zip(choices, tokens, strict=True))
         signature = winding_signature(iso, state, winding)
         if signature not in seen:
             seen.add(signature)
@@ -727,31 +737,36 @@ def _winding_variants(iso, state):
     return variants
 
 
-def _haptic_mode(isomers, mode):
-    """Apply the requested mode to haptic orientation read from an input geometry."""
-    if mode in ("free", "preserve"):
+def _haptic_mode(isomers, modes):
+    """Apply the requested modes to haptic configurations read from an input geometry."""
+    if set(modes) <= {"free", "preserve"}:
         return isomers
     out = IsomerSet()
     for iso in isomers:
-        choices = []
+        choices, changed = [], False
         for state in iso.centres:
-            vertices, _haptic, stored, _donors = materialized_state(iso, state)
-            candidate = state
-            if mode == "invert":
-                winding = {face: "+" if sign == "-" else "-" for face, sign in stored.items()}
-                candidate = state_with_winding(state, vertices, winding)
-            elif mode != "unassigned":  # racemic / separate: discard the measured orientation first
-                candidate = state_with_winding(state, vertices, {})
-            choices.append(_winding_variants(iso, candidate))
-        out.extend(iso.with_stereo(states) for states in itertools.product(*choices))
+            vertices, haptic, stored, _donors = materialized_state(iso, state)
+            mode = _face_modes(iso.graph, haptic, modes)
+            winding = {  # racemic / separate: discard the measured configuration first
+                face: MIRROR_WINDING[token] if mode[face] == "invert" else token
+                for face, token in stored.items()
+                if mode[face] not in ("racemic", "separate")
+            }
+            open_faces = {face for face in haptic if mode[face] not in ("free", "preserve")}
+            changed |= bool(open_faces)
+            choices.append(_winding_variants(iso, state_with_winding(state, vertices, winding), open_faces))
+        if changed:
+            out.extend(iso.with_stereo(states) for states in itertools.product(*choices))
+        else:
+            out.append(iso)
     return out
 
 
 def _enumerate_all_centers(mol, request):
     """Stack independently enumerated metal states into their Cartesian product."""
     metals = metal_indices(mol)
-    if len(metals) < _MULTI_METAL:
-        raise ValueError("center='all' needs at least two transition-metal centres")
+    if len(metals) < 2:  # noqa: PLR2004
+        raise ValueError("center='all' needs at least two metal centres")
     stated = stated_arrangement(mol, center=metals[0])
     metals = canonical_metals(mol, metals, allow_ties=stated is not None)
     if stated is not None:
@@ -779,14 +794,13 @@ def _enumerate_all_centers(mol, request):
     real_base = strip_phantoms(Chem.Mol(base), phantoms)
     lengths = length_source(real_base, request.lengths)
     fix_cons, graft_ref = _resolve_fix(base, request.fix, True)
-    # Each centre holds only the frozen core and skips the reach screen under a fix; the product carries the fix.
+    # Each centre holds only the frozen core; the product carries the fix.
     per_centre = replace(
         request,
         source=real_base,
         lengths=lengths,
         fix_cons=Constraints(frozen=set(fix_cons.frozen)),
         graft_ref=graft_ref,
-        screen=request.screen and not bool(request.fix),
     )
     choices = []
     for m in metals:
@@ -815,6 +829,27 @@ def _enumerate_all_centers(mol, request):
             )
         )
     return out
+
+
+_STEREO_MODES = {"unassigned", "racemic", "separate", "free", "preserve", "all", "invert"}
+_STEREO_KINDS = {"point", "ez", "axial", "planar", "helical", "locked", "default"}
+_STEREO_FILTERS = {"free", "preserve", "invert", "racemic"}
+
+
+def validate_stereo(stereo):
+    """Reject an unknown global or per-kind stereo mode."""
+    if isinstance(stereo, str) and stereo in _STEREO_MODES:
+        return
+    if (
+        isinstance(stereo, dict)
+        and all(kind in _STEREO_KINDS or re.fullmatch(r"[A-Z][a-z]?\d+", str(kind)) for kind in stereo)
+        and all(mode in _STEREO_FILTERS for mode in stereo.values())
+    ):
+        return
+    raise ValueError(
+        f"unknown stereo mode {stereo!r}; use one of {sorted(_STEREO_MODES)} or "
+        f"{{kind: mode}} with modes {sorted(_STEREO_FILTERS)}"
+    )
 
 
 def _source_defaults(mol, center, stereo):
@@ -851,9 +886,10 @@ def enumerate_isomers(
     Parameters
     ----------
     screen : bool, optional
-        Apply the native ligand-reach and donor-facing screens, by default True. False retains distinct
-        assignments beyond those model limits, with no guarantee they embed. Symmetry, stated slots, ligand
-        stereo, explicit fixes and embedding validation are unchanged.
+        Apply the chelate hull-edge rule and the native ligand-reach and donor-facing screens, by default
+        True. False retains distinct assignments beyond those model limits, with no guarantee they embed.
+        Symmetry, stated slots, ligand stereo, explicit fixes and embedding validation are unchanged. A
+        ``fix=`` turns the screens off.
     observed_only : bool, optional
         With coordinates, return only the measured donor arrangement. An explicit resource-bounded choice for
         high-coordinate inputs, not a claim that unmeasured assignments are impossible.
@@ -871,7 +907,10 @@ def enumerate_isomers(
     reject_boron_cages(mol)
     mol = canonical_metal_graph(mol)
     center, stereo = _source_defaults(mol, center, stereo)
+    validate_stereo(stereo)
     variants, haptic_mode, n_unassigned, unresolved = _ligand_stereo_variants(mol, stereo)
+    if observed_only:  # the measured arrangement includes its measured diene class
+        haptic_mode = (haptic_mode[0], "preserve")
     request = _Request(geometry, center, fix, stereo_ref, lengths, screen, observed_only, haptic_mode)
     out = IsomerSet()
     for variant, stated_label in variants:
@@ -941,7 +980,7 @@ def _enumerate_coordination(mol, request):
         return _haptic_mode(IsomerSet([iso]), request.haptic_mode)
     metals = metal_indices(mol)
     if not metals:
-        raise ValueError("no transition metal found")
+        raise ValueError("no metal found")
     # One metal means no spectators, so this is the single-centre path whether or not center= names it. An
     # explicit center= is still validated against the sole metal, raising on a wrong index or element.
     if len(metals) == 1:
@@ -976,10 +1015,18 @@ def _enumerate_coordination(mol, request):
         out.extend(_isomers_for_geometry(request, base_iso, geom, donors, haptic))
     if mol.GetNumConformers():
         out = _haptic_mode(out, request.haptic_mode)
-    elif request.haptic_mode != "free":
+    elif set(request.haptic_mode) != {"free"}:
         out = IsomerSet(
             iso.with_stereo((state, *iso.centres[1:]))
             for iso in out
-            for state in _winding_variants(iso, iso.centres[0])
+            for state in _winding_variants(
+                iso,
+                iso.centres[0],
+                {
+                    face
+                    for face, mode in _face_modes(iso.graph, iso.haptic, request.haptic_mode).items()
+                    if mode != "free"
+                },
+            )
         )
     return out

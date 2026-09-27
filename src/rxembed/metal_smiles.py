@@ -160,7 +160,7 @@ def parse_smiles(smi, *, remove_hs=True):
     Chem.SetBondStereoFromDirections(mol)
     _repair_haptic_bond_stereo(mol)
     _validate_cx_bond_stereo(smi, mol)
-    encoded_bond_stereo(mol)
+    encoded_bond_stereo(mol)  # raises on a malformed CX E/Z record
     _bind_slot_notes(mol)
     if remove_hs and "atomProp" not in smi:
         mol = Chem.RemoveHs(mol)
@@ -538,7 +538,7 @@ def _dative_hydrogens(mol):
         )
         nbrs = [neighbor for neighbor in ordered if neighbor in nbrs]
         for n in nbrs[1:]:
-            remove_bond(rw, h, n)  # re-seats the bond LAST at `n`, so the partner's tag moves basis with it
+            remove_bond(rw, h, n)  # re-seats the bond last at `n`, so the partner's tag moves basis with it
             rw.AddBond(h, n, Chem.BondType.DATIVE)  # H donates: a dative bond spends the end atom's valence
     return rw.GetMol()
 

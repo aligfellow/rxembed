@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import itertools
 
 import numpy as np
 import pytest
@@ -12,6 +13,7 @@ import rxembed as rx
 from rxembed import metal_stereo as metal
 from rxembed.metal_isomer import Isomer
 from rxembed.metal_polyhedron import POLYHEDRA, orientation_parity, point_group
+from tests.metal_fixtures import BUTADIENE_FE_CO3
 
 emb = importlib.import_module("rxembed.embed")
 
@@ -120,6 +122,38 @@ def test_resonance_identity_case_table_isomer_counts(smiles, want):
     assert len(rx.metal(smiles, "SPL")) == want
 
 
+def test_tetrahedral_zn_hand_ignores_the_drawn_benzoylacetonate_lewis_form_and_atom_order():
+    # One kappa1 benzoylacetonate complex in its two Lewis forms, same atom order, each also renumbered.
+    forms = [
+        "[Zn](<-[O-]C(C)=CC(=O)c1ccccc1)(<-[O-]C)(<-N)<-[Cl-]",
+        "[Zn](<-O=C(C)C=C([O-])c1ccccc1)(<-[O-]C)(<-N)<-[Cl-]",
+    ]
+    rng = np.random.RandomState(0)
+    hands = set()
+    for smiles in forms:
+        mol = rx.parse_smiles(smiles)
+        donors = [atom.GetIdx() for atom in mol.GetAtomWithIdx(0).GetNeighbors()]
+        orders = [list(range(mol.GetNumAtoms()))] + [rng.permutation(mol.GetNumAtoms()).tolist() for _ in range(3)]
+        for order in orders:
+            shuffled = Chem.RenumberAtoms(mol, order)
+            new = {old: order.index(old) for old in donors}
+            hands.add(
+                tuple(
+                    metal.chirality_of(shuffled, "tetrahedral", [new[donor] for donor in seating])
+                    for seating in itertools.permutations(donors)
+                )
+            )
+    assert len(hands) == 1
+
+
+def test_aqua_chloride_hydrogen_bond_is_not_a_chelate_bite():
+    mol = rx.parse_smiles("[H]O([H])->[Pt+2](<-[NH3])(<-[Br-])<-[Cl-]", remove_hs=False)
+    contact = Chem.RWMol(mol)
+    contact.AddBond(0, 6, Chem.BondType.ZERO)  # H0...Cl6
+
+    assert len(rx.metal(contact.GetMol(), "square_planar")) == len(rx.metal(mol, "square_planar")) == 3
+
+
 def test_tetraphenylporphyrinato_nitrogens_merge_into_one_site_class():
     # meso-tetraphenylporphyrinato dianion, one Lewis form (two pyrrolide N-, two pyridine-type N): all four
     # donors sit in one 48-heavy-atom macrocyclic conjugated system, so they share one resonance identity.
@@ -214,6 +248,21 @@ def test_face_winding_abstains_at_the_plane_and_is_scale_invariant():
     cip = list(Chem.ComputeAtomCIPRanks(eta2))
 
     assert {metal.face_winding(eta2, pos * scale, metal_idx, face, ranks, cip) for scale in (1e-3, 1.0, 1e3)} == {"-"}
+
+
+def test_diene_class_turns_at_ninety_degrees_and_abstains_on_a_boundary():
+    mol = Chem.MolFromSmiles(BUTADIENE_FE_CO3)
+    iron, path = 2, [7, 8, 9, 10]
+    ranks = metal.donor_classes(mol, path)
+
+    def token(degrees):
+        phi = np.radians(degrees)
+        pos = np.zeros((mol.GetNumAtoms(), 3))
+        pos[path] = [(-0.7, 1.2, 0.0), (0.0, 0.0, 0.0), (1.45, 0.0, 0.0), (2.15, 1.2 * np.cos(phi), 1.2 * np.sin(phi))]
+        pos[iron] = (0.7, 0.6, -1.7)
+        return metal.face_winding(mol, pos, iron, path, ranks)
+
+    assert [token(degrees) for degrees in (0, 89, 91, 179, -91, 90, 180)] == ["c", "c", "P", "P", "M", "", ""]
 
 
 def test_routine_hydrogen_is_removed_when_its_bond_defines_imine_stereo():

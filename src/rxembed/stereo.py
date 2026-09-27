@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import re
 
 import numpy as np
@@ -12,10 +13,10 @@ from rdkit.Chem.EnumerateStereoisomers import (
     StereoEnumerationOptions,
 )
 
-from .metal_core import haptic_sites, ligand_graph
+from .metal_core import haptic_sites, ligand_graph, torsion_path
 from .utils import (
+    DISCONNECTED,
     bond_removal_mirrors,
-    bond_replacement_mirrors,
     cip_cache_key,
     mirror_tag,
     remove_bond,
@@ -32,8 +33,13 @@ _ATROP_WEDGE = (Chem.BondDir.BEGINWEDGE, Chem.BondDir.BEGINDASH)
 _TETRAHEDRAL_TAGS = {Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW}
 _POINT_CIP = {"R", "S", "r", "s"}
 _THREE_COORDINATE_3D = {16, 34}  # RDKit's assignChiralTypesFrom3D special case: S and Se use a lone pair
-_RESONANCE_EZ_CAP = 32  # bounded because disconnected conjugated ligands can have a product-sized form pool
+_RESONANCE_EZ_CAP = 32  # forms searched per fragment: independent conjugated groups multiply its form count
 _RX_EZ_PROP = re.compile(r"_rxEZ(\d+)")
+# One ligand-stereo label item each: a point centre, a double bond, an atropisomer axis.
+_POINT_ITEM = re.compile(r"([A-Z][a-z]?)(\d+):(R|S|r|s|CW|CCW)")
+_BOND_ITEM = re.compile(r"([A-Z][a-z]?)(\d+)=([A-Z][a-z]?)(\d+):(E|Z)")
+_AXIS_ITEM = re.compile(r"([A-Z][a-z]?)(\d+)-([A-Z][a-z]?)(\d+):(M|P)")
+logger = logging.getLogger("rxembed.stereo")  # under the "rxembed" tree `set_verbose` configures
 _STEREO_SANITIZE = (
     Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES ^ Chem.SanitizeFlags.SANITIZE_FINDRADICALS
 )
@@ -42,20 +48,20 @@ _STEREO_SANITIZE = (
 def point_stereo(label):
     """Return the point-centre codes in a ligand-stereo label, keyed by atom index."""
     return {
-        int(match.group(1)): match.group(2)
+        int(match.group(2)): match.group(3)
         for part in label.split(",")
         if label
-        if (match := re.fullmatch(r"[A-Z][a-z]?(\d+):(R|S|r|s|CW|CCW)", part))
+        if (match := _POINT_ITEM.fullmatch(part))
     }
 
 
 def bond_stereo(label):
     """Return the E/Z codes in a ligand-stereo label, keyed by atom pair."""
     return {
-        frozenset((int(match.group(1)), int(match.group(2)))): match.group(3)
+        frozenset((int(match.group(2)), int(match.group(4)))): match.group(5)
         for part in label.split(",")
         if label
-        if (match := re.fullmatch(r"[A-Z][a-z]?(\d+)=[A-Z][a-z]?(\d+):(E|Z)", part))
+        if (match := _BOND_ITEM.fullmatch(part))
     }
 
 
@@ -131,31 +137,37 @@ def encoded_bond_stereo(mol):
 
 
 def apply_encoded_bond_stereo(mol, skip=()):
-    """Apply representable CX E/Z fallbacks to a temporary graph used for identity ranking."""
+    """Apply CX-encoded E/Z against the references RDKit perceives, verifying each code by CIP.
+
+    E is TRANS only relative to the CIP-leading substituents, so a code set against arbitrary neighbours can land
+    as the other isomer. ``skip`` names atom pairs to leave unassigned.
+    """
     skip = {frozenset(pair) for pair in skip}
-    for pair, wanted in encoded_bond_stereo(mol).items():
-        if pair in skip:
-            continue
-        bond = mol.GetBondBetweenAtoms(*pair)
-        if bond is None:
-            continue
-        left, right = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        refs = [
-            next(
-                (
-                    neighbor.GetIdx()
-                    for neighbor in mol.GetAtomWithIdx(end).GetNeighbors()
-                    if neighbor.GetIdx() != other
-                ),
-                None,
-            )
-            for end, other in ((left, right), (right, left))
-        ]
-        if any(ref is None for ref in refs):
-            continue
-        bond.SetStereoAtoms(*refs)
-        tag = Chem.BondStereo.STEREOTRANS if wanted == "E" else Chem.BondStereo.STEREOCIS
-        bond.SetStereo(tag)
+    encoded = {pair: code for pair, code in encoded_bond_stereo(mol).items() if pair not in skip}
+    if not encoded:
+        return
+    potential = {
+        frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())): element
+        for element in Chem.FindPotentialStereo(mol)
+        if element.type == Chem.StereoType.Bond_Double
+        for bond in (mol.GetBondWithIdx(element.centeredOn),)
+    }
+    for pair, wanted in encoded.items():
+        element = potential.get(pair)
+        if element is None:
+            raise ValueError(f"could not restore CX E/Z on bond {tuple(sorted(pair))}")
+        bond = mol.GetBondWithIdx(element.centeredOn)
+        controls = list(element.controllingAtoms)
+        left = next((idx for idx in controls[:2] if idx < mol.GetNumAtoms()), None)
+        right = next((idx for idx in controls[2:] if idx < mol.GetNumAtoms()), None)
+        if left is None or right is None or left == right:
+            raise ValueError(f"could not restore CX E/Z references on bond {tuple(sorted(pair))}")
+        bond.SetStereoAtoms(left, right)
+        bond.SetStereo(Chem.BondStereo.STEREOE)
+        if bond_stereo_code(mol, bond.GetIdx()) != wanted:
+            bond.SetStereo(Chem.BondStereo.STEREOZ)
+        if bond_stereo_code(mol, bond.GetIdx()) != wanted:
+            raise ValueError(f"could not restore CX {wanted} on bond {tuple(sorted(pair))}")
 
 
 def without_bond_stereo(label, pairs):
@@ -166,10 +178,10 @@ def without_bond_stereo(label, pairs):
 def axis_stereo(label):
     """Return native M/P atropisomer descriptors keyed by their axis atom pair."""
     return {
-        tuple(sorted((int(match.group(1)), int(match.group(2))))): match.group(3)
+        tuple(sorted((int(match.group(2)), int(match.group(4))))): match.group(5)
         for part in label.split(",")
         if label
-        if (match := re.fullmatch(r"[A-Z][a-z]?(\d+)-[A-Z][a-z]?(\d+):(M|P)", part))
+        if (match := _AXIS_ITEM.fullmatch(part))
     }
 
 
@@ -332,12 +344,94 @@ def _rdkit_3d_point_capable(atom):
     )
 
 
-def _distinct_carriers(work, ranks, index):
-    """Return whether an atom carries four substituents, hydrogens included, in four distinct graph classes."""
+def _tetrahedral_centres(mol):
+    """Return the atoms RDKit's potential-stereo perception flags as tetrahedral centres."""
+    return {
+        element.centeredOn
+        for element in Chem.FindPotentialStereo(mol)
+        if element.type == Chem.StereoType.Atom_Tetrahedral
+    }
+
+
+def _distinct_carriers(work, ranks, index, count=4):
+    """Return whether an atom carries `count` substituents, hydrogens included, in distinct graph classes."""
     atom = work.GetAtomWithIdx(index)
     classes = [ranks[neighbor.GetIdx()] for neighbor in atom.GetNeighbors()]
     classes.extend([-1] * atom.GetTotalNumHs())
-    return len(classes) == len(set(classes)) == 4  # noqa: PLR2004
+    return len(classes) == len(set(classes)) == count
+
+
+def _free_graph(mol, metals):
+    """Return the metal-free ligand graph with any E/Z reference the strip orphaned repaired or dropped."""
+    free = ligand_graph(mol, metals)
+    free.UpdatePropertyCache(strict=False)
+    repair_bond_stereo(free)
+    return free
+
+
+def _bridgehead_partners(free, atom):
+    """Return ``(partner, arms, ends)`` for each nearest atom joined to `atom` by three disjoint bridges.
+
+    ``arms`` are `atom`'s neighbours and ``ends`` the partner's neighbours on the same bridges, in the same order.
+    """
+    arms = [neighbor.GetIdx() for neighbor in free.GetAtomWithIdx(atom).GetNeighbors()]
+    cut = Chem.RWMol(free)
+    for arm in arms:
+        cut.RemoveBond(atom, arm)
+    distances = Chem.GetDistanceMatrix(cut)
+    found = []
+    for partner in range(free.GetNumAtoms()):
+        if partner == atom or partner in arms or any(distances[arm][partner] >= DISCONNECTED for arm in arms):
+            continue
+        paths = [Chem.GetShortestPath(cut, arm, partner) for arm in arms]
+        inner = [set(path[:-1]) for path in paths]
+        if any(left & right for left, right in itertools.combinations(inner, 2)):
+            continue
+        found.append((sum(map(len, paths)), partner, arms, [path[-2] for path in paths]))
+    shortest = min((row[0] for row in found), default=None)
+    return [row[1:] for row in found if row[0] == shortest]
+
+
+def _with_hand(mol, atom, order, tag):
+    """Tag `atom` so that its neighbours listed in `order` turn as `tag` names."""
+    bonded = [bond.GetOtherAtomIdx(atom) for bond in mol.GetAtomWithIdx(atom).GetBonds()]
+    rank = [bonded.index(neighbor) for neighbor in order]
+    swaps = sum(left > right for left, right in itertools.combinations(rank, 2))
+    mol.GetAtomWithIdx(atom).SetChiralTag(mirror_tag(tag) if swaps % 2 else tag)
+
+
+def _cage_fixed_nitrogens(free, centres):
+    """Return the bridgehead nitrogens among `centres` whose hand is no stereo element of their own.
+
+    A bridgehead N cannot invert alone. Its three bridges end at a partner bridgehead and, in any buildable
+    cage, both point out of it, so bridge by bridge the partner turns the opposite way. The pair carries one
+    element, the cage's hand: a partner other than N holds it as its own centre, and it is none at all when the
+    mirrored cage is the same molecule.
+    """
+    fixed = set()
+    for atom in centres:
+        arms = [neighbor.GetIdx() for neighbor in free.GetAtomWithIdx(atom).GetNeighbors()]
+        if free.GetAtomWithIdx(atom).GetAtomicNum() != 7 or len(arms) != 3:  # noqa: PLR2004  a tertiary N
+            continue
+        if any(free.GetBondBetweenAtoms(*pair) for pair in itertools.combinations(arms, 2)):
+            continue  # a three-ring N, not a bridgehead: it inverts slowly on its own
+        partners = _bridgehead_partners(free, atom)
+        if any(free.GetAtomWithIdx(partner).GetAtomicNum() != 7 for partner, _arms, _ends in partners):  # noqa: PLR2004
+            fixed.add(atom)
+            continue
+        for partner, arms, ends in partners[:1]:
+            if free.GetAtomWithIdx(partner).GetDegree() != 3:  # noqa: PLR2004  the ends must be its only carriers
+                continue
+            cage, mirror = Chem.Mol(free), Chem.Mol(free)
+            for graph, tag in (
+                (cage, Chem.ChiralType.CHI_TETRAHEDRAL_CW),
+                (mirror, Chem.ChiralType.CHI_TETRAHEDRAL_CCW),
+            ):
+                _with_hand(graph, atom, arms, tag)
+                _with_hand(graph, partner, ends, mirror_tag(tag))
+            if Chem.MolToSmiles(cage) == Chem.MolToSmiles(mirror):
+                fixed.update((atom, partner))
+    return fixed
 
 
 def _point_capability(mol, work, cap_to_metal=(), exclude=()):
@@ -361,25 +455,16 @@ def _point_capability(mol, work, cap_to_metal=(), exclude=()):
         if cap in cap_donors and any({cap_donors[cap], record[3]} <= atoms for atoms, _bonds in rings)
     }
     ranks = list(Chem.CanonicalRankAtoms(work, breakTies=False, includeChirality=False))
-    retained_chelate_nitrogen = {index for index in chelated_nitrogen if _distinct_carriers(work, ranks, index)}
-    potential = {
-        element.centeredOn
-        for element in Chem.FindPotentialStereo(mol)
-        if element.type == Chem.StereoType.Atom_Tetrahedral
-    }
-    potential.update(
-        element.centeredOn
-        for element in Chem.FindPotentialStereo(work)
-        if element.type == Chem.StereoType.Atom_Tetrahedral
-        and element.centeredOn < mol.GetNumAtoms()
-        # The coordination convention retains a neutral amine hand only for a metal-closed chelate with four
-        # distinct carriers. The graph cannot infer inversion kinetics; stereo='free' is the explicit opt-out.
-        and not (
-            work.GetAtomWithIdx(element.centeredOn).GetAtomicNum() == 7  # noqa: PLR2004  nitrogen
-            and work.GetAtomWithIdx(element.centeredOn).GetFormalCharge() == 0
-            and element.centeredOn not in retained_chelate_nitrogen
-        )
-    )
+    # A neutral N inverts unless RDKit's own rule holds it on the metal-free graph (a bridgehead or three-ring N)
+    # with three distinct carriers and, for a bridgehead, a hand the cage leaves free. The coordination
+    # convention also retains a bound amine hand for a metal-closed chelate with four distinct carriers. The
+    # graph cannot infer inversion kinetics further; stereo='free' is the explicit opt-out.
+    free = _free_graph(mol, metals)
+    free_ranks = list(Chem.CanonicalRankAtoms(free, breakTies=False, includeChirality=False))
+    held = {index for index in _tetrahedral_centres(free) if _distinct_carriers(free, free_ranks, index, 3)}
+    held -= _cage_fixed_nitrogens(free, held)
+    held.update(index for index in chelated_nitrogen if _distinct_carriers(work, ranks, index))
+    potential = _tetrahedral_centres(mol) | {index for index in _tetrahedral_centres(work) if index < mol.GetNumAtoms()}
     donors = list(cap_donors.values())
     bridged = {idx for idx in set(donors) if donors.count(idx) >= _MIN_BRIDGE_METALS}
     potential.update(bridged)
@@ -393,7 +478,7 @@ def _point_capability(mol, work, cap_to_metal=(), exclude=()):
     )
     potential.difference_update(
         index
-        for index in potential - retained_chelate_nitrogen - bridged
+        for index in potential - held - bridged
         if work.GetAtomWithIdx(index).GetAtomicNum() == 7  # noqa: PLR2004  nitrogen
         and work.GetAtomWithIdx(index).GetFormalCharge() == 0
     )
@@ -425,13 +510,13 @@ def _graft_point_tags(full, work, centers, cap_to_metal):
 
 def _label_item(part):
     """Parse one indexed ligand-stereo label into its selector fields."""
-    if match := re.fullmatch(r"([A-Z][a-z]?)(\d+):(R|S|r|s|CW|CCW)", part):
+    if match := _POINT_ITEM.fullmatch(part):
         symbol, index, code = match.groups()
         return "point", (symbol,), code, part, f"{index}{code}"
-    if match := re.fullmatch(r"([A-Z][a-z]?)(\d+)=([A-Z][a-z]?)(\d+):(E|Z)", part):
+    if match := _BOND_ITEM.fullmatch(part):
         left, i, right, j, code = match.groups()
         return "bond", tuple(sorted((left, right))), code, part, f"{i}={j}:{code}"
-    if match := re.fullmatch(r"([A-Z][a-z]?)(\d+)-([A-Z][a-z]?)(\d+):(M|P)", part):
+    if match := _AXIS_ITEM.fullmatch(part):
         left, i, right, j, code = match.groups()
         return "axis", tuple(sorted((left, right))), code, part, f"{i}-{j}:{code}"
     return None
@@ -643,14 +728,20 @@ def coordination_locked_double_bonds(mol, metals):
     metals = set(metals)
     if not metals:
         return set()
-    haptic = {
-        frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))
+    faces = [
+        site
         for metal in metals
         for site in haptic_sites(mol, [a.GetIdx() for a in mol.GetAtomWithIdx(metal).GetNeighbors()])
         if len(site) > 1
+    ]
+    haptic = {
+        frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))
+        for site in faces
         for bond in mol.GetBonds()
         if bond.GetBeginAtomIdx() in site and bond.GetEndAtomIdx() in site
     }
+    # A diene face's central bond, drawn double in its metallacyclopentene form, is the face's s-cis/s-trans class.
+    central = {frozenset(path[1:3]) for site in faces if (path := torsion_path(mol, site)) is not None}
     closed, metal_rings = _metal_closed_rings(mol, metals)
     ring_stereo = {
         frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))
@@ -665,11 +756,14 @@ def coordination_locked_double_bonds(mol, metals):
         if b.GetBondType() != Chem.BondType.DOUBLE:
             continue
         a, c = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
-        if frozenset((a, c)) in haptic:
+        pair = frozenset((a, c))
+        if pair in central:
+            locked.add(pair)
+            continue
+        if pair in haptic:
             continue  # an eta2 C=C keeps its ligand E/Z; coordination chooses a face, not a bond geometry
         in_metal_ring = any({a, c} <= atoms for atoms, _bonds in metal_rings)
         fb = free.GetBondBetweenAtoms(a, c)
-        pair = frozenset((a, c))
         if (
             in_metal_ring and pair not in ring_stereo and not (fb is not None and fb.IsInRing())
         ):  # cyclic only because of the metal
@@ -688,13 +782,8 @@ def coordination_locked_centres(mol, metals):
     metals = set(metals)
     if not metals:
         return set()
-    free = {
-        element.centeredOn
-        for element in Chem.FindPotentialStereo(ligand_graph(mol, metals), cleanIt=False, flagPossible=True)
-        if element.type == Chem.StereoType.Atom_Tetrahedral
-    }
     donors = {n.GetIdx() for m in metals for n in mol.GetAtomWithIdx(m).GetNeighbors()} - metals
-    return (point_centres(mol, exclude=metals) & donors) - free
+    return (point_centres(mol, exclude=metals) & donors) - _tetrahedral_centres(_free_graph(mol, metals))
 
 
 def _lock_double_bond(work, fb):
@@ -715,11 +804,8 @@ def _lock_double_bond(work, fb):
     nb_e = next((n.GetIdx() for n in work.GetAtomWithIdx(ei).GetNeighbors() if n.GetIdx() != bi), None)
     if nb_b is None or nb_e is None:
         return False
-    try:
-        wb.SetStereoAtoms(nb_b, nb_e)
-        wb.SetStereo(Chem.BondStereo.STEREOCIS)
-    except (RuntimeError, ValueError):  # degrade to "not locked" rather than crash; the phantom just enumerates
-        return False
+    wb.SetStereoAtoms(nb_b, nb_e)
+    wb.SetStereo(Chem.BondStereo.STEREOCIS)
     return True
 
 
@@ -791,37 +877,6 @@ def _donor_caps(mol, exclude, metal_neighbors):
     return caps
 
 
-def _restore_encoded_ez(work, encoded):
-    """Re-apply CX-encoded E/Z on the enumeration graph, with references RDKit accepts, and verify each code.
-
-    Not `apply_encoded_bond_stereo`: that one picks neighbours and never verifies.
-    """
-    if not encoded:
-        return
-    potential = {
-        frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())): element
-        for element in Chem.FindPotentialStereo(work)
-        if element.type == Chem.StereoType.Bond_Double
-        for bond in (work.GetBondWithIdx(element.centeredOn),)
-    }
-    for pair, wanted in encoded.items():
-        element = potential.get(pair)
-        if element is None:
-            raise ValueError(f"could not restore CX E/Z on bond {tuple(sorted(pair))}")
-        bond = work.GetBondWithIdx(element.centeredOn)
-        controls = list(element.controllingAtoms)
-        left = next((idx for idx in controls[:2] if idx < work.GetNumAtoms()), None)
-        right = next((idx for idx in controls[2:] if idx < work.GetNumAtoms()), None)
-        if left is None or right is None or left == right:
-            raise ValueError(f"could not restore CX E/Z references on bond {tuple(sorted(pair))}")
-        bond.SetStereoAtoms(left, right)
-        bond.SetStereo(Chem.BondStereo.STEREOE)
-        if bond_stereo_code(work, bond.GetIdx()) != wanted:
-            bond.SetStereo(Chem.BondStereo.STEREOZ)
-        if bond_stereo_code(work, bond.GetIdx()) != wanted:
-            raise ValueError(f"could not restore CX {wanted} on bond {tuple(sorted(pair))}")
-
-
 def _build_enumeration_graph(mol, exclude):
     """Disconnect each metal and single-bond-cap donors whose ligand stereo needs that neighbour.
 
@@ -849,7 +904,7 @@ def _build_enumeration_graph(mol, exclude):
         for nb in donors:
             bond = mol.GetBondBetweenAtoms(mi, nb)
             donated = bond.GetBondType() == Chem.BondType.DATIVE and bond.GetBeginAtomIdx() == nb
-            replacement_mirrors = bond_replacement_mirrors(work.GetAtomWithIdx(nb), mi)
+            replacement_mirrors = bond_removal_mirrors(work.GetAtomWithIdx(nb), mi, degrees=(3, 4))
             removal_mirrors = bond_removal_mirrors(work.GetAtomWithIdx(nb), mi)
             remove_bond(work, mi, nb)  # re-base the donor's tag onto the stripped order; `graft` inverts it
             if nb in haptic or nb not in caps:
@@ -885,7 +940,7 @@ def _build_enumeration_graph(mol, exclude):
     # references makes `FindPotentialStereo` below raise ("only can support 2 stereo neighbors"). The
     # tolerant sanitize happens to scrub most of them, but that is luck rather than a contract.
     repair_bond_stereo(work)
-    _restore_encoded_ez(work, encoded_bond_stereo(mol))
+    apply_encoded_bond_stereo(work)
     return work, cap_to_metal
 
 
@@ -1123,13 +1178,15 @@ def _resonance_stable_ez(work, bond_centers, stated, *, structural=False):
 
     A delocalised charge can swap the CIP-leading path without moving an atom, turning one geometry from E
     into Z. It can also move a coordinate-free double bond or extend it into a cumulene. Such labels are
-    Lewis-form artefacts. Explicit input is authoritative. If RDKit reaches the bounded form cap or cannot
-    enumerate a fragment, inferred stereo abstains because invariance was not proved.
+    Lewis-form artefacts. Explicit input is authoritative. Independent conjugated groups multiply a fragment's
+    forms, so the search is bounded; past the bound, or where RDKit cannot enumerate a fragment, a bond in a
+    conjugated group abstains with a warning. A bond outside every group keeps its order in every form.
     """
     keep = set(stated)
     candidates = [idx for idx in bond_centers if idx not in keep]
     if not candidates:
         return list(bond_centers)
+    unproven = set()
     mappings = []
     fragments = Chem.GetMolFrags(work, asMols=True, sanitizeFrags=False, fragsMolAtomMapping=mappings)
     for fragment, atoms in zip(fragments, mappings, strict=True):
@@ -1149,7 +1206,13 @@ def _resonance_stable_ez(work, bond_centers, stated, *, structural=False):
             forms.SetNumThreads(1)
             for count, form in enumerate(forms, 1):
                 if count > _RESONANCE_EZ_CAP:
-                    stable.clear()
+                    capped = {
+                        idx
+                        for idx in stable
+                        if forms.GetBondConjGrpIdx(fragment.GetBondBetweenAtoms(*selected[idx]).GetIdx()) >= 0
+                    }
+                    stable -= capped
+                    unproven |= capped
                     break
                 if form is None:
                     continue
@@ -1164,8 +1227,18 @@ def _resonance_stable_ez(work, bond_centers, stated, *, structural=False):
                     if _ez_description(form, selected[bond_idx], structural) != expected[bond_idx]:
                         stable.remove(bond_idx)
         except (RuntimeError, ValueError):
+            unproven.update(selected)
             continue
         keep.update(stable)
+    if unproven:
+        logger.warning(
+            "stereo: E/Z at bond(s) %s left unassigned: resonance invariance unproven in %d forms; state it to keep it",
+            ", ".join(
+                f"{bond.GetBeginAtomIdx()}={bond.GetEndAtomIdx()}"
+                for bond in map(work.GetBondWithIdx, sorted(unproven))
+            ),
+            _RESONANCE_EZ_CAP,
+        )
     return [idx for idx in bond_centers if idx in keep]
 
 

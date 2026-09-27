@@ -15,8 +15,6 @@ Modifications here:
 - ``get_proto_mol`` seeded atom 0 from ``Chem.MolFromSmarts``, making it a query atom while every
   other atom was plain. ``RemoveHs`` would not remove a query atom, so an explicit H could survive
   based on the index ordering of the .xyz file.
-- ``AC2BO`` takes ``max_combinations`` and raises a ``ValueError`` before enumerating more valence
-  combinations than that.
 
 Only the path used by rxembed (obabel-derived connectivity through AC2mol) is kept; upstream's
 Huckel and van-der-Waals connectivity routes and its CLI entry point are deleted.
@@ -25,7 +23,6 @@ Huckel and van-der-Waals connectivity routes and its CLI entry point are deleted
 import copy
 import itertools
 import logging
-import math
 from collections import defaultdict
 
 import networkx as nx
@@ -219,6 +216,15 @@ def int_atom(atom):
     return __ATOM_LIST__.index(atom) + 1
 
 
+def _allowed_valences(atomic_num, index):
+    """Return the valences xyz2mol allows `atomic_num`, raising for an element its table does not model."""
+    allowed = atomic_valence.get(atomic_num)
+    if not allowed:
+        symbol = Chem.GetPeriodicTable().GetElementSymbol(atomic_num)
+        raise ValueError(f"xyz2mol has no valence model for {symbol} (atom {index}); build the complex from a SMILES")
+    return allowed
+
+
 def get_UA(maxValence_list, valence_list):
     """"""
     UA = []
@@ -281,7 +287,7 @@ def charge_is_OK(
                 number_of_single_bonds_to_C = list(BO[i, :]).count(1)
                 if not allow_carbenes and number_of_single_bonds_to_C == 2 and BO_valences[i] == 2:
                     # A carbene-pattern C in the no-carbene charge sweep: charge it instead. This is
-                    # a normal branch of the perception ladder, not an error -- no log noise.
+                    # a normal branch of the perception ladder, not an error, so it is not logged.
                     Q += 1
                     q = 2
                 if number_of_single_bonds_to_C == 3 and Q + 1 < charge:
@@ -538,14 +544,11 @@ def get_UA_pairs(UA, AC, DU, use_graph=True):
     return UA_pairs
 
 
-def AC2BO(
-    AC, atoms, charge, allow_charged_fragments=True, use_graph=True, allow_carbenes=True, max_combinations=None
-):
+def AC2BO(AC, atoms, charge, allow_charged_fragments=True, use_graph=True, allow_carbenes=True):
     """Search bond orders and charges for the assignment with the fewest formal charges (Kim & Kim, Fig. 2).
 
     UA is the unsaturated-atom list, DU their degree of unsaturation, and best_BO the running-best bond
-    order matrix; these are the paper's own names. The search visits every combination of per-atom
-    valences, so ``max_combinations`` raises before it starts when there are more.
+    order matrix; these are the paper's own names.
     """
     global atomic_valence
     global atomic_valence_electrons
@@ -554,7 +557,7 @@ def AC2BO(
     AC_valence = list(AC.sum(axis=1))
 
     for i, (atomicNum, valence) in enumerate(zip(atoms, AC_valence)):
-        possible_valence = [x for x in atomic_valence[atomicNum] if x >= valence]  # >= neighbour count
+        possible_valence = [x for x in _allowed_valences(atomicNum, i) if x >= valence]  # >= neighbour count
         if atomicNum == 6 and valence == 1:
             possible_valence.remove(2)
         if atomicNum == 6 and not allow_carbenes and valence == 2:
@@ -565,18 +568,12 @@ def AC2BO(
             possible_valence = [1, 2]
 
         if not possible_valence:
-            # An over-valent atom the two-centre model cannot place: raise a CATCHABLE error rather
-            # than sys.exit() -- perception callers (get_lig_mol / the charge sweep) handle it as a
-            # defer, so a hard cage/hypervalent ligand never crashes the whole backend.
+            # A catchable error, not upstream's sys.exit(): perception callers defer on it.
             raise ValueError(
-                f"valence of atom {i} is {valence}, greater than the allowed max "
-                f"{max(atomic_valence[atomicNum])}"
+                f"valence of atom {i} is {valence}, greater than the allowed max {max(atomic_valence[atomicNum])}"
             )
         valences_list_of_lists.append(possible_valence)
 
-    combinations = math.prod(len(options) for options in valences_list_of_lists)
-    if max_combinations is not None and combinations > max_combinations:
-        raise ValueError(f"{combinations} valence combinations exceed the search bound of {max_combinations}")
     valences_list = itertools.product(*valences_list_of_lists)  # e.g. [[4],[2,1]] -> [[4,2],[4,1]]
 
     best_BO = AC.copy()
@@ -716,7 +713,6 @@ def AC2mol(
     use_graph=True,
     use_atom_maps=True,
     allow_carbenes=True,
-    max_combinations=None,
 ):
     """Assign bond orders and charges to ``mol`` from its adjacency matrix ``AC``."""
     BO, atomic_valence_electrons = AC2BO(
@@ -726,7 +722,6 @@ def AC2mol(
         allow_charged_fragments=allow_charged_fragments,
         use_graph=use_graph,
         allow_carbenes=allow_carbenes,
-        max_combinations=max_combinations,
     )
     mol = BO2mol(
         mol,
@@ -746,12 +741,9 @@ def AC2mol(
 def get_proto_mol(atoms):
     """Return an empty-bonded RWMol with one plain atom per element in *atoms*.
 
-    Atom 0 must not be a query atom. Upstream seeded this with ``Chem.MolFromSmarts("[#%d]" % atoms[0])``,
-    which yields a query atom for index 0 only; `RemoveHs` then refuses to remove a hydrogen there
-    (`RemoveHsParameters.removeWithQuery` defaults to False). Invisible unless atom 0 happens to be a
-    hydrogen, which depends on the xyz file's line order: on FIHTIZ shuffled, the ferrocenyl C-H that
-    landed at index 0 survived as a stray ``[H]``, and comparing the ligand SMILES as a string sorted the
-    Cp ahead of the phosphine by that leading ``[`` -- swapping their coordination slots on a reshuffle.
+    Atom 0 must not be a query atom: upstream seeded it from ``Chem.MolFromSmarts``, and `RemoveHs` keeps a
+    query hydrogen (`RemoveHsParameters.removeWithQuery` defaults to False), so the result followed the
+    file's line order whenever a hydrogen came first.
     """
     rwMol = Chem.RWMol()
     for z in atoms:
@@ -835,23 +827,8 @@ def xyz2AC_obabel(atoms, xyz, tolerance=0.45):
     for i in range(num_atoms):
         a_i = mol.GetAtomWithIdx(i)
         N_con = np.sum(AC[i, :])
-        while N_con > max(atomic_valence[a_i.GetAtomicNum()]):
+        while N_con > max(_allowed_valences(a_i.GetAtomicNum(), i)):
             AC = remove_weakest_bond(mol, i, AC, dMat, pt)
             N_con = np.sum(AC[i, :])
 
     return AC, mol
-
-
-def chiral_stereo_check(mol):
-    """Find and embed chiral information into the model based on the
-    coordinates.
-
-    Args:
-        mol - rdkit molecule, with embeded conformer
-    """
-    Chem.SanitizeMol(mol)
-    Chem.DetectBondStereochemistry(mol, -1)
-    Chem.FindPotentialStereo(mol, cleanIt=True, flagPossible=True)
-    Chem.AssignAtomChiralTagsFromStructure(mol, -1)
-
-    return

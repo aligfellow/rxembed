@@ -38,7 +38,7 @@ except optional dependencies at their point of use.
 | | `metal_slots` | distinct donor-to-slot assignments under rotations, and chelate bite windows |
 | compile | `metal_constraints` | one metal state to `Constraints`: M-L windows, L-M-L angles and chelate bites |
 | identity | `metal_isomer` | `Isomer` and `IsomerSet`, and the isomer read from coordinates |
-| screen and enumeration | `metal_screen` | the reach screens that drop arrangements a ligand cannot span |
+| screen and enumeration | `metal_screen` | the reach and fit screens that drop arrangements the model rules out |
 | | `metal_enumeration` | ligand, haptic and coordination states combined into `Isomer` candidates |
 | strings | `metal_smiles` | reading and writing dative SMILES and CXSMILES |
 | orchestration | `embed` | `prepare`, seeding, acceptance and recovery: `Conformers`, `Failure`, `EmbeddingError` |
@@ -112,11 +112,20 @@ measures them from the supplied conformer. Angle preferences come from the polyh
 both modes.
 
 `metal_slots` reduces donor-slot assignments by proper rotations and ligand equivalence. `metal_enumeration`
-combines metal, ligand and haptic stereo, and calls `metal_screen`, which checks each single-centre candidate
-against its compiled constraints and the ligands' native reach. A screen rejection is a proved contradiction;
-passing the screen proves nothing. `screen=False` turns off the screen, not symmetry reduction or embedding
-validation. `observed_only=True` returns only the measured assignment. More than `MAX_EXHAUSTIVE_ORBITS`
-assignments raise.
+combines metal, ligand and haptic stereo and screens the candidates. Only the first of three screens is a proof,
+and it is a proof against the compiled model, not against chemistry:
+
+- `metal_screen` rejects a single-centre candidate whose compiled constraints contradict the ligands' native
+  reach (row, triangle-closure and Euclidean certificates) or whose opposed donors exceed the acceptance gate's
+  fit budget.
+- The `metal_slots` edge rule holds each short chelate pair to a polyhedron hull edge, a measured claim.
+- The chelate-bite fold check and the long-arc, trans and haptic span tests in `metal_screen` are model priors. A
+  multi-metal candidate gets only these.
+
+Passing the screen proves nothing. `screen=False` and any `fix=` turn all three off, but not symmetry reduction
+or embedding validation, and the input conformer's own arrangement is exempt when its donor spans fit the native
+reach. `observed_only=True` returns only the measured assignment. More than `MAX_EXHAUSTIVE_ORBITS` assignments
+raise.
 
 ### Bounds and relaxation
 

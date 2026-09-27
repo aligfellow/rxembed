@@ -1,6 +1,6 @@
 """Test Ensemble and EnsembleSet behavior."""
 
-import logging
+import importlib
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -11,6 +11,7 @@ from rdkit.Chem import rdMolTransforms
 
 import rxembed as rx
 from rxembed import metal_core as metal
+from rxembed.embed import Failure
 from rxembed.pipeline import ensemble as ensemble_module
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.calculators import Calculator
@@ -38,7 +39,7 @@ def _dissociate(ens, cid, atom, centre, distance=4.0):
     conf.SetAtomPosition(int(atom), (pm + distance * (p - pm) / np.linalg.norm(p - pm)).tolist())
 
 
-def test_optional_connectivity_gate_does_not_break_base_minimize(monkeypatch):
+def test_optional_connectivity_gate_does_not_break_base_minimize(monkeypatch, caplog):
     ens = rx.embed("CCCC", n=1, seed=1)
     monkeypatch.setattr(
         ensemble_module.Ensemble,
@@ -46,7 +47,9 @@ def test_optional_connectivity_gate_does_not_break_base_minimize(monkeypatch):
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ImportError("xyzgraph unavailable")),
     )
 
-    assert ens.minimize().ids
+    with caplog.at_level("INFO", logger="rxembed"):
+        assert ens.minimize().ids
+    assert "connectivity is not re-checked" in caplog.text, "the skipped gate must say so"
 
 
 def test_changed_connectivity_is_not_published(monkeypatch):
@@ -164,17 +167,14 @@ def test_cleanup_ablations_filter_only_their_own_workflow_diagnostics(monkeypatc
     assert ens._workflow_failure(ens, ens.ids[0]) is None
 
 
-def test_donor_orientation_violation_logs_without_failing_the_workflow_gate(monkeypatch, caplog):
+def test_donor_orientation_violation_does_not_fail_the_workflow_gate(monkeypatch):
     iso = rx.metal("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", "SPL")[0]
     ens = rx.embed(iso, n=1, seed=42)
     detail = "N0 (sp3) M-D-X to C1: 99.5 deg < census floor 104 deg; inspect donor geometry and restraints"
     report = geom.GeometryReport([Violation("donor_orientation", (0, 1, 2), value=99.5, limit=104.0, detail=detail)])
     monkeypatch.setattr(ensemble_module.geom_check, "check", lambda *_args, **_kwargs: report)
 
-    with caplog.at_level(logging.DEBUG, logger="rxembed"):
-        failure = ens._workflow_failure(ens, ens.ids[0])
-    assert failure is None, "a donor-orientation floor violation must not fail the workflow gate"
-    assert [record.levelno for record in caplog.records if detail in record.getMessage()] == [logging.DEBUG]
+    assert ens._workflow_failure(ens, ens.ids[0]) is None, "a donor-orientation floor violation must not fail"
 
 
 def test_metal_embed_replaces_a_puckered_ligand_without_changing_the_isomer(monkeypatch):
@@ -314,6 +314,7 @@ def test_search_rebuilds_the_selected_surrogate_graph(monkeypatch, smiles):
     seen = []
 
     monkeypatch.setattr(ensemble_module.search, "available", lambda: True)
+    monkeypatch.setattr(ensemble_module.search, "config", lambda **kw: None)
 
     def inspect(mol, *_args, **_kwargs):
         seen.append(mol.GetAtomWithIdx(iso.metal).GetAtomicNum())
@@ -323,6 +324,24 @@ def test_search_rebuilds_the_selected_surrogate_graph(monkeypatch, smiles):
 
     assert seen == [metal.SURROGATE]
     assert ens.iso is iso
+
+
+def test_metal_minimize_drops_a_rejected_geometry_instead_of_reseeding(monkeypatch, caplog):
+    """minimize() relaxes the given coordinates; a rejected one is reported, never swapped for a fresh DG seed."""
+    iso = rx.metal(rx.embed(rx.metal(_EN_PDBRCL, "square_planar")[0], n=1, seed=1).mol, "square_planar")[0]
+
+    def no_seed(*_args, **_kwargs):
+        raise AssertionError("minimize() drew a fresh DG seed")
+
+    monkeypatch.setattr(importlib.import_module("rxembed.embed"), "seed_conformers", no_seed)
+    monkeypatch.setattr(
+        ensemble_module.Ensemble, "_workflow_failure", lambda *_args: Failure("physical_geometry", "rejected")
+    )
+    with caplog.at_level("WARNING", logger="rxembed"):
+        out = rx.minimize(iso)
+
+    assert out.n == 0
+    assert "kept 0/1" in caplog.text
 
 
 def test_organic_minimize_adds_no_dative_bonds():
@@ -456,7 +475,7 @@ def test_reacted_conformer_is_flagged_before_filtering():
 def test_set_rejects_scalar_ensemble_verbs(verb):
     r = rx.embed("CC(N)C(=O)O", n=2)
     assert isinstance(r, rx.EnsembleSet)
-    with pytest.raises(AttributeError, match="stereo='free'"):
+    with pytest.raises(AttributeError, match=r"pick one with \[0\] or \.select"):
         getattr(r, verb)
     assert not hasattr(r, "not_a_verb_at_all")  # an unrelated miss stays a plain AttributeError
 

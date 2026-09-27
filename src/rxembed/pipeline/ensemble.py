@@ -6,13 +6,14 @@ import logging
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from functools import cache
 from pathlib import Path
 
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdMolAlign
 
-from rxembed.bounds import EmbedParams, bounds_matrix, fragment_contacts
+from rxembed.bounds import bounds_matrix, fragment_contacts
 from rxembed.constraints import constraint_value, graft_owns, match, resolve_atom, within_window
 from rxembed.embed import BASE_STIFFNESS, Conformers, Failure
 from rxembed.metal_core import connect_metal, donor_chirality_sign, frag_map, metal_index, metal_indices
@@ -50,6 +51,12 @@ def _last_line(err):
     """Return the last non-empty line of an exception (xtb dumps a stderr tail) for a one-line warning."""
     s = str(err).strip()
     return s.splitlines()[-1] if s else "no output"
+
+
+@cache
+def _connectivity_unchecked(reason):
+    """Say once per process that the workflow connectivity gate is off, and why."""
+    logger.info("connectivity is not re-checked without the workflow extra (%s)", reason)
 
 
 def _tag_matches(ensemble, key, value):
@@ -109,17 +116,8 @@ class EnsembleSet(list):
             print(f"  [{k}] {ident}  ({e.n} seeds)")
         return self
 
-    #: verbs whose per-candidate output is comparable across candidates only via a real calculator, not the FF
-    _REAL_ENERGY_VERBS = frozenset({"score", "optimize"})
-
     def _map(self, method, *args, **kw):
         """Apply one verb within each candidate; never pool or cross-prune distinct species."""
-        logger.debug(
-            "%s: %d candidates, each on its own constraints%s",
-            method.lstrip("_"),
-            len(self),
-            "; real energies are comparable" if method in self._REAL_ENERGY_VERBS else "",
-        )
         out = EnsembleSet()
         out.errors = self.errors
         for e in self:
@@ -185,10 +183,8 @@ class EnsembleSet(list):
             raise AttributeError(name)
         labels = [e.tag.get("label") or e.tag.get("stereo") or e.tag.get("nci") or e.tag for e in self]
         raise AttributeError(
-            f"{name!r} is an Ensemble verb, but this is an EnsembleSet of {len(self)} distinct candidate(s) "
-            f"{labels}, which are never pooled. Pick one (`[0]`, `.select(label=…)`), map a chainable verb "
-            f"(mc/minimize/prune/score/optimize/lowest/representatives/dump), or pass stereo='free' to "
-            f"rx.embed if an undefined stereocentre split this and you did not want it."
+            f"{name!r} needs one Ensemble, but this EnsembleSet holds {len(self)} distinct candidates {labels}; "
+            "pick one with [0] or .select(label=...)"
         )
 
     @staticmethod
@@ -255,6 +251,10 @@ class Ensemble(Conformers):
         """
         if not search.available():
             raise ImportError("mc needs openconf; pip install 'rxembed[search]'")
+        options = {"preset": preset, "seed": seed, "max_out": max_out, "low_mode": low_mode, "config": config}
+        options.update(openconf_kw)
+        # Resolve before anything moves: an unknown preset or field is the caller's error and must raise.
+        cfg = search.config(constrained=bool(self.cons.constrained_atoms()), **options)
         if preset == "rapid" and self.cons.is_constrained:  # constrained pose-mode is rotor-only, so rapid
             logger.warning("mc: preset='rapid' under-samples a constrained system; use the default 'ensemble'")
         if self.cons.is_constrained:
@@ -280,9 +280,7 @@ class Ensemble(Conformers):
             for conf in current.GetConformers():
                 self._mol.AddConformer(Chem.Conformer(conf), assignId=False)
         self._settle_seeds()  # spread the seeds across their windows before openconf pose-freezes them
-        options = {"preset": preset, "seed": seed, "max_out": max_out, "low_mode": low_mode, "config": config}
-        options.update(openconf_kw)
-        added = self._openconf_search(self.cons, "", options)
+        added = self._openconf_search(self.cons, "", cfg)
         if added is None:
             return self
         if replace is None:
@@ -299,14 +297,14 @@ class Ensemble(Conformers):
 
         if explore and any(self.cons.contacts):  # second pass: contacts released, structure kept
             relaxed = self.cons.relaxed()
-            # releasing the grip frees the fragments it linked. openconf's own search never sees rxembed's DG
-            # bounds matrix (bounds.fragment_contacts only applies there), so explore re-bounds every
-            # inter-fragment pair here instead (setdefault never overrides a surviving structural hold).
-            if len(Chem.GetMolFrags(self._mol)) > 1:  # keep the fragments together once contacts are freed
+            # openconf never sees the DG bounds that hold fragments together, so once the contacts are released,
+            # bound every inter-fragment pair here; setdefault keeps any surviving structural hold.
+            if len(Chem.GetMolFrags(self._mol)) > 1:
                 bm = bounds_matrix(self._mol)
                 for k, v in fragment_contacts(self._mol, relaxed, bm).items():
                     relaxed.distances.setdefault(k, v)
-            more = self._openconf_search(relaxed, " explore", options)
+            cfg = search.config(constrained=bool(relaxed.constrained_atoms()), **options)
+            more = self._openconf_search(relaxed, " explore", cfg)
             if more:
                 self.ids += more
                 self.cons = relaxed  # downstream relax/score/opt no longer yank contacts
@@ -318,10 +316,10 @@ class Ensemble(Conformers):
                 )
         return self
 
-    def _openconf_search(self, cons, label, options):
+    def _openconf_search(self, cons, label, cfg):
         """Run one openconf search under `cons`; warn and return ``None`` when openconf cannot handle the system."""
         try:
-            return search.search(self._mol, cons, **options)
+            return search.search(self._mol, cons, cfg)
         except Exception as e:  # openconf can't handle every system (e.g. a TS hypervalent core)
             logger.warning(
                 "mc%s: openconf could not search this system (%s: %s); keeping the %d conformer(s)",
@@ -372,10 +370,11 @@ class Ensemble(Conformers):
 
     def _workflow_failure(self, owner, cid):
         """Return the first pipeline-only publication failure for one conformer."""
-        mol = owner._restored_mol(cid)
+        mol = owner.restored_mol(cid)
         try:
             changed = self._scan_connectivity(mol, [cid])
-        except ImportError:  # connectivity re-perception is a workflow-extra gate; core bonding still runs
+        except ImportError as err:  # connectivity re-perception is a workflow-extra gate; core bonding still runs
+            _connectivity_unchecked(str(err))
             changed = {}
         if changed:
             formed, broken = changed[cid]
@@ -394,14 +393,9 @@ class Ensemble(Conformers):
         stated_geometry = cons.fixed or cons.frozen or cons.shapes or cons.planes or any(cons.contacts)
         if owner.iso is not None and not stated_geometry:
             report = geom_check.check(mol, cid, donors=self._declared_donors())
-            violations = report.violations
-            # A donor-orientation floor violation is not proof of folding (embed._donor_facing_failure): log it
-            # at DEBUG and never reject; `check()` reports it on the kept conformers.
-            if cons.donor_orientation:
-                for v in violations:
-                    if v.kind == "donor_orientation":
-                        logger.debug("donor orientation: %s", v.detail)
-            violations = [v for v in violations if v.kind != "donor_orientation"]
+            # A donor-orientation floor violation is not proof of folding (embed._donor_facing_failure logs it):
+            # never reject on it; `check()` reports it on the kept conformers.
+            violations = [v for v in report.violations if v.kind != "donor_orientation"]
             if not cons.conjugation:
                 violations = [v for v in violations if v.kind != "conjugation"]
             if violations:
@@ -473,7 +467,7 @@ class Ensemble(Conformers):
             max_iters,
             validator=self._workflow_failure,
             template=template,
-            params=self.params if self.params is not None else (EmbedParams() if iso is not None else None),
+            params=self.params,
             allow_replacement=e is not None,
         )
         if self.cons.is_constrained:
@@ -592,14 +586,8 @@ class Ensemble(Conformers):
         return out
 
     def _calc_charge(self, charge):
-        """Return the explicit charge or the molecule's formal charge, warning for perceived metal charges."""
-        q = Chem.GetFormalCharge(self._mol) if charge is None else charge
-        if charge is None and q != 0 and metal_index(self._mol) is not None:
-            logger.warning(
-                "perceived formal charge %d is likely a perception artefact; pass charge=<total>",
-                q,
-            )
-        return q
+        """Return the explicit charge, else the molecule's total formal charge (stated by SMILES or read_xyz)."""
+        return Chem.GetFormalCharge(self._mol) if charge is None else charge
 
     def _clear_shape(self):
         """Clear `SHAPE_PROP` from every tracked conformer: it describes a geometry a later stage moved off."""
@@ -742,9 +730,7 @@ class Ensemble(Conformers):
                 spheres.setdefault(iso.metal, list(iso.donors))
         else:  # post-minimize: the real elements are back, and `sphere` is what remembers the coordination
             metals = set(metal_indices(mol))
-        # Not _calc_charge: it warns about a metal's perceived charge and this runs on every stage, and
-        # connectivity-only perception (no bond orders) barely moves the total charge.
-        q = Chem.GetFormalCharge(self._mol) if charge is None else charge
+        q = self._calc_charge(charge)
         # Coordination windows describe the metal shell, which the covalent perceiver cannot represent; an
         # ordinary restrained ligand distance is still a graph edge and must round-trip. A numeric `fix` is
         # different: explicit TS authority that may intentionally hold a forming or breaking pair.
@@ -840,7 +826,7 @@ class Ensemble(Conformers):
 
     def prune(
         self,
-        by="auto",
+        by="rmsd",
         *,
         energy_window=12.0,
         max_dist=0.75,
@@ -850,8 +836,8 @@ class Ensemble(Conformers):
     ):
         """Deduplicate by geometry, in place.
 
-        The implicit ``minimize()`` settles raw seeds first. ``by`` accepts ``'rmsd'`` (the ``'auto'`` default),
-        ``'moi'``, ``'descriptor'``, ``'energy'`` or a sequence. MOI can merge distinct multi-fragment poses.
+        The implicit ``minimize()`` settles raw seeds first. ``by`` accepts ``'rmsd'`` (the default), ``'moi'``,
+        ``'descriptor'``, ``'energy'`` or a sequence. MOI can merge distinct multi-fragment poses.
         Discarded conformers remain available to ``duplicates()``.
         """
         self.minimize()
@@ -860,8 +846,6 @@ class Ensemble(Conformers):
         # a metal complex looks multi-fragment only because the surrogate stripped its coordinate bonds, and
         # those "fragments" are one molecule, so moi is a fine choice there
         n_frag = 1 if metal_index(self._mol) is not None else len(Chem.GetMolFrags(self._mol))
-        if by == "auto":
-            by = "rmsd"  # rigorous everywhere; moi/cascade are opt-in for speed
         methods = [by] if isinstance(by, str) else list(by)
         if n_frag > 1 and "moi" in methods:
             logger.warning(
@@ -875,7 +859,7 @@ class Ensemble(Conformers):
             before = list(self.ids)
             energies = [self.energies.get(i, float("inf")) for i in self.ids]  # no energy -> outside any window,
             # never merged into a phantom 0.0-kcal band nor kept over a real-energy duplicate
-            kept, _ = apply(
+            kept = apply(
                 self._mol,
                 self.ids,
                 energies,
@@ -1014,11 +998,11 @@ class Ensemble(Conformers):
         ]
         noise_k = [k for k in range(len(labels)) if labels[k] == -1]
         recovered, skipped_e = [], 0
-        if noise_k and recover_noise is not False:
-            sigs = None if recover_noise is True else mode_signature(self._mol, self.ids, nci=nci)
-            if recover_noise is True:
-                recovered = [self.ids[k] for k in noise_k]
-            elif sigs is not None:  # one rep per noise signature not already clustered
+        if noise_k and recover_noise is True:
+            recovered = [self.ids[k] for k in noise_k]
+        elif noise_k and recover_noise is not False:
+            sigs = mode_signature(self._mol, self.ids, nci=nci)  # None for a plain organic: noise is scatter
+            if sigs is not None:  # one rep per noise signature not already clustered
                 shown = {sigs[k] for k in range(len(labels)) if labels[k] != -1}  # all members, not just reps
                 fresh = {}
                 for k in noise_k:
@@ -1064,9 +1048,7 @@ class Ensemble(Conformers):
             rdMolAlign.AlignMolConformers(m, atomIds=self._align_atoms(on), confIds=list(self.ids))
         return self._derive(self.ids, mol=m)
 
-    # looking (returns an artifact, never mutates) ----------------------------
-    # 3D rendering is notebook-level (align()/dump() plus a few lines of py3Dmol/xyzrender). Only `landscape`
-    # lives here, because the dim-reduction is real reusable work.
+    # looking (returns an artifact, never mutates); 3D rendering is left to notebooks ----------------------
 
     @property
     def n(self):
@@ -1084,24 +1066,12 @@ class Ensemble(Conformers):
         Real metal elements are restored. Frames are core-aligned by default; pass ``align=False`` for raw
         coordinates. The live ensemble is unchanged.
         """
-        if not self.ids:  # `Conformers.dump`'s guard: a 0-byte file that reads as a successful write is the
-            raise ValueError(  # worst possible outcome, and minimize() can drop every conformer
+        if not self.ids:  # a stage, not only the embed, can drop every conformer
+            raise ValueError(
                 "nothing to dump: this ensemble has no conformers (the embed produced none, or a stage "
                 "dropped them all); check the log for what was discarded"
             )
-        mol = Chem.Mol(self._mol)  # the ensemble mol is already real (no haptic centroid dummy); work on a copy
-        if self.iso is not None:  # show the real metal(s) with their formal charge, not the C surrogate
-            self.iso.restore(mol)
-        if align and len(self.ids) > 1:  # overlay frames on the rigid core
-            try:
-                aln = self._align_atoms(None)
-                rdMolAlign.AlignMolConformers(mol, atomIds=aln, confIds=list(self.ids))
-            except Exception as e:
-                logger.debug("dump: alignment skipped (%s)", e)
-        with open(path, "w") as f:
-            for i in self.ids:
-                f.write(Chem.MolToXYZBlock(mol, confId=i))
-        return path
+        return Conformers.dump(self.align() if align else self, path)
 
     def __repr__(self):
         """Summarise the ensemble: conformer count, state, and energy spread."""
@@ -1119,7 +1089,7 @@ def wrap(mol, ids=None, *, energies=None, minimized=False):
     By default the wrapped geometries are treated as un-relaxed, so `prune()`/`representatives()`/`lowest()`
     run one FF `minimize()` first, which moves atoms. If your conformers are already optimised and must not be
     disturbed (a CREST / xtb / DFT output), pass ``minimized=True``: the relax is skipped and energies come
-    from ``energies=`` (a list aligned to `ids`, or a dict), or as single points if omitted.
+    from ``energies=`` in kcal/mol (a list aligned to `ids`, or a dict), or as single points if omitted.
     """
     ids = ids if ids is not None else [c.GetId() for c in mol.GetConformers()]
     ens = Ensemble(mol, list(ids))
@@ -1129,7 +1099,7 @@ def wrap(mol, ids=None, *, energies=None, minimized=False):
         if isinstance(energies, dict):
             ens.energies = dict(energies)
         else:
-            ens.energies = {i: float(e) for i, e in zip(ids, energies, strict=False)}
+            ens.energies = {i: float(e) for i, e in zip(ids, energies, strict=True)}
     if minimized:
         if not ens.energies:
             e = ff_energies(mol, minimize=False)  # single-point, geometry untouched

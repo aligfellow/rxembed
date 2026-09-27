@@ -450,7 +450,7 @@ def _state_label(iso, state):
     if not state.geometry:
         return ""
     vertices, haptic, _winding, _donors = materialized_state(iso, state)
-    return order_label(iso.graph, vertices, state.geometry, range(len(vertices)), haptic)
+    return order_label(iso.graph, vertices, state.geometry, haptic)
 
 
 def _state_arrangement(iso, state):
@@ -829,7 +829,7 @@ class IsomerSet(list):
 
 
 def resolve_center(mol, metals, center):
-    """Pick which transition metal to enumerate.
+    """Pick which metal to enumerate.
 
     `center` is None (the sole metal, else an error asking you to choose), an atom index, or an element
     symbol such as ``'Mn'``. The caller handles ``'all'`` before this single-centre resolver.
@@ -838,13 +838,13 @@ def resolve_center(mol, metals, center):
         if len(metals) == 1:
             return metals[0]
         raise ValueError(
-            f"{len(metals)} transition metals present "
+            f"{len(metals)} metals present "
             f"({[mol.GetAtomWithIdx(x).GetSymbol() + str(x) for x in metals]}); choose which to "
             f"enumerate with center=<atom index or element symbol>, or use center='all'"
         )
     if is_index(center):
         if center not in metals:
-            raise ValueError(f"center={center} is not a transition-metal atom; metals are at {metals}")
+            raise ValueError(f"center={center} is not a metal atom; metals are at {metals}")
         return center
     if not isinstance(center, str):
         raise TypeError(f"center must be an atom index, element symbol, or 'all'; got {center!r}")

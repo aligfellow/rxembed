@@ -57,9 +57,9 @@ def metal_donors(mol, ids):
     """Return ``(metal, its coordination sphere)``, or ``(None, None)`` when there is no metal.
 
     A bonded graph states the complete non-metal sphere directly; a bond-less wrapped Mol falls back to
-    `metal_perceive`'s covalent-radius rule (a flat 2.8 Å cutoff misses long La-Se bonds and admits nearby
-    chelate backbone atoms). The two sources are never intersected: a descriptor needs one stable column
-    schema across every conformer, so a partially bonded sphere is treated as declared, not guessed complete.
+    `metal_perceive`'s covalent-radius shell. The two sources are never intersected: a descriptor needs one
+    stable column schema across every conformer, so a partially bonded sphere is treated as declared, not
+    guessed complete.
     """
     m = metal_index(mol)
     if m is None:
@@ -322,7 +322,7 @@ def nearest_kept(mol, kept, dropped):
 def apply(
     mol, ids, energies, method="rmsd", *, energy_window=12.0, max_dist=0.75, moi_dev=0.01, max_rmsd=0.5, energy_tol=0.05
 ):
-    """Deduplicate ``ids`` by ``method`` (moi | rmsd | descriptor | energy | none) -> (kept_ids, {})."""
+    """Deduplicate ``ids`` by ``method`` (moi | rmsd | descriptor | energy); return the kept ids, energy-sorted."""
     ids = list(ids)
     energies = np.asarray(energies, float)
     order = np.argsort(energies)
@@ -330,8 +330,6 @@ def apply(
     en = energies[order]
     coords = np.array([mol.GetConformer(i).GetPositions() for i in ids_s])
     atoms = np.array([a.GetSymbol() for a in mol.GetAtoms()])
-    if method == "none":
-        return ids_s, {}
     if method == "moi":
         try:
             from prism_pruner.pruner import prune_by_moment_of_inertia as prune_by_moi
@@ -358,10 +356,10 @@ def apply(
         mask = energy_prune(en, energy_tol=energy_tol)
     else:
         raise ValueError(
-            f"unknown dedup method {method!r} (use 'moi' | 'rmsd' | 'descriptor' | 'energy' | 'none', "
+            f"unknown dedup method {method!r} (use 'moi' | 'rmsd' | 'descriptor' | 'energy', "
             f"or representatives() for a binding-mode summary)"
         )
-    return list(itertools.compress(ids_s, mask)), {}
+    return list(itertools.compress(ids_s, mask))
 
 
 def energy_prune(energies, *, labels=None, energy_tol=0.05):
@@ -412,8 +410,8 @@ def _descriptor_config():
 def descriptor_prune(coords, features, energies, *, labels=None, max_dist=1.0, energy_window=12.0):
     """Descriptor de-dup on prism's energy-sorted engine; keep-mask aligned to input order (energy-sorted).
 
-    A wart: ``_run`` is a *private* prism entry point (no public API for a custom ``evaluate_sim``; prism's
-    own ``prune_by_rmsd`` also calls it). Accepted rather than reinventing prism's engine.
+    It calls prism's private ``_run``, the only entry point that takes a custom ``evaluate_sim``; prism's own
+    ``prune_by_rmsd`` calls it too.
     """
     f = np.asarray(features, float)
     if len(f) > 1:

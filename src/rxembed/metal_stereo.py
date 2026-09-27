@@ -13,11 +13,12 @@ from .metal_core import (
     frag_map,
     ligand_distance_matrix,
     metal_indices,
+    torsion_path,
     vertex_atom,
 )
 from .metal_polyhedron import DELTA, LAMBDA, handedness, orientation_parity, vertex_dirs
 from .stereo import apply_encoded_bond_stereo, coordination_locked_double_bonds
-from .utils import bond_removal_mirrors, mirror_tag, without_zero_bonds
+from .utils import dihedral_angle, without_zero_bonds
 
 _FACE_EPS = 1e-8
 _HALF_TURN = 180
@@ -29,24 +30,8 @@ _CHALCOGEN_OUTER = 6  # group 16: the terminal donor atom of a p-block hypervale
 
 
 def remove_routine_hydrogens(mol, keep=()):
-    """Return a hydrogen-reduced Mol and its old-to-new atom-index mapping."""
+    """Return a hydrogen-reduced Mol and its old-to-new atom-index mapping; `keep` hydrogens stay explicit."""
     out, keep = Chem.Mol(mol), set(keep)
-    out.UpdatePropertyCache(strict=False)
-    point_tags = {}
-    for atom in out.GetAtoms():
-        tag = atom.GetChiralTag()
-        if tag not in {Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW}:
-            continue
-        for neighbor in atom.GetNeighbors():
-            if neighbor.GetAtomicNum() == 1 and neighbor.GetIdx() not in keep:
-                if bond_removal_mirrors(atom, neighbor.GetIdx()):
-                    tag = mirror_tag(tag)
-        point_tags[atom.GetIdx()] = tag
-    hydrogens = {
-        atom.GetIdx(): atom.GetTotalNumHs() + sum(neighbor.GetAtomicNum() == 1 for neighbor in atom.GetNeighbors())
-        for atom in out.GetAtoms()
-        if atom.GetAtomicNum() != 1
-    }
     for atom in out.GetAtoms():
         atom.SetIntProp("_rxembedOriginalIndex", atom.GetIdx())
         if atom.GetIdx() in keep and atom.GetAtomicNum() == 1 and not atom.GetIsotope():
@@ -55,25 +40,16 @@ def remove_routine_hydrogens(mol, keep=()):
     params = Chem.RemoveHsParameters()
     params.removeDegreeZero = True
     params.removeDefiningBondStereo = True
+    params.updateExplicitCount = True
     params.showWarnings = False  # protected donor hydrides are deliberately isotope-marked and retained
     out = Chem.RemoveHs(out, params, sanitize=False)
     at = {}
-    deficits = []
     for atom in out.GetAtoms():
-        original = atom.GetIntProp("_rxembedOriginalIndex")
-        at[original] = atom.GetIdx()
-        if original in point_tags:
-            atom.SetChiralTag(point_tags[original])
-        if atom.GetAtomicNum() != 1:
-            current = atom.GetTotalNumHs() + sum(neighbor.GetAtomicNum() == 1 for neighbor in atom.GetNeighbors())
-            deficits.append((atom, hydrogens[original] - current))
+        at[atom.GetIntProp("_rxembedOriginalIndex")] = atom.GetIdx()
         atom.ClearProp("_rxembedOriginalIndex")
         if atom.HasProp("_rxembedCoordinationH"):
             atom.SetIsotope(0)
             atom.ClearProp("_rxembedCoordinationH")
-    for atom, deficit in deficits:
-        if deficit > 0:
-            atom.SetNumExplicitHs(atom.GetNumExplicitHs() + deficit)
     out.UpdatePropertyCache(strict=False)
     return out, at
 
@@ -90,7 +66,7 @@ def _terminal_chalcogen(atom):
     return _PT.GetNOuterElecs(atom.GetAtomicNum()) == _CHALCOGEN_OUTER and heavy_degree == 1
 
 
-def _hypervalent_bond(bond):
+def _terminal_chalcogen_bond(bond):
     """Return whether a bond joins a p-block centre to one of its terminal chalcogen donors.
 
     RDKit's conjugation perception never marks an expanded-octet X=O bond conjugated, so a terminal chalcogen
@@ -110,7 +86,6 @@ def _root_classes(mol, roots):
     fixed, so ranking the graph with every conjugated bond one type and every charge zero proves the same
     identity as enumerating every form, at any molecule size.
     """
-    roots = list(dict.fromkeys(roots))
     chemical = Chem.RWMol(mol)
     for bond in mol.GetBonds():
         if bond.GetBondType() in (Chem.BondType.ZERO, Chem.BondType.DATIVE):
@@ -118,31 +93,24 @@ def _root_classes(mol, roots):
     try:
         chemical.UpdatePropertyCache(strict=False)
         Chem.SetConjugation(chemical)
-        systems = Chem.RWMol(chemical)
         flat = Chem.RWMol(mol)
         for bond in chemical.GetBonds():
-            begin, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-            if not (bond.GetIsConjugated() or _hypervalent_bond(bond)):
-                systems.RemoveBond(begin, end)
-                continue
-            flat.GetBondBetweenAtoms(begin, end).SetBondType(Chem.BondType.AROMATIC)
-            flat.GetBondBetweenAtoms(begin, end).SetIsAromatic(False)
-        for atoms in Chem.GetMolFrags(systems, sanitizeFrags=False):
-            for index in atoms:
-                atom = flat.GetAtomWithIdx(index)
-                atom.SetNumExplicitHs(mol.GetAtomWithIdx(index).GetTotalNumHs())
-                atom.SetNoImplicit(True)
-                atom.SetFormalCharge(0)
-                atom.SetIsAromatic(False)
+            if bond.GetIsConjugated() or _terminal_chalcogen_bond(bond):
+                flat_bond = flat.GetBondBetweenAtoms(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+                flat_bond.SetBondType(Chem.BondType.AROMATIC)
+                flat_bond.SetIsAromatic(False)
+        for atom, source in zip(flat.GetAtoms(), mol.GetAtoms(), strict=True):
+            atom.SetNumExplicitHs(source.GetTotalNumHs())
+            atom.SetNoImplicit(True)
+            atom.SetFormalCharge(0)
+            atom.SetIsAromatic(False)
         flat.UpdatePropertyCache(strict=False)
         ranks = list(Chem.CanonicalRankAtoms(flat, breakTies=False))
-        exact = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
     except (RuntimeError, ValueError) as exc:
         raise ValueError("RDKit could not canonicalize coordination-site identity") from exc
-    labels = {}
-    for root in roots:
-        labels[ranks[root]] = min(labels.get(ranks[root], exact[root]), exact[root])
-    return {root: labels[ranks[root]] for root in roots}
+    # The flat rank also names each class: handedness and face walks order classes by these values, so a
+    # name read from the drawn graph would flip a hand with the Lewis form.
+    return {root: ranks[root] for root in roots}
 
 
 def donor_classes(mol, donors):
@@ -167,8 +135,6 @@ def site_classes(mol, sites, haptic=None, coordination=()):
     atoms.update(donor for donor, _metal, _atomic_num, _charge in coordination)
     rw = Chem.RWMol(without_zero_bonds(mol))
     for donor, metal, atomic_num, _charge in coordination:
-        if min(donor, metal) < 0 or max(donor, metal) >= mol.GetNumAtoms():
-            continue
         atom = rw.GetAtomWithIdx(metal)
         atom.SetAtomicNum(atomic_num)
         # Formal charge stays out of identity here too, for the reason beside _root_classes: a redox split
@@ -208,32 +174,29 @@ def site_classes(mol, sites, haptic=None, coordination=()):
 
 def equivalent_site_assignments(classes, links=None, *, targets=None, sources=None):
     """Yield class- and chelate-link-preserving target-to-source vertex maps."""
-    link_labels = {} if links is None else links
     occupied = [vertex for vertex, value in enumerate(classes) if value is not None]
     targets = occupied if targets is None else list(targets)
     sources = occupied if sources is None else list(sources)
-    remaining, assigned = set(sources), {}
+    yield from _place(classes, {} if links is None else links, targets, sources, {})
 
-    def place(position):
-        if position == len(targets):
-            yield dict(assigned)
-            return
-        target = targets[position]
-        for source in sources:
-            if source not in remaining or classes[target] != classes[source]:
-                continue
-            if any(
-                link_labels.get(frozenset((target, other))) != link_labels.get(frozenset((source, mapped)))
-                for other, mapped in assigned.items()
-            ):
-                continue
-            assigned[target] = source
-            remaining.remove(source)
-            yield from place(position + 1)
-            remaining.add(source)
-            del assigned[target]
 
-    yield from place(0)
+def _place(classes, links, targets, sources, assigned):
+    """Extend `assigned` over the remaining targets, yielding each complete class- and link-preserving map."""
+    if len(assigned) == len(targets):
+        yield dict(assigned)
+        return
+    target = targets[len(assigned)]
+    for source in sources:
+        if source in assigned.values() or classes[target] != classes[source]:
+            continue
+        if any(
+            links.get(frozenset((target, other))) != links.get(frozenset((source, mapped)))
+            for other, mapped in assigned.items()
+        ):
+            continue
+        assigned[target] = source
+        yield from _place(classes, links, targets, sources, assigned)
+        del assigned[target]
 
 
 def _face_walk(mol, face):
@@ -364,6 +327,22 @@ def face_has_orientation(mol, face, ranks):
     return _canonical_face_walk(mol, face, ranks) is not None
 
 
+# The mirror image of each face token: a reflection flips a face side and a helicity, and keeps a symmetric s-cis.
+MIRROR_WINDING = {"+": "-", "-": "+", "P": "M", "M": "P", "c": "c"}
+
+
+def face_orientations(mol, face, ranks):
+    """Return the tokens that name one haptic face's configurations, or none when it has one configuration.
+
+    A face side is ``'+'`` or ``'-'``. A rotatable diene face (`torsion_path`) adds its s-trans helicity
+    ``'P'`` or ``'M'``, and its s-cis form is a face side, or ``'c'`` when a mirror relates the two sides.
+    """
+    sides = ("+", "-") if face_has_orientation(mol, face, ranks) else ()
+    if torsion_path(mol, face) is None:
+        return sides
+    return (*(sides or ("c",)), "P", "M")
+
+
 def _face_side(normal, direction, area_scale):
     """Return a scale-invariant side of a face, or zero for a degenerate placement."""
     value = float(normal @ direction)
@@ -374,10 +353,15 @@ def _face_side(normal, direction, area_scale):
 
 
 def face_winding(mol, pos, metal, face, ranks, eta2_ranks=None):
-    """Return the canonical ``'+'`` or ``'-'`` orientation of a haptic face.
+    """Return the canonical configuration token of a haptic face (see `face_orientations`), or ``''``.
 
-    Proper rotation preserves the sign and reflection flips it. The sign remains authoritative when RDKit's
-    CIP ranks cannot supply a conventional re/si or planar descriptor.
+    Proper rotation preserves the token and reflection mirrors it (`MIRROR_WINDING`). The sign remains
+    authoritative when RDKit's CIP ranks cannot supply a conventional re/si or planar descriptor.
+
+    A rotatable diene face is s-cis when its C1-C2-C3-C4 torsion is under 90 degrees in magnitude (syn in
+    Klyne-Prelog terms) and s-trans above (anti), with no fitted margin. s-trans is named by the helicity of
+    that backbone torsion, P when positive, so it needs no priorities and is not a CIP atropisomer label. A
+    path read either way has the same torsion.
     """
     if len(face) == ETA2:
         try:
@@ -396,6 +380,15 @@ def face_winding(mol, pos, metal, face, ranks, eta2_ranks=None):
         mirror = tuple(sorted((key, "si" if name == "re" else "re") for key, name in signature))
         return "+" if signature < mirror else "-" if signature > mirror else ""
     canonical = _canonical_face_walk(mol, face, ranks)
+    if (path := torsion_path(mol, face)) is not None:
+        phi = np.radians(dihedral_angle(*pos[path]))
+        cos, sin = np.cos(phi), np.sin(phi)
+        if not np.isfinite(phi) or abs(cos) <= _FACE_EPS:
+            return ""
+        if cos < 0.0:
+            return "" if abs(sin) <= _FACE_EPS else "P" if sin > 0.0 else "M"
+        if canonical is None:
+            return "c"
     if canonical is None:
         return ""
     sequence, closed = canonical

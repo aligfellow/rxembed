@@ -13,7 +13,7 @@ import numpy as np
 from rdkit import Chem, DistanceGeometry
 
 from .bounds import coordination_reach, coordination_reach_base
-from .constraints import FIX_DISTANCE_TOL, Constraints
+from .constraints import ML_WINDOW_TOL, Constraints
 from .mechanisms import law_of_cosines, triangle_distances
 from .metal_constraints import (
     CoordinationSphere,
@@ -42,20 +42,17 @@ _CERTIFICATE_STEPS = 32  # accelerated-gradient step budget for the refinement s
 _CROSS_EPS = 1e-9  # Å, floating-point slack shared by every closed-bound comparison against a reach matrix
 _COMPILED_CONSTRAINTS_KEY = "_span_compiled"  # context scratch slot: this candidate's compiled constraints,
 # written by _compiled_span_failure and consumed once by unreachable_span; never read stale (see both).
-_CERTIFICATE_MEMO_KEY = "_certificate_memo"  # context scratch slot: _certified_conflict results for this
-# screen. A screen reasks the same bounds many times across candidates but never across screens, so the memo
-# lives in the caller's context and is freed with it, rather than in a module-level cache that keeps evicting
-# entries mid-screen and recomputing them.
+_CERTIFICATE_MEMO_KEY = "_certificate_memo"  # context scratch slot: one screen's _certified_conflict results
 
 
-def _radial_distance_windows(iso, mol, atoms, positions, base_distances=None, context=None):
+def _radial_distance_windows(iso, atoms, positions, base_distances=None, context=None):
     """Return each donor atom's model M-donor distance window and hybridisation.
 
     `positions` is resolved by the caller: `unreachable_span` measures from `iso.length_mol`, which need
-    not be `mol` itself. `context` reuses a caller's already-compiled hybridisation/charges (`compile_context`)
-    instead of recomputing them for every candidate.
+    not be `iso.graph` itself. `context` reuses a caller's already-compiled hybridisation/charges
+    (`compile_context`) instead of recomputing them for every candidate.
     """
-    metal, real_z, donors = iso.metal, iso.real_z, set(iso.donors)
+    mol, metal, real_z, donors = iso.graph, iso.metal, iso.real_z, set(iso.donors)
     if context is None:
         hyb = stripped_hybridisation(mol)
         charges = delocalised_charges(mol) if positions is None else None
@@ -135,8 +132,10 @@ def _haptic_span_failure(iso, reach, left, right, angle, compiled):
     left_face, right_face = iso.haptic.get(left, (left,)), iso.haptic.get(right, (right,))
     try:
         if measured:
+            positions = iso.length_mol.GetConformer().GetPositions()
             radii = tuple(
-                _measured_radius(iso, vertex, face) for vertex, face in ((left, left_face), (right, right_face))
+                float(np.linalg.norm(np.mean(positions[list(face)], axis=0) - positions[metal]))
+                for face in (left_face, right_face)
             )
         else:
             assert compiled is not None
@@ -148,13 +147,6 @@ def _haptic_span_failure(iso, reach, left, right, angle, compiled):
     if math.isfinite(available) and needed > available + SPAN_TOL:
         return f"haptic faces {left}/{right} need >= {needed:.3f} A; centroid reach <= {available:.3f} A"
     return None
-
-
-def _measured_radius(iso, vertex, face):
-    """Return the observed metal-to-site radius for a real atom or haptic centroid."""
-    positions = iso.length_mol.GetConformer().GetPositions()
-    point = np.mean(positions[list(face)], axis=0) if vertex in iso.haptic else positions[vertex]
-    return float(np.linalg.norm(point - positions[iso.metal]))
 
 
 def _centroid_reach(reach, left, right):
@@ -177,17 +169,16 @@ def _centroid_reach(reach, left, right):
 
 
 def unreachable_span(iso, reach, classes, links, native=None, context=None):
-    """Screen jointly compiled targets, retaining the prior screen for unsupported relations.
+    """Return why a candidate's compiled targets or span priors exceed native ligand reach, else ``None``.
 
-    Haptics retain their separate real-atom network; centroid feasibility remains an embedding/FF concern.
-    The prior directional test covers multi-centre states and base constraints, where this selected-sphere
-    certificate cannot yet own the spectator geometry. That test permits distortion down to TRANS_ANGLE;
-    above 90 degrees, separation increases with both M-L lengths. Neither screen proves chemical impossibility.
+    A single centre gets the compiled certificate and, with chelate links or haptic faces, the span priors
+    and the opposed-donor fit budget. A multi-centre candidate, whose spectator geometry no certificate owns,
+    gets the span priors only: the chelate-bite fold, the long-arc and haptic spans, and trans pairs allowed
+    to close to TRANS_ANGLE (above 90 degrees a span grows with both M-L lengths). None of this proves
+    chemical impossibility.
     """
     mol, metal, vertices, haptic = iso.graph, iso.metal, iso.vertices, iso.haptic
     directions = POLYHEDRA[iso.geometry].vertex_dirs
-    # A multi-centre candidate has a selected sphere plus a spectator state; keep its prior outer screen until
-    # one certificate owns both spheres jointly.
     compiled = None
     if len(iso.centres) == 1:
         failure = _compiled_span_failure(iso, reach, None, native, context)
@@ -213,7 +204,7 @@ def unreachable_span(iso, reach, classes, links, native=None, context=None):
         return None
     atoms = set(vertices) - haptic.keys() - {VACANT}
     positions, _ = resolve_lengths(iso.length_mol, iso.lengths)
-    radial, hyb = _radial_distance_windows(iso, mol, atoms, positions, iso.base_cons.distances, context=context)
+    radial, hyb = _radial_distance_windows(iso, atoms, positions, iso.base_cons.distances, context=context)
     if failure := _chelate_span_failure(iso, reach, radial, links, compiled, context):
         return failure
     for left, right in pairs:
@@ -249,12 +240,7 @@ def _route_has_donor_bond(mol, path, donors):
 def _route_certificate_paths(mol, donors, topology):
     """Return each donor-pair route's deduped, bond-filtered atom path, independent of vertex seating.
 
-    A donor pair's shortest route (ties included, via the topology union) and whether that route crosses
-    a donor-donor bond depend only on molecular topology and which atoms are donors, never on which
-    polyhedron vertex a candidate seats a donor at. `_compiled_span_failure` computes this list once per
-    (mol, donor set) through its `context` cache and reuses it for every screened seating. Each path's
-    subset certificates stay lazy in the caller, not expanded here, so a whole-route conflict still skips
-    ever generating its smaller diagnostic subsets (see `_route_certificate_subsets`).
+    Routes depend only on topology and the donor set, so `_compiled_span_failure` caches them per screen.
     """
     tested_paths = set()
     paths = []
@@ -490,14 +476,12 @@ def _opposed_donor_span_failure(iso, reach, radial, hyb, classes, links):
     FIT_FLOOR**2 converts the per-vertex RMS floor back into that raw-sum budget for `occupied` vertices, so
     disjoint pairs sum against one shared budget, not a fresh one per chelate. Caps follow from the existing
     single-endpoint cones without assuming a donor-substituent bond length. Native ligand reach intervals
-    remain model priors, not proof of chemical impossibility. Not `embed._donor_facing_failure`, which screens
-    the accepted conformer after embedding rather than this pre-embed candidate.
+    remain model priors, not proof of chemical impossibility.
     """
     vertices, mol, metal = iso.vertices, iso.graph, iso.metal
     occupied = sum(vertex != VACANT for vertex in vertices)
     if len(iso.centres) != 1:
         return None
-    hyb = stripped_hybridisation(mol) if hyb is None else hyb
     donors = set(iso.donors)
     # Coordination can expand radial caps for bonded co-donors; the uncompiled windows cannot bound them.
     bonded_donors = {d for d in donors if any(n.GetIdx() in donors for n in mol.GetAtomWithIdx(d).GetNeighbors())}
@@ -522,7 +506,7 @@ def _opposed_donor_span_failure(iso, reach, radial, hyb, classes, links):
         if not Chem.GetShortestPath(mol, left, right):
             return 0.0
         radii = [radial.distances[tuple(sorted((metal, atom)))] for atom in (left, right)]
-        radii = [(lo - FIX_DISTANCE_TOL, hi + FIX_DISTANCE_TOL) for lo, hi in radii]
+        radii = [(lo - ML_WINDOW_TOL, hi + ML_WINDOW_TOL) for lo, hi in radii]
         if any(not (0 < lo <= hi) or not all(map(math.isfinite, (lo, hi))) for lo, hi in radii):
             return 0.0
         axes, floors = [], []
