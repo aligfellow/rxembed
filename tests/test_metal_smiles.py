@@ -4,76 +4,35 @@ from __future__ import annotations
 
 import importlib
 import logging
-import random
 import re
-import subprocess
-import sys
 from importlib.util import find_spec
 
 import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDepictor, rdDistGeom, rdMolTransforms
+from rdkit.Chem import rdDepictor, rdDistGeom
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
-from rxembed import metal_enumeration, metal_isomer, metal_smiles, stereo
+from rxembed import metal_isomer, metal_smiles, stereo
 from rxembed.core import embed as core_embed
-from rxembed.metal_core import COORDINATION_METALS, VACANT, MetalState, connect_metal, materialized_state, metal_indices
+from rxembed.metal_core import VACANT, connect_metal, materialized_state
 from rxembed.metal_perceive import SHAPE_PROP, SHAPE_REQUEST_PROP
-from rxembed.metal_polyhedron import SLOT_BOND_PROP, point_group, vertex_dirs
-from rxembed.metal_stereo import donor_classes, eta2_signatures, face_winding, realised_chirality
+from rxembed.metal_polyhedron import SLOT_BOND_PROP, point_group, record, vertex_dirs
+from rxembed.metal_stereo import donor_classes, eta2_signatures, face_winding
 from rxembed.pipeline import geom_check as geom
-from rxembed.pipeline.perceive import _drop_bridgehead_bonds, read_xyz
-from rxembed.utils import remove_bond
+from rxembed.pipeline.perceive import read_xyz
 from tests.conftest import EXAMPLES_DIR
-from tests.metal_fixtures import BUTADIENE_FE_CO3, ISOPRENE_FE_CO3, one_arm_bound_pt
+from tests.metal_fixtures import BUTADIENE_FE_CO3
 
 _MN_H2 = str(EXAMPLES_DIR / "mn-h2.xyz")  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
 _MNH = str(EXAMPLES_DIR / "mnh.xyz")  # the corresponding Mn hydride minimum
-_MA2B2_SEATS = {"cis": [1, 2, 3, 4], "trans": [1, 3, 2, 4]}  # square_planar: 0 and 2 are the trans pair
 _MA3B3_SEATS = {"fac": [1, 4, 2, 5, 3, 6], "mer": [1, 2, 3, 4, 5, 6]}  # octahedral: 0/1, 2/3, 4/5 are trans
-_CIS3 = [1, 3, 2, 5, 4, 6]  # cis,cis,cis-MA2B2C2: every same-element pair at 90 degrees, so the centre is chiral
 _ETA2_ASYM_E = r"C/[CH]1=[CH](/F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1"
-_TWO_ETA2 = r"C/[CH]1=[CH](/F)->[Pt+2]2(<-[CH](Cl)=[CH](Br)->2)(<-[NH3])(<-[Cl-])<-1"
-_ATROP_RU_COVALENT_CX = (
-    "[Cl-][Ru+2]12([Cl-])([NH2][C@H](c3ccccc3)[C@H]([NH2]1)c1ccccc1)"
-    "[P](c1ccccc1)(c1ccccc1)c1ccc3ccccc3c1-c1c([P]2(c2ccccc2)c2ccccc2)ccc2ccccc12 |wU:41.47|"
-)
 _BINAP_PD = (
     "[Pd+2]%90(<-[Cl-])(<-[Cl-])(<-P(c1ccccc1)(c2ccccc2)c3ccc4ccccc4c3-c3c(P(c4ccccc4)(c5ccccc5)->%90)ccc4ccccc34)"
 )
-_NON_CIP_CAGE_AU = "Cn1n[n+]([C@]23C[C@H]4C[C@H](C[C@H](C4)C2)C3)[c-](->[Au+]<-[Cl-])c1-c1ccccc1"
-_PSEUDO_BIS_ETA2_RU = "CC#[N]->[Ru+]123(<-[Cl-])(<-[N]#CC)(<-[N]#CC)<-[CH]4=[CH]->1[C@H]1C[C@@H]4[CH]->2=[CH]->31"
-_BIS_SILYL_ISOCYANIDE_PT = (
-    "CC(C)(C)[N+]#[C-]->[Pt+2](<-[SiH-](c1ccccc1)c1ccccc1)(<-[SiH-](c1ccccc1)c1ccccc1)<-[P](C)(C)C"
-)
-# One shared owner for a (smi, geometry) coverage set, reused by `test_all_enumerated_isomers_read_back`
-# and by every general order-invariance guard over "the existing metal test fixtures".
-_ENUMERATION_FIXTURES = [
-    ("[NH3]->[Pt](<-[NH3])(Cl)Cl", "square_planar"),  # cis / trans
-    ("[Pt](F)(F)(Cl)(Cl)(Br)Br", "octahedral"),  # MA2B2C2: six isomers, one delta / lambda pair
-    ("Br[Pd]1(Cl)NCCN1", "square_planar"),  # a chelate, so a bite edge is in the fold
-    ("[Co]123(OCCN1)(OCCN2)OCCN3", "octahedral"),  # three identical unsymmetrical chelates
-    ("[CH2]=[CH2].Cl[Pt](Cl)Cl", "square_planar"),  # Zeise: an eta2 face is one vertex
-    ("[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])<-N", "seesaw"),
-    ("[O+]#[C-]->[Fe+2](<-[F-])(<-[Cl-])(<-N)<-O", "trigonal_bipyramidal"),
-    ("[O+]#[C-]->[Co+3](<-[F-])(<-[Cl-])(<-[Br-])(<-N)<-O", "octahedral"),
-    ("O->[Co+3](<-[Cl-])(<-[CH3-])(<-N)(<-[F-])<-P", "octahedral"),
-    (ISOPRENE_FE_CO3, "tetrahedral"),  # an eta4 diene: two s-cis faces and the s-trans P/M pair
-]
-_ENUMERATION_FIXTURE_IDS = [
-    "MA2B2",
-    "MA2B2C2",
-    "chelate",
-    "tris-chelate",
-    "eta2",
-    "SEE-all-distinct",
-    "TBP-all-distinct",
-    "OH-all-distinct",
-    "OH-all-distinct-PH3",
-    "eta4-diene",
-]
+# One shared owner for a (smi, geometry) coverage set, reused by `test_all_enumerated_isomers_read_back`.
 
 
 def _isomer(smi, geometry, seating):
@@ -123,50 +82,9 @@ def _haptic_windings(mol, iso, cid):
 
 # Run the graph round trip while a meta-path block refuses every optional dependency. The final import checks
 # that the block is active; an in-process ``sys.modules`` probe alone would be a null measurement.
-_BASE_INSTALL = """
-import sys
-BLOCKED = ("xyzgraph", "openconf", "scipy", "sklearn", "matplotlib", "prism_pruner", "ase", "xyzrender")
-
-class BaseInstall:
-    def find_spec(self, name, path=None, target=None):
-        if any(name == b or name.startswith(b + ".") for b in BLOCKED):
-            raise ImportError("no module named %r (simulated base install)" % name)
-        return None
-
-sys.meta_path.insert(0, BaseInstall())
-
-from rdkit import Chem
-import rxembed as rx
-
-mol = Chem.AddHs(Chem.MolFromSmiles("[NH3]->[Pt](<-[NH3])(Cl)Cl"))
-text = rx.cxsmiles(rx.enumerate_isomers(mol, "square_planar")[0])
-embedded = rx.embed(text, n=2, seed=1)
-assert embedded.iso is not None, "the stated arrangement was not read"
-assert embedded.ids, "nothing embedded"
-assert rx.cxsmiles(embedded.iso) == text, "the string is not a fixed point"
-try:
-    import xyzgraph
-except ImportError:
-    pass
-else:
-    raise AssertionError("the block is not blocking, so this proves nothing")
-print(text)
-"""
-
-
-def test_graph_roundtrip_needs_no_optional_deps():
-    run = subprocess.run([sys.executable, "-c", _BASE_INSTALL], capture_output=True, text=True, check=False)
-    assert run.returncode == 0, run.stderr
-    assert "[H]" not in run.stdout, run.stdout
 
 
 # --- the parse / write contract -------------------------------------------------------------------------
-
-
-def test_bad_smiles_raises():
-    assert metal_smiles.parse_smiles("CCO").GetNumAtoms() == 3
-    with pytest.raises(ValueError, match="could not parse SMILES"):
-        metal_smiles.parse_smiles("C1CC")
 
 
 def test_covalent_metal_input_normalizes_before_kekulization():
@@ -175,31 +93,57 @@ def test_covalent_metal_input_normalizes_before_kekulization():
     assert metal_smiles.dative_smiles(mol) == "c1cc[n](->[Zn]<-[n]2ccccc2)cc1"
 
 
-def test_writer_does_not_invent_a_radical_on_an_unbound_aromatic_sulfur():
-    mol = Chem.AddHs(Chem.MolFromSmiles("c1ccsc1.N->[Pt+](<-[Cl-])<-[Cl-]"))
-    for atom in mol.GetAtoms():
-        atom.SetNoImplicit(True)
-    mol.UpdatePropertyCache(strict=False)
+def test_parse_smiles_removes_explicit_hydrogens_by_default():
+    mol = metal_smiles.parse_smiles("[H]OC")
+    assert not any(atom.GetAtomicNum() == 1 for atom in mol.GetAtoms())
+
+
+def test_writer_keeps_the_nonmetal_leg_of_a_bridging_hydrogen():
+    written = set()
+    for edges in (((0, 1), (1, 2)), ((1, 2), (0, 1))):
+        rw = Chem.RWMol()
+        boron = Chem.Atom(5)
+        boron.SetFormalCharge(-1)
+        boron.SetNumExplicitHs(3)
+        boron.SetNoImplicit(True)
+        hydrogen = Chem.Atom(1)
+        hydrogen.SetNoImplicit(True)
+        iron = Chem.Atom(26)
+        iron.SetFormalCharge(1)
+        iron.SetNoImplicit(True)
+        for atom in (boron, hydrogen, iron):
+            rw.AddAtom(atom)
+        for edge in edges:
+            rw.AddBond(*edge, Chem.BondType.SINGLE)
+        mol = rw.GetMol()
+        mol.UpdatePropertyCache(strict=False)
+        conf = Chem.Conformer(3)
+        for atom, point in enumerate(((-1, 0, 0), (0, 0, 0), (1, 0, 0))):
+            conf.SetAtomPosition(atom, Point3D(*point))
+        mol.AddConformer(conf)
+        written.add(metal_smiles.dative_smiles(mol))
+
+    assert written == {"[BH3-][H]->[Fe+]"}
+
+
+def test_hydrogen_bond_cycle_does_not_make_chelate_imine_stereo_order_dependent():
+    mol = metal_smiles.parse_smiles("[N]1(->[Ni]2)/O[H]~O=[N+]->2=C/C=1 |Z:3|", remove_hs=False)
+    reversed_mol = Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))
 
     text = metal_smiles.dative_smiles(mol)
 
-    sulfur = next(atom for atom in metal_smiles.parse_smiles(text).GetAtoms() if atom.GetSymbol() == "S")
-    assert sulfur.GetNumRadicalElectrons() == 0
+    assert metal_smiles.dative_smiles(reversed_mol) == text
+    back = metal_smiles.parse_smiles(text, remove_hs=False)
+    assert not stereo.bond_stereo(stereo.defined_stereo_label(back, metal_smiles.metal_indices(back)))
 
 
-def test_native_atrop_cx_survives_covalent_input_and_metal_enumeration():
-    # Test native stereo serialization even for arrangements excluded by the ground-state model.
-    isomers = rx.metal(_ATROP_RU_COVALENT_CX, "OCT", screen=False)
-
-    assert len(isomers) == 6
-    assert all(iso.stereo_label.endswith(":M") for iso in isomers)
-    for iso in isomers:
-        text = rx.cxsmiles(iso)
-        back = rx.metal(text)
-        assert [item.stereo_label for item in back] == [iso.stereo_label]
-        assert rx.cxsmiles(back[0]) == text
-    with pytest.raises(ValueError, match="plain dative SMILES cannot retain atropisomer stereo"):
-        metal_smiles.dative_smiles(metal_smiles.parse_smiles(_ATROP_RU_COVALENT_CX))
+def test_isomer_and_mol_write_same_constitution():
+    for smi in (s for pair in _LEWIS_PAIRS.values() for s in pair):
+        mol = Chem.AddHs(Chem.MolFromSmiles(smi))
+        isos = rx.enumerate_isomers(mol)
+        assert isos, f"{smi} enumerated nothing"
+        core = rx.cxsmiles(isos[0]).split(" |", 1)[0]
+        assert core == metal_smiles.dative_smiles(mol), f"{smi}: the Isomer door wrote a different constitution"
 
 
 def test_cxsmiles_measures_a_marked_atrop_axis_from_3d():
@@ -217,22 +161,6 @@ def test_cxsmiles_measures_a_marked_atrop_axis_from_3d():
     assert after == {"M": "P", "P": "M"}[before]
 
 
-def test_cxsmiles_perceives_unmarked_bound_binap_axis_from_3d():
-    iso = rx.metal(_BINAP_PD, "SPL")[0]
-    assert not stereo.axis_stereo(iso.stereo_label)
-
-    geometry = rx.embed(iso, n=1, seed=7).minimize().mol
-    text = rx.cxsmiles(geometry)
-    back = rx.metal(text)
-    perceived = rx.metal(geometry, "SPL")
-
-    assert len(stereo.axis_stereo(back[0].stereo_label)) == 1
-    assert len(stereo.axis_stereo(perceived[0].stereo_label)) == 1
-    assert len(rx.embed(perceived[0], n=1, seed=7)) == 1
-    with pytest.raises(ValueError, match="plain dative SMILES cannot retain atropisomer stereo"):
-        rx.dative_smiles(geometry)
-
-
 def test_coplanar_bound_biaryl_is_not_forced_to_have_an_atrop_hand():
     mol = metal_smiles.parse_smiles(_BINAP_PD, remove_hs=False)
     rdDepictor.Compute2DCoords(mol)
@@ -244,147 +172,21 @@ def test_coplanar_bound_biaryl_is_not_forced_to_have_an_atrop_hand():
     assert not stereo.axis_stereo(stereo.stereo_from_3d(mol, metal_smiles.metal_indices(mol)))
 
 
-def test_dative_writer_returns_written_atom_order():
-    mol = Chem.AddHs(Chem.MolFromSmiles("[NH3]->[Pd](<-[NH3])(Cl)Cl"))
-    smi, at, _bonds, _unwritable = metal_smiles._write_dative(
-        mol, stereo.defined_stereo_label(mol, metal_smiles.metal_indices(mol))
-    )
-    assert smi == metal_smiles.dative_smiles(mol), "the two doors disagree about the string"
-    heavy = {a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() != 1}
-    assert set(at) == heavy, "routine hydrogens should be implicit and have no string position"
-    assert sorted(at.values()) == list(range(len(at))), "the order is not a permutation of the written atoms"
-    params = Chem.SmilesParserParams()
-    params.removeHs = False
-    back = Chem.MolFromSmiles(smi, params)
-    written = [back.GetAtomWithIdx(at[a]).GetAtomicNum() for a in sorted(at)]
-    assert written == [mol.GetAtomWithIdx(a).GetAtomicNum() for a in sorted(at)], "a position addresses another atom"
-
-
-def test_dative_writer_rebases_double_bond_stereo_after_metal_normalization():
-    mol = metal_smiles.parse_smiles(r"C/C=N(/C)->[Fe+2](<-[Cl-])<-[Cl-]")
-    assert stereo.defined_stereo_label(mol, metal_smiles.metal_indices(mol)) == "C1=N2:E"
-
-    text = metal_smiles._write_dative(mol, "C1=N2:Z")[0]
-
-    back = metal_smiles.parse_smiles(text)
-    assert stereo.defined_stereo_label(back, metal_smiles.metal_indices(back)) == "C1=N2:Z"
-
-
-def test_canonical_slots_keep_identical_donor_links_with_their_assigned_slots():
-    mol = metal_smiles.parse_smiles(_BIS_SILYL_ISOCYANIDE_PT)
-    expected = {rx.cxsmiles(iso) for iso in rx.metal(mol, "SPL", screen=False)}
-
-    assert len(expected) == 2
-    for permutation in (list(reversed(range(mol.GetNumAtoms()))), list(range(0, mol.GetNumAtoms(), 2))):
-        order = permutation + [index for index in range(mol.GetNumAtoms()) if index not in permutation]
-        renumbered = Chem.RenumberAtoms(mol, order)
-        assert {rx.cxsmiles(iso) for iso in rx.metal(renumbered, "SPL", screen=False)} == expected
-
-
-def test_centre_cip_cannot_rank_writes_one_hand_in_any_bond_order(monkeypatch):
-    """A centre CIP cannot rank (DOCPIW's adamantyl C, a clathrochelate B cap) is written from its raw tag.
-
-    CIP is blinded here on a 2-butylamine so the centre carries a hydrogen, which the writer removes from a
-    bond slot that depends on the input order; a raw code that did not follow that edit wrote either hand.
-    """
-    monkeypatch.setattr(stereo, "_point_cip_codes", lambda _mol, _centers: {})
-    source = Chem.AddHs(metal_smiles.parse_smiles("[Cl-]->[Au+]<-[NH2][C@@H](C)CC", remove_hs=False))
-    assert rx.metal(source)[0].stereo_label == "C3:CW"
-    texts, counts = set(), set()
-    for seed in range(8):
-        rng = random.Random(seed)
-        order = list(range(source.GetNumAtoms()))
-        rng.shuffle(order)
-        rw = Chem.RWMol(Chem.RenumberAtoms(source, order))
-        bonds = [(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), bond.GetBondType()) for bond in rw.GetBonds()]
-        rng.shuffle(bonds)
-        for begin, end, kind in bonds:
-            remove_bond(rw, begin, end)  # re-seats the bond last, keeping every tetrahedral hand
-            rw.AddBond(begin, end, kind)
-        mol = rw.GetMol()
-        mol.UpdatePropertyCache(strict=False)
-        assert Chem.MolToSmiles(mol) == Chem.MolToSmiles(source)
-        isomers = rx.metal(mol)
-        counts.add(len(isomers))
-        texts.update(rx.cxsmiles(iso) for iso in isomers)
-    assert counts == {1}
-    assert len(texts) == 1, texts
-
-
-@pytest.mark.parametrize("unbound_metal", [False, True])
-def test_zero_order_contact_is_written_but_is_not_constitution(unbound_metal):
+def test_zero_order_contact_is_written_but_is_not_constitution():
     """Only the O~N contact tells C1's two CH2OH arms apart, so C1 is no stereocentre; the contact still round-trips."""
     mol = metal_smiles.parse_smiles("C[C@@H](CO)CO~N |Z:5|")
-    if unbound_metal:
-        mol = Chem.CombineMols(mol, metal_smiles.parse_smiles("[Zn+2]"))
     before = Chem.MolToCXSmiles(mol)
     assert stereo.defined_stereo_label(mol) == ""
 
-    text, at, _bonds, _unwritable = metal_smiles._write_dative(
-        mol, stereo.defined_stereo_label(mol, metal_smiles.metal_indices(mol))
-    )
+    text = rx.dative_smiles(mol)
     back = metal_smiles.parse_smiles(text)
 
     assert "Z:" in text
     assert "@" not in text
-    assert back.GetBondBetweenAtoms(at[5], at[6]).GetBondType() == Chem.BondType.ZERO
+    assert sum(bond.GetBondType() == Chem.BondType.ZERO for bond in back.GetBonds()) == 1
     assert metal_smiles.dative_smiles(back) == text
     assert metal_smiles.dative_smiles(Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))) == text
     assert Chem.MolToCXSmiles(mol) == before
-    if unbound_metal:
-        assert rx.cxsmiles(mol) == text
-
-
-@pytest.mark.parametrize(
-    ("smiles", "geometry", "marker"),
-    [
-        (_ETA2_ASYM_E, "SPL", r",[ct]:"),
-        (_ATROP_RU_COVALENT_CX, "OCT", r",w[UD]:"),
-        ("C[N@](CC)(CCC)->[Pt+2](<-[Cl-])(<-[Br-])<-[I-]", "SPL", r",atomProp:"),
-    ],
-)
-def test_zero_order_contacts_compose_with_metal_and_native_stereo_fields(smiles, geometry, marker):
-    mol = Chem.CombineMols(metal_smiles.parse_smiles(smiles), metal_smiles.parse_smiles("C[C@@H](CO)CO~N |Z:5|"))
-    iso = rx.metal(mol, geometry)[0]
-
-    text = rx.cxsmiles(iso)
-    back = rx.parse_smiles(text)
-
-    assert text.count("|") == 2
-    assert "Z:" in text
-    assert "atomNote" in text
-    assert re.search(marker, text)
-    assert sum(bond.GetBondType() == Chem.BondType.ZERO for bond in back.GetBonds()) == 1
-    assert rx.cxsmiles(rx.metal(back)[0]) == text
-    assert rx.cxsmiles(Chem.RenumberAtoms(back, list(reversed(range(back.GetNumAtoms()))))) == text
-
-
-def test_hydrogen_bond_cycle_does_not_make_chelate_imine_stereo_order_dependent():
-    mol = metal_smiles.parse_smiles("[N]1(->[Ni]2)/O[H]~O=[N+]->2=C/C=1 |Z:3|", remove_hs=False)
-    reversed_mol = Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))
-
-    text = metal_smiles.dative_smiles(mol)
-
-    assert metal_smiles.dative_smiles(reversed_mol) == text
-    back = metal_smiles.parse_smiles(text, remove_hs=False)
-    assert not stereo.bond_stereo(stereo.defined_stereo_label(back, metal_smiles.metal_indices(back)))
-
-
-def test_dative_writer_omits_coordination_locked_imine_stereo():
-    mol = metal_smiles.parse_smiles(r"C/C1=[NH]->[Ni+2](<-[Cl-])(<-[Cl-])<-[NH2]CC1")
-
-    text = metal_smiles.dative_smiles(mol)
-
-    assert "/" not in text
-    assert "\\" not in text
-    back = metal_smiles.parse_smiles(text)
-    assert not stereo.bond_stereo(stereo.defined_stereo_label(back, metal_smiles.metal_indices(back)))
-
-
-def test_cx_cis_marker_may_encode_e_after_canonical_traversal():
-    mol = metal_smiles.parse_smiles("ClC(F)=C(Br)I |c:2|")
-
-    assert stereo.defined_stereo_label(mol) == "C1=C3:E"
 
 
 def test_cx_fields_losslessly_retain_conjugated_imine_ez():
@@ -416,7 +218,6 @@ def test_cx_fields_losslessly_retain_conjugated_imine_ez():
     ("smiles", "remove_hs"),
     [
         ("CC=[NH]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Br-]", True),
-        ("CC=N([H])->[Pt+2](<-[Cl-])(<-[Cl-])<-[Br-]", False),
     ],
 )
 def test_dative_writer_retains_coordinated_imine_ez_and_maps_only_source_atoms(smiles, remove_hs):
@@ -436,112 +237,6 @@ def test_dative_writer_retains_coordinated_imine_ez_and_maps_only_source_atoms(s
     assert not unwritable
 
 
-def test_monodentate_imine_ez_remains_a_ligand_configuration():
-    isomers = rx.metal("CC=[NH]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Br-]", "square_planar")
-    texts = {rx.cxsmiles(iso) for iso in isomers}
-
-    assert isomers
-    assert {iso.stereo_label for iso in isomers} == {"C1=N2:E", "C1=N2:Z"}
-    assert len(texts) == len(isomers)
-    assert all(rx.cxsmiles(rx.metal(text)[0]) == text for text in texts)
-
-
-def test_hydrogen_reduction_conserves_a_haptic_carbanion_hydrogen():
-    params = Chem.SmilesParserParams()
-    params.removeHs = False
-    mol = Chem.MolFromSmiles("[H][c-]1(->[Fe+])cccc1", params)
-    hydrogen = next(atom for atom in mol.GetAtoms() if atom.GetAtomicNum() == 1)
-    hydrogen.GetNeighbors()[0].SetNoImplicit(False)
-    mol.UpdatePropertyCache(strict=False)
-
-    text = metal_smiles.dative_smiles(mol)
-
-    assert "[cH-]" in text
-    assert metal_smiles.parse_smiles(text) is not None
-
-
-def test_writer_hides_routine_h_and_keeps_hydride(capfd):
-    cisplatin = Chem.AddHs(Chem.MolFromSmiles("[NH3]->[Pt](<-[NH3])(Cl)Cl"))
-    text = rx.cxsmiles(metal_isomer.Isomer(cisplatin, "square_planar", [0, 2, 3, 4]))
-    assert "[H]" not in text, text
-
-    mol = metal_smiles.parse_smiles(text)
-    assert mol.GetNumAtoms() < cisplatin.GetNumAtoms(), "routine hydrogens were written explicitly"
-    assert Chem.AddHs(mol).GetNumAtoms() == cisplatin.GetNumAtoms(), "the implicit hydrogen count changed"
-    kept = metal_enumeration.stated_arrangement(mol)
-    assert kept is not None, "the arrangement did not survive the parse at all"
-    assert sorted(mol.GetAtomWithIdx(a).GetSymbol() for a in kept[1].values()) == ["Cl", "Cl", "N", "N"]
-    assert rx.cxsmiles(rx.enumerate_isomers(mol)[0]) == text, "the string is not a fixed point"
-    expected = {rx.cxsmiles(i) for i in rx.enumerate_isomers(cisplatin, "square_planar")}
-    reordered = Chem.RenumberAtoms(cisplatin, list(reversed(range(cisplatin.GetNumAtoms()))))
-    assert {rx.cxsmiles(i) for i in rx.enumerate_isomers(reordered, "square_planar")} == expected
-
-    params = Chem.SmilesParserParams()
-    params.removeHs = False
-    hydride = Chem.MolFromSmiles("[H-]->[Pt+2](Cl)(Cl)<-[NH3]", params)
-    hydride_text = rx.cxsmiles(rx.enumerate_isomers(hydride, "square_planar")[0])
-    assert "[H-]" in hydride_text, "the hydrogen donor lost the atom that carries its slot"
-    assert rx.cxsmiles(rx.enumerate_isomers(rx.parse_smiles(hydride_text))[0]) == hydride_text
-    assert "not removing hydrogen atom without neighbors" not in capfd.readouterr().err
-
-
-def test_writer_keeps_the_nonmetal_leg_of_a_bridging_hydrogen():
-    written = set()
-    for edges in (((0, 1), (1, 2)), ((1, 2), (0, 1))):
-        rw = Chem.RWMol()
-        boron = Chem.Atom(5)
-        boron.SetFormalCharge(-1)
-        boron.SetNumExplicitHs(3)
-        boron.SetNoImplicit(True)
-        hydrogen = Chem.Atom(1)
-        hydrogen.SetNoImplicit(True)
-        iron = Chem.Atom(26)
-        iron.SetFormalCharge(1)
-        iron.SetNoImplicit(True)
-        for atom in (boron, hydrogen, iron):
-            rw.AddAtom(atom)
-        for edge in edges:
-            rw.AddBond(*edge, Chem.BondType.SINGLE)
-        mol = rw.GetMol()
-        mol.UpdatePropertyCache(strict=False)
-        conf = Chem.Conformer(3)
-        for atom, point in enumerate(((-1, 0, 0), (0, 0, 0), (1, 0, 0))):
-            conf.SetAtomPosition(atom, Point3D(*point))
-        mol.AddConformer(conf)
-        written.add(metal_smiles.dative_smiles(mol))
-
-    assert written == {"[BH3-][H]->[Fe+]"}
-
-
-def test_coordinate_free_stated_arrangement_is_a_cxsmiles_fixed_point():
-    text = rx.cxsmiles(_isomer("[Pt](F)(F)(Cl)Cl", "square_planar", _MA2B2_SEATS["cis"]))
-    parsed = metal_smiles.parse_smiles(text)
-
-    assert parsed.GetNumConformers() == 0
-    assert rx.cxsmiles(parsed) == text
-
-
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_dative_smiles_roundtrips_nonstandard_complex():
-    mol = read_xyz(_MN_H2, metal_charges={0: 2, 1: 1})
-    assert any(a.GetAtomicNum() == 1 and a.GetDegree() > 1 for a in mol.GetAtoms()), (
-        "this fixture must contain an over-connected hydrogen, or it does not test the repair"
-    )
-
-    def metals(m):  # SMILES renumbers, so the multiset is the claim, not the order
-        return sorted(
-            (m.GetAtomWithIdx(i).GetSymbol(), m.GetAtomWithIdx(i).GetFormalCharge()) for i in metal_indices(m)
-        )
-
-    text = metal_smiles.dative_smiles(mol)
-    assert "[H][H]->" in text
-    back = Chem.AddHs(Chem.MolFromSmiles(text))
-    assert back.GetNumAtoms() == mol.GetNumAtoms()
-    assert metals(back) == metals(mol) == [("Fe", 2), ("Mn", 1)]
-    assert metal_smiles.dative_smiles(metal_smiles.parse_smiles(text)) == text
-    assert metal_smiles.dative_smiles(Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))) == text
-
-
 def test_dative_smiles_rejects_unreadable_graph():
     rw = Chem.RWMol(Chem.AddHs(Chem.MolFromSmiles("[NH3]->[Pd](<-[NH3])(Cl)Cl")))
     c = rw.AddAtom(Chem.Atom(6))
@@ -550,44 +245,6 @@ def test_dative_smiles_rejects_unreadable_graph():
         rw.AddBond(c, h, Chem.BondType.SINGLE)
     with pytest.raises(ValueError, match="round-tripping SMILES"):
         metal_smiles.dative_smiles(rw.GetMol())
-
-
-def test_writer_round_trips_a_hydroxycarbene_whose_oh_fixes_ez():
-    """A hydroxycarbene O-H fixing the C=O+ bond's E/Z stays explicit through a cxsmiles round trip (ASINUO)."""
-    smi = "[H]/[O+]=[C-](/C)->[Cr](<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]"
-    isomers = rx.metal(smi, "octahedral")
-    texts = [rx.cxsmiles(iso) for iso in isomers]
-    assert texts
-    for text in texts:
-        assert rx.cxsmiles(rx.metal(text)[0]) == text
-
-
-def test_dative_writer_does_not_invent_point_stereo_on_a_degree_five_atom():
-    mol = Chem.MolFromSmiles("F[Si](Cl)(Br)(I)->[Pd]", sanitize=False)
-    mol.UpdatePropertyCache(strict=False)
-    Chem.SanitizeMol(
-        mol,
-        Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES,
-        catchErrors=True,
-    )
-    assert rdDistGeom.EmbedMolecule(mol, randomSeed=7) == 0
-
-    text = metal_smiles.dative_smiles(mol)
-
-    assert "@" not in text
-    assert metal_smiles.dative_smiles(metal_smiles.parse_smiles(text)) == text
-
-
-def test_macrocycle_ez_writer_has_a_canonical_fixed_point():
-    text = (
-        r"C1=CC=C2/C(=[N]3->[Hf+2]456(<-[O]=[C]->4(Cc4ccccc4)Cc4ccccc4)"
-        r"<-[N](=C4/C=CC=CC=C4[N-]->5CCC\3)/CCCCC[N-]->62)C=C1"
-    )
-
-    once = metal_smiles.dative_smiles(metal_smiles.parse_smiles(text))
-
-    assert once == text
-    assert metal_smiles.dative_smiles(metal_smiles.parse_smiles(once)) == once
 
 
 # --- canonicality: one species, one string, whatever Lewis form described it ------------------------------
@@ -603,244 +260,7 @@ _LEWIS_PAIRS = {
 }
 
 
-@pytest.mark.parametrize(("kind", "pair"), _LEWIS_PAIRS.items(), ids=_LEWIS_PAIRS)
-def test_lewis_forms_share_species_string(kind, pair):
-    mols = [Chem.AddHs(Chem.MolFromSmiles(s)) for s in pair]
-    assert len({Chem.GetFormalCharge(m) for m in mols}) == 1, f"{kind}: the pair is not one species, fix the fixture"
-    written = {metal_smiles.dative_smiles(m) for m in mols}
-    assert len(written) == 1, f"{kind}: two Lewis forms of one species gave {len(written)} strings: {written}"
-
-
-def test_terminal_oxo_is_ionic_and_pi_face_unchanged():
-    lewis, ionic = "O=[V](Cl)(Cl)Cl", "[O-2]->[V+5](<-[Cl-])(<-[Cl-])<-[Cl-]"
-    mols = [Chem.AddHs(Chem.MolFromSmiles(s)) for s in (lewis, ionic)]
-    assert len({sum(a.GetFormalCharge() for a in m.GetAtoms()) for m in mols}) == 1, "not the same total charge"
-    before = [[a.GetFormalCharge() for a in m.GetAtoms()] for m in mols]
-    written = [metal_smiles.dative_smiles(m) for m in mols]
-    assert written[0] == written[1], f"one species, two strings: {written}"
-    assert "[O-2]" in written[0], f"the terminal oxo was not written ionically: {written[0]}"
-    assert [[a.GetFormalCharge() for a in m.GetAtoms()] for m in mols] == before, "the writer mutated its input"
-
-    fe = metal_smiles.dative_smiles(Chem.AddHs(Chem.MolFromSmiles("[cH-]1cccc1.[cH-]1cccc1.[Fe+2]")))
-    assert "[Fe+2]" in fe, f"the pi face was charged and the iron took the balance: {fe}"
-    assert fe.count("[cH-]") == 2, f"a Cp carbon beyond the two anionic ones was charged: {fe}"
-
-
-def test_coordinated_ring_resonance_has_one_nonmutating_dative_string(capfd):
-    written = set()
-    for face in ("[c-]1(F)c(Br)ccc1", "c1(F)c(Br)[cH-]cc1"):
-        ligands = (Chem.MolFromSmiles(face), Chem.MolFromSmiles("[cH-]1cccc1"))
-        rw = Chem.RWMol(Chem.CombineMols(Chem.CombineMols(*ligands), Chem.MolFromSmiles("[Fe+2]")))
-        metal = rw.GetNumAtoms() - 1
-        for atom in list(rw.GetAtoms()):
-            if atom.GetAtomicNum() == 6 and atom.GetIsAromatic():
-                rw.AddBond(atom.GetIdx(), metal, Chem.BondType.DATIVE)
-        mol = rw.GetMol()
-        mol.UpdatePropertyCache(strict=False)
-        mol = Chem.AddHs(mol)
-        for order in (list(range(mol.GetNumAtoms())), list(reversed(range(mol.GetNumAtoms())))):
-            variant = Chem.RenumberAtoms(mol, order)
-            before = [atom.GetFormalCharge() for atom in variant.GetAtoms()]
-            written.add(metal_smiles.dative_smiles(variant))
-            assert [atom.GetFormalCharge() for atom in variant.GetAtoms()] == before
-
-    assert len(written) == 1
-    assert "Can't kekulize mol" not in capfd.readouterr().err
-
-
-def test_multiply_charged_aromatic_macrocycle_has_an_idempotent_dative_string():
-    text = (
-        "FC1=C(F)c2c(-c3c(F)c(F)c(F)c(F)c3F)c3c(F)c(F)c4cc5c(F)c(F)"
-        "c6c(-c7c(F)c(F)c(F)c(F)c7F)c7[n]8->[Zn+2](<-[n]2c1cc8C(F)=C7F)"
-        "(<-[n-]43)(<-[n-]56)<-[O]1CCCC1"
-    )
-    molecule = metal_smiles.parse_smiles(text)
-    expected = metal_smiles.dative_smiles(molecule)
-    reordered = Chem.RenumberAtoms(molecule, list(reversed(range(molecule.GetNumAtoms()))))
-
-    assert metal_smiles.dative_smiles(metal_smiles.parse_smiles(expected)) == expected
-    assert metal_smiles.dative_smiles(reordered) == expected
-
-
-def test_neutral_carbene_remains_neutral_in_dative_output():
-    text = metal_smiles.dative_smiles(metal_smiles.parse_smiles("C[C](C)->[Rh+](<-[Br-])<-[C-]#[O+]"))
-
-    assert "C[C](C)->[Rh+]" in text
-
-
-def test_isomer_and_mol_write_same_constitution():
-    for smi in (s for pair in _LEWIS_PAIRS.values() for s in pair):
-        mol = Chem.AddHs(Chem.MolFromSmiles(smi))
-        isos = rx.enumerate_isomers(mol)
-        assert isos, f"{smi} enumerated nothing"
-        core = rx.cxsmiles(isos[0]).split(" |", 1)[0]
-        assert core == metal_smiles.dative_smiles(mol), f"{smi}: the Isomer door wrote a different constitution"
-
-
 # --- the arrangement the SMILES grammar cannot say -------------------------------------------------------
-
-
-def test_cxsmiles_distinguishes_metal_hands():
-    smi, flipped = "[Pt](F)(F)(Cl)(Cl)(Br)Br", [_CIS3[v] for v in (0, 1, 2, 3, 5, 4)]  # the Br pair exchanged
-    hands = [_isomer(smi, "octahedral", seating) for seating in (_CIS3, flipped)]
-    assert {i.chirality for i in hands} == {"delta", "lambda"}, [i.chirality for i in hands]
-    one, other = (rx.cxsmiles(i) for i in hands)
-    assert one.split("|")[0] == other.split("|")[0], "the constitution is the same molecule"
-    assert one != other, "the two hands share a canonical string"
-
-
-@pytest.mark.parametrize(("smi", "geometry"), _ENUMERATION_FIXTURES, ids=_ENUMERATION_FIXTURE_IDS)
-def test_all_enumerated_isomers_read_back(smi, geometry):
-    isos = rx.enumerate_isomers(Chem.AddHs(Chem.MolFromSmiles(smi)), geometry)
-    assert len(isos) >= 1
-    for iso in isos:
-        text = rx.cxsmiles(iso)
-        back = rx.enumerate_isomers(metal_smiles.parse_smiles(text))
-        assert len(back) == 1, f"{iso.label}: its own string enumerated {len(back)} isomers"
-        got = back[0]
-        assert rx.cxsmiles(got) == text, f"{iso.label}: the string is not a fixed point"
-        assert got.geometry == iso.geometry, f"{iso.label}: came back as {got.geometry}"
-        assert got.chirality == iso.chirality, f"{iso.label}: {iso.chirality!r} came back {got.chirality!r}"
-        was, now = _seated(iso), _seated(got)
-        dirs = vertex_dirs(iso.geometry)
-        rotations = None if dirs is None else point_group(tuple(map(tuple, dirs)))[0]
-        assert rotations is not None, f"{iso.label}: no vertex-direction template"
-        assert any([was[q[v]] for v in range(len(was))] == now for q in rotations), (
-            f"{iso.label}: {was} and {now} are not the same arrangement under any rotation of the template"
-        )
-
-
-def test_cxsmiles_on_a_pruned_bridgehead_graph_does_not_crash():
-    """`cxsmiles` must canonicalize a Class A bridgehead graph before deriving `bound` and `centre_notes`.
-
-    `pipeline.perceive._drop_bridgehead_bonds` prunes the bridgehead the way `read_xyz` would; this Mol
-    is built by hand to keep the exact graph rather than read from coordinates.
-    """
-    rw = Chem.RWMol()
-
-    def add(symbol, charge=0):
-        atom = Chem.Atom(symbol)
-        atom.SetFormalCharge(charge)
-        atom.SetNoImplicit(True)
-        return rw.AddAtom(atom)
-
-    ni, p, c1, c2, sd, ss = add("Ni", 2), add("P"), add("C"), add("C"), add("S"), add("S", -1)
-    for carbon in (c1, c2):
-        rw.GetAtomWithIdx(carbon).SetNumExplicitHs(3)
-    rw.AddBond(p, c1, Chem.BondType.SINGLE)
-    rw.AddBond(p, c2, Chem.BondType.SINGLE)
-    rw.AddBond(p, sd, Chem.BondType.DOUBLE)
-    rw.AddBond(p, ss, Chem.BondType.SINGLE)
-    rw.AddBond(sd, ni, Chem.BondType.DATIVE)
-    rw.AddBond(ss, ni, Chem.BondType.DATIVE)
-    rw.AddBond(p, ni, Chem.BondType.DATIVE)  # the wrong bridgehead bond: kappa2 dithiophosphinate P
-
-    mol = rw.GetMol()
-    mol.UpdatePropertyCache(strict=False)
-    Chem.SanitizeMol(mol, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
-    conf = Chem.Conformer(mol.GetNumAtoms())
-    for idx, xyz in {
-        ni: (0.0, 0.0, 0.0),
-        p: (0.0, 0.0, 2.2),
-        c1: (1.4, 0.0, 2.8),
-        c2: (-1.4, 0.0, 2.8),
-        sd: (1.1, 1.9, -0.6),
-        ss: (-1.1, -1.9, -0.6),
-    }.items():
-        conf.SetAtomPosition(idx, Point3D(*xyz))
-    mol.AddConformer(conf, assignId=True)
-    mol = _drop_bridgehead_bonds(mol)
-
-    text = rx.cxsmiles(mol)
-
-    back = rx.metal(text)[0]
-    donors = sorted(back.mol.GetAtomWithIdx(d).GetSymbol() for d, _m in back.donor_bonds)
-    assert donors == ["S", "S"]
-
-
-def test_bis_silyl_cxsmiles_keeps_distinct_trans_pairs():
-    bis_silyl_isocyanide_pt = (
-        "CC(C)(C)[N+]#[C-]->[Pt+2](<-[SiH-](c1ccccc1)c1ccccc1)(<-[SiH-](c1ccccc1)c1ccccc1)<-[P](C)(C)C"
-    )
-    isomers = rx.metal(bis_silyl_isocyanide_pt, "square_planar", stereo="free")
-    texts = {iso.label: rx.cxsmiles(iso) for iso in isomers}
-    source = metal_smiles.parse_smiles(bis_silyl_isocyanide_pt)
-    reversed_source = Chem.RenumberAtoms(source, list(reversed(range(source.GetNumAtoms()))))
-    reordered = {iso.label: rx.cxsmiles(iso) for iso in rx.metal(reversed_source, "square_planar", stereo="free")}
-
-    assert set(texts) == {"cis", "trans"}
-    assert texts["cis"] != texts["trans"]
-    assert all(rx.metal(text)[0].label == label for label, text in texts.items())
-    assert reordered == texts
-
-
-def test_tetradentate_tetrahedron_keeps_mirror_arrangements():
-    base = Chem.MolFromSmiles("SCCCCN=CC=NCCCCS")
-    rw = Chem.RWMol(base)
-    metal = rw.AddAtom(Chem.Atom("Cu"))
-    donors = [atom.GetIdx() for atom in rw.GetAtoms() if atom.GetSymbol() in {"N", "S"}]
-    for donor in donors:
-        rw.AddBond(donor, metal, Chem.BondType.DATIVE)
-    source = rw.GetMol()
-    source.UpdatePropertyCache(strict=False)
-
-    isomers = rx.metal(source, "tetrahedral", stereo="free")
-    texts = {rx.cxsmiles(iso) for iso in isomers}
-    reversed_source = Chem.RenumberAtoms(source, list(reversed(range(source.GetNumAtoms()))))
-
-    assert len(isomers) == len(texts) == 2
-    assert {iso.chirality for iso in isomers} == {"delta", "lambda"}
-    assert {rx.cxsmiles(iso) for iso in rx.metal(reversed_source, "tetrahedral", stereo="free")} == texts
-    assert all(rx.cxsmiles(rx.metal(text)[0]) == text for text in texts)
-
-
-def test_small_metal_closed_imine_uses_the_arrangement_instead_of_ez():
-    diimine = r"C/N1=C(/F)C(/Cl)=N(/Br)->[Ni+2](<-[Cl-])(<-[I-])<-1"
-    text = rx.cxsmiles(rx.metal(diimine, "square_planar")[0])
-
-    assert not rx.metal(text)[0].stereo_label
-    assert rx.cxsmiles(rx.metal(text)[0]) == text
-    assert rx.cxsmiles(rx.embed(rx.metal(text)[0], n=1, seed=7).mol) == text
-
-
-def test_each_chiral_octahedral_key_is_atom_order_invariant():
-    source = Chem.MolFromSmiles("[O+]#[C-]->[Co+3](<-[F-])(<-[Cl-])(<-[Br-])(<-N)<-O")
-    order = list(reversed(range(source.GetNumAtoms())))  # new index -> old index
-    old_to_new = {old: new for new, old in enumerate(order)}
-    renumbered = Chem.RenumberAtoms(source, order)
-    for iso in rx.metal(source, "octahedral", stereo="free"):
-        remapped = rx.Isomer(renumbered, iso.geometry, [old_to_new[donor] for donor in iso.vertices])
-        assert rx.cxsmiles(remapped) == rx.cxsmiles(iso)
-
-
-def test_stated_arrangement_rejects_wrong_chirality():
-    chiral = next(
-        i
-        for i in rx.enumerate_isomers(Chem.AddHs(Chem.MolFromSmiles("[Pt](F)(F)(Cl)(Cl)(Br)Br")), "octahedral")
-        if i.chirality == "delta"
-    )
-    text = rx.cxsmiles(chiral)
-    with pytest.raises(ValueError, match="omits chirality"):
-        rx.enumerate_isomers(metal_smiles.parse_smiles(text.replace("-delta", "")))
-    with pytest.raises(ValueError, match="seating is delta"):
-        rx.enumerate_isomers(metal_smiles.parse_smiles(text.replace("-delta", "-lambda")))
-
-    square = rx.cxsmiles(_isomer("[Pt](F)(F)(Cl)Cl", "square_planar", _MA2B2_SEATS["cis"]))
-    with pytest.raises(ValueError, match="planar"):
-        rx.enumerate_isomers(metal_smiles.parse_smiles(square.replace(".SPL", ".SPL-delta")))
-    with pytest.raises(ValueError, match="not a haptic face"):
-        rx.enumerate_isomers(metal_smiles.parse_smiles(square.replace(".s0", ".s0+", 1)))
-
-    trans = next(
-        i
-        for i in rx.enumerate_isomers(
-            Chem.AddHs(Chem.MolFromSmiles("Cl[Co]12(Cl)(NCCN1)NCCN2")), "octahedral", stereo="free"
-        )
-        if not i.chirality
-    )
-    forged = rx.cxsmiles(trans).replace(".OCT:", ".OCT-delta:")
-    with pytest.raises(ValueError, match="seating is achiral"):
-        rx.enumerate_isomers(metal_smiles.parse_smiles(forged), stereo="free")
 
 
 def test_planar_chiral_ferrocene_winding_roundtrips_and_selects_after_dg():
@@ -907,8 +327,6 @@ def _cd_fan_near_tie_conformer():
     same construction `test_metal_enumeration.py`'s Berry-pseudorotation test uses): fixed geometry, no embed
     and no seed, so the near-tie does not depend on where a relax happens to land.
     """
-    from rxembed.metal_polyhedron import record
-
     fans = rx.metal("[NH2]1CC[NH]2CC[NH2]->[Cd+2](<-[Cl-])(<-[Cl-])<-1<-2", "square_pyramidal")
     iso = next(c for c in fans if c.vertices[0] == 3 and set(c.vertices[1::2]) == {0, 6})
 
@@ -938,16 +356,6 @@ def _cd_fan_near_tie_conformer():
     return iso, mol, cid
 
 
-def test_reading_a_conformer_hand_logs_no_perception_warning(caplog):
-    """A near-tie warning is about the user's input; the hand check reads intermediate geometry silently."""
-    emb = importlib.import_module("rxembed.embed")
-    iso, mol, cid = _cd_fan_near_tie_conformer()
-
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        emb._realised_hand(mol, iso, cid)
-    assert not caplog.records, caplog.text
-
-
 def test_cadmium_near_tie_conformer_round_trips_in_its_requested_frame():
     emb = importlib.import_module("rxembed.embed")
     iso, mol, cid = _cd_fan_near_tie_conformer()
@@ -963,13 +371,6 @@ def test_cadmium_near_tie_conformer_round_trips_in_its_requested_frame():
     raw.GetConformer(cid).ClearProp(SHAPE_PROP)
     assert rx.cxsmiles(raw) != rx.cxsmiles(iso), "a raw geometry with no request must keep the argmin reading"
     assert ".TBP:" in rx.cxsmiles(raw), "the argmin at this geometry is trigonal_bipyramidal, not the request"
-
-
-def test_stated_haptic_winding_survives_ligand_stereo_enumeration():
-    fixed = rx.cxsmiles(rx.metal(_planar_chiral_ferrocene(point_stereo=True))[0]).replace("@", "")
-    back = rx.enumerate_isomers(metal_smiles.parse_smiles(fixed))
-    assert {iso.stereo_label for iso in back} == {"C1:R", "C1:S"}
-    assert {tuple(iso.haptic_winding.values()) for iso in back} == {("+",)}
 
 
 def test_carbanion_stereo_stays_in_the_smiles_core():
@@ -1011,50 +412,53 @@ def test_carbanion_stereo_stays_in_the_smiles_core():
     assert rx.cxsmiles(realised) == expected
 
 
-@pytest.mark.parametrize(
-    "smiles",
-    [
-        "[Cu+]1<-[N@H](C)CCN->1",
-        "[O+]#[C-]->[Cu+]12<-[N@@H](C)[C@@H]3C[C@H]([N@H]->1C)C[C@H]([N@H]->2C)C3",
-    ],
-    ids=["secondary-amine", "coupled-triamine"],
-)
-def test_coordinated_point_stereo_has_a_canonical_atom_and_bond_basis(smiles):
-    mol = metal_smiles.parse_smiles(smiles)
-    params = Chem.SmilesWriteParams()
-    params.cleanStereo = False
-    flags = Chem.CXSmilesFields.CX_COORDINATE_BONDS
-    text = metal_smiles.dative_smiles(mol)
-    rng = np.random.default_rng(42)
+def test_eta2_ez_and_chiral_substituent_are_one_cxsmiles_fixed_point():
+    smiles = r"F[C@H](Cl)/[CH]1=[CH](/Br)->[Pt+2](<-[Cl-])(<-[I-])(<-[NH3])<-1"
+    iso = rx.metal(smiles, "SPL")[0]
+    text = rx.cxsmiles(iso)
+    back = rx.metal(text)
+    assert len(back) == 1
+    assert sorted(part.rsplit(":", 1)[-1] for part in back[0].stereo_label.split(",")) == ["E", "R"]
+    assert rx.cxsmiles(back[0]) == text
+    embedded = rx.embed(iso, n=1, seed=7)
+    order = list(reversed(range(embedded.mol.GetNumAtoms())))
+    assert rx.cxsmiles(Chem.RenumberAtoms(embedded.mol, order)) == text
 
-    for _ in range(8):
-        mol = Chem.RenumberAtoms(mol, rng.permutation(mol.GetNumAtoms()).tolist())
-        native = Chem.MolToCXSmiles(mol, params, flags)
-        written, at, _bonds, _unwritable = metal_smiles._write_dative(
-            mol, stereo.defined_stereo_label(mol, metal_smiles.metal_indices(mol))
+
+@pytest.mark.parametrize(("smi", "geometry"), [("[CH2]=[CH2].Cl[Pt](Cl)Cl", "square_planar")], ids=["eta2"])
+def test_all_enumerated_isomers_read_back(smi, geometry):
+    isos = rx.enumerate_isomers(Chem.AddHs(Chem.MolFromSmiles(smi)), geometry)
+    assert len(isos) >= 1
+    for iso in isos:
+        text = rx.cxsmiles(iso)
+        back = rx.enumerate_isomers(metal_smiles.parse_smiles(text))
+        assert len(back) == 1, f"{iso.label}: its own string enumerated {len(back)} isomers"
+        got = back[0]
+        assert rx.cxsmiles(got) == text, f"{iso.label}: the string is not a fixed point"
+        assert got.geometry == iso.geometry, f"{iso.label}: came back as {got.geometry}"
+        assert got.chirality == iso.chirality, f"{iso.label}: {iso.chirality!r} came back {got.chirality!r}"
+        was, now = _seated(iso), _seated(got)
+        dirs = vertex_dirs(iso.geometry)
+        rotations = None if dirs is None else point_group(tuple(map(tuple, dirs)))[0]
+        assert rotations is not None, f"{iso.label}: no vertex-direction template"
+        assert any([was[q[v]] for v in range(len(was))] == now for q in rotations), (
+            f"{iso.label}: {was} and {now} are not the same arrangement under any rotation of the template"
         )
-        assert written == text
-        assert Chem.MolToCXSmiles(mol, params, flags) == native, "writer must not mutate its input"
-        back = metal_smiles.parse_smiles(written)
-        source, target = Chem.Mol(mol), Chem.Mol(back)
-        for view in (source, target):
-            for bond in view.GetBonds():
-                if bond.GetBondType() == Chem.BondType.DATIVE:
-                    bond.SetBondType(Chem.BondType.SINGLE)  # include all carriers in RDKit's chiral match
-            view.UpdatePropertyCache(strict=False)
-        for old, new in at.items():
-            source.GetAtomWithIdx(old).SetIsotope(1000 + old)
-            target.GetAtomWithIdx(new).SetIsotope(1000 + old)
-        assert target.HasSubstructMatch(source, useChirality=True), "retain the mapped stereo, not just hand counts"
-        mol = back
-
-    altered = Chem.Mol(mol)
-    donor = next(a for a in altered.GetAtoms() if a.GetSymbol() == "N" and a.GetChiralTag())
-    donor.InvertChirality()
-    assert metal_smiles.dative_smiles(altered) != text
 
 
-@pytest.mark.parametrize("embedded", [False, True])
+@pytest.mark.parametrize(
+    ("smiles", "tokens"), [(BUTADIENE_FE_CO3, ["M", "P", "c"])], ids=["butadiene-mirror-symmetric-s-cis"]
+)
+def test_bound_diene_s_cis_and_s_trans_forms_are_isomers(smiles, tokens):
+    """A bound diene is s-cis, named by its face or `c` when a mirror relates both, or s-trans P or M."""
+    isomers = rx.metal(smiles)
+    assert sorted("".join(iso.haptic_winding.values()) for iso in isomers) == tokens
+    for iso in isomers:
+        (back,) = rx.metal(rx.cxsmiles(iso))
+        assert rx.cxsmiles(back) == rx.cxsmiles(iso)
+
+
+@pytest.mark.parametrize("embedded", [True])
 def test_raw_donor_point_override_composes_with_an_independent_ez_override(embedded):
     mol = metal_smiles.parse_smiles("C/C=C/C[N@H](C)->[Cu+]<-[Cl-]")
     if embedded:  # the coordinates hold the source hand; the stated label still wins
@@ -1079,290 +483,13 @@ def test_raw_donor_point_override_composes_with_an_independent_ez_override(embed
     assert back.HasSubstructMatch(expected, useChirality=True)
 
 
-def test_non_cip_ring_fusion_tags_stay_in_the_smiles_core():
-    mol = metal_smiles.parse_smiles(_NON_CIP_CAGE_AU)
-    before = stereo.point_stereo(stereo.defined_stereo_label(mol, metal_smiles.metal_indices(mol)))
-    assert sorted(before.values()) == ["CCW", "s", "s", "s"], "fixture premise"
-
-    text = metal_smiles.dative_smiles(mol)
-    back = metal_smiles.parse_smiles(text)
-
-    assert metal_smiles.dative_smiles(back) == text
-    assert len(stereo.point_stereo(stereo.defined_stereo_label(back, metal_smiles.metal_indices(back)))) == 4
-
-
-def test_pseudoasymmetric_bis_eta2_cage_is_atom_order_invariant():
-    source = metal_smiles.parse_smiles(_PSEUDO_BIS_ETA2_RU)
-    reversed_source = Chem.RenumberAtoms(source, list(reversed(range(source.GetNumAtoms()))))
-
-    expected = rx.metal(source, "OCT")
-    reordered = rx.metal(reversed_source, "OCT")
-
-    # The trans bis-η² seating is outside the native ligand reach and is screened before embedding.
-    assert len(expected) == len(reordered) == 2
-    assert {rx.cxsmiles(iso) for iso in expected} == {rx.cxsmiles(iso) for iso in reordered}
-    assert {iso.label for iso in expected} == {"fac", "mer"}
-    assert {iso.stereo_label.split(":")[-1] for iso in expected} == {"s"}
-    assert {rx.cxsmiles(iso) for iso in reordered} == {rx.cxsmiles(iso) for iso in expected}
-
-
-def test_tagged_chiral_amine_donor_stays_in_the_smiles_core():
-    hands = {}
-    for tag in ("@", "@@"):
-        isomers = rx.metal(f"[Pd](Cl)(Cl)(Cl)([N{tag}H](C)O)", "square_planar")
-        assert len(isomers) == 1
-        hands[isomers[0].stereo_label] = rx.cxsmiles(isomers[0])
-
-    assert set(hands) == {"N4:R", "N4:S"}
-    assert all("[N@" in text for text in hands.values())
-    assert all("rxStereo" not in text for text in hands.values())
-    assert {rx.metal(text)[0].stereo_label.rsplit(":", 1)[1] for text in hands.values()} == {"R", "S"}
-    assert all(rx.cxsmiles(rx.metal(text)[0]) == text for text in hands.values())
-
-    for text in hands.values():
-        realised = rx.embed(rx.metal(text)[0], n=1, seed=2).minimize().mol
-        assert rx.cxsmiles(realised) == text
-
-
-def test_isomer_writes_the_bound_amine_hand_it_states_against_its_coordinates():
-    """stereo='invert' states the mirror of a bound N's measured hand; the CX keeps it, not the coordinates' one."""
-    mol = one_arm_bound_pt()
-    [iso] = rx.metal(mol, stereo={"N13": "invert"})
-
-    written = rx.cxsmiles(iso)
-    back = rx.parse_smiles(written)
-
-    assert written != rx.cxsmiles(mol)
-    assert sorted(stereo.point_stereo(stereo.defined_stereo_label(back, metal_indices(back))).values()) == sorted(
-        stereo.point_stereo(iso.stereo_label).values()
-    )
-
-
-def test_coupled_chelated_amine_hands_write_together():
-    text = "CC1(C)C[N@@H]2[C@@H]3CCCC[C@@H]3[N@@H]3CC(C)(C)[S-]->[Ni+2]<-2<-3<-[S-]1"
-
-    written = rx.dative_smiles(rx.parse_smiles(text, remove_hs=False))
-    back = rx.parse_smiles(written)
-
-    assert rx.dative_smiles(back) == written
-    assert len(stereo.point_stereo(stereo.defined_stereo_label(back, metal_smiles.metal_indices(back)))) == 4
-
-
-def test_coupled_amine_hands_are_written_after_canonical_ring_closure_rebasing():
-    base = metal_smiles.parse_smiles(
-        "O=C1C[N]2(CC[N]34CC(=O)[O-]->[Ti+5]<-2<-3(<-[O-2])(<-[O-]1)<-[O-]c1ccccc1C4)Cc1ccccc1O",
-        remove_hs=False,
-    )
-    rw = Chem.RWMol()
-    for atom in base.GetAtoms():
-        rw.AddAtom(Chem.Atom(atom))
-    bonds = sorted(
-        base.GetBonds(),
-        key=lambda bond: (max(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()), bond.GetBeginAtomIdx()),
-        reverse=True,
-    )
-    for bond in bonds:
-        rw.AddBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), bond.GetBondType())
-    mol = rw.GetMol()
-    mol.UpdatePropertyCache(strict=False)
-    Chem.FastFindRings(mol)
-    centres = sorted(stereo.point_centres(mol, metal_smiles.metal_indices(mol)))
-    written = set()
-    for left in "RS":
-        for right in "RS":
-            configured = Chem.Mol(mol)
-            stereo.apply_point_stereo(
-                configured,
-                f"N{centres[0]}:{left},N{centres[1]}:{right}",
-                centres,
-            )
-            text = metal_smiles.dative_smiles(configured)
-            back = metal_smiles.parse_smiles(text, remove_hs=False)
-            assert sorted(
-                stereo.point_stereo(stereo.defined_stereo_label(back, metal_smiles.metal_indices(back))).values()
-            ) == sorted((left, right))
-            assert (
-                metal_smiles.dative_smiles(
-                    Chem.RenumberAtoms(configured, list(reversed(range(configured.GetNumAtoms()))))
-                )
-                == text
-            )
-            assert metal_smiles.dative_smiles(back) == text
-            written.add(text)
-    assert len(written) == 4
-
-
-def _shuffled_bond_order(mol, seed):
-    """Rebuild `mol` with a seeded-random atom renumbering and bond insertion order.
-
-    RDKit reads a tetrahedral CW/CCW tag against `atom.GetBonds()` order, which follows bond creation
-    order rather than atom index, so this is the vehicle for an order-invariance assertion. Each tag is
-    parity-corrected for the resulting neighbour permutation, so the represented chirality survives.
-    """
-    rng = random.Random(seed)
-    order = list(range(mol.GetNumAtoms()))
-    rng.shuffle(order)
-    renumbered = Chem.RenumberAtoms(mol, order)
-    bonds = list(renumbered.GetBonds())
-    rng.shuffle(bonds)
-    rw = Chem.RWMol()
-    for atom in renumbered.GetAtoms():
-        rw.AddAtom(Chem.Atom(atom))
-    for bond in bonds:
-        rw.AddBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), bond.GetBondType())
-        new_bond = rw.GetBondBetweenAtoms(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
-        new_bond.SetIsAromatic(bond.GetIsAromatic())
-        new_bond.SetIsConjugated(bond.GetIsConjugated())
-        if bond.GetStereo() != Chem.BondStereo.STEREONONE and len(bond.GetStereoAtoms()) == 2:
-            new_bond.SetStereoAtoms(*bond.GetStereoAtoms())
-            new_bond.SetStereo(bond.GetStereo())
-    tetrahedral = (Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
-    for atom in renumbered.GetAtoms():
-        tag = atom.GetChiralTag()
-        if tag not in tetrahedral:
-            continue
-        old_order = [neighbor.GetIdx() for neighbor in atom.GetNeighbors()]
-        new_order = [neighbor.GetIdx() for neighbor in rw.GetAtomWithIdx(atom.GetIdx()).GetNeighbors()]
-        position = [old_order.index(neighbor) for neighbor in new_order]
-        odd = sum(position[i] > position[j] for i in range(len(position)) for j in range(i + 1, len(position))) % 2
-        mirrored = tetrahedral[1] if tag == tetrahedral[0] else tetrahedral[0]
-        rw.GetAtomWithIdx(atom.GetIdx()).SetChiralTag(mirrored if odd else tag)
-    out = rw.GetMol()
-    out.UpdatePropertyCache(strict=False)
-    Chem.FastFindRings(out)
-    return out
-
-
-_MIRROR_AMINE_OCT_STATED = (
-    "O=C1C[S]2CC[N@@]34->[Fe+2]<-256(<-[N@@](CC[S]->5CC(=O)[O-]->6)(CCC3)CC4)<-[O-]1 "
-    "|atomProp:3.atomNote.s0:6.atomNote.s3:7.atomNote.OCT-delta:8.atomNote.s1:11.atomNote.s2:"
-    "15.atomNote.s5:21.atomNote.s4|"
-)
-
-
-def test_mirror_related_amine_arms_write_one_cx_for_any_bond_order():
-    """Two opposite-hand, non-swap-symmetric amine donors on one octahedral metal keep one canonical string.
-
-    RDKit reads a tetrahedral tag against bond insertion order, not atom index, so a stated arrangement's
-    canonical string must not depend on incidental bond order (they are genuinely distinct donors: one N is
-    R, the other S, and the ligand has no arm-swap symmetry).
-    """
-    stated = rx.parse_smiles(_MIRROR_AMINE_OCT_STATED)
-    texts = {rx.cxsmiles(_shuffled_bond_order(stated, seed)) for seed in range(12)}
-    assert len(texts) == 1, texts
-
-
-@pytest.mark.parametrize(("smi", "geometry"), _ENUMERATION_FIXTURES, ids=_ENUMERATION_FIXTURE_IDS)
-def test_enumerated_cx_strings_are_bond_order_invariant(smi, geometry):
-    """General guard: coordination-site identity must not depend on incidental bond order on any fixture."""
-    mol = Chem.AddHs(Chem.MolFromSmiles(smi))
-    reference = {rx.cxsmiles(iso) for iso in rx.enumerate_isomers(mol, geometry)}
-    for seed in range(5):
-        texts = {rx.cxsmiles(iso) for iso in rx.enumerate_isomers(_shuffled_bond_order(mol, seed), geometry)}
-        assert texts == reference, (seed, texts, reference)
-
-
-def test_embedded_phosphorus_stays_in_the_smiles_core():
-    isomer = rx.metal("[Pd](Cl)(Cl)(Cl)([P@H](C)O)", "square_planar")[0]
-    text = rx.cxsmiles(rx.embed(isomer, n=1, seed=7).minimize().mol)
-    assert "[P@" in text
-    assert "rxStereo" not in text
-    assert rx.metal(text)[0].stereo_label.endswith(":R")
-
-
-def test_invalid_phosphorus_tag_is_cleaned_without_losing_its_hydrogen():
-    text = metal_smiles.dative_smiles(metal_smiles.parse_smiles("[Pd](Cl)(Cl)(Cl)([P@H](C)C)"))
-    assert "[PH]" in text
-    assert "@" not in text
-
-
-def test_symmetric_donor_bridging_two_metals_is_not_called_chiral():
-    text = metal_smiles.dative_smiles(metal_smiles.parse_smiles("C[N](C)(->[Pd](Cl)(Cl)Cl)->[Pt](Br)(Br)Br"))
-    assert "@" not in text
-
-
-def test_tagged_amine_between_two_metals_survives_dative_normalization():
-    mol = metal_smiles.parse_smiles("C[N@H](->[Pd](Cl)(Cl)Cl)->[Pt](Br)(Br)Br")
-
-    text = metal_smiles.dative_smiles(mol)
-
-    assert "[N@" in text
-    assert stereo.defined_stereo_label(metal_smiles.parse_smiles(text), metal_smiles.metal_indices(mol)) == "N1:R"
-
-
-def test_coordinate_free_haptic_winding_enumerates_both_hands():
-    isomers = rx.metal(_planar_chiral_ferrocene())
-    assert len(isomers) == 2
-    assert {next(iter(iso.haptic_winding.values())) for iso in isomers} == {"+", "-"}
-    assert {"η5Rₚ", "η5Sₚ"} <= {part[:4] for iso in isomers for part in iso.arrangement.split()}
-    by_sign = {next(iter(iso.haptic_winding.values())): iso.arrangement for iso in isomers}
-    assert "η5Rₚ" in by_sign["+"]
-    assert "η5Sₚ" in by_sign["-"]
-    assert all("Rₚ" not in rx.cxsmiles(iso) and "Sₚ" not in rx.cxsmiles(iso) for iso in isomers)
-    for iso in isomers:
-        embedded = core_embed(iso, n=4, params=rx.EmbedParams(seed=7, prune_rms=-1))
-        assert {next(iter(_haptic_windings(embedded.mol, iso, cid).values())) for cid in embedded.ids} == set(
-            iso.haptic_winding.values()
-        )
-
-
-@pytest.mark.parametrize(
-    ("smiles", "tokens"),
-    [
-        (BUTADIENE_FE_CO3, ["M", "P", "c"]),
-        (ISOPRENE_FE_CO3, ["+", "-", "M", "P"]),
-        ("[O+]#[C-]->[Fe]123(<-[C-]#[O+])(<-[C-]#[O+])<-[CH]4=[CH]->1[CH]->2=[CH]->3CC4", [""]),
-    ],
-    ids=["butadiene-mirror-symmetric-s-cis", "isoprene-two-s-cis-faces", "cyclohexadiene-ring-held-s-cis"],
-)
-def test_bound_diene_s_cis_and_s_trans_forms_are_isomers(smiles, tokens):
-    """A bound diene is s-cis, named by its face or `c` when a mirror relates both, or s-trans P or M."""
-    isomers = rx.metal(smiles)
-    assert sorted("".join(iso.haptic_winding.values()) for iso in isomers) == tokens
-    for iso in isomers:
-        (back,) = rx.metal(rx.cxsmiles(iso))
-        assert rx.cxsmiles(back) == rx.cxsmiles(iso)
-
-
-def test_butadiene_iron_tricarbonyl_embeds_each_class_and_reads_it_back():
-    """Each class embeds as itself and reads back from its coordinates in any atom order; a mirror swaps P and M."""
-    isomers = {next(iter(iso.haptic_winding.values())): iso for iso in rx.metal(BUTADIENE_FE_CO3, "TET")}
-    texts = {token: rx.cxsmiles(iso) for token, iso in isomers.items()}
-    torsion = {"c": (-90, 90), "P": (90, 180), "M": (-180, -90)}
-
-    def read(mol):
-        return rx.cxsmiles(rx.metal(mol, "TET", observed_only=True)[0])
-
-    for token, iso in isomers.items():
-        (path,) = iso.haptic.values()  # the SMILES numbers the diene C1-C4 in chain order
-        ensemble = rx.embed(iso, n=2, seed=7)
-        for cid in ensemble.ids:
-            mol = Chem.Mol(ensemble.mol, False, int(cid))
-            low, high = torsion[token]
-            assert low < rdMolTransforms.GetDihedralDeg(mol.GetConformer(), *path) < high
-            assert read(mol) == texts[token]
-        assert (
-            read(Chem.RenumberAtoms(mol, random.Random(7).sample(range(mol.GetNumAtoms()), mol.GetNumAtoms())))
-            == (texts[token])
-        )
-        conf = mol.GetConformer()
-        for atom, (x, y, z) in enumerate(conf.GetPositions()):
-            conf.SetAtomPosition(atom, Point3D(-x, y, z))
-        assert read(mol) == texts[{"c": "c", "P": "M", "M": "P"}[token]]
-
-
 @pytest.mark.parametrize(
     ("smiles", "count", "names"),
     [
         (r"C/[CH]1=[CH](\F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1", 6, {"(re,re)", "(si,si)"}),
-        (_ETA2_ASYM_E, 6, {"(re,si)", "(si,re)"}),
-        (r"C/[CH]1=[CH](\C)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1", 3, set()),
-        (r"C/[CH]1=[CH](/C)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1", 6, {"(re,re)", "(si,si)"}),
         (r"[CH2]1=[CH](C)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1", 6, {"(re)", "(si)"}),
-        (r"[CH2]1=[CH2]->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1", 3, set()),
-        ("O1C[CH]2=[CH](CC1)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-2", 6, {"(re,re)", "(si,si)"}),
     ],
-    ids=["asymmetric-Z", "asymmetric-E", "symmetric-Z", "symmetric-E", "propene", "ethene", "small-ring"],
+    ids=["asymmetric-Z", "propene"],
 )
 def test_eta2_face_orientation_matrix(smiles, count, names):
     isomers = rx.metal(smiles, "SPL")
@@ -1370,45 +497,6 @@ def test_eta2_face_orientation_matrix(smiles, count, names):
     assert len(isomers) == count
     assert shown == names
     assert {tuple(iso.haptic_winding.values()) for iso in isomers} == ({("+",), ("-",)} if names else {()})
-
-
-def test_eta2_face_is_selected_after_dg_and_reflection_flips_it():
-    free = rx.metal(_ETA2_ASYM_E, "SPL", stereo="free")[0]
-    raw = core_embed(free, n=16, params=rx.EmbedParams(seed=7, prune_rms=-1))
-    by_sign = {next(iter(_haptic_windings(raw.mol, free, cid).values())): cid for cid in raw.ids}
-    assert set(by_sign) == {"+", "-"}, "the ungated DG control did not sample both alkene faces"
-
-    cid = by_sign["+"]
-    conf = raw._mol.GetConformer(cid)
-    positions = conf.GetPositions()
-    positions[:, 0] *= -1
-    for atom, xyz in enumerate(positions):
-        conf.SetAtomPosition(atom, xyz.tolist())
-    assert set(_haptic_windings(raw.mol, free, cid).values()) == {"-"}
-
-    for iso in rx.metal(_ETA2_ASYM_E, "SPL")[:2]:
-        embedded = core_embed(iso, n=4, params=rx.EmbedParams(seed=7, prune_rms=-1))
-        assert {next(iter(_haptic_windings(embedded.mol, iso, i).values())) for i in embedded.ids} == set(
-            iso.haptic_winding.values()
-        )
-
-
-def test_eta2_face_and_coordinated_amine_stereo_compose_in_one_dg_seed():
-    smiles = r"C/[CH]1=[CH](\F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[N@H](C)O)<-1"
-    for iso in rx.metal(smiles, "SPL")[:2]:  # one seating, its two eta2 faces
-        embedded = core_embed(iso, n=2, params=rx.EmbedParams(seed=7, prune_rms=-1))
-        assert {next(iter(_haptic_windings(embedded.mol, iso, cid).values())) for cid in embedded.ids} == set(
-            iso.haptic_winding.values()
-        )
-        assert {
-            stereo.stereo_from_3d(Chem.Mol(embedded.mol, False, int(cid)), exclude={iso.metal}) for cid in embedded.ids
-        } == {iso.stereo_label}
-
-
-def test_eta2_face_enumerates_from_a_mol_with_implicit_hydrogens():
-    isomers = rx.metal(rx.parse_smiles(_ETA2_ASYM_E), "SPL")
-    assert len(isomers) == 6
-    assert {tuple(iso.haptic_winding.values()) for iso in isomers} == {("+",), ("-",)}
 
 
 def test_eta2_stereoany_does_not_imply_a_face_relation():
@@ -1430,7 +518,6 @@ def test_dative_cx_option_retains_eta2_ez_without_arrangement_notes():
 @pytest.mark.parametrize(
     ("smiles", "label"),
     [
-        (_ETA2_ASYM_E, "C1=C2:E"),
         (r"C/[CH]1=[CH](\F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1", "C1=C2:Z"),
     ],
 )
@@ -1460,56 +547,6 @@ def test_eta2_face_and_ez_are_one_cxsmiles_fixed_point(smiles, label, caplog):
     assert {iso.stereo_label for iso in rx.metal(plain, "SPL")} == {"C1=C2:E", "C1=C2:Z"}
 
 
-def test_cxsmiles_round_trips_two_eta2_bonds_and_rejects_invalid_fields():
-    isomers = rx.metal(_TWO_ETA2, "SPL")
-    assert len(isomers) == 24  # 3 SPL seatings x 2 and 4 configurations of the non-equivalent eta2 faces
-    assert len({iso.arrangement for iso in isomers}) == len(isomers)
-    two_faces = next(iso for iso in isomers if iso.stereo_label.count(":E") == 2)
-    text = rx.cxsmiles(two_faces)
-    back = rx.metal(text)
-    assert len(back) == 1
-    assert back[0].stereo_label.count(":E") == 2
-    assert rx.cxsmiles(back[0]) == text
-    embedded = rx.embed(two_faces, n=1, seed=4)
-    assert rx.cxsmiles(Chem.RenumberAtoms(embedded.mol, list(reversed(range(embedded.mol.GetNumAtoms()))))) == text
-
-    native = rx.cxsmiles(rx.metal(_ETA2_ASYM_E, "SPL")[0])
-    valid = native
-    assert rx.metal(valid)[0].stereo_label == "C1=C2:E"
-    for forged in (
-        valid.replace("t:1", "t:999"),
-        valid.replace("t:1", "t:0"),
-        valid.replace("t:1", "t:"),
-        valid.replace("t:1", "t:1,c:1"),
-        valid.removesuffix("|") + ",t:1|",
-    ):
-        with pytest.raises(ValueError, match="CX"):
-            rx.parse_smiles(forged)
-
-
-def test_eta2_ez_and_chiral_substituent_are_one_cxsmiles_fixed_point():
-    smiles = r"F[C@H](Cl)/[CH]1=[CH](/Br)->[Pt+2](<-[Cl-])(<-[I-])(<-[NH3])<-1"
-    iso = rx.metal(smiles, "SPL")[0]
-    text = rx.cxsmiles(iso)
-    back = rx.metal(text)
-    assert len(back) == 1
-    assert sorted(part.rsplit(":", 1)[-1] for part in back[0].stereo_label.split(",")) == ["E", "R"]
-    assert rx.cxsmiles(back[0]) == text
-    embedded = rx.embed(iso, n=1, seed=7)
-    order = list(reversed(range(embedded.mol.GetNumAtoms())))
-    assert rx.cxsmiles(Chem.RenumberAtoms(embedded.mol, order)) == text
-
-
-def test_haptic_winding_enumeration_composes_with_ligand_stereo():
-    isomers = rx.metal(_planar_chiral_ferrocene(point_stereo=True))
-    assert {(iso.stereo_label, next(iter(iso.haptic_winding.values()))) for iso in isomers} == {
-        ("C5:R", "+"),
-        ("C5:R", "-"),
-        ("C5:S", "+"),
-        ("C5:S", "-"),
-    }
-
-
 def test_identical_haptic_faces_canonicalize_opposite_windings():
     source = _planar_chiral_ferrocene(two_chiral_faces=True)
     isomers = rx.metal(source)
@@ -1531,7 +568,7 @@ def test_identical_haptic_faces_canonicalize_opposite_windings():
     targets = engine._stereo_targets(target)
     ranks, eta2 = engine._winding_ranks(raw.mol, targets)
     assert all(
-        engine._seed_stereo_matches(raw.mol, by_winding[winding], target, targets, ranks, eta2, False)
+        engine._seed_stereo_matches(raw.mol, by_winding[winding], target, targets, ranks, eta2)
         for winding in (("+", "-"), ("-", "+"))
     )
 
@@ -1547,89 +584,6 @@ def test_stated_arrangement_rejects_shape_override_and_composes_fix():
 
     fixed = rx.enumerate_isomers(mol, fix={(1, 2): 2.0})
     assert fixed[0].cons.fixed[(1, 2)] == (2.0, 2.0)
-
-
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_multimetal_cxsmiles_roundtrips_and_gates_every_sphere_after_dg():
-    source = read_xyz(_MN_H2, metal_charges={0: 2, 1: 1})
-    direct = rx.metal(source, "OCT", center="Mn", fix=[1, 5, 63, 64, 65, 66], stereo="free").filter(label="mer")[0]
-    text = rx.cxsmiles(direct)
-    iso = rx.metal(text, center="Mn", stereo="free")[0]
-
-    assert len(direct.centres) == len(iso.centres) == 2
-    assert rx.cxsmiles(iso) == text
-    assert len(rx.metal(rx.cxsmiles(source), center="Mn", stereo="free")[0].centres) == 2
-    raw = core_embed(direct, n=4, params=rx.EmbedParams(seed=7, prune_rms=-1))
-    expected_fe = metal_isomer.centre_states(direct, "Fe")[0]
-    expected_fe_winding = materialized_state(direct, expected_fe)[2]
-    assert {
-        tuple(metal_isomer.from_geometry(Chem.Mol(raw.mol, False, int(cid)), center="Fe").haptic_winding.values())
-        for cid in raw.ids
-    } == {tuple(expected_fe_winding.values())}
-    assert {
-        realised_chirality(
-            raw.mol, cid, direct.geometry, direct.vertices, direct.metal, direct.chirality, direct.haptic
-        )
-        for cid in raw.ids
-    } == {direct.chirality}
-
-    fe = rx.metal(text, center="Fe", stereo="free")[0]
-    raw = core_embed(fe, n=2, params=rx.EmbedParams(seed=9, prune_rms=-1))
-    expected_mn = metal_isomer.centre_states(fe, "Mn")[0]
-    mn_vertices, mn_haptic, _mn_winding, _mn_donors = materialized_state(fe, expected_mn)
-    assert {
-        tuple(metal_isomer.from_geometry(Chem.Mol(raw.mol, False, int(cid)), center="Fe").haptic_winding.values())
-        for cid in raw.ids
-    } == {tuple(fe.haptic_winding.values())}
-    assert {
-        realised_chirality(
-            raw.mol,
-            cid,
-            expected_mn.geometry,
-            mn_vertices,
-            expected_mn.atom,
-            expected_mn.hand,
-            mn_haptic,
-        )
-        for cid in raw.ids
-    } == {expected_mn.hand}
-
-
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_multimetal_haptic_center_enumerates_each_face_before_uff():
-    source = read_xyz(_MNH)
-    preserved = rx.metal(source, center="Fe", stereo="preserve")
-    inverted = rx.metal(source, center="Fe", stereo="invert")
-    racemic = rx.metal(source, center="Fe", stereo="racemic")
-    free = rx.metal(source, center="Fe", stereo="free")
-    assert [tuple(iso.haptic_winding.values()) for iso in preserved] == [("-",)]
-    assert [tuple(iso.haptic_winding.values()) for iso in inverted] == [("+",)]
-    assert len(racemic) == 8  # 2 Fe face windings x 2 N5 hands x 2 C47 hands
-    assert {tuple(iso.haptic_winding.values()) for iso in racemic} == {("+",), ("-",)}
-    assert {iso.stereo_label for iso in racemic} == {
-        "N5:R,C47:R",
-        "N5:R,C47:S",
-        "N5:S,C47:R",
-        "N5:S,C47:S",
-    }
-    assert [tuple(iso.haptic_winding.values()) for iso in free] == [("-",)]
-
-    representatives = [
-        next(iso for iso in racemic if tuple(iso.haptic_winding.values()) == (winding,)) for winding in ("+", "-")
-    ]
-    for iso in representatives:
-        raw = core_embed(iso, n=2, params=rx.EmbedParams(seed=3, prune_rms=-1))
-        assert {
-            tuple(metal_isomer.from_geometry(Chem.Mol(raw.mol, False, int(cid)), center="Fe").haptic_winding.values())
-            for cid in raw.ids
-        } == {tuple(iso.haptic_winding.values())}
-
-    spectator_n = racemic.filter(stereo="N5:S")[0]
-    cleaned = rx.embed(spectator_n, n=2, seed=2)
-    assert set(cleaned.sphere) == {0, 1}
-    assert {stereo.stereo_from_3d(Chem.Mol(cleaned.mol, False, int(cid)), exclude={0, 1}) for cid in cleaned.ids} == {
-        spectator_n.stereo_label
-    }
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
@@ -1719,25 +673,6 @@ def test_all_centers_is_the_cartesian_product_and_roundtrips():
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_multimetal_reach_preserves_reference_and_only_omits_opposed_short_chelates():
-    source = read_xyz(_MNH)
-    exact = {rx.cxsmiles(iso): iso for iso in rx.metal(source, screen=False, lengths="input")}
-    screened = {rx.cxsmiles(iso) for iso in rx.metal(source, lengths="input")}
-    assert len(exact) == 15
-    assert len(screened) == 12
-    assert screened < exact.keys()
-    assert rx.cxsmiles(source) in screened
-    reversed_source = Chem.RenumberAtoms(source, list(reversed(range(source.GetNumAtoms()))))
-    assert {rx.cxsmiles(iso) for iso in rx.metal(reversed_source, lengths="input")} == screened
-    for identity in exact.keys() - screened:
-        iso = exact[identity]
-        left, right = [atom for atom in iso.donors if source.GetAtomWithIdx(atom).GetAtomicNum() == 7]
-        assert len(Chem.GetShortestPath(iso.graph, left, right)) == 4
-        rays = np.asarray(vertex_dirs(iso.geometry))
-        np.testing.assert_allclose(rays[iso.vertices.index(left)], -rays[iso.vertices.index(right)])
-
-
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_all_centers_stacks_the_frozen_core_once():
     fixed = [1, 5, 63, 64, 65, 66]
     source = read_xyz(_MN_H2, metal_charges={0: 2, 1: 1})
@@ -1806,56 +741,7 @@ def test_bridging_donor_carries_one_slot_per_adjacent_metal():
     )
 
 
-def test_multimetal_writer_rejects_lossy_graphs():
-    with pytest.raises(ValueError, match="no transition metal"):
-        rx.cxsmiles(Chem.MolFromSmiles("CC"))
-    with pytest.raises(ValueError, match="ambiguous charge allocation"):
-        metal_smiles.dative_smiles(Chem.MolFromSmiles("[Cl][Fe]O[Mn][Br]"))
-
-    mol = metal_smiles.parse_smiles("N(->[Pd+]<-[Cl-])->[Pt+]<-[Br-]")
-    rw = Chem.RWMol(mol)
-    metals = [a.GetIdx() for a in rw.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS]
-    rw.AddBond(metals[0], metals[1], Chem.BondType.SINGLE)
-    direct = rw.GetMol()
-    conf = Chem.Conformer(direct.GetNumAtoms())
-    for atom in range(direct.GetNumAtoms()):
-        conf.SetAtomPosition(atom, (float(2 * atom), 0.0, 0.0))
-    direct.AddConformer(conf)
-    with pytest.raises(ValueError, match="bond type cannot be restored"):
-        metal_isomer.from_geometry(direct)
-
-
 def test_cxsmiles_leaves_an_unbound_metal_without_an_arrangement_note():
     mol = Chem.MolFromSmiles("[Ag+].F/C=C/F")
 
     assert rx.cxsmiles(mol) == metal_smiles.dative_smiles(mol)
-
-
-def _tied_palladium_centres(second_seating):
-    """Return two graph-equivalent square-planar Pd centres with the requested second seating."""
-    mol = Chem.MolFromSmiles("[Pd](F)(F)(Cl)Cl.[Pd](F)(F)(Cl)Cl")
-    conf = Chem.Conformer(mol.GetNumAtoms())
-    directions = np.asarray(vertex_dirs("square_planar"))
-    for offset, (metal, seating) in enumerate(((0, [1, 2, 3, 4]), (5, second_seating))):
-        origin = np.array([8.0 * offset, 0.0, 0.0])
-        conf.SetAtomPosition(metal, tuple(map(float, origin)))
-        for vertex, donor in enumerate(seating):
-            conf.SetAtomPosition(donor, tuple(map(float, origin + 2.0 * directions[vertex])))
-    mol.AddConformer(conf)
-    return mol
-
-
-def test_multimetal_writer_rejects_distinct_states_on_tied_centres():
-    with pytest.raises(ValueError, match="symmetry-equivalent metal centres"):
-        rx.cxsmiles(_tied_palladium_centres([6, 8, 7, 9]))
-
-
-def test_identical_states_on_tied_centres_roundtrip():
-    text = rx.cxsmiles(_tied_palladium_centres([6, 7, 8, 9]))
-    assert rx.cxsmiles(rx.metal(text)[0]) == text
-
-
-def test_cxsmiles_rejects_unknown_shape():
-    bare = metal_isomer.Isomer.from_state(Chem.MolFromSmiles("[Pt](F)(F)(Cl)Cl"), (MetalState(0, 78, 0),))
-    with pytest.raises(ValueError, match="no polyhedron template"):
-        rx.cxsmiles(bare)

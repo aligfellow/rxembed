@@ -190,9 +190,7 @@ def stripped_hybridisation(mol, bound=None) -> dict[int, Chem.HybridizationType]
     return out
 
 
-def donation_axis(
-    mol, d, all_donors, sphere=None, *, hyb=None, network=True, metals=1, stripped=None
-) -> list[int] | None:
+def donation_axis(mol, d, all_donors, sphere=None, *, hyb=None, metals=1, stripped=None) -> list[int] | None:
     """Return donor `d`'s judgeable heavy substituents X, or `None` when it donates along no axis.
 
     Four donors have no M-D-X axis to judge: an H donor (hydride, sigma-complex, agostic) has no lone pair; a
@@ -200,17 +198,16 @@ def donation_axis(
     co-donor donates a face, sitting ~70 deg off any M-D-X axis regardless of that pair's bond order; a
     nonterminal sp atom has two opposing substituents, so neither can face away from the metal.
 
-    Both the coordinate-space ruler (`_donor_walk`) and the enumeration screen share this abstention list. An
-    empty list means every substituent is itself exempt (a co-donor, a kappa2 bite bridgehead, a proton, or a
-    metal): "ask, but nothing to measure", distinct from `None` meaning "do not ask". Freeze ownership is
-    applied later, over the complete M-D-X term, not here.
+    The coordinate-space ruler (`_donor_walk`) shares this abstention list. An empty list means every
+    substituent is itself exempt (a co-donor, a kappa2 bite bridgehead, a proton, or a metal): "ask, but
+    nothing to measure", distinct from `None` meaning "do not ask". Freeze ownership is applied later, over the
+    complete M-D-X term, not here.
 
     `sphere` is this metal's own donors, for the bite-bridgehead test, and defaults to `all_donors`. `metals` is
     how many metals the caller declares `d` bound to, read instead of graph bonds so a stripped and a bonded
-    graph agree. `network` drops a backbone arm (R_pair) whose co-donor is calibrated and has fewer than 3 heavy
-    substituents, so it holds the arm itself, unless `d` qualifies the same way, since a ring of two small
-    donors must keep one walled arm. Enumeration disables it for its conservative outer-bound screen.
-    `stripped` reuses an already-built `ligand_graph`.
+    graph agree. A backbone arm (R_pair) whose co-donor is calibrated and has fewer than 3 heavy substituents is
+    dropped, so that co-donor holds the arm itself, unless `d` qualifies the same way, since a ring of two small
+    donors must keep one walled arm. `stripped` reuses an already-built `ligand_graph`.
     """
     a = mol.GetAtomWithIdx(d)
     if a.GetAtomicNum() == 1:  # hydride / η²-H₂ / agostic H: no lone pair, so no donation axis
@@ -223,7 +220,7 @@ def donation_axis(
     hyb = stripped_hybridisation(mol) if hyb is None else hyb
     if hyb.get(d) == _SP and ligand_degree(a) != 1:
         return None
-    backbone = _backbone_targets(mol, d, sphere, stripped=stripped) if network else {}
+    backbone = _backbone_targets(mol, d, sphere, stripped=stripped)
     d_class = (mol.GetAtomWithIdx(d).GetSymbol(), hyb.get(d))
     return [
         nb.GetIdx()

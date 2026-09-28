@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import builtins
 
+import numpy as np
 import pytest
 
 from rxembed.pipeline.select import cluster_on
 
 
 def test_message_names_the_operation_and_what_pip_installs(monkeypatch):
-    import numpy as np
-
     real = builtins.__import__
 
     def blocked(name, *args, **kwargs):

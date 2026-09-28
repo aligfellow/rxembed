@@ -315,7 +315,7 @@ def _stereo_variants(source, stereo):
     return variants, True
 
 
-def _resolve_template(template, fix, own=None, target=None):
+def _resolve_template(template, fix, target):
     """Fold ``template=`` into a coordinate ``fix``, extending the core resolver with the pipeline's `Ensemble`.
 
     The core takes a Mol, an ``.xyz`` path or an (N, 3) array; this adds an `Ensemble`, handing over the
@@ -323,8 +323,8 @@ def _resolve_template(template, fix, own=None, target=None):
     an xyz or coordinate array uses an explicit index map. The template is read for coordinates and never
     perceived, which lets a hypervalent reacting core serve as a reference.
 
-    ``own`` is the source's own coordinates, which a ``fix=[atoms]`` list beside the template is resolved
-    against; the caller must read them from the *normalised* source.
+    ``target`` is the *normalised* source, whose own conformer resolves a ``fix=[atoms]`` list beside the
+    template.
     """
     if isinstance(template, (tuple, list)) and len(template) == 2:  # noqa: PLR2004  template=(reference, mapping)
         reference, mapping = template
@@ -340,7 +340,7 @@ def _resolve_template(template, fix, own=None, target=None):
             reference.RemoveAllConformers()
             reference.AddConformer(chosen, assignId=False)
             template = (reference, mapping)
-    return template_to_fix(template, fix, own, target)
+    return template_to_fix(template, fix, target)
 
 
 def enumerate_isomers(
@@ -571,10 +571,8 @@ def embed(
     metal_enumeration.validate_stereo(stereo)
     if not isinstance(source, Isomer):
         source = _normalize(source, charge)[0]
-    own_mol = source.mol if isinstance(source, Isomer) else source
     if template is not None:
-        own = own_mol.GetConformer().GetPositions() if own_mol.GetNumConformers() else None
-        fix = _resolve_template(template, fix, own, own_mol)
+        fix = _resolve_template(template, fix, source.mol if isinstance(source, Isomer) else source)
     variants, expanded = _stereo_variants(source, stereo)
     groups, force_set = [], False
     execute_kw = {"constrain": constrain, "n": n, "params": params}
@@ -655,7 +653,7 @@ def minimize(
         )
     if template is not None:  # `template` resolves exactly as it does in `embed`: a reference core becomes a fix
         # after the normalise above, so a `fix=[atoms]` list resolves against the geometry just read
-        fix = _resolve_template(template, fix, mol.GetConformer().GetPositions(), mol)
+        fix = _resolve_template(template, fix, mol)
     # The surrogate / sphere-hold / graft assembly is the core's (`rxembed.embed.minimize` is the same call
     # with a `Conformers` result); this only wraps it as an `Ensemble` so the pipeline verbs chain off it.
     mol, ids, cons, iso = prepare_relax(spec, fix=fix, constrain=constrain)

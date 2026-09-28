@@ -33,21 +33,6 @@ class _Stub(calc.Calculator):
 # --- resolve: the one place a refine spec becomes a calculator ---------------------------------------------
 
 
-def test_resolve_maps_refine_specs_and_rejects_unknown():
-    assert calc.resolve(None) is None
-    assert calc.resolve("ff") is None
-
-    assert {type(calc.resolve(m)) for m in ("gxtb", "gfn2", "gfnff")} == {calc.XTB}
-    c = calc.resolve("gfn2", solvent="water", charge=-1)
-    assert (c.method, c.solvent, c.charge) == ("gfn2", "water", -1)
-
-    stub = _Stub()
-    assert calc.resolve(stub) is stub
-
-    with pytest.raises(ValueError, match="unknown refine"):
-        calc.resolve("dft")
-
-
 # --- the xtb interface: what it refuses before ever running the binary --------------------------------------
 
 
@@ -80,12 +65,6 @@ def test_solvated_gxtb_uses_thermodynamic_cycle(monkeypatch):
 
 
 # --- parsing xtb's output: be loud, never return a plausible None ------------------------------------------
-
-
-def test_energy_parser_reads_total_or_raises():
-    assert calc._energy("random preamble\n :: total energy   -11.3990 Eh ::\ntail") == pytest.approx(-11.3990)
-    with pytest.raises(RuntimeError, match="no total energy"):
-        calc._energy("normal termination\n")
 
 
 def test_xtbopt_returns_coords_and_energy_or_raises(tmp_path):

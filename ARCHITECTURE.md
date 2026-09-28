@@ -38,8 +38,7 @@ except optional dependencies at their point of use.
 | | `metal_slots` | distinct donor-to-slot assignments under rotations, and chelate bite windows |
 | compile | `metal_constraints` | one metal state to `Constraints`: M-L windows, L-M-L angles and chelate bites |
 | identity | `metal_isomer` | `Isomer` and `IsomerSet`, and the isomer read from coordinates |
-| screen and enumeration | `metal_screen` | the reach and fit screens that drop arrangements the model rules out |
-| | `metal_enumeration` | ligand, haptic and coordination states combined into `Isomer` candidates |
+| enumeration | `metal_enumeration` | ligand, haptic and coordination states as screened `Isomer` candidates |
 | strings | `metal_smiles` | reading and writing dative SMILES and CXSMILES |
 | orchestration | `embed` | `prepare`, seeding, acceptance and recovery: `Conformers`, `Failure`, `EmbeddingError` |
 | facade | `core` | the low-level API, logging setup and the version lookup |
@@ -112,14 +111,14 @@ measures them from the supplied conformer. Angle preferences come from the polyh
 both modes.
 
 `metal_slots` reduces donor-slot assignments by proper rotations and ligand equivalence. `metal_enumeration`
-combines metal, ligand and haptic stereo and screens the candidates. Only the first of three screens is a proof,
-and it is a proof against the compiled model, not against chemistry:
+combines metal, ligand and haptic stereo and screens the candidates of a tethered sphere. Only the first of three
+screens is a proof, and it is a proof against the compiled model, not against chemistry:
 
-- `metal_screen` rejects a single-centre candidate whose compiled constraints contradict the ligands' native
-  reach (row, triangle-closure and Euclidean certificates).
+- The reach certificate rejects a single-centre candidate whose compiled constraints contradict the ligands'
+  native reach (row, triangle-smoothing and Euclidean certificates).
 - The `metal_slots` edge rule holds each short chelate pair to a polyhedron hull edge, a measured claim.
-- The chelate-bite fold check and the long-arc, trans and haptic span tests in `metal_screen` are model priors. A
-  multi-metal candidate gets only these.
+- The haptic span test, and for a multi-metal candidate in place of the certificate the trans span test, are
+  model priors.
 
 Passing the screen proves nothing. `screen=False` and any `fix=` turn all three off, but not symmetry reduction
 or embedding validation, and the input conformer's own arrangement is exempt when its donor spans fit the native

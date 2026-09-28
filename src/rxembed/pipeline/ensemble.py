@@ -393,7 +393,7 @@ class Ensemble(Conformers):
         stated_geometry = cons.fixed or cons.frozen or cons.shapes or cons.planes or any(cons.contacts)
         if owner.iso is not None and not stated_geometry:
             report = geom_check.check(mol, cid, donors=self._declared_donors())
-            # A donor-orientation floor violation is not proof of folding (embed._donor_facing_failure logs it):
+            # A donor-orientation floor violation is not proof of folding (`metal_perceive.donor_orientation`):
             # never reject on it; `check()` reports it on the kept conformers.
             violations = [v for v in report.violations if v.kind != "donor_orientation"]
             if not cons.conjugation:
@@ -417,9 +417,8 @@ class Ensemble(Conformers):
         if not self.ids or not self.cons.is_constrained:
             return self
         before = list(self.ids)
-        template = Chem.Mol(self._mol) if self.iso is not None else None
         frames = [] if trajectory else None
-        e = self._relax_constrained(
+        typed = self._relax_constrained(
             BASE_STIFFNESS,
             max_iters=max_iters,
             operation="embed",
@@ -430,15 +429,14 @@ class Ensemble(Conformers):
             max_iters,
             operation="embed",
             validator=self._workflow_failure,
-            template=template,
-            params=self.params,
-            allow_replacement=e is not None,
+            typed=typed,
+            raise_if_empty=True,
         )
         self.discarded += [cid for cid in before if cid not in set(self.ids)]
         self._store_trajectory(frames)
         self.energies = {}  # embed publishes geometry; minimize owns the FF score
         self.unrelaxed = [cid for cid in self.unrelaxed if cid in self.ids]
-        if self.ids and e is not None and not self.unrelaxed:
+        if self.ids and typed and not self.unrelaxed:
             self._stage = _RELAXED
         return self
 
@@ -456,19 +454,16 @@ class Ensemble(Conformers):
             return self
         iso = self.iso  # capture before restore: the coordination-planarity gate needs metal + donors
         before = list(self.ids)
-        template = Chem.Mol(self._mol) if iso is not None else None
         if self.cons.is_constrained and self._stage == _RELAXED:
-            e = True  # already relaxed at embed time; _rescore_restrained below scores it at this stiffness
+            typed = True  # already relaxed at embed time; _rescore_restrained below scores it at this stiffness
         else:
             self.trajectory = None
-            e = self._relax_once(stiffness, max_iters)
+            typed = self._relax_once(stiffness, max_iters)
         self._accept_relaxed(
             stiffness,
             max_iters,
             validator=self._workflow_failure,
-            template=template,
-            params=self.params,
-            allow_replacement=e is not None,
+            typed=typed,
         )
         if self.cons.is_constrained:
             # Re-embedded batches may have needed different restraint stiffnesses, and a replaced conformer's

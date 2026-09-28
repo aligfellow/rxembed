@@ -1,13 +1,11 @@
 """Metal coordination-sphere gates: has an atom collapsed onto the metal, and does a ligand still point right.
 
-Read-only: these gates judge a finished geometry without changing it. `pipeline.geom_check` consumes them
-directly; `embed._donor_facing_failure` also reads `donor_orientation` inside the embed acceptance path, but
-only logs it at DEBUG. They look into the coordination sphere, which every `geometry` check excludes because a
-dative distance is not covalent: `metal_overbond` asks whether an atom reached bonding distance,
-`donor_orientation` whether a ligand still donates along its axis, and `donor_fold` reports the metric behind
-the same walk. The rest is the sphere perception both resolve on. `pipeline.geom_check` also reads `spheres`
-for its side-on, coordinated-carbon and cis-donor exemptions, and `pipeline.select` reads `coordinating_atoms`
-for a wrapped metal with no bonds.
+Read-only: these gates judge a finished geometry without changing it, and `pipeline.geom_check` consumes them.
+They look into the coordination sphere, which every `geometry` check excludes because a dative distance is not
+covalent: `metal_overbond` asks whether an atom reached bonding distance, `donor_orientation` whether a ligand
+still donates along its axis, and `donor_fold` reports the metric behind the same walk. The rest is the sphere
+perception both resolve on. `pipeline.geom_check` also reads `spheres` for its side-on, coordinated-carbon and
+cis-donor exemptions, and `pipeline.select` reads `coordinating_atoms` for a wrapped metal with no bonds.
 
 The shape reading (`classify_geometry`, `shape_gap`) names the polyhedron a sphere's coordinates fit best; the
 acceptance gate, enumeration and CX writing all read a sphere through it.
@@ -177,8 +175,8 @@ def donor_orientation(mol, pos, donors=None, frozen=frozenset()) -> list[Violati
     percentile minus 5 deg, keyed on (element, hybridisation) since a thiolate donates at 103 deg where a
     carboxylate donates at 126 deg. A floor violation flags an unusual angle, not proven folding or inversion:
     a tetrahedral donor can sit inside its carrier hull below this floor, and real crystals do (a Zn-bound
-    C(SiMe3)3 donor reads 101 deg against its 104 deg floor). `embed._donor_facing_failure` logs it at DEBUG
-    and never rejects. `donor_fold` reports the rest.
+    C(SiMe3)3 donor reads 101 deg against its 104 deg floor), so acceptance never rejects on it. `donor_fold`
+    reports the rest.
 
     Exemptions follow `donation_axis` (no axis to judge), plus one more here: an M-D-X unit wholly inside the
     frozen core takes its orientation from the reference TS, not this gate. A donor the two estimators

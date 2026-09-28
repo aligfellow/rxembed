@@ -75,8 +75,7 @@
 - Never make `src/` or tests depend on `benchmark/`. After changes to bounds, mechanisms, or metal geometry, run
   `just bench fixtures --seed 42 7 1234 2026 99` and
   `uv run python benchmark/run.py compare benchmark/baseline.csv <new.csv>`, and report every reference and isomer
-  loss. The sample and issues cohorts need `RXEMBED_TMQMG_DIR`; report them unavailable without it. Run
-  `just bench-test` after changing `benchmark/run.py`.
+  loss. `just bench tmqmg` samples a local tmQMg clone and needs `RXEMBED_TMQMG_DIR`; it is optional.
 - Refresh `benchmark/baseline.csv` in the commit that accepts a measured change. Keep `benchmark/results/`
   untracked. Ship a structure only with its origin in `benchmark/README.md` and its licence in `LICENSES.md`.
 - Skip optional-tier tests cleanly on a base install.

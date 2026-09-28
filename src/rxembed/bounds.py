@@ -19,7 +19,7 @@ from rdkit.Chem import rdDistGeom, rdMolDescriptors
 
 from .constraints import DIST_ATOMS, metal_distance_tolerance
 from .mechanisms import MECHANISM_ORDER, DGContext, triangle_angles, triangle_distances
-from .metal_core import COORDINATION_METALS, materialise_phantoms
+from .metal_core import COORDINATION_METALS, SURROGATE, materialise_phantoms
 from .relax import bonding_failure
 from .utils import atom_label
 
@@ -333,9 +333,10 @@ def _write(mol, cons, params=None):
     (`mechanisms.py`) says what it writes, never when. RELIEVE must precede COMMIT so an explicit
     window always beats a floor relief; POST must follow it so the coplanar bound can read committed legs.
     """
-    # `seed_conformers` temporarily adds dative M-L edges so RDKit sees a labelled donor's full CIP basis and a
-    # terminal sp donor's linear axis. Remove only edges owned by a selected metal's explicit M-L distance, on a
-    # private copy.
+    # `seed_conformers` temporarily restores the real metal and adds dative M-L edges so RDKit sees a labelled
+    # donor's full CIP basis and a terminal sp donor's linear axis. The bounds basis stays the surrogate graph
+    # every other seed uses: on a private copy, remove the edges owned by a selected metal's explicit M-L
+    # distance and give each metal left bondless its surrogate carbon, whose floors the metal model assumes.
     owned = {tuple(sorted(atoms)) for atoms in cons.distances}
     removable = []
     for bond in mol.GetBonds():
@@ -346,10 +347,14 @@ def _write(mol, cons, params=None):
         if len(metals) == 1 and metals[0] in cons.metals and tuple(sorted((begin, end))) in owned:
             removable.append((begin, end))
     native = mol
-    if removable:
+    if removable or any(atom.GetAtomicNum() in COORDINATION_METALS for atom in mol.GetAtoms()):
         rw = Chem.RWMol(mol)
         for begin, end in removable:
             rw.RemoveBond(begin, end)
+        for atom in rw.GetAtoms():
+            if atom.GetAtomicNum() in COORDINATION_METALS and not atom.GetDegree():  # undo `restore_metal`
+                atom.SetAtomicNum(SURROGATE)
+                atom.SetFormalCharge(0)
         native = rw.GetMol()
         native.ClearComputedProps()
         native.UpdatePropertyCache(strict=False)

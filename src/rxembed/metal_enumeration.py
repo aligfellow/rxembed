@@ -1,18 +1,20 @@
-"""Enumerate ligand, haptic and coordination states into ready-to-embed `Isomer` candidates."""
+"""Enumerate ligand, haptic and coordination states into `Isomer` candidates, screened against ligand reach."""
 
 from __future__ import annotations
 
+import functools
 import itertools
 import math
 import re
 from dataclasses import dataclass, replace
 
 import numpy as np
-from rdkit import Chem
+from rdkit import Chem, DistanceGeometry
 
-from .bounds import coordination_reach_base, ligand_reach
+from .bounds import coordination_reach, coordination_reach_base, ligand_reach
 from .constraints import Constraints, compose, resolve_core
-from .metal_constraints import compile_context
+from .mechanisms import law_of_cosines, triangle_distances
+from .metal_constraints import compile_constraints, compile_context
 from .metal_core import (
     VACANT,
     MetalState,
@@ -55,10 +57,11 @@ from .metal_polyhedron import (
     geometries_for_cn,
     read_slot_notes,
     resolve_geometry,
+    vertex_angle,
 )
-from .metal_screen import unreachable_span
 from .metal_slots import (
     SPAN_TOL,
+    TRANS_ANGLE,
     SeatingProblem,
     assignment_cap_error,
     chelate_edge_links,
@@ -426,7 +429,7 @@ def _screen_reach(request, base_iso, geom):
     """Return a tethered sphere's ligand reach, native reach and compile context, each None where unscreened.
 
     Every path that leaves a screened request unscreened says so: a fix= and a multi-metal sphere, which keeps
-    only the prior span tests, at INFO, and a reach failure as a warning.
+    only the trans-span prior, at INFO, and a reach failure as a warning.
     """
     if not request.screen:
         return None, None, None
@@ -438,13 +441,283 @@ def _screen_reach(request, base_iso, geom):
     except (ValueError, RuntimeError) as exc:
         logger.warning("metal[%s]: native ligand reach failed (%s); no arrangement is screened", geom, exc)
         return None, None, None
-    if len(base_iso.centres) != 1:
-        logger.info("metal[%s]: a multi-metal sphere has no reach certificate or edge rule; span tests only", geom)
-        return reach, None, None
-    native_reach = coordination_reach_base(request.source, reach, {base_iso.metal})
     context = compile_context(request.source, base_iso.donor_bonds)
+    if len(base_iso.centres) != 1:
+        logger.info("metal[%s]: a multi-metal sphere has no reach certificate or edge rule; trans spans only", geom)
+        return reach, None, context
+    native_reach = coordination_reach_base(request.source, reach, {base_iso.metal})
     context["native_reach"] = native_reach  # metal_constraints.seated_bites' own fact, seeded once
     return reach, native_reach, context
+
+
+_REACH_CONFLICT = "compiled coordination distances conflict with native ligand reach"
+_CROSS_EPS = 1e-9  # Å, floating-point slack shared by every closed-bound comparison against a reach matrix
+_HAPTIC_MATCHING_CAP = 7  # factorial matching remains tiny for ordinary pi faces; larger faces use the safe mean bound.
+_EUCLIDEAN_SUBSET_BUDGET = 128  # Keep local route certificates bounded; the full route remains authoritative.
+_PROJECTOR_EPS = 1e-10  # Ignore the numerically null centred constant eigenspace.
+_CERTIFICATE_STEPS = 32  # accelerated-gradient step budget for the refinement search, not a feasibility threshold
+
+
+def _reach_conflict(iso, reach, links, native, context):
+    """Return why a candidate's compiled constraints exceed native ligand reach, else ``None``.
+
+    A single centre gets the compiled certificate (`_compiled_reach_conflict`), a proof against the compiled
+    model, not against chemistry. A multi-centre candidate, whose spectator geometry no certificate owns
+    (`native` is None), gets the trans-span prior instead (`_trans_span_conflict`). The certificate omits haptic
+    centroid rows, so a tethered face pair at `TRANS_ANGLE` or wider is checked against its centroid reach
+    (`_haptic_span_conflict`). Passing proves nothing.
+    """
+    compiled = compile_constraints(iso, context=context)
+    if native is None:
+        failure = _trans_span_conflict(iso, reach, compiled)
+    else:
+        failure = _compiled_reach_conflict(iso, reach, compiled, native, context)
+    if failure:
+        return failure
+    directions = POLYHEDRA[iso.geometry].vertex_dirs
+    for pair in links:
+        i, j = sorted(pair)
+        left, right = iso.vertices[i], iso.vertices[j]
+        angle = vertex_angle(directions[i], directions[j])
+        if {left, right} & iso.haptic.keys() and angle >= TRANS_ANGLE:
+            if failure := _haptic_span_conflict(iso, reach, left, right, angle, compiled):
+                return failure
+    return None
+
+
+def _trans_span_conflict(iso, reach, compiled):
+    """Return why a ligand cannot span a trans pair of its own sigma donors, else ``None``.
+
+    A model prior, not a proof: an unbonded donor pair at `TRANS_ANGLE` or wider needs at least the span of
+    its two lower M-L bounds at `TRANS_ANGLE`. On the tests' MnH hydride at input lengths it refuses 3 of 15
+    arrangements, none of which embeds at any of five seeds, and spares 65 s of CPU at one seed.
+    """
+    mol, metal, vertices, haptic = iso.graph, iso.metal, iso.vertices, iso.haptic
+    directions = POLYHEDRA[iso.geometry].vertex_dirs
+    for (i, left), (j, right) in itertools.combinations(enumerate(vertices), 2):
+        if (
+            VACANT in (left, right)
+            or {left, right} & haptic.keys()
+            or mol.GetBondBetweenAtoms(left, right) is not None
+            or vertex_angle(directions[i], directions[j]) < TRANS_ANGLE
+        ):
+            continue
+        a, b = (compiled.distances[tuple(sorted((metal, donor)))][0] for donor in (left, right))
+        needed = law_of_cosines(a, b, TRANS_ANGLE)
+        available = float(reach[min(left, right), max(left, right)])
+        if needed > available + SPAN_TOL:
+            return f"donors {left}/{right} need >= {needed:.3f} A; ligand reach <= {available:.3f} A"
+    return None
+
+
+def _haptic_span_conflict(iso, reach, left, right, angle, compiled):
+    """Check centroid reach; member rays need not share the angle between centroid sites.
+
+    A model prior: it reads the ideal vertex angle, not the compiled window. Every candidate it refuses in the
+    fixtures, issues and sample cohorts (15 in 8 structures) fails to embed at all five benchmark seeds; it
+    costs no measurable enumeration time and spares 268 s of CPU in those embeds at one seed.
+    """
+    metal = iso.metal
+    left_face, right_face = iso.haptic.get(left, (left,)), iso.haptic.get(right, (right,))
+    if iso.lengths == "input":
+        positions = iso.length_mol.GetConformer().GetPositions()
+        radii = tuple(
+            float(np.linalg.norm(np.mean(positions[list(face)], axis=0) - positions[metal]))
+            for face in (left_face, right_face)
+        )
+    else:
+        radii = tuple(compiled.distances[tuple(sorted((metal, vertex)))][0] for vertex in (left, right))
+    available = _centroid_reach(reach, left_face, right_face)
+    needed = law_of_cosines(radii[0], radii[1], angle)
+    if math.isfinite(available) and needed > available + SPAN_TOL:
+        return f"haptic faces {left}/{right} need >= {needed:.3f} A; centroid reach <= {available:.3f} A"
+    return None
+
+
+def _centroid_reach(reach, left, right):
+    """Return a safe upper bound for the distance between two donor centroids.
+
+    For any matching of equal-size faces, the centroid difference is the mean of the matched displacement
+    vectors. The triangle inequality makes that matching mean an upper bound; taking the smallest matching
+    keeps the certificate while dropping the looser all-pairs mean. Unequal or unusually large faces keep the
+    uniform coupling bound.
+    """
+    values = [[float(reach[min(a, b), max(a, b)]) for b in right] for a in left]
+    if not all(math.isfinite(value) for row in values for value in row):
+        return math.inf
+    if len(left) == len(right) and len(left) <= _HAPTIC_MATCHING_CAP:
+        return min(
+            sum(row[index] for row, index in zip(values, order, strict=True))
+            for order in itertools.permutations(range(len(right)))
+        ) / len(left)
+    return sum(map(sum, values)) / (len(left) * len(right))
+
+
+def _compiled_reach_conflict(iso, reach, constraints, native, context):
+    """Reject a jointly inconsistent compiled donor network, not an unsuccessful embedding attempt.
+
+    Each compiled L-M-L row is first compared alone with the native reach of its donor pair, then the whole
+    network through triangle smoothing and, along every shortest donor-to-donor route, the interval Euclidean
+    certificate (`_certified_conflict`).
+    """
+    mol, metal = iso.graph, iso.metal
+    for (left, centre, right), angles in constraints.angles.items():
+        if centre != metal or constraints.haptic.keys() & {left, right}:
+            continue
+        legs = (
+            constraints.distances.get(tuple(sorted((left, centre)))),
+            constraints.distances.get(tuple(sorted((centre, right)))),
+        )
+        if legs[0] is None or legs[1] is None:
+            continue
+        a, b = sorted((left, right))
+        lower, upper = triangle_distances(*legs, angles)
+        if lower > native[a, b] + _CROSS_EPS or upper < native[b, a] - _CROSS_EPS:
+            return _REACH_CONFLICT
+    closed = coordination_reach(mol, constraints, reach, native=native)
+    if not DistanceGeometry.DoTriangleSmoothing(closed, _CROSS_EPS):
+        return _REACH_CONFLICT
+    donors = frozenset(iso.donors)
+    if (route_key := ("route_atoms", donors)) not in context:
+        # Routes depend only on topology and the donor set, which every candidate of one screen shares.
+        context[route_key] = _route_certificate_paths(mol, donors, Chem.GetDistanceMatrix(mol, force=True))
+    memo = context.setdefault("certificate_memo", {})
+    for path in context[route_key]:
+        # Store only route unions, not their fourth-order number of subsets; stream those once per union.
+        for subset in _route_certificate_subsets(path):
+            atoms = sorted((metal, *subset))
+            # Refine the whole route once; its smaller diagnostic subsets retain the cheap midpoint test.
+            if _euclidean_conflict(closed[np.ix_(atoms, atoms)], refine=subset == path, memo=memo) is not None:
+                return f"compiled coordination distances have no Euclidean realization at atoms {atoms}"
+    return None
+
+
+def _route_certificate_subsets(path):
+    """Return a bounded set of local route witnesses after the complete route."""
+    subset_count = sum(math.comb(len(path), n) for n in (3, 4) if n < len(path))
+    if subset_count > _EUCLIDEAN_SUBSET_BUDGET:
+        return (path,)
+    return itertools.chain((path,), *(itertools.combinations(path, n) for n in (3, 4) if n < len(path)))
+
+
+def _route_has_donor_bond(mol, path, donors):
+    """Return whether a shortest donor route contains a bond between two metal donors.
+
+    The route certificate assumes ordinary two-centre ligand connectivity. A donor-donor edge is a bridge or
+    multicentre donor network, where its native bond bounds are not a valid proxy for the independent metal-ray
+    geometry. Leave that route to the normal embedding and acceptance gates.
+    """
+    return any(
+        left in donors and right in donors and mol.GetBondBetweenAtoms(int(left), int(right)) is not None
+        for left, right in itertools.combinations(path, 2)
+    )
+
+
+def _route_certificate_paths(mol, donors, topology):
+    """Return each donor-pair route's deduped, bond-filtered atom path, independent of vertex seating."""
+    tested_paths = set()
+    paths = []
+    for left, right in itertools.combinations(sorted(donors), 2):
+        separation = topology[left, right]
+        if not 0 < separation < mol.GetNumAtoms():
+            continue
+        # The union includes every equally short route through a cyclic ligand. Selecting one route
+        # depends on atom numbering; skipping ties instead loses the reach check for the entire chelate.
+        path = tuple(map(int, np.flatnonzero(topology[left] + topology[right] == separation)))
+        if path in tested_paths:
+            continue
+        tested_paths.add(path)
+        if _route_has_donor_bond(mol, path, donors):
+            continue
+        paths.append(path)
+    return paths
+
+
+@functools.lru_cache(maxsize=32)
+def _centering_matrix(n):
+    """Return the size-`n` double-centering projector shared by every squared-distance Gram build."""
+    return np.eye(n) - np.ones((n, n)) / n
+
+
+def _euclidean_conflict(matrix, *, refine=False, memo=None):
+    """Say whether these distance bounds are impossible, memoised since every candidate reasks the same ones."""
+    array = np.ascontiguousarray(matrix, dtype=float)
+    key = (array.shape[0], array.tobytes(), bool(refine))
+    if memo is None:
+        return _certified_conflict(*key)
+    if key not in memo:
+        memo[key] = _certified_conflict(*key)
+    return memo[key]
+
+
+def _eigen_witnesses(groups, values, vectors, centre):
+    """Yield the projector onto each negative eigenspace of the midpoint Gram matrix."""
+    for group in groups:
+        if min(values[group]) < 0:
+            basis = centre @ vectors[:, group]
+            yield basis @ basis.T
+
+
+def _projected_witnesses(gram, lower, upper, n):
+    """Yield the witness an accelerated projected-gradient search finds for a centred Gram matrix in the box."""
+    centre = _centering_matrix(n)
+    current, extrapolated, momentum = gram, gram.copy(), 1.0
+    for _ in range(_CERTIFICATE_STEPS):
+        squared = np.diag(extrapolated)[:, None] + np.diag(extrapolated) - 2 * extrapolated
+        errors = squared - np.clip(squared, lower, upper)
+        # Half the squared pair violations have gradient diag(errors.sum(1))-errors and
+        # Lipschitz bound 2*n on centred Gram matrices. Simultaneous steps preserve atom symmetry.
+        proposal = extrapolated - (np.diag(errors.sum(axis=1)) - errors) / (2 * n)
+        proposal = centre @ ((proposal + proposal.T) / 2) @ centre
+        eigenvalues, eigenvectors = np.linalg.eigh(proposal)
+        updated = (eigenvectors * np.maximum(eigenvalues, 0.0)) @ eigenvectors.T
+        next_momentum = (1 + math.sqrt(1 + 4 * momentum**2)) / 2
+        extrapolated = updated + (momentum - 1) / next_momentum * (updated - current)
+        current, momentum = updated, next_momentum
+    basis = (centre @ eigenvectors) * np.sqrt(np.maximum(-eigenvalues, 0.0))
+    yield basis @ basis.T
+
+
+def _certified_conflict(n, payload, refine):
+    """Return a certified positive squared-distance margin, or None without a Euclidean contradiction.
+
+    For PSD W with W*1=0, trace(W D²)=-2*trace(X.T W X)<=0 for every Euclidean point set X.
+    Minimize that linear expression over the squared-distance intervals. A positive lower bound
+    excludes all dimensions, not just 3D. Midpoint eigenspaces only propose W; whole projectors avoid
+    arbitrary eigenvector choices at repeated eigenvalues. Optional centred-Gram refinement proposes a
+    stronger witness when the midpoint misses coupled distances. Only its certified interval margin
+    rejects a box, never convergence failure. No certificate does not prove feasibility.
+
+    Takes the matrix as `n` plus its raw bytes so the result can be memoised; see `_euclidean_conflict`.
+    """
+    matrix = np.frombuffer(payload, dtype=float).reshape(n, n)
+    lower, upper = np.tril(matrix, -1), np.triu(matrix, 1)
+    lower, upper = lower + lower.T, upper + upper.T
+    if (
+        n <= 1
+        or not np.isfinite(lower).all()
+        or not np.isfinite(upper).all()
+        or np.any(lower < 0)
+        or np.any(lower > upper)
+    ):
+        return None
+    lower, upper = lower**2, upper**2
+    centre = _centering_matrix(n)
+    gram = -0.25 * centre @ (lower + upper) @ centre
+    values, vectors = np.linalg.eigh(gram)
+    groups = np.split(np.arange(n), np.flatnonzero(np.diff(values) > 1e-9 * max(1.0, *abs(values))) + 1)
+    witnesses = _eigen_witnesses(groups, values, vectors, centre)
+    if refine:
+        witnesses = itertools.chain(witnesses, _projected_witnesses(gram, lower, upper, n))
+    for candidate in witnesses:
+        if np.trace(candidate) < _PROJECTOR_EPS:
+            continue
+        weights = candidate / np.trace(candidate)
+        terms = weights * np.where(weights >= 0, lower, upper)
+        margin = float(terms.sum())
+        if margin > 1e-9 * max(1.0, float(np.abs(terms).sum())):
+            return margin
+    return None
 
 
 def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
@@ -470,11 +743,12 @@ def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
     tethered = has_tether(padded, frag_map(base), haptic)
     classes = site_classes(base, padded, haptic, roles)
     distances = ligand_distance_matrix(base) if tethered else None
+    # Read the measured seating, not the bare donor list: a vacancy request is read on its occupied vertices.
     retained = (
-        input_ordering(base, m, padded, geom, haptic, roles, classes=classes)
-        if base.GetNumConformers() and shape_gap(base, m, donors, haptic, geom)[3]
-        else None
+        input_ordering(base, m, padded, geom, haptic, roles, classes=classes) if base.GetNumConformers() else None
     )
+    if retained is not None and not shape_gap(base, m, [padded[k] for k in retained], haptic, geom)[3]:
+        retained = None
     if request.observed_only:
         if retained is None:
             raise ValueError(
@@ -515,7 +789,7 @@ def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
             shared_mol=True,
         )
         if reach is not None and (retained is None or tuple(order) != tuple(retained)):
-            failure = unreachable_span(candidate, reach, links, native_reach, screen_context)
+            failure = _reach_conflict(candidate, reach, links, native_reach, screen_context)
             if failure:
                 logger.debug("metal[%s]: omit arrangement: %s", geom, failure)
                 unreachable += 1
@@ -886,7 +1160,7 @@ def enumerate_isomers(
     Parameters
     ----------
     screen : bool, optional
-        Apply the chelate hull-edge rule and the native ligand-reach and donor-facing screens, by default
+        Apply the chelate hull-edge rule and the native ligand-reach screen, by default
         True. False retains distinct assignments beyond those model limits, with no guarantee they embed.
         Symmetry, stated slots, ligand stereo, explicit fixes and embedding validation are unchanged. A
         ``fix=`` turns the screens off.

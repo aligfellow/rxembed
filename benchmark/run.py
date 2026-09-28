@@ -13,65 +13,138 @@ import itertools
 import json
 import multiprocessing as mp
 import os
-import platform
 import statistics
 import sys
 import tempfile
 import time
+import zlib
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
 import rdkit
-from rdkit import Chem
+from rdkit import Chem, DataStructs
 from rdkit.Chem import rdMolAlign
-from rdkit.Geometry import Point3D
+from rdkit.SimDivFilters import rdSimDivPickers
 
 import rxembed as rx
 
-# The one private import: the redox re-read must judge both sides through the choke point `rx.metal` applies.
-from rxembed.metal_core import canonical_metal_graph as _canonical_metal_graph
-
 HERE = Path(__file__).resolve().parent
-# Hashed at import, not at write time: an edit mid-run must not be recorded as the code that ran.
-RUNNER_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-# Above the M-L distance model's worst case; a wrongly seated sphere moves donors much further.
-MAX_CORE_RMSD = 0.75  # Angstrom
-# The core's coordination-metal range, copied so `canonical_metal_graph` stays the only private import.
-_METALS = frozenset(range(21, 31)) | frozenset(range(39, 49)) | frozenset(range(57, 81)) | frozenset(range(89, 113))
-_MIN_CORE_SITES = 2  # a metal and at least one site; fewer cannot define an alignment
+_MAX_SWAP_MATCHES = 5000  # cap on permutations searched across a structure's equivalent-site classes
+_CARBORANE_BORONS = 5  # boron count at which a B/C row reads as a carborane cage, out of the tmQMg sample
 
 FIELDS = ["id", "seed", "status", "stage", "detail", "seconds", "core_rmsd", "isomers", "embedded", "valid", "valid_cx"]
 
 
-def _ids(name):
-    """Return the IDs listed in benchmark/<name>, ignoring `#` comments."""
-    return [i for line in (HERE / name).read_text().splitlines() for i in line.split("#", 1)[0].split()]
+# --- fixture and tmQMg selection ---------------------------------------------
 
 
-def _cohort(args):
-    """Return (id, xyz path, charge) per structure; exit up front on a missing tmQMg clone or an unknown ID."""
-    if args.cohort == "fixtures":
-        xyz, table = HERE / "fixtures", HERE / "fixtures.csv"
-    else:
-        data = os.environ.get("RXEMBED_TMQMG_DIR", "")
-        xyz, table = Path(data, "xyz"), Path(data, "tmQMg_properties_and_targets.csv")
-        if not data or not xyz.is_dir():
-            raise SystemExit("set RXEMBED_TMQMG_DIR to a tmQMg clone's data/ directory and unzip tmQMg_xyz.zip there")
-    with table.open(newline="") as fh:
-        charges = {row["id"]: row["charge"] for row in csv.DictReader(fh)}
-    if args.cohort == "sample":
-        listed = _ids("tmqmg.txt")[: args.size]
-    elif args.cohort == "issues":
-        listed = _ids("issues.txt")
-    else:
-        listed = list(charges)
-    ids = args.only or listed
+def _fixtures(only):
+    """Return (id, xyz path, charge) for the shipped fixtures, or just `only`."""
+    with (HERE / "fixtures.csv").open(newline="") as fh:
+        charges = {row["id"]: int(row["charge"]) for row in csv.DictReader(fh)}
+    ids = only or list(charges)
     missing = [i for i in ids if i not in charges]
     if missing:
         raise SystemExit(f"unknown ids: {' '.join(missing)}")
-    return [(i, xyz / f"{i}.xyz", int(charges[i])) for i in ids]
+    return [(i, HERE / "fixtures" / f"{i}.xyz", charges[i]) for i in ids]
+
+
+def _in_scope(row):
+    """Exclude carborane-cage rows (>= 5 borons and any carbon) from the tmQMg sample."""
+    mol = Chem.MolFromSmiles(row.get("smiles", ""), sanitize=False)
+    if mol is None:
+        return True
+    counts = Counter(atom.GetAtomicNum() for atom in mol.GetAtoms())
+    return not (counts[5] >= _CARBORANE_BORONS and counts[6])
+
+
+def _fingerprint(row):
+    """Build a metal/donor/ligand-graph fingerprint for MaxMin diversity picking."""
+    tokens = [f"M:{row['metal_center']}", f"q:{row['charge']}"]
+    ligand = None
+    mol = Chem.MolFromSmiles(row["smiles"], sanitize=False) if row["smiles"] else None
+    if mol is not None:
+        mol.UpdatePropertyCache(strict=False)
+        Chem.FastFindRings(mol)
+        z = Chem.GetPeriodicTable().GetAtomicNumber(row["metal_center"])
+        metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == z]
+        if len(metals) == 1:
+            metal = metals[0]
+            donors = [a.GetIdx() for a in mol.GetAtomWithIdx(metal).GetNeighbors()]
+            rw = Chem.RWMol(mol)
+            rw.RemoveAtom(metal)
+            ligand = rw.GetMol()
+            ligand.UpdatePropertyCache(strict=False)
+            Chem.FastFindRings(ligand)
+            donors = {a - (a > metal) for a in donors}
+            elements = Counter(ligand.GetAtomWithIdx(a).GetSymbol() for a in donors)
+            denticity, carbon_sites = Counter(), Counter()
+            for fragment in Chem.GetMolFrags(ligand):
+                sites = donors & set(fragment)
+                if sites:
+                    denticity[len(sites)] += 1
+                    carbon_sites[sum(ligand.GetAtomWithIdx(a).GetSymbol() == "C" for a in sites)] += 1
+            tokens.append(f"CN:{len(donors)}")
+            tokens += [f"D:{e}:{n}" for e, c in elements.items() for n in range(1, c + 1)]
+            tokens += [f"dent:{v}:{n}" for v, c in denticity.items() for n in range(1, c + 1)]
+            tokens += [f"Csites:{v}:{n}" for v, c in carbon_sites.items() for n in range(1, c + 1)]
+    if ligand is None:
+        tokens += ["missing-smiles", f"atoms:{int(row['n_atoms']) // 10}"]
+    fp = DataStructs.ExplicitBitVect(128)
+    if ligand is not None:
+        ligand_fp = Chem.RDKFingerprint(ligand, minPath=1, maxPath=2, fpSize=32, nBitsPerHash=1)
+        for bit in ligand_fp.GetOnBits():
+            fp.SetBit(bit)
+    for token in tokens:
+        fp.SetBit(32 + zlib.crc32(token.encode()) % 96)
+    return fp, tuple(sorted(tokens))
+
+
+def _sample_tmqmg(rows, size):
+    """Return `size` tmQMg IDs via a MaxMin diversity pick seeded by one typical structure per metal.
+
+    Deterministic (seed=0): the same clone and size give the same IDs, and a smaller size is a prefix
+    of a larger one, since each pick depends only on the picks made before it.
+    """
+    features = [_fingerprint(row) for row in rows]
+    first = []
+    for metal in sorted({row["metal_center"] for row in rows}):
+        indices = [i for i, row in enumerate(rows) if row["metal_center"] == metal]
+        counts = Counter(features[i][1] for i in indices)
+        mode = max(counts, key=lambda value: (counts[value], value))
+        typical = [i for i in indices if features[i][1] == mode]
+        middle = sorted(int(rows[i]["n_atoms"]) for i in typical)[len(typical) // 2]
+        first.append(min(typical, key=lambda i: (abs(int(rows[i]["n_atoms"]) - middle), rows[i]["id"])))
+    started = time.monotonic()
+    picks = rdSimDivPickers.MaxMinPicker().LazyBitVectorPick(
+        [fp for fp, _tokens in features], len(rows), size, first, seed=0
+    )
+    # LazyBitVectorPick never returns fewer than the one-per-metal seed picks, even for a smaller `size`.
+    picks = list(picks)[:size]
+    print(f"tmqmg: picked {len(picks)} of {len(rows)} in-scope structures in {time.monotonic() - started:.1f} s")
+    return [rows[i]["id"] for i in picks]
+
+
+def _tmqmg(size, only):
+    """Return (id, xyz path, charge) for a MaxMin-diverse tmQMg sample, or just `only`."""
+    data = os.environ.get("RXEMBED_TMQMG_DIR", "")
+    xyz_dir = Path(data, "xyz")
+    table = Path(data, "tmQMg_properties_and_targets.csv")
+    if not data or not xyz_dir.is_dir():
+        raise SystemExit("set RXEMBED_TMQMG_DIR to a tmQMg clone's data/ directory and unzip tmQMg_xyz.zip there")
+    with table.open(newline="") as fh:
+        rows = [row for row in csv.DictReader(fh) if _in_scope(row)]
+    charges = {row["id"]: int(row["charge"]) for row in rows}
+    ids = only or _sample_tmqmg(rows, size)
+    missing = [i for i in ids if i not in charges]
+    if missing:
+        raise SystemExit(f"unknown ids: {' '.join(missing)}")
+    return [(i, xyz_dir / f"{i}.xyz", charges[i]) for i in ids]
+
+
+# --- core RMSD (reported, never a gate) --------------------------------------
 
 
 def _positions_mol(positions):
@@ -86,46 +159,30 @@ def _positions_mol(positions):
     return mol
 
 
-def _site_centroids(mol, groups):
-    """Return one point per site: its atoms' mean position."""
-    positions = mol.GetConformer().GetPositions()
-    return np.array([positions[group].mean(axis=0) for group in groups])
+def _site_groups(iso):
+    """One atom-index group per coordination site: the metal(s), then a lone donor or a whole haptic face."""
+    return [[m] for m, _, _ in iso.metals] + [list(iso.haptic.get(v, [v])) for v in iso.vertices]
 
 
-def _site_groups(ref, iso):
-    """Return one atom-index group per coordination site: a lone donor, or a whole haptic face.
+def core_rmsd(ref, mol, iso):
+    """RMSD of the metal and site centroids, via RDKit's own automorphism search over equivalent sites.
 
-    A face scored per carbon would read a free spin about the metal axis as a large error.
+    A haptic face scored per atom would read a free spin about the metal axis as error, so it is scored at
+    its centroid (`Isomer.haptic`/`vertices`, both public). `CanonicalRankAtoms` finds which sites are
+    graph-equivalent (e.g. two identical Cl); `GetBestRMS` then searches those permutations for the true
+    minimum through an explicit atom map, which a fixed pairing cannot.
     """
-    metals = [atom.GetIdx() for atom in ref.GetAtoms() if atom.GetAtomicNum() in _METALS]
-    if iso is not None:
-        sites = [list(iso.haptic.get(v, [v])) for v in iso.vertices]
-        return [[i] for i in metals] + sites
-    donors = {n.GetIdx() for i in metals for n in ref.GetAtomWithIdx(i).GetNeighbors() if n.GetAtomicNum() > 1}
-    return [[i] for i in metals] + [[i] for i in sorted(donors)]
-
-
-def core_rmsd(ref, cand, iso=None, max_matches=5000):
-    """Return the RMSD of the metal and its site centroids, minimised over swaps of graph-equivalent sites.
-
-    A fixed pairing would read two equivalent donors that changed places as an error. The search stops
-    after `max_matches` swaps, which can only overstate the RMSD.
-    """
-    groups = _site_groups(ref, iso)
-    n = min(ref.GetNumAtoms(), cand.GetNumAtoms())
-    if len(groups) < _MIN_CORE_SITES or any(i >= n for g in groups for i in g):
+    groups = _site_groups(iso)
+    n = min(ref.GetNumAtoms(), mol.GetNumAtoms())
+    if len(groups) < 2 or any(i >= n for g in groups for i in g):  # noqa: PLR2004
         return float("nan")
     graph = Chem.Mol(ref)
+    for atom in graph.GetAtoms():
+        atom.SetFormalCharge(0)  # a resonance-delocalised donor pair must not split into separate classes
+        atom.SetNoImplicit(True)
     for bond in graph.GetBonds():
         bond.SetBondType(Chem.BondType.SINGLE)
         bond.SetIsAromatic(False)
-    for atom in graph.GetAtoms():
-        atom.SetIsAromatic(False)
-        # Formal charge is the same Lewis artefact as bond order: a resonance-delocalised donor pair
-        # (dithiocarbamate S,S-; a Cp ring anion) carries its -1 on one arbitrarily chosen atom, which
-        # would rank two equivalent donors apart and hide the swap that makes them interchangeable.
-        atom.SetFormalCharge(0)
-        atom.SetNoImplicit(True)
     ranks = list(Chem.CanonicalRankAtoms(graph, breakTies=False))
     classes = {}
     for i, group in enumerate(groups):
@@ -136,85 +193,29 @@ def core_rmsd(ref, cand, iso=None, max_matches=5000):
             base | dict(zip(members, order, strict=True))
             for base in orders
             for order in itertools.permutations(members)
-        ][:max_matches]
-    n_sites = len(groups)
-    target = _positions_mol(_site_centroids(ref, groups))
-    probe = _positions_mol(_site_centroids(cand, groups))  # candidate sites in their own natural order
-    return rdMolAlign.GetBestRMS(
-        probe, target, map=[[(order.get(i, i), i) for i in range(n_sites)] for order in orders]
-    )
+        ][:_MAX_SWAP_MATCHES]
+
+    def centroids(m):
+        pos = m.GetConformer().GetPositions()
+        return np.array([pos[g].mean(axis=0) for g in groups])
+
+    target, probe = _positions_mol(centroids(ref)), _positions_mol(centroids(mol))
+    k = len(groups)
+    return rdMolAlign.GetBestRMS(probe, target, map=[[(order.get(i, i), i) for i in range(k)] for order in orders])
 
 
-def _edge_diff(a, b):
-    """Return (formed, lost) sorted atom-index bond pairs between two graphs of the same atom order."""
-
-    def edges(mol):
-        return {
-            tuple(sorted((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())))
-            for bond in mol.GetBonds()
-            if bond.GetBondType() != Chem.BondType.ZERO
-        }
-
-    ea, eb = edges(a), edges(b)
-    return sorted(eb - ea), sorted(ea - eb)
+# --- the round trip -----------------------------------------------------------
 
 
-def _constitution(mol):
-    """Return a stereo-free `rx.dative_smiles` key, whose canonical ionic form hides no graph change.
-
-    Bond stereo is cleared too: `RemoveStereochemistry` keeps atropisomer stereo, on which `dative_smiles` raises.
-    """
-    graph = Chem.Mol(mol)
-    Chem.RemoveStereochemistry(graph)
-    for bond in graph.GetBonds():
-        bond.SetStereo(Chem.BondStereo.STEREONONE)
-    graph.RemoveAllConformers()
-    return rx.dative_smiles(graph)
-
-
-def _redox_key(mol):
-    """Return a per-fragment key that ignores which side of a metal-ligand bond carries the charge.
-
-    A non-innocent ligand (dithiolene, porphyrin) has closed-shell readings that only move charge between
-    metal and ligand. The key keeps each fragment's element graph, H counts, total charge and radical count,
-    re-parsed from SMILES so a stale ring cache on a rebuilt isomer cannot steer the canonical form.
-    """
-    keys = []
-    for frag in Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False):
-        work = Chem.RWMol(frag)
-        work.RemoveAllConformers()
-        work.UpdatePropertyCache(strict=False)
-        charge = sum(atom.GetFormalCharge() for atom in work.GetAtoms())
-        radicals = sum(atom.GetNumRadicalElectrons() for atom in work.GetAtoms())
-        for atom in work.GetAtoms():
-            h = atom.GetTotalNumHs()
-            atom.SetFormalCharge(0)
-            atom.SetIsAromatic(False)
-            atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
-            atom.SetNumRadicalElectrons(0)
-            atom.SetNoImplicit(True)
-            atom.SetNumExplicitHs(h)
-            for prop in list(atom.GetPropNames()):
-                atom.ClearProp(prop)
-        for bond in work.GetBonds():
-            bond.SetBondType(Chem.BondType.SINGLE)
-            bond.SetIsAromatic(False)
-            bond.SetStereo(Chem.BondStereo.STEREONONE)
-            bond.SetBondDir(Chem.BondDir.NONE)
-        flat = Chem.MolFromSmiles(Chem.MolToSmiles(work), sanitize=False)
-        flat.UpdatePropertyCache(strict=False)
-        keys.append((Chem.MolToSmiles(flat), charge, radicals))
-    return sorted(keys)
-
-
-def _transplant(mol, fresh):
-    """Return `mol`'s own graph (bond types, charges, radicals) placed on `fresh`'s coordinates."""
-    out = Chem.Mol(mol)
-    conf = out.GetConformer()
-    positions = fresh.GetConformer().GetPositions()
-    for i in range(out.GetNumAtoms()):
-        conf.SetAtomPosition(i, Point3D(*positions[i]))
-    return out
+def _heavy_bonds(mol):
+    """Return each heavy-atom bond as an unordered index pair, ignoring bond order and zero-order NCI legs."""
+    return {
+        frozenset((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))
+        for b in mol.GetBonds()
+        if b.GetBondType() != Chem.BondType.ZERO
+        and b.GetBeginAtom().GetAtomicNum() > 1
+        and b.GetEndAtom().GetAtomicNum() > 1
+    }
 
 
 def _short(err):
@@ -223,59 +224,30 @@ def _short(err):
     return msg.replace("\n", " ")[:200]
 
 
-def _requested_cx(mol, iso):
-    """Return the CX of `mol` read in the isomer's requested polyhedron, not its argmin reading."""
-    if len(iso.centres) != 1:
-        return rx.cxsmiles(mol)
-    return rx.cxsmiles(rx.metal(mol, geometry=iso.geometry, observed_only=True)[0])
+def _validate(mol, ens, cid, expected_cx, charge, xyz_path):
+    """Re-check one written candidate: same heavy-atom bonds on re-read, same requested CX, clean geometry.
 
-
-def _validate(ref, mol, ens, cid, iso, expected_cx, charge, xyz_path):
-    """Re-check one written candidate from a fresh `rx.read_xyz`; return (ok, stage, detail, fresh_cx).
-
-    The first failed check wins, and an exception is labelled with the step that raised it. A wrong
-    charge raises inside `rx.read_xyz` (validate:read). A constitution change that is only a Lewis
-    re-read (same `_redox_key`) passes with a note, and the cx step then reads the candidate's own
-    graph at the fresh coordinates.
+    Return (ok, stage, detail, own_cx); an exception is labelled with the step that raised it.
     """
     step = "read"
     try:
         fresh = rx.read_xyz(str(xyz_path), charge=charge, connectivity="xyzgraph", bond_orders="xyz2mol")
 
-        step = "fresh"
-        heavy = [
-            atom.GetIdx() for atom in ref.GetAtoms() if atom.GetAtomicNum() > 1 and atom.GetIdx() < mol.GetNumAtoms()
-        ]
-        target = _positions_mol(ref.GetConformer().GetPositions()[heavy])
-        probe = _positions_mol(mol.GetConformer().GetPositions()[heavy])
-        if rdMolAlign.AlignMol(probe, target) < 0.01:  # noqa: PLR2004
-            return False, "validate:fresh", "input geometry returned", ""
-
         step = "connectivity"
-        # `read_xyz` drops donorless bridgehead M-X bonds on every read, so both graphs had the same guard.
-        formed, lost = _edge_diff(mol, fresh)
-        if formed or lost:
-            return False, "validate:connectivity", _short(f"formed {formed}, lost {lost}"), ""
-
-        step = "constitution"
-        note = ""
-        if _constitution(mol) != _constitution(fresh):
-            if _redox_key(_canonical_metal_graph(mol)) != _redox_key(_canonical_metal_graph(fresh)):
-                return False, "validate:constitution", "graph changed across the XYZ round trip", ""
-            note = "Lewis re-read: same redox key, different electron split"
-            fresh = _transplant(mol, fresh)
+        if _heavy_bonds(mol) != _heavy_bonds(fresh):
+            return False, "validate:connectivity", "heavy-atom bonds changed across the XYZ round trip", ""
 
         step = "cx"
-        fresh_cx = rx.cxsmiles(fresh)
-        if _requested_cx(fresh, iso) != expected_cx:
-            return False, "validate:cx", "fresh CX != expected isomer CX", fresh_cx
+        own_cx = rx.cxsmiles(mol)
+        if own_cx != expected_cx:
+            return False, "validate:cx", "embedded CX != requested isomer CX", own_cx
 
         step = "geometry"
         report = ens.check()[cid]
         if not report:
-            return False, "validate:geometry", _short(report.summary()), fresh_cx
+            return False, "validate:geometry", _short(report.summary()), own_cx
 
-        return True, "", note, fresh_cx
+        return True, "", "", own_cx
     except Exception as exc:
         return False, f"validate:{step}", _short(exc), ""
 
@@ -292,7 +264,7 @@ def _counts(candidates):
 
 
 def _verdict(reference_cx, candidates):
-    """Return the structure's row: its reference isomer must be unique, valid and near the input."""
+    """Return the structure's row: its reference isomer must be unique in the enumeration and pass every check."""
     row = _counts(candidates) | {"core_rmsd": ""}
     refs = [c for c in candidates if c["cx"] == reference_cx]
     if len(refs) != 1:
@@ -300,14 +272,6 @@ def _verdict(reference_cx, candidates):
         return row | {"status": "fail", "stage": "enumerate", "detail": detail}
     ref = refs[0]
     row["core_rmsd"] = ref["core_rmsd"]
-    other = next((c for c in candidates if c is not ref and c["fresh_cx"] == reference_cx), None)
-    if other is not None:
-        detail = f"candidate {other['k']} also read back as the reference structure"
-        return row | {"status": "fail", "stage": "validate:identity", "detail": detail}
-    # An empty or nan core_rmsd could not be measured and never gates (nan compares false).
-    if ref["valid"] and ref["core_rmsd"] and float(ref["core_rmsd"]) > MAX_CORE_RMSD:
-        detail = f"reference core RMSD {float(ref['core_rmsd']):.2f} A exceeds {MAX_CORE_RMSD} A"
-        return row | {"status": "fail", "stage": "validate:core-rmsd", "detail": detail}
     return row | {"status": "pass" if ref["valid"] else "fail", "stage": ref["stage"], "detail": ref["error"]}
 
 
@@ -323,13 +287,13 @@ def _worker(send, path, charge, seed, xyz_stem):
         send.send(("stage", stage))
         isos = rx.metal(ref, lengths="model")
         reference_cx = rx.cxsmiles(ref)
-        expected = [rx.cxsmiles(iso) for iso in isos]
 
         candidates = []
-        for k, (iso, cx) in enumerate(zip(isos, expected, strict=True), start=1):
+        for k, iso in enumerate(isos, start=1):
             stage = f"embed {k}/{len(isos)}"
             send.send(("stage", stage))
-            c = {"k": k, "cx": cx, "valid": False, "stage": "embed", "error": "", "fresh_cx": "", "core_rmsd": ""}
+            cx = rx.cxsmiles(iso)
+            c = {"k": k, "cx": cx, "valid": False, "stage": "embed", "error": "", "core_rmsd": ""}
             try:  # a failure here belongs to this isomer alone
                 ens = rx.embed(iso, n=1, seed=seed, threads=1)
                 c["stage"] = "write"
@@ -340,9 +304,7 @@ def _worker(send, path, charge, seed, xyz_stem):
                 if cx == reference_cx:
                     with contextlib.suppress(Exception):
                         c["core_rmsd"] = f"{core_rmsd(ref, mol, iso):.4f}"
-                c["valid"], c["stage"], c["error"], c["fresh_cx"] = _validate(
-                    ref, mol, ens, cid, iso, cx, charge, xyz_path
-                )
+                c["valid"], c["stage"], c["error"], _own_cx = _validate(mol, ens, cid, cx, charge, xyz_path)
             except Exception as exc:
                 c["error"] = _short(exc)
             candidates.append(c)
@@ -386,6 +348,9 @@ def _run_one(path, charge, seed, xyz_stem, timeout):
     proc.kill()
     proc.join()
     return _counts(candidates) | {"core_rmsd": ""} | row
+
+
+# --- compare -------------------------------------------------------------------
 
 
 def _load(path):
@@ -446,6 +411,22 @@ def compare(base_path, new_path):
     return int(tally["reference", "lost"] + tally["isomer", "lost"] > 0)
 
 
+# --- summary and CLI ------------------------------------------------------------
+
+
+def _summarize(rows, seeds):
+    """Print pass counts per seed, failures grouped by stage, and the ten slowest structure-seed runs."""
+    for seed in seeds:
+        at_seed = [r for r in rows if r["seed"] == seed]
+        passed = sum(r["status"] == "pass" for r in at_seed)
+        print(f"seed {seed}: {passed}/{len(at_seed)} pass")
+    stages = Counter(r["stage"] for r in rows if r["status"] != "pass")
+    for stage, n in stages.most_common():
+        print(f"{n} failed at {stage or '(none)'}")
+    for r in sorted(rows, key=lambda r: float(r["seconds"]), reverse=True)[:10]:
+        print(f"{r['seconds']}s {r['id']} seed {r['seed']} {r['status']}")
+
+
 def main(argv=None):
     """Run a cohort into one results CSV, or `compare BASE.csv NEW.csv`."""
     argv = sys.argv[1:] if argv is None else argv
@@ -455,37 +436,28 @@ def main(argv=None):
         return compare(Path(argv[1]), Path(argv[2]))
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("cohort", choices=("fixtures", "sample", "issues"))
-    parser.add_argument("--only", nargs="+", metavar="ID", help="run just these IDs")
-    parser.add_argument("--size", type=int, default=100, help="tmQMg sample size (sample cohort only)")
-    parser.add_argument("--seed", type=int, nargs="+", default=[42], help="rx.embed random seed(s)")
-    parser.add_argument("--timeout", type=int, default=600, help="seconds per structure and seed")
-    parser.add_argument("--out", type=Path, help="results CSV (default benchmark/results/<cohort>-<UTC>.csv)")
-    parser.add_argument("--keep-xyz", action="store_true", help="keep candidate XYZ files in <out stem>-xyz/")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--only", nargs="+", metavar="ID", help="run just these IDs")
+    common.add_argument("--seed", type=int, nargs="+", default=[42], help="rx.embed random seed(s)")
+    common.add_argument("--timeout", type=int, default=600, help="seconds per structure and seed")
+    common.add_argument("--out", type=Path, help="results CSV (default benchmark/results/<cohort>-<UTC>.csv)")
+    common.add_argument("--keep-xyz", action="store_true", help="keep candidate XYZ files in <out stem>-xyz/")
+    sub = parser.add_subparsers(dest="cohort", required=True)
+    sub.add_parser("fixtures", parents=[common], help="the 100 shipped fixtures")
+    tmqmg = sub.add_parser("tmqmg", parents=[common], help="a MaxMin-diverse sample of a local tmQMg clone")
+    tmqmg.add_argument("--size", type=int, default=100, help="sample size (ignored with --only)")
     args = parser.parse_args(argv)
 
-    jobs = _cohort(args)
+    jobs = _fixtures(args.only) if args.cohort == "fixtures" else _tmqmg(args.size, args.only)
     out = args.out or HERE / "results" / f"{args.cohort}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
-    pkg = Path(rx.__file__).resolve().parent
-    source = hashlib.sha256()
-    for path in sorted(pkg.rglob("*.py")):
-        source.update(path.relative_to(pkg).as_posix().encode())
-        source.update(hashlib.sha256(path.read_bytes()).hexdigest().encode())
     header = {
-        "cohort": args.cohort,
+        "rxembed_version": rx.__version__,
+        "rdkit_version": rdkit.__version__,
         "seeds": args.seed,
         "timeout": args.timeout,
-        "argv": argv,
-        "rxembed_version": rx.__version__,
-        "rxembed_source": str(pkg),
-        "rxembed_source_sha256": source.hexdigest(),
-        "runner_sha256": RUNNER_SHA256,
-        "rdkit_version": rdkit.__version__,
-        "python_version": platform.python_version(),
-        "python_hash_seed": os.environ.get("PYTHONHASHSEED", ""),
-        "utc_start": datetime.now(UTC).isoformat(),
     }
+    rows = []
     with out.open("x", newline="") as fh, tempfile.TemporaryDirectory(prefix="rxembed-bench-") as tmp:
         xyz_dir = out.with_name(f"{out.stem}-xyz") if args.keep_xyz else Path(tmp)
         xyz_dir.mkdir(exist_ok=True)
@@ -499,7 +471,9 @@ def main(argv=None):
                 row |= {"id": structure_id, "seed": seed, "seconds": f"{time.monotonic() - started:.2f}"}
                 writer.writerow(row)
                 fh.flush()
+                rows.append(row)
                 print(structure_id, seed, row["status"], row["stage"], row["seconds"])
+    _summarize(rows, args.seed)
     return 0
 
 

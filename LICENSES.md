@@ -29,8 +29,8 @@ SOFTWARE.
 
 ## tmQMg
 
-Some test fixtures and the tmQMg-origin benchmark fixtures come from this dataset; `benchmark/tmqmg.txt` and
-`benchmark/issues.txt` list IDs only.
+Some test fixtures and the tmQMg-origin benchmark fixtures come from this dataset; see
+`benchmark/README.md`.
 
 MIT License
 

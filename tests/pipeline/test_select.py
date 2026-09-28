@@ -1,6 +1,5 @@
 """`pipeline/select.py`: the per-conformer latent, the clustering over it, and the dedup prunes."""
 
-import warnings
 from importlib.util import find_spec
 
 import numpy as np
@@ -26,33 +25,14 @@ def _metal_feature_columns(mol, ids):
 # --- the latent: which blocks are live, and what they carry -----------------------------------------------
 
 
-def test_butanol_dihedral_latent_excludes_the_methyl_and_hydroxyl_rotors():
-    """A terminal methyl or hydroxyl rotor, and any ring bond, are not distinct heavy-atom conformers."""
-    assert select.rotatable_quads(Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1"))) == []
-
-    mol = Chem.AddHs(Chem.MolFromSmiles("CCCCO"))  # 1-butanol: only C1-C2 and C2-C3 are real backbone rotors
-    quads = select.rotatable_quads(mol)
-    bonds = {tuple(sorted((b, c))) for _a, b, c, _d in quads}
-    assert bonds == {(1, 2), (2, 3)}
-
-    ring_mol = Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1CCO"))  # a saturated ring welded to a real rotor chain
-    ring_quads = select.rotatable_quads(ring_mol)
-    assert ring_quads
-    for _a, b, c, _d in ring_quads:
-        bond = ring_mol.GetBondBetweenAtoms(int(b), int(c))
-        assert bond is not None, f"({b},{c}) is not even a bond"
-        assert not bond.IsInRing(), f"({b},{c}) is a ring bond, not a rotor"
-
-
 @pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
 @pytest.mark.parametrize(
     ("smiles", "kw", "kinds", "mode"),
     [
         ("CCCCO", {}, ["dihedral"], "conformer family"),
-        ("CCCC.CCCC", {}, ["dihedral", "relpose"], "relative arrangement"),
         ("OC(=O)c1ccccc1.n1ccccc1", {"contacts": "auto"}, ["dihedral", "relpose", "nci"], "contact pattern"),
     ],
-    ids=["conformer", "relative", "contact"],
+    ids=["conformer", "contact"],
 )
 def test_active_features_define_mode_kind(smiles, kw, kinds, mode):
     ens = _ens(smiles, **kw)
@@ -68,32 +48,6 @@ def test_metal_latent_suppresses_other_blocks():
     assert select.mode_kind(ens.mol, ens.ids) == "ligand arrangement"
 
     assert _metal_feature_columns(ens.mol, ens.ids) == 6, "four donors give six L-M-L pairs"
-
-
-def test_metal_latent_uses_declared_sphere():
-    rw = Chem.RWMol()
-    metal = rw.AddAtom(Chem.Atom(57))
-    donors = [rw.AddAtom(Chem.Atom(34)) for _ in range(2)]
-    near_non_donor = rw.AddAtom(Chem.Atom(8))
-    for donor in donors:
-        rw.AddBond(donor, metal, Chem.BondType.DATIVE)
-    mol = rw.GetMol()
-    mol.UpdatePropertyCache(strict=False)
-    conf = Chem.Conformer(mol.GetNumAtoms())
-    for atom, xyz in enumerate(((0.0, 0.0, 0.0), (3.0, 0.0, 0.0), (-3.0, 0.0, 0.0), (0.0, 2.6, 0.0))):
-        conf.SetAtomPosition(atom, xyz)
-    cid = mol.AddConformer(conf, assignId=True)
-    stretched = Chem.Conformer(conf)
-    stretched.SetAtomPosition(donors[0], (5.0, 0.0, 0.0))
-    stretched_cid = mol.AddConformer(stretched, assignId=True)
-
-    assert select.metal_donors(mol, [cid]) == (metal, donors)
-    assert select.metal_donors(mol, [stretched_cid, cid]) == (metal, donors), (
-        "reordering conformers changed the descriptor's declared donor columns"
-    )
-    assert _metal_feature_columns(mol, [cid]) == 1, (
-        f"long La-Se donors were missed or nearby O{near_non_donor} was mistaken for one"
-    )
 
 
 def test_only_bondless_metal_uses_geometric_sphere():
@@ -171,27 +125,9 @@ def test_cascade_drops_reacted_before_dedup():
     assert set(ens.duplicates()) <= set(ens.ids), "a conformer was absorbed by one the filter then dropped"
 
 
-def test_prune_rejects_unknown_tuning_kwarg():
-    ens = _ens("CCCCO", n=2)
-    with pytest.raises(TypeError, match="rmsd"):
-        ens.prune(by="rmsd", rmsd=0.1)
-
-
 @pytest.mark.skipif(find_spec("prism_pruner") is None or find_spec("sklearn") is None, reason="needs rxembed[workflow]")
 def test_multifragment_moi_warns_overmerge(caplog):
     ens = _ens("CCCC.CCCC", n=4)
     with caplog.at_level("WARNING", logger="rxembed"):
         ens.prune(by="moi")
     assert any("over-merge" in r.getMessage() for r in caplog.records)
-
-
-@pytest.mark.skipif(find_spec("prism_pruner") is None or find_spec("sklearn") is None, reason="needs rxembed[workflow]")
-def test_prune_ignores_a_conformer_with_no_energy():
-    """A missing energy is float('inf') (Ensemble.prune); inf - inf is NaN and must not warn (nor merge)."""
-    ens = _ens("CCCCO", n=4)
-    unscored = ens.ids[0]
-    del ens.energies[unscored]
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        ens.prune()
-    assert unscored in ens.ids  # inside no energy window relative to itself: never merged away

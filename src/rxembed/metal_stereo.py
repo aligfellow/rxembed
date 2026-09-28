@@ -493,21 +493,25 @@ def chirality_of(mol, geometry, vertices, haptic=None, coordination=(), *, class
 
 
 def realised_chirality(mol, cid, geometry, vertices, metal, chirality, haptic=None):
-    """Read the stated metal-centre hand from one 3D conformer."""
+    """Read the stated metal-centre hand from one 3D conformer.
+
+    A vacant vertex has no atom to read; the occupied vertices' fit places it (see `handedness`).
+    """
     dirs = vertex_dirs(geometry) if chirality else None
-    if dirs is None or len(vertices) != len(dirs) or any(atom < 0 for atom in vertices):
+    if dirs is None or len(vertices) != len(dirs):
         return ""
+    occupied = [v for v, atom in enumerate(vertices) if atom != VACANT]
     pos = mol.GetConformer(int(cid)).GetPositions()
     haptic = haptic or {}
     observed = np.asarray(
         [
             (np.mean(pos[list(haptic[atom])], axis=0) if haptic.get(atom) else pos[atom]) - pos[metal]
-            for atom in vertices
+            for atom in (vertices[v] for v in occupied)
         ]
     )
     lengths = np.linalg.norm(observed, axis=1, keepdims=True)
     if not np.all(np.isfinite(observed)) or not np.all(lengths > EPS_LEN):
         return ""
-    if orientation_parity(observed / lengths, dirs) > 0:
+    if orientation_parity(observed / lengths, np.asarray(dirs, float)[occupied]) > 0:
         return chirality
     return LAMBDA if chirality == DELTA else DELTA

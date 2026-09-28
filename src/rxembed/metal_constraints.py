@@ -56,7 +56,7 @@ _ML_SEED_HALF_WIDTH = 0.05  # Å: numerical room around an M-L seed target, not 
 _STRAIGHT = 180.0
 _SHELL_ATOL = 1e-6  # numerical tolerance for template coplanarity and sector closure
 # Slack on an otherwise-unconstrained compiled L-M-L angle row: wide enough for ordinary distortion, narrow
-# enough that metal_screen's per-candidate reach screen can still prove a compiled angle conflicts with the
+# enough that the enumeration reach screen can still prove a compiled angle conflicts with the
 # native ligand reach.
 ANGLE_PAD = 8.0
 
@@ -274,20 +274,19 @@ class CoordinationSphere:
         return frag[vertex_atom(self.haptic, v)]
 
 
-def compile_constraints(iso, *external, params=None, force_field=True, context=None):
+def compile_constraints(iso, *external, params=None, context=None):
     """Compile `iso`'s constrained metal states onto a copy of its base constraints.
 
     `iso.graph` supplies current topology and atom indexing; `iso.length_mol` preserves the input geometry
     used for lengths. `external` informs model independence without merging or bypassing the caller's later
     validation. `params` (an `EmbedParams`) supplies the `donor_orientation` and `conjugation` switches, both
-    on when omitted. `force_field=False` keeps the same coordination targets for a reach screen while omitting
-    derived contact walls; it is not an alternative embedding model.
+    on when omitted.
     """
     params = EmbedParams() if params is None else params
     context = {} if context is None else context
     mol = iso.graph
     _fact(context, "bound", lambda: Counter(d for d, _metal in iso.donor_bonds))
-    base = iso.base_cons.copy(donor_orientation=params.donor_orientation, conjugation=params.conjugation)
+    base = iso.base_cons.copy(conjugation=params.conjugation)
     built = []
     if iso.constrained_metals:
         pos, _note = resolve_lengths(iso.length_mol, iso.lengths)
@@ -317,7 +316,7 @@ def compile_constraints(iso, *external, params=None, force_field=True, context=N
                 donor_orientation=params.donor_orientation,
                 context=context,
             )
-            built.append(coordination(sphere, force_field))
+            built.append(coordination(sphere))
     out = compose(*built, base)
     _add_donor_angle_floors(out, mol, context.get("bounds"))
     _add_point_umbrellas(out, mol, iso.stereo_label, iso.donor_bonds)
@@ -488,9 +487,8 @@ def _bite_window_and_reach(mol, left, right, donors, matrix, lengths, row):
 def seated_bites(sphere, ideal_angles, distances, angle_rows=None):
     """Return each same-ligand donor pair's (window, reach) angle windows, keyed by its seated site pair.
 
-    The one place `coordination` and `metal_screen`'s chelate screens both read, so the bite condition
-    is defined once, not copied. `angle_rows` is `coordination`'s stated polyhedron subset; a pair missing
-    from it falls back to `ideal_angles`.
+    `angle_rows` is `coordination`'s stated polyhedron subset; a pair missing from it falls back to
+    `ideal_angles`.
     """
     mol, metal, od, haptic, context = sphere.mol, sphere.metal, sphere.vertices, sphere.haptic, sphere.context
     angle_rows = angle_rows or {}
@@ -505,8 +503,6 @@ def seated_bites(sphere, ideal_angles, distances, angle_rows=None):
         ):
             continue
         keys = ((min(metal, left), max(metal, left)), (min(metal, right), max(metal, right)))
-        if any(key not in distances for key in keys):  # the screen's sigma radial legs carry no haptic leg
-            continue
         lengths = (0.5 * sum(distances[keys[0]]), 0.5 * sum(distances[keys[1]]))
         left_site, right_site = haptic.get(left, (left,)), haptic.get(right, (right,))
         base = angle_rows.get(pair, ideal_angles[pair])
@@ -852,14 +848,13 @@ def _assign_angle_rows(sphere, angle_rows, bites, corner_images, mid_angles, c):
             c.pulls[canonical] = float(mid_angles[i, j])
 
 
-def coordination(sphere, force_field=True):
+def coordination(sphere):
     """Build one metal state's distance, angle, floor and umbrella constraints.
 
     Cis chelates use calibrated ring-size bite windows (`seated_bites`); every other angle row narrows
     toward the shells those bites can build, or otherwise takes the polyhedron's own ideal angle
     (`_chelate_bite_images`, `_assign_angle_rows`). This compiles the full model before `_drop_graft_owned`
-    removes the terms `sphere.frozen` already covers. A false `force_field` flag omits only derived nonbonded
-    contact terms, for enumeration screening.
+    removes the terms `sphere.frozen` already covers.
 
     Each step below reads and writes the same `c` in dependency order: the radial M-D windows first, since
     the bite, angle and force-field steps that follow all read them.
@@ -871,22 +866,21 @@ def coordination(sphere, force_field=True):
     _fill_angle_rows(sphere, ideal_angles, angle_rows, bites)
     bites, corner_images, mid_angles = _chelate_bite_images(sphere, ideal_angles, bites)
     _assign_angle_rows(sphere, angle_rows, bites, corner_images, mid_angles, c)
-    if force_field:
-        # The real coordinating atoms, never a centroid key, so nondonor_floors never floors a face atom. An η²
-        # pi bond needs no hold of its own: one axial pull plus the cone pins both atoms at the face radius, where
-        # two separate M-donor pulls tore C≡C from 1.2 to 1.7 Å.
-        coord = [d for d in sphere.vertices if d != VACANT and d not in sphere.haptic]
-        coord += [a for site in sphere.haptic.values() for a in site]
-        ff_terms(
-            sphere.mol,
-            c,
-            sphere.metal,
-            sphere.real_z,
-            coord,
-            frozen=sphere.frozen,
-            fragments=sphere.context.get("fragments"),
-            topology=sphere.context.get("topology"),
-        )
+    # The real coordinating atoms, never a centroid key, so nondonor_floors never floors a face atom. An η²
+    # pi bond needs no hold of its own: one axial pull plus the cone pins both atoms at the face radius, where
+    # two separate M-donor pulls tore C≡C from 1.2 to 1.7 Å.
+    coord = [d for d in sphere.vertices if d != VACANT and d not in sphere.haptic]
+    coord += [a for site in sphere.haptic.values() for a in site]
+    ff_terms(
+        sphere.mol,
+        c,
+        sphere.metal,
+        sphere.real_z,
+        coord,
+        frozen=sphere.frozen,
+        fragments=sphere.context.get("fragments"),
+        topology=sphere.context.get("topology"),
+    )
     _add_umbrella(c, sphere.metal, sphere.vertices, sphere.poly)
     return _drop_graft_owned(c, sphere.frozen, sphere.haptic)
 

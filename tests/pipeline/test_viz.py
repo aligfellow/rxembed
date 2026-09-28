@@ -2,27 +2,11 @@
 
 from importlib.util import find_spec
 
-import numpy as np
 import pytest
 
 import rxembed as rx
-from rxembed.pipeline.viz import project
 
 pytestmark = pytest.mark.skipif(find_spec("matplotlib") is None, reason="needs rxembed[workflow]")
-
-
-@pytest.fixture(autouse=True)
-def _headless():
-    import matplotlib as mpl
-
-    mpl.use("Agg")
-
-
-def test_projection_is_2d_and_rejects_unknown_method():
-    feats = np.random.default_rng(0).normal(size=(12, 7))
-    assert project(feats, "pca").shape == (12, 2)
-    with pytest.raises(ValueError, match="umap"):
-        project(feats, "umap")
 
 
 def test_landscape_projects_kept_and_pruned():

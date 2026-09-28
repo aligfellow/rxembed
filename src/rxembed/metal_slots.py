@@ -20,6 +20,7 @@ from .metal_polyhedron import (
     point_group,
     seat_by_alignment,
     seat_properly,
+    seating_frames,
     vertex_angle,
     vertex_dirs,
 )
@@ -301,8 +302,9 @@ def distinct_vertex_orderings(problem, perms=None, *, retained=None, max_orbits=
     tethered pool only, dropping an order it forbids before the cap below can raise on an orbit no completion
     of it could ever satisfy.
 
-    Canonical vertex classes and same-ligand path lengths distinguish candidates under proper rotations. No
-    graph heuristic proves conformational reachability, so feasibility remains the embedder's job.
+    Canonical vertex classes and same-ligand path lengths distinguish candidates under `seating_frames`, with
+    a vacancy as a class of its own. No graph heuristic proves conformational reachability, so feasibility
+    remains the embedder's job.
     """
     mol, donors, geometry, haptic = problem.mol, problem.donors, problem.geometry, problem.haptic
     dirs = vertex_dirs(geometry)
@@ -319,7 +321,8 @@ def distinct_vertex_orderings(problem, perms=None, *, retained=None, max_orbits=
         and len({frag[donor] for donor in donors}) == len(donors)
     ):
         return [tuple(range(len(donors)))]
-    rotations = point_group(tuple(map(tuple, dirs)))[0]
+    template = tuple(map(tuple, dirs))
+    rotations = point_group(template)[0]
     retained = tuple(retained) if retained is not None and perms is None else None
     if perms is None and not tethered and VACANT not in donors and len(set(classes.values())) == len(donors):
         _check_assignment_cap(geometry, [1] * len(donors), rotations, limit)
@@ -343,12 +346,13 @@ def distinct_vertex_orderings(problem, perms=None, *, retained=None, max_orbits=
     for order in perms:
         od = [donors[k] for k in order]  # od[position] = donor atom (or VACANT) at that polyhedron vertex
         links = chelate_links(mol, od, haptic, dmat) if tethered else {}
+        frames = seating_frames(template, tuple(v for v, donor in enumerate(od) if donor != VACANT))
         sig = min(
             (
                 tuple(site[od[q[v]]] for v in range(len(dirs))),
                 tuple(links.get(frozenset((q[p], q[r])), -1) for p, r in pairs),
             )
-            for q in rotations
+            for q in frames
         )
         if sig not in seen:
             seen.add(sig)

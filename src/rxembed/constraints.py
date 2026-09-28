@@ -66,7 +66,6 @@ class Constraints:
     umbrellas: dict = field(default_factory=dict)  # four atoms -> improper: None is planar, 0 keeps only the
     #   seed-side half-space, a positive value the minimum magnitude (soft walls; validate final stereo);
     #   (anchor, weight) is a template planar well with its fraction of the complete shell's force coefficient
-    donor_orientation: bool = True  # retain rxembed's M-D-X fold and sp2 donor-plane terms
     conjugation: bool = True  # retain rxembed's organic sp2/conjugation UFF cleanup terms
 
     @property
@@ -224,7 +223,6 @@ _MERGE = {  # field -> how two sources combine. See `compose`.
     "phantoms": lambda a, b: a | b,
     "haptic": partial(_merge_exclusive, "haptic"),  # a shared key = two faces claiming one reserved index = corruption
     "umbrellas": partial(_merge_exclusive, "umbrellas"),
-    "donor_orientation": lambda a, b: a and b,
     "conjugation": lambda a, b: a and b,
 }
 
@@ -673,11 +671,11 @@ def reference_positions(reference):
     raise ValueError("a template reference must be a Mol with a conformer, an .xyz path, or an (N, 3) array")
 
 
-def template_to_fix(template, fix=None, own=None, target=None):
+def template_to_fix(template, fix=None, target=None):
     """Fold ``template=(reference, map_or_smarts)`` into a coordinate ``fix``; sugar, not a mechanism.
 
     Every rigid spec answers one question, where do these atoms' coordinates come from: your own geometry
-    (`fix=[i, j]`, resolved against `own`), coordinates you supply (`fix={i: (x, y, z)}`), or another
+    (`fix=[i, j]`, read from `target`'s conformer), coordinates you supply (`fix={i: (x, y, z)}`), or another
     molecule (`template=`). They compose, with an explicit `fix` on the same atom winning.
 
     Coordinates carry handedness, which a distance/angle spec cannot and may give the mirror image
@@ -725,11 +723,12 @@ def template_to_fix(template, fix=None, own=None, target=None):
     if isinstance(fix, dict):
         return {**coords, **fix}
     if fix:  # a list of atoms held at the source's own coordinates: another coordinate source, so merge it
-        if own is None:
+        if target is None or not target.GetNumConformers():
             raise ValueError(
                 "template= with fix=[atoms] needs the source's own geometry to resolve that list. Give those "
                 "atoms as coordinates instead (fix={i: (x, y, z)}), or embed without the list."
             )
+        own = target.GetConformer().GetPositions()
         coords.update({int(i): tuple(own[int(i)]) for i in fix})
     return coords
 

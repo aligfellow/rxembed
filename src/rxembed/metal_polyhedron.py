@@ -541,6 +541,23 @@ def point_group(dirs):
 
 
 @lru_cache(maxsize=None)
+def seating_frames(dirs, occupied):
+    """Return the vertex permutations that relabel a seating of `occupied` vertices without moving an atom.
+
+    The proper rotations always qualify. A vacant vertex is a direction with no atom, placed only through the
+    donors, so once the occupied vertices are coplanar with the metal, the reflection through that plane fixes
+    every atom and the improper permutations join them: such a seating has no hand and no mirror isomer. A planar
+    template's improper permutations are already rotations, so it returns `rot` itself, whose iteration order
+    breaks `canonical_slots` ties.
+    """
+    rot, refl = point_group(dirs)
+    rays = np.array(dirs, float)[list(occupied)]
+    if refl <= rot or (len(rays) >= 3 and np.linalg.matrix_rank(rays, tol=_SYM_TOL) == 3):  # noqa: PLR2004
+        return rot
+    return rot | refl
+
+
+@lru_cache(maxsize=None)
 def hull_edges(dirs):
     """Return the vertex-index pairs on the polyhedron's convex-hull 1-skeleton (edges, not diagonals).
 
@@ -758,16 +775,17 @@ def _slot_form(q, keys, labelled):
 
 
 def canonical_slots(dirs, keys, links=None):
-    """Return ``slots[vertex]`` minimised over proper template rotations.
+    """Return ``slots[vertex]`` minimised over the seating's `seating_frames`.
 
-    `keys` identifies each site and `links` labels same-ligand pairs by graph distance. Neither may depend on
-    atom order. A renderer must retain the link-preserving donor-to-slot pairing when tied sites are folded.
+    `keys` identifies each site (``None`` at a vacancy) and `links` labels same-ligand pairs by graph distance.
+    Neither may depend on atom order. A renderer must retain the link-preserving donor-to-slot pairing when
+    tied sites are folded.
     """
-    rot = point_group(tuple(map(tuple, dirs)))[0]
-    if not rot:
+    frames = seating_frames(tuple(map(tuple, dirs)), tuple(v for v, key in enumerate(keys) if key is not None))
+    if not frames:
         return None
     labelled = [(tuple(edge), label) for edge, label in (links or {}).items()]
-    return list(min(rot, key=lambda q: _slot_form(q, keys, labelled)))
+    return list(min(frames, key=lambda q: _slot_form(q, keys, labelled)))
 
 
 _SLOT_NOTE = re.compile(r"^s(\d+)([+\-cPM]?)$")  # a donor's canonical slot and optional haptic face token
@@ -805,13 +823,17 @@ def handedness(dirs, order, donor_class, chelate_links=None):
 
     Donor symmetry classes and graph-distance-labelled chelate links decorate the seated template. A
     reflection that preserves both makes it achiral; otherwise the canonical frame's parity gives the hand.
-    A vacant vertex cannot fix parity.
+    A vacant vertex (a negative `order` entry) is a direction with no atom: it decorates its vertex as a class
+    of its own, and `seating_frames` says when no atom can place it.
     """
     n = len(dirs)
-    if len(order) != n or any(d < 0 for d in order):  # a vacancy (or padding) can't fix a parity
+    if len(order) != n:
         return ""
-    rot, refl = point_group(tuple(map(tuple, dirs)))
-    label = {v: donor_class[order[v]] for v in range(n)}
+    key = tuple(map(tuple, dirs))
+    rot, refl = point_group(key)
+    if seating_frames(key, tuple(v for v in range(n) if order[v] >= 0)) & refl:
+        return ""
+    label = {v: donor_class[order[v]] if order[v] >= 0 else () for v in range(n)}
     labelled = [(tuple(edge), value) for edge, value in (chelate_links or {}).items()]
     forms = {q: _decorated_form(q, label, labelled) for q in rot | refl}
     base = forms[tuple(range(n))]
