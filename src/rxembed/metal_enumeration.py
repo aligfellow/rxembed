@@ -515,7 +515,7 @@ def _isomers_for_geometry(request, base_iso, geom, donors, haptic):
             shared_mol=True,
         )
         if reach is not None and (retained is None or tuple(order) != tuple(retained)):
-            failure = unreachable_span(candidate, reach, classes, links, native_reach, screen_context)
+            failure = unreachable_span(candidate, reach, links, native_reach, screen_context)
             if failure:
                 logger.debug("metal[%s]: omit arrangement: %s", geom, failure)
                 unreachable += 1

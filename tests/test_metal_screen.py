@@ -15,7 +15,7 @@ from rxembed.bounds import ligand_reach
 from rxembed.constraints import Constraints
 from rxembed.mechanisms import law_of_cosines
 from rxembed.metal_slots import SPAN_TOL, TRANS_ANGLE
-from rxembed.metal_stereo import chelate_links, site_classes
+from rxembed.metal_stereo import chelate_links
 
 
 @pytest.mark.parametrize("refine", [False, True])
@@ -102,16 +102,15 @@ def test_trans_reach_screen_uses_the_shared_150_degree_slot_boundary(monkeypatch
         donors=(0, 1, 2, 3),
     )
     monkeypatch.setattr(metal_screen, "donor_distance_window", lambda *_args, **_kwargs: (2.0, 2.1))
-    monkeypatch.setattr(metal_screen, "_opposed_donor_span_failure", lambda *_args: None)
     # the trans slot boundary at each donor's lower M-L bound (2.0, not the upper 2.1), widened by SPAN_TOL
     boundary = law_of_cosines(2.0, 2.0, TRANS_ANGLE) - SPAN_TOL
 
     reach = np.full((5, 5), 10.0)
     reach[1, 3] = reach[3, 1] = boundary - 0.02
-    assert metal_screen.unreachable_span(iso, reach, {}, ()) is not None
+    assert metal_screen.unreachable_span(iso, reach, ()) is not None
 
     reach[1, 3] = reach[3, 1] = boundary + 0.02
-    assert metal_screen.unreachable_span(iso, reach, {}, ()) is None
+    assert metal_screen.unreachable_span(iso, reach, ()) is None
 
 
 def test_compiled_span_uses_local_triangle_before_global_certificate(monkeypatch):
@@ -176,16 +175,14 @@ def test_tethered_haptic_faces_reject_an_unreachable_trans_state():
     trans.length_mol.AddConformer(Chem.Conformer(seed.GetConformer(0)))
     reach = ligand_reach(trans.length_mol)
     links = chelate_links(trans.graph, trans.vertices, trans.haptic)
-    classes = site_classes(trans.graph, trans.vertices, trans.haptic, ())
 
     assert len(isomers) == 6
-    assert "haptic faces" in metal_screen.unreachable_span(trans, reach, classes, links)
+    assert "haptic faces" in metal_screen.unreachable_span(trans, reach, links)
 
     model = rx.metal(smiles, "octahedral", screen=False)[0]
     model_reach = ligand_reach(model.length_mol)
     model_links = chelate_links(model.graph, model.vertices, model.haptic)
-    model_classes = site_classes(model.graph, model.vertices, model.haptic, ())
-    assert "haptic faces" in metal_screen.unreachable_span(model, model_reach, model_classes, model_links)
+    assert "haptic faces" in metal_screen.unreachable_span(model, model_reach, model_links)
 
 
 def test_haptic_centroid_reach_uses_a_valid_minimum_matching():

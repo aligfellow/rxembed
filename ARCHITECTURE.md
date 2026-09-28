@@ -116,8 +116,7 @@ combines metal, ligand and haptic stereo and screens the candidates. Only the fi
 and it is a proof against the compiled model, not against chemistry:
 
 - `metal_screen` rejects a single-centre candidate whose compiled constraints contradict the ligands' native
-  reach (row, triangle-closure and Euclidean certificates) or whose opposed donors exceed the acceptance gate's
-  fit budget.
+  reach (row, triangle-closure and Euclidean certificates).
 - The `metal_slots` edge rule holds each short chelate pair to a polyhedron hull edge, a measured claim.
 - The chelate-bite fold check and the long-arc, trans and haptic span tests in `metal_screen` are model priors. A
   multi-metal candidate gets only these.

@@ -13,7 +13,7 @@ import numpy as np
 from rdkit import Chem, DistanceGeometry
 
 from .bounds import coordination_reach, coordination_reach_base
-from .constraints import ML_WINDOW_TOL, Constraints
+from .constraints import Constraints
 from .mechanisms import law_of_cosines, triangle_distances
 from .metal_constraints import (
     CoordinationSphere,
@@ -25,16 +25,13 @@ from .metal_constraints import (
 )
 from .metal_core import VACANT
 from .metal_distance import delocalised_charges
-from .metal_donor_orient import FOLD_WINDOW, donation_axis, stripped_hybridisation
-from .metal_perceive import FIT_FLOOR
+from .metal_donor_orient import stripped_hybridisation
 from .metal_polyhedron import CHELATE_SPAN_ANGLE, POLYHEDRA, vertex_angle
 from .metal_slots import SPAN_TOL, TRANS_ANGLE, chelate_bite_window
-from .metal_stereo import equivalent_site_assignments
 
 _CHELATE_PATH_MIN = 3
 _CHELATE_SPAN_MIN = 120.0
 _HAPTIC_MATCHING_CAP = 7  # factorial matching remains tiny for ordinary pi faces; larger faces use the safe mean bound.
-_FIT_ROUNDOFF = 1e-10  # Numerical comparison on unit rays, not an angular or chemical tolerance.
 _EUCLIDEAN_SUBSET_BUDGET = 128  # Keep local route certificates bounded; the full route remains authoritative.
 _ROUTE_ATOMS_KEY = "route_atoms"  # context cache: _route_certificate_paths is candidate-independent, see there.
 _PROJECTOR_EPS = 1e-10  # Ignore the numerically null centered constant eigenspace.
@@ -130,19 +127,16 @@ def _haptic_span_failure(iso, reach, left, right, angle, compiled):
     """Check centroid reach; member rays need not share the angle between centroid sites."""
     metal, measured = iso.metal, iso.lengths == "input"
     left_face, right_face = iso.haptic.get(left, (left,)), iso.haptic.get(right, (right,))
-    try:
-        if measured:
-            positions = iso.length_mol.GetConformer().GetPositions()
-            radii = tuple(
-                float(np.linalg.norm(np.mean(positions[list(face)], axis=0) - positions[metal]))
-                for face in (left_face, right_face)
-            )
-        else:
-            assert compiled is not None
-            radii = tuple(compiled.distances[tuple(sorted((metal, vertex)))][0] for vertex in (left, right))
-        available = _centroid_reach(reach, left_face, right_face)
-    except (KeyError, IndexError, ZeroDivisionError):
-        return None
+    if measured:
+        positions = iso.length_mol.GetConformer().GetPositions()
+        radii = tuple(
+            float(np.linalg.norm(np.mean(positions[list(face)], axis=0) - positions[metal]))
+            for face in (left_face, right_face)
+        )
+    else:
+        assert compiled is not None
+        radii = tuple(compiled.distances[tuple(sorted((metal, vertex)))][0] for vertex in (left, right))
+    available = _centroid_reach(reach, left_face, right_face)
     needed = law_of_cosines(radii[0], radii[1], angle)
     if math.isfinite(available) and needed > available + SPAN_TOL:
         return f"haptic faces {left}/{right} need >= {needed:.3f} A; centroid reach <= {available:.3f} A"
@@ -168,14 +162,13 @@ def _centroid_reach(reach, left, right):
     return sum(map(sum, values)) / (len(left) * len(right))
 
 
-def unreachable_span(iso, reach, classes, links, native=None, context=None):
+def unreachable_span(iso, reach, links, native=None, context=None):
     """Return why a candidate's compiled targets or span priors exceed native ligand reach, else ``None``.
 
-    A single centre gets the compiled certificate and, with chelate links or haptic faces, the span priors
-    and the opposed-donor fit budget. A multi-centre candidate, whose spectator geometry no certificate owns,
-    gets the span priors only: the chelate-bite fold, the long-arc and haptic spans, and trans pairs allowed
-    to close to TRANS_ANGLE (above 90 degrees a span grows with both M-L lengths). None of this proves
-    chemical impossibility.
+    A single centre gets the compiled certificate and, with chelate links or haptic faces, the span priors.
+    A multi-centre candidate, whose spectator geometry no certificate owns, gets the span priors only: the
+    chelate-bite fold, the long-arc and haptic spans, and trans pairs allowed to close to TRANS_ANGLE (above
+    90 degrees a span grows with both M-L lengths). None of this proves chemical impossibility.
     """
     mol, metal, vertices, haptic = iso.graph, iso.metal, iso.vertices, iso.haptic
     directions = POLYHEDRA[iso.geometry].vertex_dirs
@@ -204,7 +197,7 @@ def unreachable_span(iso, reach, classes, links, native=None, context=None):
         return None
     atoms = set(vertices) - haptic.keys() - {VACANT}
     positions, _ = resolve_lengths(iso.length_mol, iso.lengths)
-    radial, hyb = _radial_distance_windows(iso, atoms, positions, iso.base_cons.distances, context=context)
+    radial, _ = _radial_distance_windows(iso, atoms, positions, iso.base_cons.distances, context=context)
     if failure := _chelate_span_failure(iso, reach, radial, links, compiled, context):
         return failure
     for left, right in pairs:
@@ -213,7 +206,7 @@ def unreachable_span(iso, reach, classes, links, native=None, context=None):
         available = float(reach[min(left, right), max(left, right)])
         if needed > available + SPAN_TOL:
             return f"donors {left}/{right} need >= {needed:.3f} A; ligand reach <= {available:.3f} A"
-    return _opposed_donor_span_failure(iso, reach, radial, hyb, classes, links)
+    return None
 
 
 def _route_certificate_subsets(path):
@@ -434,99 +427,3 @@ def _compiled_span_failure(iso, reach, compiled=None, native=None, context=None)
             if _euclidean_conflict(closed[np.ix_(atoms, atoms)], refine=subset == path, context=context) is not None:
                 return f"compiled coordination distances have no Euclidean realization at atoms {atoms}"
     return None
-
-
-def _fold_gap(reach, radii, axes, floors, donors, theta):
-    """Return how far the pair's donor-axis atoms overshoot their native reach at angle `theta`, or 0."""
-    a, b = radii[0][0], radii[1][0]
-    span = law_of_cosines(a, b, math.degrees(theta))
-    gaps = [0.0]
-    for k, other in enumerate(reversed(donors)):
-        beta = math.atan2(radii[1 - k][1] * math.sin(theta), radii[k][0] - radii[1 - k][1] * math.cos(theta))
-        away = max(0.0, floors[k] - beta)
-        for atom in axes[k]:
-            available = float(reach[min(atom, other), max(atom, other)])
-            if math.isfinite(available) and available > 0:
-                gaps.append(span * math.sin(min(away, math.pi / 2)) - available - SPAN_TOL)
-    return max(gaps)
-
-
-def _donor_pair_fit_cost(reach, radii, axes, floors, donors):
-    """Lower-bound opposed-pair fit cost using length-free donor cones."""
-    if _fold_gap(reach, radii, axes, floors, donors, math.pi) <= 0:
-        return 0.0
-    lo, hi = math.pi / 2, math.pi
-    if _fold_gap(reach, radii, axes, floors, donors, lo) > 0:
-        hi = lo  # Any unexamined acute angle spends at least this much opposed-pair error.
-    else:
-        for _ in range(40):
-            mid = (lo + hi) / 2
-            if _fold_gap(reach, radii, axes, floors, donors, mid) > 0:
-                hi = mid
-            else:
-                lo = mid
-    return 4 - 4 * math.sin(hi / 2)  # Use the upper bracket: a conservative lower fit cost.
-
-
-def _opposed_donor_span_failure(iso, reach, radial, hyb, classes, links):
-    """Reject only when donor-facing reach exhausts the shared fit budget in every equivalent seating.
-
-    An ideal opposed pair capped at angle theta costs at least 4-4*sin(theta/2), a squared unit-ray error on
-    the same raw (unaveraged, pre-sqrt) scale `metal_polyhedron.fit_residual` averages and roots: occupied *
-    FIT_FLOOR**2 converts the per-vertex RMS floor back into that raw-sum budget for `occupied` vertices, so
-    disjoint pairs sum against one shared budget, not a fresh one per chelate. Caps follow from the existing
-    single-endpoint cones without assuming a donor-substituent bond length. Native ligand reach intervals
-    remain model priors, not proof of chemical impossibility.
-    """
-    vertices, mol, metal = iso.vertices, iso.graph, iso.metal
-    occupied = sum(vertex != VACANT for vertex in vertices)
-    if len(iso.centres) != 1:
-        return None
-    donors = set(iso.donors)
-    # Coordination can expand radial caps for bonded co-donors; the uncompiled windows cannot bound them.
-    bonded_donors = {d for d in donors if any(n.GetIdx() in donors for n in mol.GetAtomWithIdx(d).GetNeighbors())}
-    directions = [
-        tuple(value / math.hypot(*direction) for value in direction)
-        for direction in POLYHEDRA[iso.geometry].vertex_dirs
-    ]
-    opposed = [
-        (i, j)
-        for i, j in itertools.combinations(range(len(vertices)), 2)
-        if VACANT not in (vertices[i], vertices[j])
-        and math.dist(directions[i], tuple(-value for value in directions[j])) <= _FIT_ROUNDOFF
-    ]
-    used = [slot for pair in opposed for slot in pair]
-    if not opposed or len(used) != len(set(used)):
-        return None  # A nonstandard template cannot spend one donor's fit error twice.
-
-    @functools.cache
-    def pair_cost(left, right):
-        if {left, right} & (iso.haptic.keys() | bonded_donors):
-            return 0.0
-        if not Chem.GetShortestPath(mol, left, right):
-            return 0.0
-        radii = [radial.distances[tuple(sorted((metal, atom)))] for atom in (left, right)]
-        radii = [(lo - ML_WINDOW_TOL, hi + ML_WINDOW_TOL) for lo, hi in radii]
-        if any(not (0 < lo <= hi) or not all(map(math.isfinite, (lo, hi))) for lo, hi in radii):
-            return 0.0
-        axes, floors = [], []
-        for atom in (left, right):
-            floor = FOLD_WINDOW.get((mol.GetAtomWithIdx(atom).GetSymbol(), hyb.get(atom)))
-            floors.append(math.radians(floor[0]) if floor else 0.0)
-            axes.append(tuple(donation_axis(mol, atom, donors, hyb=hyb, network=False) or ()) if floor else ())
-        if not any(axes):
-            return 0.0
-
-        return _donor_pair_fit_cost(reach, radii, axes, floors, (left, right))
-
-    keys = [None if vertex == VACANT else classes[vertex] for vertex in vertices]
-    budget = occupied * FIT_FLOOR**2
-    minimum = math.inf
-    for assignment in equivalent_site_assignments(keys, links):
-        cost = sum(pair_cost(*sorted((vertices[assignment[i]], vertices[assignment[j]]))) for i, j in opposed)
-        if cost <= budget + _FIT_ROUNDOFF:
-            return None
-        minimum = min(minimum, cost)
-    if not math.isfinite(minimum):
-        return None
-    return f"donor-facing network needs squared fit error >= {minimum:.3f}; shape budget is {budget:.3f}"
