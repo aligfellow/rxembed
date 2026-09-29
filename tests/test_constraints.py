@@ -10,6 +10,7 @@ from rxembed.constraints import (
     compose,
     compose_soft,
     constraint_value,
+    match,
     resolve_atom,
     resolve_core,
     template_to_fix,
@@ -212,6 +213,12 @@ def test_resolve_atom_rejects_an_ambiguous_or_unparsable_smarts():
     with pytest.raises(ValueError, match="did not parse"):
         resolve_atom(mol, "[not a smarts")
     assert resolve_atom(mol, "[Cl]C[c]") == 8
+
+
+def test_match_finds_a_thiourea_anion_in_either_lewis_form():
+    """A thiourea anion drawn [N-]C(=S)N or N=C([S-])N is one molecule, so one SMARTS names the same atoms."""
+    amide, thiolate = (Chem.AddHs(Chem.MolFromSmiles(s)) for s in ("C[N-]C(=S)NCC", "CN=C([S-])NCC"))
+    assert match(amide, "NC(=S)N") == match(thiolate, "NC(=S)N") == (1, 2, 3, 4)
 
 
 @pytest.mark.parametrize(

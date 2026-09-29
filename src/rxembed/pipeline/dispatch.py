@@ -16,7 +16,14 @@ from rdkit import Chem
 
 from rxembed import metal_enumeration
 from rxembed.bounds import resolve_params
-from rxembed.constraints import Constraints, compose_soft, resolve_atom, resolve_core, template_to_fix
+from rxembed.constraints import (
+    Constraints,
+    compose_soft,
+    resolve_atom,
+    resolve_core,
+    substruct_matches,
+    template_to_fix,
+)
 from rxembed.embed import (  # module functions, not the package facade
     BASE_STIFFNESS,
     EmbeddingError,
@@ -135,7 +142,7 @@ def _coordination_choices(iso, coordinate, nvac):
                 f"coordinate={coordinate!r} is not a valid SMARTS; pass a SMARTS pattern, an atom "
                 "index, or a list with one spec per vacancy"
             )
-        ms = [m[0] for m in iso.mol.GetSubstructMatches(pattern)]
+        ms = [m[0] for m in substruct_matches(iso.mol, pattern)]
         if not ms:
             raise ValueError(f"coordinate={coordinate!r} matched no atoms")
         if len(ms) == 1:

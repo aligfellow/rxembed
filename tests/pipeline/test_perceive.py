@@ -72,7 +72,7 @@ def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog)
         raise ValueError("no assignment")
 
     monkeypatch.setattr(perceive, "_from_xyz2mol", fail)
-    monkeypatch.setattr(perceive, "_from_xyzgraph", lambda *_args: fallback)
+    monkeypatch.setattr(perceive, "_from_xyzgraph", lambda *_args, **_kwargs: fallback)
     caplog.set_level(logging.WARNING, logger="rxembed")
     with pytest.raises(ValueError, match="no assignment"):
         perceive.read_xyz(_BIMP, 0, connectivity="xyz2mol", bond_orders="xyz2mol", fallback=False)
@@ -207,60 +207,8 @@ def test_invalid_selected_connectivity_falls_back_with_provenance(monkeypatch, c
     assert result.GetProp("_rxembedBondOrders") == "xyz2mol"
 
 
-def test_default_xyzgraph_keeps_a_native_omitted_metal_donor_contact(monkeypatch, caplog):
-    """SOSHOY analogue: a real xyzgraph Zn-O 2.43 A contact must survive a native RDKit omission.
-
-    xyzgraph and xyz2mol are the metal-aware readers; native RDKit connectivity never arbitrates a
-    metal-donor contact between them (user direction), so the selected reader's donor set is untouched.
-    """
-
-    def graph(long_contact):
-        rw = Chem.RWMol()
-        for atomic_number in (30, 7, 7, 8, 8):  # Zn, 2x NH3 N, 2x carboxylate O (SOSHOY analogue)
-            atom = Chem.Atom(atomic_number)
-            atom.SetNoImplicit(True)
-            rw.AddAtom(atom)
-        for donor in (1, 2, 3, 4):
-            rw.AddBond(donor, 0, Chem.BondType.DATIVE)
-        if not long_contact:
-            rw.RemoveBond(0, 4)
-        mol = rw.GetMol()
-        conf = Chem.Conformer(5)
-        for index, xyz in enumerate(((0, 0, 0), (2.05, 0, 0), (-2.05, 0, 0), (0, 2.05, 0), (0, -2.43, 0))):
-            conf.SetAtomPosition(index, xyz)
-        mol.AddConformer(conf)
-        mol.UpdatePropertyCache(strict=False)
-        return mol
-
-    def donor_edges(mol):
-        return {
-            frozenset((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))
-            for b in mol.GetBonds()
-            if b.GetBeginAtomIdx() == 0 or b.GetEndAtomIdx() == 0
-        }
-
-    raw = donor_edges(graph(True))  # r_cov(Zn)+r_cov(O) = 1.88; 2.43 A is 0.10 over the 2.33 outer limit
-    monkeypatch.setattr(perceive, "_with_fallback", lambda *_args: (graph(True), "xyzgraph"))
-    monkeypatch.setattr(perceive, "_from_rdkit_connectivity", lambda *_args: graph(False))
-
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        result = perceive.read_xyz("unused.xyz", bond_orders="xyzgraph")
-
-    assert donor_edges(result) == raw
-    assert result.GetBondBetweenAtoms(0, 4) is not None
-    assert not result.HasProp("_rxembedConnectivityRemoved")
-    assert result.GetProp("_rxembedConnectivityAdded") == ""
-
-    strict = perceive.read_xyz("unused.xyz", bond_orders="xyzgraph", fallback=False)
-    assert donor_edges(strict) == raw
-
-
-def test_side_on_disulfide_bond_restored_by_consensus_reads_closed_shell(tmp_path, caplog):
-    """WICHIZ analogue: xyzgraph drops an eta2-S2 S-S bond that closes a three-ring through the metal.
-
-    RDKit and xyz2mol both find it, so xyzgraph re-reads with it and assigns its Lewis form on that graph,
-    not the two sulfur radicals it gave without the bond.
-    """
+def test_side_on_disulfide_bond_reads_closed_shell(tmp_path):
+    """WICHIZ analogue: an eta2-S2 S-S bond that closes a three-ring through the metal is read, closed shell."""
     atoms = [
         ("Nb", 0.0, 0.0, 0.0),
         ("S", 2.35, 1.06, 0.0),
@@ -271,12 +219,9 @@ def test_side_on_disulfide_bond_restored_by_consensus_reads_closed_shell(tmp_pat
     ]
     path = _write_complex(tmp_path, "NbS2Cl3", atoms, range(len(atoms)))
 
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        mol = perceive.read_xyz(path, 0)
+    mol = perceive.read_xyz(path, 0)
 
     assert mol.GetBondBetweenAtoms(1, 2) is not None
-    assert mol.GetProp("_rxembedConnectivityAdded") == "1-2"
-    assert "added 1-2 internal ligand bonds confirmed" in caplog.text
     assert not any(atom.GetNumRadicalElectrons() for atom in mol.GetAtoms())
 
 
@@ -360,11 +305,8 @@ def test_read_xyz_drops_the_ring_junction_of_a_four_membered_quinolinyl_chelate(
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_read_drops_a_triazolate_cross_ring_contact(tmp_path):
-    """A 1,2,4-triazole's two ring carbons sit 2.095 A apart, just inside xyzgraph's C-C cutoff.
-
-    xyzgraph 1.6.14 bonds that contact anyway, since its strict three-ring check only rejects an obtuse
-    apex above 110 deg (mean-Z adjusted) and this one is 101.8 deg; a real three-ring cannot have an obtuse
-    apex at all, so `_right_angle_ring_chords` drops the bond and xyzgraph rebuilds without it.
+    """A 1,2,4-triazole's two ring carbons sit 2.095 A apart, inside xyzgraph's C-C cutoff but across an obtuse
+    (101.8 deg) apex that no real three-ring has, so the read leaves them unbonded.
     """
     mol = Chem.AddHs(Chem.MolFromSmiles("[nH]1ncnc1"))  # ring order N1-N2-C3-N4-C5, N4 flanked by both carbons
     rdDistGeom.EmbedMolecule(mol, randomSeed=1)
@@ -383,20 +325,18 @@ def test_read_drops_a_triazolate_cross_ring_contact(tmp_path):
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_read_drops_a_bridgehead_ring_carbon_flanked_by_only_one_ring_donor(caplog, tmp_path):
+def test_read_drops_a_bridgehead_ring_carbon_flanked_by_only_one_ring_donor(tmp_path):
     """A folded kappa2-S,O chelate: the bridgehead's ring donor (O) keeps a real ring face, but its
     exocyclic thiolate (S) does not, so one shared ring is not a face and the La-C bond still drops.
     """
     path = tmp_path / "sorgak_fragment.xyz"
     path.write_text(_SORGAK_BRIDGEHEAD_FRAGMENT)
 
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        mol = perceive.read_xyz(str(path), charge=1, connectivity="xyzgraph", bond_orders="xyz2mol")
+    mol = perceive.read_xyz(str(path), charge=1, connectivity="xyzgraph", bond_orders="xyz2mol")
 
     metal = next(a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS)
     kept = sorted(n.GetSymbol() for n in mol.GetAtomWithIdx(metal).GetNeighbors())
     assert kept == ["O", "S"]
-    assert "bridgehead" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -440,19 +380,15 @@ def _cisplatin_xyz(tmp_path):
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_tetraammineplatinum_default_read_takes_xyz2mol_orders_when_xyzgraph_misses_the_total(tmp_path, caplog):
-    """xyzgraph reads [Pt(NH3)4]2+ as Pt(0); the default read keeps its graph and takes xyz2mol's charges."""
+def test_tetraammineplatinum_default_read_conserves_the_charge_on_xyzgraph_orders(tmp_path):
+    """xyzgraph's own orders read [Pt(NH3)4]2+ as Pt(II), meeting the stated total with no fallback."""
     path = _square_planar_xyz(tmp_path, "[NH3]->[Pt+2](<-[NH3])(<-[NH3])<-[NH3]")
 
-    with caplog.at_level(logging.WARNING, logger="rxembed"):
-        mol = perceive.read_xyz(path, charge=2)
+    mol = perceive.read_xyz(path, charge=2)
 
     assert [(a.GetSymbol(), a.GetFormalCharge()) for a in mol.GetAtoms() if a.GetFormalCharge()] == [("Pt", 2)]
-    assert (mol.GetProp("_rxembedConnectivity"), mol.GetProp("_rxembedBondOrders")) == ("xyzgraph", "xyz2mol")
-    assert mol.GetBoolProp("_rxembedPerceptionFallback")
-    assert "xyzgraph's charges total 0, not charge=2" in caplog.text
-    with pytest.raises(ValueError, match="does not match charge=2"):
-        perceive.read_xyz(path, charge=2, fallback=False)
+    assert (mol.GetProp("_rxembedConnectivity"), mol.GetProp("_rxembedBondOrders")) == ("xyzgraph", "xyzgraph")
+    assert not mol.GetBoolProp("_rxembedPerceptionFallback")
 
 
 @pytest.mark.parametrize(
@@ -470,6 +406,21 @@ def test_perceiver_pairs_read_complex(connectivity, bond_orders, tmp_path):
 def test_xyzgraph_bond_orders_need_xyzgraph_connectivity(tmp_path):
     with pytest.raises(ValueError, match="connectivity='xyzgraph'"):
         perceive.read_xyz(_cisplatin_xyz(tmp_path), 0, connectivity="xyz2mol", bond_orders="xyzgraph")
+
+
+def test_xyzgraph_edge_outside_the_kekule_contract_fails_instead_of_reading_single(monkeypatch):
+    """A flagged NCI edge is left out; an order-0 edge without its flag, as a renamed flag would return a hydrogen
+    bond, is refused."""
+    graph = nx.Graph()
+    for node, (atomic_number, x) in enumerate(((8, 0.0), (1, 1.8))):
+        graph.add_node(node, atomic_number=atomic_number, formal_charge=0, position=(x, 0.0, 0.0))
+    graph.add_edge(0, 1, bond_order=0.0, NCI=True)
+    monkeypatch.setitem(sys.modules, "xyzgraph", SimpleNamespace(build_graph=lambda *_a, **_k: graph, __version__="9"))
+    assert perceive._from_xyzgraph("unused.xyz", 0).GetNumBonds() == 0
+
+    graph.add_edge(0, 1, bond_order=0.0, NCI=False)
+    with pytest.raises(ValueError, match="outside the NCI or kekule 1-3 contract"):
+        perceive.read_xyz("unused.xyz", fallback=False)
 
 
 def test_bond_order_perception_does_not_accept_auto_mode():

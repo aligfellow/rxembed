@@ -18,7 +18,7 @@ classifiers = [
 
 [project.optional-dependencies]
 search = ["openconf>=0.0.16"]
-workflow = ["xyzgraph>=1.6.14", "prism_pruner", "scikit-learn", "matplotlib"]
+workflow = ["xyzgraph>=1.6.16", "prism_pruner", "scikit-learn", "matplotlib"]
 
 [project.urls]
 homepage = "https://github.com/aligfellow/rxembed"

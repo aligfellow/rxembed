@@ -45,7 +45,8 @@ apply to every member. The examples below run from the root of a clone. The [not
 ## Constraints and Rigid Cores
 
 Every input shares the same `fix`, `constrain` and `template` arguments. Atom indices are 0-based;
-`rx.match(mol, smarts)` resolves a unique SMARTS match or raises.
+`rx.match(mol, smarts)` resolves a unique SMARTS match, in the drawn Lewis form or else any resonance form,
+or raises.
 
 | constraint | call |
 |---|---|
@@ -104,8 +105,7 @@ or an atom index, to an open vertex:
 ```python
 mn = rx.read_xyz("examples/structures/mn-h2.xyz", charge=-1)
 core = [1, 5, 63, 64, 65, 66]  # Mn, its amine N, and the H-H and N-H...O atoms of a reacting core
-states = rx.metal(mn, "OCT", center="Mn", fix=core)
-chosen = states.select(label="mer", hand="lambda", index=4)
+chosen = rx.metal(mn, "OCT", center="Mn", fix=core, observed_only=True)[0]  # the input's own arrangement
 mn_confs = rx.embed(chosen, n=4)
 
 templated = rx.embed(trans, template=(trans_confs[0], {0: 0, 1: 1, 2: 2}), n=10)
@@ -220,18 +220,17 @@ warning means the result differs from the request. `rx.set_verbose("DEBUG")` sho
 `rxembed.core` is the low-level API for an explicit-H RDKit `Mol`, such as
 `core.embed(mol, constrain={(0, 5): (2.6, 3.0)}, n=8)`. [ARCHITECTURE.md](ARCHITECTURE.md) maps the modules.
 
-## Limitations
+## Metal performance
 
-- Rigid conjugated macrocycles, such as porphyrins, can embed in unlikely folded seatings that pass the gate.
-- A relaxation can make or break a bond that the gate does not re-read; use `filter("connectivity")`.
-- XYZ charges come from a Lewis-structure perception and can disagree with a published oxidation state.
-  `read_xyz` can keep a chelate-diagonal bond, as in LAPQIC's κ2-C,C ring.
-- More than 1,000 distinct arrangements are refused (SORGAK's La podand); use `observed_only=True`,
-  `rx.embed(mol)` without `metal=`, or `rx.metal(rx.cxsmiles(mol))`.
-- `rx.metal` does not enumerate a haptic ligand's rotation about the metal-centroid axis; `mc()` keeps each pose.
-- A ring bound through some of its atoms (an η4-arene) folds about 10° past its crystal fold.
-- `mc()` holds poses softly, with about 0.1 Å drift; state a constraint that must hold as a number.
-- g-xTB with solvent is `E_gxtb(gas) + [E_gfn2(solv) - E_gfn2(gas)]`.
+Each structure is read from its XYZ, written as a CX SMILES, and embedded fresh from that CX string; it
+passes when the embedded CX matches. `just bench` runs the 100 shipped fixtures, `just bench tmqmg
+--size N` a diverse tmQMg sample.
+
+![pass rate by class: fixtures](benchmark/docs/fixtures_by_class.png)
+![pass rate by class: tmQMg sample](benchmark/docs/tmqmg_by_class.png)
+
+[benchmark/README.md](benchmark/README.md) has timings, per-metal breakdowns, core RMSD and the sample's
+coverage of tmQMg.
 
 ## Development
 
@@ -265,15 +264,3 @@ Related projects:
 - [Molassembler](https://github.com/qcscine/molassembler): molecular graphs, coordination stereochemistry and conformer generation
 - [racerTS](https://github.com/digital-chemistry-laboratory/racerts): efficient conformer sampling for transition states
 - [OIN-SMILES](https://github.com/tjmustard/OIN-SMILES): lossless conversion between 3D XYZ structures and 1D SMILES
-
-## Metal performance
-
-Each structure is read from its XYZ, written as a CX SMILES, and embedded fresh from that CX string; it
-passes when the embedded CX matches. `just bench` runs the 100 shipped fixtures, `just bench tmqmg
---size N` a diverse tmQMg sample.
-
-![pass rate by class: fixtures](benchmark/docs/fixtures_by_class.png)
-![pass rate by class: tmQMg sample](benchmark/docs/tmqmg_by_class.png)
-
-[benchmark/README.md](benchmark/README.md) has timings, per-metal breakdowns, core RMSD and the sample's
-coverage of tmQMg.

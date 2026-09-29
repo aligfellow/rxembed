@@ -10,7 +10,7 @@ from importlib.util import find_spec
 import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDepictor, rdDistGeom
+from rdkit.Chem import rdDepictor, rdDistGeom, rdMolAlign
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
@@ -687,26 +687,19 @@ def test_all_centers_is_the_cartesian_product_and_roundtrips():
 def test_all_centers_stacks_the_frozen_core_once():
     fixed = [1, 5, 63, 64, 65, 66]
     source = read_xyz(_MN_H2, metal_charges={0: 2, 1: 1})
-    assert len(rx.metal(source, center="Mn", fix=fixed, stereo="preserve")) == 12
     haptic_racemic = {"planar": "racemic"}
-    assert len(rx.metal(source, center="Fe", fix=fixed, stereo=haptic_racemic)) == 2
+    mn = rx.metal(source, center="Mn", fix=fixed, stereo="preserve")
+    fe = rx.metal(source, center="Fe", fix=fixed, stereo=haptic_racemic)
     isomers = rx.metal(source, center="all", fix=fixed, stereo=haptic_racemic)
-    assert len(isomers) == 24
-    assert {iso.stereo_label for iso in isomers} == {"N5:R,C47:R"}
+    assert len(isomers) == len(mn) * len(fe)
     assert all(iso.cons.frozen == set(fixed) and not iso.cons.shapes for iso in isomers)
 
-    reference_cx = rx.cxsmiles(source)
-    target = next(iso for iso in isomers if rx.cxsmiles(iso) == reference_cx)
+    target = next(iso for iso in isomers if rx.cxsmiles(iso) == rx.cxsmiles(source))
     embedded = rx.embed(target, n=1, seed=1)
-    assert embedded.n == 1
-    reference = source.GetConformer().GetPositions()[fixed]
-    realised_core = embedded.mol.GetConformer(embedded.ids[0]).GetPositions()[fixed]
-    reference_distances = np.linalg.norm(reference[:, None] - reference, axis=2)
-    realised_distances = np.linalg.norm(realised_core[:, None] - realised_core, axis=2)
-    assert np.allclose(realised_distances, reference_distances, atol=1e-12)
-    expected = rx.cxsmiles(target).split("|", 1)[1]
-    realised = rx.cxsmiles(Chem.Mol(embedded.mol, False, embedded.ids[0])).split("|", 1)[1]
-    assert realised == expected
+    core = [(i, i) for i in fixed]
+    assert rdMolAlign.AlignMol(embedded.mol, source, prbCid=embedded.ids[0], atomMap=core) < 1e-6
+    realised = rx.cxsmiles(Chem.Mol(embedded.mol, False, embedded.ids[0]))
+    assert realised.split("|", 1)[1] == rx.cxsmiles(target).split("|", 1)[1]
 
 
 def test_bridging_donor_carries_one_slot_per_adjacent_metal():

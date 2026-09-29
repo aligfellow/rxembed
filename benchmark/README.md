@@ -50,8 +50,4 @@ sample bar beside it stacks fail on pass by the same category.
 | origin | fixtures | source | licence |
 |---|---|---|---|
 | tmQMg | 65 | github.com/hkneiding/tmQMg | MIT, (c) 2024 Hannes Kneiding |
-| OIN | 34 | github.com/tjmustard/OIN-SMILES `tests/fixtures` | MIT, (c) 2025 Thomas J. L. Mustard |
-| rxembed | 1 (MnH) | built in this repo | MIT, this repo |
-
-ASISAX, BENVOG and KAXVOX carry tmPHOTO/tmCAT dataset headers from OIN-SMILES's own copy; PdCl2-RR-DPDME
-carries a MetalloGen-3D header. See [../LICENSES.md](../LICENSES.md) for the licence text.
+| OIN | 34 | github.com/tjmustard/OIN-SMILES | MIT, (c) 2025 Thomas J. L. Mustard |

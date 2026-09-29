@@ -430,8 +430,26 @@ def resolve_atom(mol, ref):
     return match(mol, ref)[0]
 
 
+def substruct_matches(mol, query, **params):
+    """Return the query's matches in `mol` as drawn or, when that Lewis form has none, in any resonance form.
+
+    A graph carries one Lewis form, so `NC(=S)N` misses a thiourea anion drawn N=C([S-])N. RDKit's
+    `ResonanceMolSupplier` matches across the forms, but they are Kekulé: there `c1ccccc1` hits nothing and
+    `[#6]=[#6]` also hits styrene's ring bonds. Searching the drawn form first keeps every pattern that already
+    matches; one that names a single resonance-equivalent atom, such as a carboxylate's C=O oxygen, therefore
+    follows the drawn form. `params` are RDKit's `GetSubstructMatches` keywords, uniquified by default as on a Mol.
+    """
+    params = {"uniquify": True, **params}
+    if hits := mol.GetSubstructMatches(query, **params):
+        return hits
+    try:
+        return Chem.ResonanceMolSupplier(mol).GetSubstructMatches(query, **params)
+    except Chem.AtomValenceException:  # a hypervalent TS centre has no Lewis form to enumerate
+        return ()
+
+
 def match(mol, smarts):
-    """Return the atom indices of the one SMARTS match, raising if there is not exactly one.
+    """Return the atom indices of the one SMARTS match (`substruct_matches`), raising if there is not exactly one.
 
     `GetSubstructMatch` returns () for no match and silently returns the first hit for several, so a
     mistyped or ambiguous pattern can key a constraint to a wrong-but-plausible atom: on 2-chlorobenzyl
@@ -440,7 +458,7 @@ def match(mol, smarts):
     query = Chem.MolFromSmarts(smarts)
     if query is None:
         raise ValueError(f"SMARTS {smarts!r} did not parse; check its syntax with Chem.MolFromSmarts")
-    hits = mol.GetSubstructMatches(query)
+    hits = substruct_matches(mol, query)
     if not hits:
         raise ValueError(f"SMARTS {smarts!r} matched nothing; check it against this molecule's atoms")
     if len(hits) > 1:
@@ -701,8 +719,8 @@ def template_to_fix(template, fix=None, target=None):
         target_match, reference_match = match(target, mapping), match(reference, mapping)
         query = Chem.MolFromSmarts(mapping)
         if (
-            len(target.GetSubstructMatches(query, uniquify=False, maxMatches=2)) > 1
-            or len(reference.GetSubstructMatches(query, uniquify=False, maxMatches=2)) > 1
+            len(substruct_matches(target, query, uniquify=False, maxMatches=2)) > 1
+            or len(substruct_matches(reference, query, uniquify=False, maxMatches=2)) > 1
         ):
             raise ValueError(
                 f"template SMARTS {mapping!r} has symmetry-equivalent atom orderings; "
