@@ -1,7 +1,8 @@
-"""Test ETKDG bounds editing, smoothing and coordinate seeding."""
+"""Test RDKit bounds editing, smoothing and coordinate seeding."""
 
 from __future__ import annotations
 
+import json
 import math
 
 import numpy as np
@@ -10,7 +11,7 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 
 from rxembed import bounds as bnd
-from rxembed import mechanisms as mech
+from rxembed import metal_core
 from rxembed.constraints import Constraints, add_distance
 
 
@@ -25,28 +26,57 @@ def _mol(smiles="CCO", seed=1):
     return mol
 
 
-def _matrix(mol):
-    return rdDistGeom.GetMoleculeBoundsMatrix(mol)
-
-
 # ---------------------------------------------------------------------------------------------------------
-# etkdg: the one place RDKit's embed defaults are overridden
+# embed_parameters: native model and reproducible sampling defaults
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_etkdg_states_every_default_it_overrides():
-    on = bnd.etkdg(11)
-    assert on.randomSeed == 11
-    with pytest.raises(TypeError):
-        bnd.etkdg()  # ty: ignore[missing-argument]
+def test_native_parameters_reach_rdkit_without_model_fallback_or_stale_bounds():
+    """The caller's own EmbedParams(native=...) object is restored to its prior state after use."""
+    native = rdDistGeom.srETKDGv3()
+    native.useRandomCoords = True
+    params = bnd.EmbedParams(seed=42, threads=1, prune_rms=-1, native=native)
+    # Set the caller's own pre-existing native fields only after wrapping: EmbedParams requires them at
+    # RDKit's defaults, but seed_coordinates must still save and restore whatever the caller had before it.
+    native.randomSeed, native.numThreads, native.pruneRmsThresh = 7, 2, 0.4
+    before = json.loads(rdDistGeom.EmbedParametersToJSON(native))
 
-    assert (on.useExpTorsionAnglePrefs, on.useBasicKnowledge) == (True, True)
-    off = bnd.etkdg(11, knowledge=False)
-    assert (off.useExpTorsionAnglePrefs, off.useBasicKnowledge) == (False, False)
+    assert bnd.seed_coordinates(_graph("CCCC"), Constraints(), 1, params)
 
-    assert on.pruneRmsThresh == -1.0
-    assert bnd.etkdg(11, prune_rms=0.0).pruneRmsThresh == 0.0
-    assert bnd.etkdg(11, prune_rms=0.5).pruneRmsThresh == 0.5
+    after = json.loads(rdDistGeom.EmbedParametersToJSON(native))
+    assert after.pop("boundsMatrix")
+    assert after == before
+
+
+# ---------------------------------------------------------------------------------------------------------
+# EmbedParams: one owner per setting
+# ---------------------------------------------------------------------------------------------------------
+
+
+def test_seed_or_threads_together_with_params_is_a_loud_conflict():
+    with pytest.raises(ValueError, match=r"dataclasses\.replace"):
+        bnd.resolve_params(bnd.EmbedParams(), 5, None)
+    with pytest.raises(ValueError, match=r"dataclasses\.replace"):
+        bnd.resolve_params(bnd.EmbedParams(), None, 2)
+    assert bnd.resolve_params(None, 5, 2) == bnd.EmbedParams(seed=5, threads=2)
+    assert bnd.resolve_params(None, None, None) == bnd.EmbedParams()
+
+
+@pytest.mark.parametrize(("rdkit_name", "field_name"), [("pruneRmsThresh", "prune_rms")])
+def test_native_sampling_fields_must_stay_at_rdkits_own_defaults(rdkit_name, field_name):
+    native = rdDistGeom.KDG()
+    setattr(native, rdkit_name, 42 if rdkit_name != "pruneRmsThresh" else 0.4)
+    with pytest.raises(ValueError, match=f"native.{rdkit_name}.*EmbedParams\\({field_name}="):
+        bnd.EmbedParams(native=native)
+
+
+def test_knowledge_together_with_native_must_agree_or_stay_unset():
+    with pytest.raises(ValueError, match="useBasicKnowledge"):
+        bnd.EmbedParams(native=rdDistGeom.KDG(), knowledge=False)
+    with pytest.raises(ValueError, match="useBasicKnowledge"):
+        bnd.EmbedParams(native=rdDistGeom.ETDG(), knowledge=True)
+    assert bnd.EmbedParams(native=rdDistGeom.KDG(), knowledge=True).knowledge
+    assert bnd.EmbedParams(native=rdDistGeom.KDG()).native.useBasicKnowledge  # ty: ignore[unresolved-attribute]
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -57,9 +87,34 @@ def test_etkdg_states_every_default_it_overrides():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_failed_probe_returns_none_rather_than_an_empty_mol(monkeypatch):
-    monkeypatch.setattr(bnd.rdDistGeom, "EmbedMolecule", lambda *_a, **_k: -1)
-    assert bnd.probe_conformer(_mol(), 7) is None
+def test_ligand_reach_keeps_native_bounds_for_ring_closure():
+    ring = Chem.MolFromSmiles("Pc1ccccc1P")
+    native = rdDistGeom.GetMoleculeBoundsMatrix(ring, set14bounds=True, set15bounds=False)
+    assert bnd.ligand_reach(ring)[0, 7] == pytest.approx(native[0, 7])
+
+    # A saturated ring's central bond is not aromatic, so only the native 1-4 lower bound carries over;
+    # the upper bound is free-torsion, which is looser than RDKit's sp2-sp2 cis template (4.456 -> 4.552).
+    saturated = Chem.MolFromSmiles("PC1CCCCC1P")
+    native = rdDistGeom.GetMoleculeBoundsMatrix(saturated, set14bounds=True, set15bounds=False)
+    assert bnd.ligand_reach(saturated)[0, 7] >= native[0, 7] - 1e-9
+
+    chain = Chem.MolFromSmiles("PCCCCP")
+    free = bnd.ligand_reach(chain)
+    native = rdDistGeom.GetMoleculeBoundsMatrix(chain, set14bounds=True, set15bounds=False)
+    assert free[0, 5] > native[0, 5]
+
+
+@pytest.mark.parametrize("window", [(1.0, math.inf), (3.0, 3.1)])
+def test_three_bond_reach_abstains_without_supported_local_triangles(window):
+    matrix = np.ones((4, 4))
+    matrix[1, 0], matrix[0, 1] = window
+    assert math.isinf(bnd._chain_upper(matrix, (0, 1, 2, 3)))
+
+
+def test_inconsistent_ligand_reach_is_not_repaired(monkeypatch):
+    monkeypatch.setattr(bnd.DistanceGeometry, "DoTriangleSmoothing", lambda *_args: False)
+    with pytest.raises(ValueError, match="native ligand reach bounds are inconsistent"):
+        bnd.ligand_reach(_graph("CCCN"))
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -67,140 +122,55 @@ def test_failed_probe_returns_none_rather_than_an_empty_mol(monkeypatch):
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_unrepairable_bounds_raise():
-    bm = _matrix(_mol())
-    bm[0][2], bm[2][0] = 0.31, 0.30
-    with pytest.raises(RuntimeError, match="triangle smoothing failed"):
-        bnd._smooth(bm)
+def test_carried_nitrile_bond_and_real_iron_seed_from_the_surrogate_basis():
+    """A carried sp-donor bond and its restored Fe(II) leave the bounds of the bondless-carbon surrogate graph."""
+    real = Chem.AddHs(Chem.MolFromSmiles("CC#N.[Fe+2]"))  # C0 C1 N2 Fe3, methyl H4-H6
+    surrogate = Chem.RWMol(real)
+    surrogate.GetAtomWithIdx(3).SetAtomicNum(metal_core.SURROGATE)
+    surrogate.GetAtomWithIdx(3).SetFormalCharge(0)
+    surrogate = surrogate.GetMol()
+    surrogate.UpdatePropertyCache(strict=False)
+    cons = Constraints(metals={3}, distances={(2, 3): (1.9, 1.95)})
+
+    carried = bnd._write(metal_core.connect_metal(real, [(2, 3)]), cons).bm
+
+    np.testing.assert_array_equal(carried, bnd._write(surrogate, cons).bm)
 
 
 # ---------------------------------------------------------------------------------------------------------
-# crossings: WHICH window over-determined the matrix
-#
-# The tolerance says how far smoothing had to give; these say where. Every case below is built so the answer
-# is known in advance, because a diagnosis that names a plausible window is indistinguishable from one that
-# names the right one.
+# _feasible_bounds: the edit, and what happens when it cannot be satisfied
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_crossed_matrix_names_violated_window():
-    mol = _mol()
-    assert bnd._smooth(_matrix(mol)) == 0.0, "RDKit's own bounds are realisable: the premise this rests on"
-    assert bnd.crossings(mol, Constraints(distances={(0, 2): (2.5, 2.6)})) == []
-
-    cons = Constraints(distances={(0, 2): (1.0, 1.02)})  # C0...O2 forced to 1.0 A across two ~1.5 A bonds
-    bm = _matrix(mol)
-    bm[0][2], bm[2][0] = 1.02, 0.98
-    assert bnd._smooth(bm) > 0.0
-    crossed = bnd.crossings(mol, cons)
-    assert crossed, "smoothing has to widen for this spec; the closure must see the same thing"
-    assert [str(w) for w in crossed[0].windows()] == ["distance 0-2"]
-
-
-def test_reported_gap_repairs_crossing():
-    mol = _mol()
-    worst = bnd.crossings(mol, Constraints(distances={(0, 2): (1.0, 1.02)}))[0]
-    assert bnd._bounds(mol, Constraints(distances={(0, 2): (1.0, 1.02 + worst.gap)}))[1] == 0.0
-    assert bnd._bounds(mol, Constraints(distances={(0, 2): (1.0, 1.02 + 0.9 * worst.gap)}))[1] > 0.0
-
-
-@pytest.mark.parametrize(
-    ("metal", "kind"),
-    [(1, "D-M-D angle"), (0, "M-D-X fold")],
-)
-def test_angle_crossing_names_metal_position(metal, kind):
-    mol = _graph("C.C.C.C")
-    cons = Constraints(metals={metal})
-    for (i, j), d in {(0, 1): 4.0, (1, 2): 4.0, (2, 3): 3.9, (0, 3): 3.9}.items():
-        add_distance(cons.distances, i, j, d, d)
-    cons.angles[(0, 1, 2)] = (180.0, 180.0)
-
-    worst = bnd.crossings(mol, cons)[0]
-    assert worst.pair == (0, 3)
-    assert worst.gap == pytest.approx(0.2)
-    assert [(w.kind, w.key) for w in worst.pushing] == [(kind, (0, 1, 2))]
-    assert {w.key for w in worst.capping} == {(2, 3), (0, 3)}
-
-
 # ---------------------------------------------------------------------------------------------------------
-# _bounds / _feasible_bounds: the edit, and what happens when it cannot be satisfied
+# _cap_fragment_contacts: every free component repels every other at its van der Waals floor and stays
+# within a shared, formula-derived ceiling; no probe conformer, no chosen contact pair
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_matrix_is_edited_not_replaced():
-    mol = _mol()
-    before = _matrix(mol)
-    assert before[1][0] > 1.0, "the C0-C1 lower bound is RDKit's own bond window: the premise"
-
-    after, tol = bnd._bounds(mol, Constraints(distances={(0, 2): (2.5, 2.6)}))
-    assert (after[0][2], after[2][0]) == pytest.approx((2.6, 2.5))
-    assert tol == 0.0
-    assert (after[0][1], after[1][0]) == (before[0][1], before[1][0]), "a bonded pair was rewritten"
-
-
-def test_unrealisable_spec_names_failed_window(caplog):
-    mol = _mol()
-    with caplog.at_level("WARNING", logger="rxembed.bounds"):
-        _bm, tol = bnd._feasible_bounds(mol, Constraints(distances={(0, 2): (1.0, 1.02)}))
-    assert tol > 0.0
-    assert "bounds needed smoothing" in caplog.text
-    assert "distance 0-2" in caplog.text, "the tolerance alone points nowhere; the window is the point"
-
-
-def test_realisable_spec_says_nothing(caplog):
-    mol = _mol()
-    with caplog.at_level("INFO", logger="rxembed.bounds"):
-        _bm, tol = bnd._feasible_bounds(mol, Constraints(distances={(0, 2): (2.5, 2.6)}))
-    assert tol == 0.0
-    assert caplog.records == []
-
-
 # ---------------------------------------------------------------------------------------------------------
-# embed: the ETKDG call itself
+# embed: the native distance-geometry call itself
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_unconstrained_embed_does_not_build_a_custom_matrix(monkeypatch):
-    calls = []
-    monkeypatch.setattr(bnd, "_feasible_bounds", lambda *a, **k: calls.append(a) or (_matrix(a[0]), 0.0))
+def test_native_failure_counts_are_reported_once_with_a_random_start_remedy(monkeypatch, caplog):
+    counts = [0] * (max(map(int, rdDistGeom.EmbedFailureCauses.names.values())) + 1)
+    counts[int(rdDistGeom.EmbedFailureCauses.INITIAL_COORDS)] = 2
 
-    bnd.seed_coordinates(_mol(), Constraints(), n=2, seed=3)
-    assert calls == []
+    def reject(_mol, _n, params):
+        assert params.trackFailures
+        return []
 
-    bnd.seed_coordinates(_mol(), Constraints(distances={(0, 2): (2.5, 2.6)}), n=2, seed=3)
-    assert len(calls) == 1
+    monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", reject)
+    monkeypatch.setattr(rdDistGeom.EmbedParameters, "GetFailureCounts", lambda _self: tuple(counts))
+    with caplog.at_level("DEBUG", logger="rxembed.bounds"):
+        assert not bnd.seed_coordinates(_graph("CC"), Constraints(), 1, bnd.EmbedParams(seed=42))
 
-
-def test_embed_ids_are_reproducible_and_attached():
-    mol = _graph("CCO")
-    ids = bnd.seed_coordinates(mol, Constraints(), n=4, seed=3, prune_rms=-1)
-    assert len(ids) == 4
-    assert {int(c.GetId()) for c in mol.GetConformers()} == {int(i) for i in ids}
-
-    assert len(bnd.seed_coordinates(_graph("CCO"), Constraints(), n=8, seed=3)) < 8
-
-    a, b = _graph("CCO"), _graph("CCO")
-    bnd.seed_coordinates(a, Constraints(), n=2, seed=1234)
-    bnd.seed_coordinates(b, Constraints(), n=2, seed=1234)
-    assert np.allclose(a.GetConformer(0).GetPositions(), b.GetConformer(0).GetPositions())
-
-
-def test_bring_real_confs_removes_phantoms():
-    real = _mol()
-    n = real.GetNumAtoms()
-    work = Chem.RWMol(real)
-    work.AddAtom(Chem.Atom(0))  # the transient centroid dummy
-    work = work.GetMol()
-    conf = Chem.Conformer(n + 1)
-    for a in range(n + 1):
-        conf.SetAtomPosition(a, (float(a), 0.0, 0.0))
-    conf.SetId(5)
-    work.AddConformer(conf, assignId=False)
-
-    bnd._bring_real_confs(real, work, [5])
-    assert [int(c.GetId()) for c in real.GetConformers()] == [5]
-    assert real.GetConformer(5).GetPositions().shape == (n, 3)
-    assert real.GetConformer(5).GetAtomPosition(0).x == pytest.approx(0.0)
+    messages = [record.message for record in caplog.records if record.name == "rxembed.bounds"]
+    assert len(messages) == 1
+    assert "random=False" in messages[0]
+    assert "{'INITIAL_COORDS': 2}" in messages[0]
+    assert "EmbedParams(native=...), useRandomCoords=True" in messages[0]
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -240,76 +210,9 @@ def _rule_mol(smi):
 
 
 def _edited(mol, cons):
-    """The edited bounds matrix alone; `_bounds` also returns the tolerance it settled at."""
-    bm, _tol = bnd._bounds(mol, cons)
+    """The edited bounds matrix alone; `_feasible_bounds` also returns the tolerance it settled at."""
+    bm, _tol = bnd._feasible_bounds(mol, cons)
     return bm
-
-
-def _window(bm, i, j):
-    """(lo, hi) for a pair, in the matrix's own convention: bm[hi_idx][lo_idx] is the lower bound."""
-    a, b = (i, j) if i < j else (j, i)
-    return bm[b][a], bm[a][b]
-
-
-def test_r1_a_stated_distance_pre_empts_the_angle():
-    mol = _rule_mol("CCC")
-    cons = Constraints()
-    add_distance(cons.distances, 0, 2, 3.00, 3.02)
-    cons.angles[(0, 1, 2)] = (60.0, 70.0)  # would imply a MUCH shorter 0..2 if it were applied
-    lo, hi = _window(_edited(mol, cons), 0, 2)
-    assert (round(lo, 6), round(hi, 6)) == (3.00, 3.02)
-
-
-@pytest.mark.parametrize(
-    ("window", "note"),
-    [
-        ((100.0, 130.0), "wider than the backbone -> the tighter REAL bound survives untouched"),
-        ((109.0, 111.0), "narrower than the backbone -> the angle tightens it"),
-    ],
-    ids=["wider", "narrower"],
-)
-def test_angle_bounds_intersect_bond_path(window, note):
-    mol = _rule_mol("CCC")
-    topo = Chem.GetDistanceMatrix(mol)
-    assert topo[0][2] < mech._DISCONNECTED  # a real bond path: the predicate that selects INTERSECT
-
-    base = _edited(mol, Constraints())
-    blo, bhi = _window(base, 0, 2)
-    ctx = mech.DGContext(mol, base)
-    d01, d12 = ctx.mid(0, 1), ctx.mid(1, 2)
-    alo = mech._law_of_cosines(d01, d12, window[0])
-    ahi = mech._law_of_cosines(d01, d12, window[1])
-
-    cons = Constraints()
-    cons.angles[(0, 1, 2)] = window
-    got = _window(_edited(mol, cons), 0, 2)
-    assert got == pytest.approx((max(alo, blo), min(ahi, bhi))), note
-
-
-def test_r2_disjoint_intersection_keeps_backbone():
-    mol = _rule_mol("CCC")
-    base = _edited(mol, Constraints())
-    blo, bhi = _window(base, 0, 2)
-
-    cons = Constraints()
-    cons.angles[(0, 1, 2)] = (1.0, 2.0)  # a physically impossible bite -> derived window far below the backbone
-    lo, hi = _window(_edited(mol, cons), 0, 2)
-    assert (lo, hi) == pytest.approx((blo, bhi)), "a disjoint intersection must leave the backbone standing"
-
-
-def test_r3_no_bond_path_writes_the_angle_outright():
-    mol = _rule_mol("C.C.C")
-    topo = Chem.GetDistanceMatrix(mol)
-    assert topo[0][2] >= mech._DISCONNECTED  # no bond path: the predicate that selects WRITE OUTRIGHT
-
-    cons = Constraints()
-    add_distance(cons.distances, 0, 1, 2.00, 2.00)
-    add_distance(cons.distances, 1, 2, 2.00, 2.00)
-    cons.angles[(0, 1, 2)] = (90.0, 90.0)
-    lo, hi = _window(_edited(mol, cons), 0, 2)
-    want = math.sqrt(2.0**2 + 2.0**2)  # law of cosines at exactly 90 deg
-    assert lo == pytest.approx(want, abs=1e-6)
-    assert hi == pytest.approx(want, abs=1e-6)
 
 
 def _coplanar_case(angle_window):
@@ -325,20 +228,21 @@ def _coplanar_case(angle_window):
     return mol, cons
 
 
-def test_unstated_mdx_angle_adds_no_coplanar_bound():
-    mol, cons = _coplanar_case(None)
+@pytest.mark.parametrize(("atoms", "overrides"), [((0, 1, 2, 3), True)])
+def test_stated_torsion_supersedes_coplanar_seed_bound(atoms, overrides):
+    mol, cons = _coplanar_case((118.0, 122.0))
+    without_cap = _edited(mol, cons.copy(coplanar=[]))
     with_cap = _edited(mol, cons)
+    assert not np.array_equal(with_cap, without_cap), "the unoverridden cap must be active"
 
-    mol2, cons2 = _coplanar_case(None)
-    cons2.coplanar = []
-    without_cap = _edited(mol2, cons2)
-
-    np.testing.assert_array_equal(with_cap, without_cap)
+    stated = cons.copy(dihedrals={atoms: (89.0, 91.0)})
+    np.testing.assert_array_equal(_edited(mol, stated), without_cap if overrides else with_cap)
 
 
-def test_c2_14_edge_uses_window_extremum():
-    mol, narrow = _coplanar_case((118.0, 122.0))
-    _, wide = _coplanar_case((100.0, 180.0))
-    lo_n, _ = _window(_edited(mol, narrow), 0, 3)
-    lo_w, _ = _window(_edited(mol, wide), 0, 3)
-    assert lo_w <= lo_n + 1e-9, "a wider M-D-X window must not produce a TIGHTER coplanarity floor"
+def test_repeated_inactive_cap_does_not_replace_stronger_owner():
+    mol, cons = _coplanar_case((118.0, 122.0))
+    row = cons.coplanar[0]
+    weak, strong = (*row[:5], 45.0), (*row[:5], 20.0)
+    cons.coplanar = [weak, strong, weak]
+    ctx = bnd._write(mol, cons)
+    np.testing.assert_array_equal(ctx.bm, bnd._write(mol, cons.copy(coplanar=[strong])).bm)

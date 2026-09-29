@@ -1,110 +1,86 @@
 # rxembed development instructions
 
-## Scope
+## General
 
-- Build a library, not a CLI.
-- Put usage in `README.md`.
-- Put structure in `ARCHITECTURE.md`.
-- Put rationale beside the owning code.
+### Code
 
-## Structure
+- Prefer KISS, YAGNI, deletion, existing code, and data over branches.
+- Fix a problem at its shared owner. Do not patch each caller or add a parallel path.
+- Avoid one-use abstractions and pass-through wrapper functions. Add one only when it removes duplication or
+  adapts an external interface.
+- Prefer the standard library, native platform features, and installed dependencies before custom code or a
+  new dependency.
+- Fail with an actionable remedy. Never silently change inputs, backends, or results.
 
-- Keep core modules flat in `src/rxembed/`.
-- Keep core limited to NumPy and RDKit.
-- Keep input adaptation and optional capabilities in `pipeline/`.
-- Keep `__init__.py` as facade composition only.
-- Keep `rxembed.embed` as the normal facade and `core.py` as the Mol/Isomer engine facade.
-- Do not add a directory unless no existing abstraction fits.
-- Keep core imports relative and pipeline imports from `rxembed`.
-- Never import `pipeline/` from core.
+### Development loop
 
-## Implementation
+- Inspect the real code path and its tests before planning a change.
+- Assess, plan, implement, adversarially review, check edge cases, reassess, and regress.
+- Add the smallest regression test for a defect and verify that it fails without the fix.
+- Test public contracts, not internal constants or duplicate implementations.
+- Give the command and result for behavior claims. Label unmeasured claims as unmeasured.
+- Treat a claim as refuted when its key result cannot be reproduced.
+- Ask an independent reviewer to challenge non-trivial changes. Isolate editing agents in worktrees, use unique
+  scratch names, and run tests with no reviewers active.
 
-- Prefer KISS, YAGNI, deletion, and existing abstractions.
-- Add a registry row or argument, not a new code path.
-- Derive chemistry rules from the graph; do not enumerate cases.
+### Style
+
+- Explain each guarantee, caveat, rationale, or measured decision once, beside its owner. Do not restate code.
+- Start docstrings with an imperative summary and use the configured style.
+- Use plain factual prose. Do not use em dashes, bold or caps for emphasis.
+- Keep log messages under about 110 characters and check placeholder counts after edits.
+
+### Commits
+
+- Preserve unrelated working-tree changes.
+- Keep commits self-contained, history linear, and squash before landing.
+- Do not add AI attribution, assistant trailers, tool names, or session URLs.
+
+## rxembed
+
+### Layout
+
+- Build a library, not a CLI. Put usage in `README.md`, package structure in `ARCHITECTURE.md`, and rationale
+  beside its owning code.
+- Keep core modules flat in `src/rxembed/`, limited to NumPy and RDKit, with relative imports only.
+- Put input adaptation and optional capabilities in `pipeline/`, importing core through `rxembed`. Never import
+  `pipeline` from core.
+- Keep `__init__.py` as facade composition only. `rxembed.embed` is the normal workflow; `rxembed.core` is the
+  low-level Mol/Isomer API.
+- Put changes with the existing owner named in `ARCHITECTURE.md`. Prefer a registry row or argument to a new
+  path, and add a directory only when no owner fits.
+
+### Chemistry
+
+- Use RDKit directly when possible. If RDKit offers several approaches, test the simplest ones on the same
+  regression or benchmark. Keep custom code only when they fail.
+- Derive chemistry rules from the molecular graph. Do not enumerate compounds or special cases.
+- Use `Constraints` as the only stage-to-stage geometry payload.
+- Keep RDKit's ETKDG engine and edit its bounds matrix. Bias seed geometry and let energy choose final geometry.
 - Tabulate genuine physical constants and cite their source.
-- Use `Constraints` as the only stage-to-stage constraint struct.
-- Edit RDKit's ETKDG bounds matrix; do not replace it.
-- Bias seed geometry; let energy decide final geometry.
-- Fail loudly with an actionable remedy.
-- Never silently change a graph, backend, or energy result.
+- Prefer ionic dative metal SMILES with donor-to-metal arrows and formal ligand charges, for example
+  `N->[Pd+2](<-[Cl-])(<-[Cl-])<-N`. Accept neutral/covalent and dative inputs.
+- Keep ordinary donor hydrogens implicit and hydride, H2, and bridging-H sites explicit.
 
-## Metal SMILES
+### Dependencies
 
-- Write ionic dative SMILES with donor-to-metal arrows and formal ligand charges.
-- Preferred example: `N->[Pd+2](<-[Cl-])(<-[Cl-])<-[Cl-]`.
-- Keep ordinary donor hydrogens implicit; keep hydride, H₂, and bridging-H sites explicit.
-- Accept neutral/covalent and dative inputs.
-- Write neutral/covalent SMILES only when requested or when demonstrating input support.
+- The base tier is NumPy, RDKit, and NetworkX. NetworkX is pipeline-only; core remains NumPy and RDKit.
+- Import optional packages at point of use. Put package-managed dependencies in an existing extra and name the
+  extra in errors. Dependencies behind caller-supplied adapters remain caller-managed. Keep core behavior
+  invariant across installed extras.
+- Source the version through `importlib.metadata`. Treat a new base dependency or extra as a tier decision.
 
-## Dependencies
+### Tests and tools
 
-- Base tier: NumPy, RDKit, NetworkX.
-- Import optional backends at point of use under `try/except ImportError`.
-- Name the missing distribution and extra in dependency errors.
-- Add every optional dependency to `pyproject.toml` extras.
-- Treat a new base dependency as a tier decision.
-- Keep core behavior invariant across installed extras.
-- Keep the version sourced from `pyproject.toml` via `importlib.metadata`.
-
-## Change placement
-
-- Constraint kind: `Constraints` field plus root `Mechanism`.
-- Coordination shape: `POLYHEDRA` row in `metal_polyhedron.py`.
-- NCI contact: `KINDS` row in `pipeline/nci.py`.
-- Search, calculator, QA, or input format: owning `pipeline/` module.
-- Measured number: `benchmark/`.
-
-## Comments and docs
-
-- Start docstrings with a one-line imperative summary.
-- Use NumPy docstring conventions.
-- Keep only guarantees, caveats, chemistry rationale, and measured decisions.
-- Explain each concept once in its owning module.
-- Do not restate code in comments.
-- Keep log messages under about 110 characters.
-- Check logging placeholder counts after edits.
-- Name fixtures for their chemistry.
-- Do not use em dashes, bold emphasis, or caps emphasis.
-
-## Evidence and tests
-
-- Give a command and number for behavior claims.
-- Label unmeasured claims as unmeasured.
-- Verify measurements exercise the named path.
-- Add the smallest regression test for every fixed defect.
-- Mutate the named behavior to verify the test fails.
-- Test contracts, not internal constants or duplicated paths.
-- Keep tests with their source owner.
+- Never make `src/` or tests depend on `benchmark/`. After changes to bounds, mechanisms, or metal geometry,
+  run `just bench` and report every loss it prints.
+- Refresh `benchmark/baseline.csv` in the commit that accepts a measured change. Keep `benchmark/results/`
+  untracked. Ship a structure only with its origin in `benchmark/README.md` and its licence in `LICENSES.md`.
 - Skip optional-tier tests cleanly on a base install.
-- Run `benchmark/run.py` after changes to `bounds.py`, `mechanisms.py`, or `metal_*`.
-- Keep `benchmark/` local, gitignored, and free of redistributed structures.
-- Never read `benchmark/` from `src/`; gate test access on its existence.
-
-## Development loop
-
-- Run: assess, plan, implement, adversarial review, edge-case review, reassess, regress.
-- After implementation, ask independent reviewers to break the change.
-- Default a claim to refuted when its key number cannot be reproduced.
-- Use worktree isolation for any agent that may edit.
-- Run tests with no review agents active.
-- Use unique scratch filenames.
-- Demonstrate new capabilities in `examples/*.ipynb` with the public API.
-- Gate embedded notebook structures with `rx.geom_check.check`.
-- Clear notebook outputs before commit.
-
-## Gates and toolchain
-
-- Gate changes with `just test`; use `just check` for lint and types too.
-- Run `just setup` for environment setup and pre-commit installation.
-- Keep bare `uv sync` as the full dev environment.
-- Do not use `uv sync --all-extras`.
-- Use `uv pip install .` or `uv sync --no-default-groups` for the base tier.
-- Keep extras limited to `search` and `workflow` unless a real capability requires another.
-
-## Commits
-
-- Keep history linear and squash before landing.
-- Make each commit self-contained.
-- Never add AI attribution, assistant trailers, tool names, or session URLs.
+- Name tests and fixtures for their chemistry. Keep tests with their source owner.
+- Demonstrate new public capabilities in output-cleared `examples/*.ipynb` notebooks using the public API.
+- Run `just test`; use `just check` for formatting, lint, types, and tests. Run `just setup` for environment and
+  pre-commit setup.
+- Keep bare `uv sync` as the full development install. Use `uv pip install .` or
+  `uv sync --no-default-groups` for the base tier; do not use `uv sync --all-extras`.
+- Keep extras limited to `search` and `workflow` until a real capability needs another.

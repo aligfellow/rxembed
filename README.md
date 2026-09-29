@@ -1,8 +1,8 @@
 # rxembed: Constrained conformer embedding for reactive chemistry
 
 rxembed generates 3D conformers around stated geometry: distances, angles, rigid transition-state cores,
-coordination polyhedra, and non-covalent contacts. It edits RDKit's distance bounds before embedding and
-holds the constraints through restrained UFF relaxation.
+coordination polyhedra and non-covalent contacts. It edits RDKit's distance bounds before embedding and holds
+the constraints through a restrained UFF relaxation.
 
 [![License](https://img.shields.io/github/license/aligfellow/rxembed)](https://github.com/aligfellow/rxembed/LICENSE)
 [![Powered by: uv](https://img.shields.io/badge/-uv-purple)](https://docs.astral.sh/uv)
@@ -11,13 +11,6 @@ holds the constraints through restrained UFF relaxation.
 [![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/aligfellow/rxembed/ci.yml?branch=main&logo=github-actions)](https://github.com/aligfellow/rxembed/actions)
 [![Codecov](https://img.shields.io/codecov/c/github/aligfellow/rxembed)](https://codecov.io/gh/aligfellow/rxembed)
 
-## Features
-
-- SMILES, XYZ, RDKit `Mol`, and metal `Isomer` inputs.
-- Composable numeric, rigid-core, coordination, and non-covalent constraints.
-- Coordination isomers with named polyhedra, vertex slots, and Λ/Δ chirality.
-- Embedding, Monte Carlo search, pruning, geometry checks, and energy ranking.
-
 ## Installation
 
 rxembed is not yet on PyPI. Install it from a clone:
@@ -25,21 +18,13 @@ rxembed is not yet on PyPI. Install it from a clone:
 ```bash
 git clone https://github.com/aligfellow/rxembed.git
 cd rxembed
-# Base
-pip install .
-# Or recommended: also pruning, representatives and plots
-pip install '.[workflow]'
-# Or full: also OpenConf Monte Carlo search
-pip install '.[search,workflow]'
+pip install .                     # base: NumPy, RDKit and NetworkX
+pip install '.[workflow]'         # recommended: adds XYZ perception, pruning, representatives and plots
+pip install '.[search,workflow]'  # full: adds OpenConf Monte Carlo search
 ```
 
-| extra | brings | for |
-|---|---|---|
-| `workflow` | `xyzgraph`, `prism_pruner`, `scikit-learn`, `matplotlib` | perception, NCI, selection and plots |
-| `search` | `openconf` | Monte Carlo conformational search |
-
-xTB scoring and optimization require the [xTB executable](https://github.com/grimme-lab/g-xtb). Put it at
-`~/bin/xtb` or set `$XTB_EXE` to its path.
+xTB scoring and optimization need the [xTB executable](https://github.com/grimme-lab/g-xtb) at `~/bin/xtb`, or
+at the path in `$XTB_EXE`.
 
 ## Quick Start
 
@@ -48,274 +33,216 @@ import rxembed as rx
 
 ens = rx.embed("OCCCCO", n=20).minimize()
 best = ens.lowest(3)
-best.dump("best.xyz")              # three conformers in one multi-frame XYZ
+best.dump("best.xyz")  # three conformers in one multi-frame XYZ
 ```
 
-`embed` accepts SMILES, `.xyz`, RDKit `Mol`, or a selected metal `Isomer`. It normally returns one `Ensemble`.
-If the request creates several choices, such as every metal isomer, it returns an `EnsembleSet` and applies
-chainable methods to each member. `stereo="separate"` returns a list of those sets.
-
-### XYZ input
-
-```python
-import rxembed as rx
-
-mol = rx.read_xyz("complex.xyz", charge=0, bond_orders="xyz2mol")
-```
-
-`read_xyz` returns an RDKit `Mol` with coordinates and perceived bonds. The default xyzgraph backend preserves
-reactive contacts such as bridging hydrides, side-on H₂, and shared protons. Choose perception separately:
-
-- `connectivity="xyzgraph"` decides which atoms are bonded; use `"xyz2mol"` as an alternative.
-- `bond_orders="xyzgraph"` assigns bond orders; use `"xyz2mol"` for transition-metal valence optimization.
-
-`bond_orders="xyzgraph"` requires `connectivity="xyzgraph"`.
+`rx.embed` takes SMILES, an `.xyz` path, an RDKit `Mol` or a selected metal `Isomer` and always makes new
+coordinates; `rx.minimize` relaxes existing ones. One molecule returns an `Ensemble`; a request with several
+answers, such as every isomer of a metal complex, returns an `EnsembleSet`, a list of ensembles whose methods
+apply to every member. The examples below run from the root of a clone. The [notebooks](examples/) go from
+[the bounds matrix](examples/00_how_it_works.ipynb) to [transition-metal catalysts](examples/11_tm_catalysts.ipynb).
 
 ## Constraints and Rigid Cores
 
-Ordinary molecules, reacting structures, and metal complexes all use the same `fix`, `constrain`, and
-`template` arguments. For metals, supply a constraint before selection if it can decide which isomer is
-possible.
+Every input shares the same `fix`, `constrain` and `template` arguments. Atom indices are 0-based;
+`rx.match(mol, smarts)` resolves a unique SMARTS match, in the drawn Lewis form or else any resonance form,
+or raises.
 
 | constraint | call |
 |---|---|
 | a numeric distance, angle or dihedral | `fix={(i, j): 2.05, (i, j, k): 170.0, (i, j, k, l): 180.0}` |
 | a soft numeric window | `constrain={(i, j): (2.0, 2.2), (i, j, k, l): (170.0, 190.0)}` |
-| a rigid reacting core | `fix=[i, j, k]`, or `template=(ref, SMARTS_or_map)` |
+| a rigid core | `fix=[i, j, k]`, `fix={i: (x, y, z)}`, or `template=(ref, SMARTS_or_map)` |
 | a coordination polyhedron | `rx.metal(smiles, "octahedral")` |
 | a stated NCI grip or π stack | `constrain={(ring_a, ring_b): 3.5}` |
 | automatically proposed NCI contacts | `contacts="auto"` |
 
-> [!IMPORTANT]
-> `fix` and `constrain` use 0-based atom indices. `rx.match(mol, smarts)` resolves a unique match or raises.
-
-`fix=[atoms]` keeps those atoms at their coordinates in the source. `template=(reference, mapping)` transfers
-a core from another structure into that same rigid `fix` path:
-
 ```python
-rx.embed(mol, fix=[3, 7, 11])
-rx.embed(mol, fix={3: (x, y, z)})
-rx.embed(mol, template=(ref, "CC(=O)N"))
-rx.embed(mol, template=(xyz, {3: 11}))
-```
+ref = rx.embed("OCCCCO", n=1)
+held = rx.embed(ref.mol, fix=[0, 1, 2], n=4)  # atoms 0-2 stay where ref has them
+grafted = rx.embed("OCCCCCO", template=(ref, {0: 0, 1: 1, 2: 2}), n=4)  # copied onto another molecule
 
-### A reacting core
-
-```python
-core = "[F].[#6]-[Cl]"
-ref = rx.read_xyz("ts.xyz", charge=-1)
-reaction = rx.embed("[F-].c1ccccc1CCl", template=(ref, core), n=4)
+core = "[F].[#6]-[Cl]"  # an SN2 transition state onto a new substrate
+ts = rx.read_xyz("examples/structures/sn2.xyz", charge=-1)
+reaction = rx.embed("[F-].c1ccccc1CCl", template=(ts, core), n=4)
 fluoride, carbon, chloride = rx.match(reaction.mol, core)
-reaction.measure((fluoride, carbon))          # forming bond
-reaction.measure((carbon, chloride))          # breaking bond
+reaction.measure((fluoride, carbon))  # forming bond
+
+pair = rx.embed("CC(=O)O.c1ccncc1", constrain={(3, 7): (2.6, 2.9)}, n=5)  # acid O-H...N of pyridine
 ```
 
-`template` supplies coordinates to `fix`. A SMARTS maps one ordered match on each graph; symmetric SMARTS and
-coordinate-only templates need an explicit `{target_index: reference_index}` map.
+A symmetric SMARTS, or a reference with coordinates only, needs an explicit `{target_index: reference_index}`
+map. Dot-separated molecules embed in one frame with each free fragment kept beside the others. See
+[constraints](examples/02_constraints.ipynb), [NCI modes](examples/03_nci.ipynb),
+[transition states](examples/04_organic_ts.ipynb) and [retargeting a TS](examples/10_retarget_ts.ipynb).
 
 ## Metal Complexes
 
 ```python
-import rxembed as rx
-
 isomers = rx.metal("CCCN->[Pd+2](<-[Cl-])(<-[Cl-])<-NCCC", "SPL")
 isomers.summary()
 trans = isomers.select(label="trans")
 trans_confs = rx.embed(trans, n=10)
-
-# Or embed every square-planar isomer in one call.
-all_confs = rx.embed("CCCN->[Pd+2](<-[Cl-])(<-[Cl-])<-NCCC", metal="SPL", n=10)
+all_confs = rx.embed("CCCN->[Pd+2](<-[Cl-])(<-[Cl-])<-NCCC", metal="SPL", n=10)  # every isomer
 ```
 
-`rx.metal` accepts SMILES, `.xyz`, or `Mol` and returns distinct arrangements. Write ionic dative SMILES with
-donor-to-metal arrows and charged anionic ligands; neutral/covalent SMILES are also accepted as input.
+`rx.metal` takes SMILES, an `.xyz` path or a `Mol` and returns every distinct arrangement as an `IsomerSet`.
+Dative SMILES with charged anionic ligands, as above, is preferred and covalent SMILES is accepted. Write
+hydrides, H₂ and bridging hydrogens explicitly. `.select()` returns the one isomer matching `label`, `hand`,
+`index`, `stereo` or `center`, or raises; `.filter()` returns a subset. `screen=False` keeps arrangements the
+ligands cannot reach, and `lengths="input"` measures metal-ligand distances instead of using the fitted model.
 
-For tethered sigma donors, `rx.metal` rejects an arrangement when the ligand's distance-geometry upper bound is
-shorter than the required donor separation. Embedding can still fail when the full set of metal distances and
-angles is inconsistent, and successful arrangements should be checked with an appropriate energy method.
+Geometries by coordination number, default first: 1 `MCO`; 2 `LIN`; 3 `TPL`, `TSH`, `TPY`; 4 `SPL`, `TET`, `SEE`;
+5 `TBP`, `SPY`; 6 `OCT`, `TPR`, `HPL`; 7 `PBP`, `COC`, `CTP`; 8 `SQA`, `DOD`; 9 `TCT`; 10 `BSA`; 11 `ECI`. Codes
+and full names (`octahedral`, `t_shape`) are case-insensitive, and an unknown name lists them all. Without a
+geometry, rxembed classifies the input coordinates or takes the default. Each haptic face (a side-on bond, Cp,
+an arene) is one site bound through its centroid; four sites with an η3 or larger face default to tetrahedral.
 
-Use `rx.metal` when you want to inspect and select the isomer yourself. The `metal="SPL"` shortcut embeds every
-enumerated isomer; `n` applies separately to each one.
-
-If `fix` includes several atoms in the coordination sphere, pass it to `rx.metal` before selection:
+A `fix` on the coordination sphere decides which arrangements exist, so give it to `rx.metal`. A ligand core
+away from the metal does not, so template it after selection. `coordinate=` binds a fragment's donor, as SMARTS
+or an atom index, to an open vertex:
 
 ```python
-path = "examples/structures/mnh.xyz"
-fixed = [1, 5, 63, 64, 65, 66]
+mn = rx.read_xyz("examples/structures/mn-h2.xyz", charge=-1)
+core = [1, 5, 63, 64, 65, 66]  # Mn, its amine N, and the H-H and N-H...O atoms of a reacting core
+chosen = rx.metal(mn, "OCT", center="Mn", fix=core, observed_only=True)[0]  # the input's own arrangement
+mn_confs = rx.embed(chosen, n=4)
 
-states = rx.metal(path, fix=fixed)
-chosen = states.filter(center="Mn", label="mer").select(hand="lambda")
-mn_confs = rx.embed(chosen, n=12)
+templated = rx.embed(trans, template=(trans_confs[0], {0: 0, 1: 1, 2: 2}), n=10)
+bound = rx.embed(rx.metal("N->[Pt](Cl)Cl.CC(C)=O", "SPL").select(index=0), coordinate="[OX1]", n=10)
 ```
 
-An off-sphere ligand core does not choose the metal arrangement, so it can be templated after selection:
+### Stereo
 
-```python
-ligand_core = [0, 1, 2]
-templated = rx.embed(trans, template=(trans_confs[0], {i: i for i in ligand_core}), n=10)
-```
+`stereo=` on `rx.embed` and `rx.metal` controls point R/S, E/Z, atropisomer M/P and bound-donor hands:
 
-Other `fix`, `constrain`, `template`, `coordinate`, and `contacts` arguments can be added to the final
-`rx.embed` call. A conflicting combination raises an error.
-
-`coordinate=` fills an open metal site and applies the normal coordination constraints:
-
-```python
-pocket = rx.metal("N->[Pt](Cl)Cl.CC(C)=O", "SPL").select(index=0)
-bound = rx.embed(pocket, coordinate="[OX1]", n=10)
-```
-
-Geometry inputs keep their measured ligand and haptic stereo. Several metals are handled together by default;
-use `center=` to enumerate only one, or `stereo=` to vary selected stereo:
-
-```python
-n_hands = rx.metal(path, stereo={"N5": "racemic"})
-all_hands = rx.metal(path, stereo="racemic")
-```
-
-Native atropisomer CXSMILES (`wU`/`wD`, reported as `M`/`P`) round-trips and enumerates with metal
-arrangements. Alkene `E`/`Z` remains independent of an η² face.
-
-`.summary(details=True)` adds trans pairs or axial/equatorial sites and distinguishes graph-non-equivalent
-same-element donors. `center="Mn"` enumerates only Mn and retains the other spheres.
-
-Ordinary donor hydrogens may be implicit. Hydrides, H₂, and bridging hydrogen donors must be explicit.
-
-### Geometries
-
-Names and three-letter codes are case-insensitive. If omitted, rxembed classifies existing coordinates or
-uses the first geometry listed for the coordination-site count. Each haptic face is one centroid site; a CN4
-complex with an η3 or higher face instead defaults to tetrahedral for a piano-stool geometry.
-
-| CN | geometries (default first) |
+| `stereo=` | effect |
 |---|---|
-| 1 | `monocoordinate` (`MCO`) |
-| 2 | `linear` (`LIN`) |
-| 3 | `trigonal_planar` (`TPL`) · `t_shape` (`TSH`) · `trigonal_pyramidal` (`TPY`) |
-| 4 | `square_planar` (`SPL`) · `tetrahedral` (`TET`) · `seesaw` (`SEE`) |
-| 5 | `trigonal_bipyramidal` (`TBP`) · `square_pyramidal` (`SPY`) |
-| 6 | `octahedral` (`OCT`) · `trigonal_prismatic` (`TPR`) |
-| 7 | `pentagonal_bipyramidal` (`PBP`) · `capped_octahedral` (`COC`) · `capped_trigonal_prismatic` (`CTP`) |
-| 8 | `square_antiprism` (`SQA`) · `dodecahedral` (`DOD`) |
+| omitted | a SMILES enumerates only its undefined stereo; a geometry keeps what it measures, except a diene's class |
+| `"racemic"` | enumerate every configurable element, defined ones included |
+| `"separate"` | `rx.embed` only: as omitted, but return a `list[EnsembleSet]`, one per configuration |
+| `"free"` | no enumeration; the seed decides |
+| `{"N5": "racemic"}` | set the mode of one atom, named by element and index |
+| `{"locked": "racemic"}` | enumerate both hands of every coordination-locked donor, such as a bound amine N |
 
-> [!TIP]
-> Each unused polyhedron vertex remains an open coordination site.
-
-Haptic ligands, including side-on bonds, Cp, and arenes, bind through a centroid.
-
-### Ligands
+A dict can also key a mode (`"preserve"`, `"racemic"`, `"invert"`, `"free"`) by kind: `"point"`, `"ez"`,
+`"axial"`, `"locked"` or `"default"`. A bound diene is s-cis or s-trans, each an isomer
+([07_metal](examples/07_metal.ipynb)); s-trans binding is rare (10 of 358 open-chain η4 dienes in tmQMg), so
+compare the classes with a real energy, or keep the measured one with `observed_only=True`.
 
 ```python
-import rxembed as rx
-
-for lig in rx.ligands(complex_mol):
-    lig.mol, lig.donors, lig.atoms
+locked_hands = rx.metal("examples/structures/mnh.xyz", stereo={"locked": "racemic"})
 ```
 
-`lig.donors` maps original metal indices to donor indices in `lig.mol`; `lig.atoms` maps ligand positions
-back to original complex indices.
+### Shape check
+
+An accepted conformer's sphere reads as the requested polyhedron within 0.01 of the best fit (0 is ideal); one
+that slid into another shape is rejected. The reading is the conformer property `shape`:
+
+```python
+cid = trans_confs.ids[0]
+print(trans_confs.mol.GetConformer(cid).GetProp("shape"))  # e.g. Pd4 SPL 0.070 (next SEE 0.322)
+```
+
+`rx.ligands(mol)` splits a complex into ligands. See [metals](examples/07_metal.ipynb),
+[catalysts](examples/11_tm_catalysts.ipynb) and [dative SMILES](examples/12_dative_smiles.ipynb).
+
+## XYZ Input
+
+```python
+mol = rx.read_xyz("examples/structures/mnh.xyz", charge=0, bond_orders="xyz2mol")
+```
+
+By default xyzgraph (the `workflow` extra) perceives bonds and bond orders. xyz2mol bond orders optimize
+transition-metal valence; keep xyzgraph's for reactive or multicentre bonds such as a TS or a bridging hydride.
+The alternatives `connectivity="rdkit"` and `"xyz2mol"` need xyz2mol bond orders. An XYZ stores no charge and
+rxembed never infers one: pass the real charge for an ion (`rx.embed`, `rx.metal` and `rx.minimize` take
+`charge=` too), or `metal_charges={0: 2, 1: 1}` for a split the total does not fix. `read_xyz` warns when a
+metal looks like an ion read as neutral, and on every perception change, which never alters the atoms, their
+order or the charge; `fallback=False` raises instead.
 
 ## Save Results
 
-Print dative SMILES for connectivity or CXSMILES to also retain the selected metal arrangement:
-
 ```python
-print(rx.dative_smiles(mn_confs.mol))
-print(rx.cxsmiles(chosen))
-
-for state in states:
-    print(rx.cxsmiles(state))
+print(rx.dative_smiles(mn_confs.mol))  # connectivity
+print(rx.cxsmiles(chosen))  # also the selected metal arrangement; rx.embed reads it back directly
+mn_confs.dump("mn.xyz")  # one multi-frame XYZ
+paths = all_confs.dump("palladium.xyz")  # one file per isomer
 ```
 
-Embedded results expose a normal RDKit `Mol`, so RDKit's writers work directly:
-
-```python
-from rdkit import Chem
-
-Chem.MolToXYZFile(mn_confs.mol, "mn_0.xyz", confId=mn_confs.ids[0])
-```
-
-For several conformers, `dump` is the convenience method: an `Ensemble` writes one multi-frame XYZ, while an
-`EnsembleSet` writes one named multi-frame XYZ per isomer.
-
-```python
-mn_confs.dump("mn.xyz")
-paths = all_confs.dump("palladium.xyz")
-```
-
-CXSMILES can go directly back into `rx.embed`; plain SMILES must be enumerated again. Neither stores `fix` or
-`constrain`. Every XYZ frame includes all disconnected components in the molecule.
+Neither SMILES stores `fix` or `constrain`. `ens.mol` is a normal RDKit `Mol`, so RDKit's writers work too.
 
 ## Workflow Operations
 
 ```python
 searched = rx.embed("OCCCCO").mc(preset="rapid").minimize().prune()
 representatives = searched.representatives()
-ranked = searched.score("gxtb")
-best = ranked.lowest(3)
-optimized = best.optimize("gfn2")
+optimized = searched.score("gxtb").lowest(3).optimize("gfn2")
+walk = rx.embed(trans, n=1, trajectory=True)  # walk.trajectory holds the seed and UFF snapshots
+walk.dump_trajectory("cleanup.xyz")
 ```
 
-- `mc()` searches with OpenConf and needs the `search` extra.
-- `prune()` and `representatives()` need `workflow`.
-- `minimize()` uses restrained UFF. `score("ff")` uses MMFF94s where possible, otherwise UFF.
-- xTB scoring and optimization need the xTB executable.
+- `mc()` needs the `search` extra; `prune()`, `representatives()` and `filter("connectivity")` need `workflow`.
+- `minimize()` is restrained UFF. When UFF cannot type the real graph it relaxes a stand-in and marks the
+  result `energy_kind="uff-surrogate"`; `score("ff")` is an exact single point and raises instead.
+- `check()` reports geometry problems per conformer and `filter("geometry")` drops them.
+- `score()` also takes a caller-supplied ASE calculator, such as `rx.ASE(XTB())` from
+  [xtb_ase](https://github.com/Quantum-Accelerators/xtb_ase). See [energies](examples/08_energies.ipynb).
 
-Record one restrained-UFF cleanup with `trajectory=True`:
+## Embedding Settings
+
+`n`, `seed` and `threads` go to `rx.embed`; everything else about seeding is one `rx.EmbedParams`. The default
+model is RDKit's `KDG()` with all-in-one refinement; pass another as `native`:
 
 ```python
-walk = rx.embed(selected_isomer, n=1, trajectory=True)
-cleanup = walk.trajectory
+from rdkit.Chem import rdDistGeom
+
+ens = rx.embed("C1CCCCC1O", n=3, params=rx.EmbedParams(seed=42, native=rdDistGeom.srETKDGv3()))
+again = rx.embed("C1CCCCC1O", n=3, params=ens.params)  # the same conformers
 ```
 
-Caller-supplied ASE calculators work with `score()`. With `xtb` on `PATH`:
+Set `seed`, `threads` and `prune_rms` on `EmbedParams`, not the native object, and geometry through `fix` and
+`constrain`. The switches `coplanar_14`, `metal_floor_relief`, `donor_orientation` and `conjugation` each remove
+one of rxembed's additions, for study ([07_metal](examples/07_metal.ipynb)). `max_iters` caps the UFF relax.
 
-```python
-from xtb_ase import XTB
+## Errors and How It Works
 
-ranked = rx.embed("O", n=1).score(rx.ASE(XTB()))
-```
+Distance geometry seeds each conformer from RDKit's bounds matrix with the stated geometry written in
+([00_how_it_works](examples/00_how_it_works.ipynb)). Restrained UFF cleans each seed, and a gate checks bonds,
+clashes, the polyhedron, hands, stereocentres and `fix` values, retrying with stiffer restraints and then fresh
+seeds. The metal is a stand-in atom during both; the real metal and its charge are restored before any check.
 
-## Embedding Engine
+A single request that cannot be built raises `EmbeddingError`: one sentence naming the isomer, the most common
+reason and a remedy, with every rejected seed counted in `err.failures`. A request that expands into several
+candidates returns what embedded, lists the rest in `result.errors`, and raises only when none embeds. A
+warning means the result differs from the request. `rx.set_verbose("DEBUG")` shows every retry.
 
-Use `rxembed.core` when the input is already an explicit-H RDKit `Mol` and the pipeline tools are not needed:
+`rxembed.core` is the low-level API for an explicit-H RDKit `Mol`, such as
+`core.embed(mol, constrain={(0, 5): (2.6, 3.0)}, n=8)`. [ARCHITECTURE.md](ARCHITECTURE.md) maps the modules.
 
-```python
-from rdkit import Chem
-from rxembed import core
+## Metal performance
 
-mol = Chem.AddHs(Chem.MolFromSmiles("OCCCCO"))
-confs = core.embed(mol, constrain={(0, 5): (2.6, 3.0)}, n=8).minimize()
-confs.measure((0, 5))
-```
+Each structure is read from its XYZ, written as a CX SMILES, and embedded fresh from that CX string; it
+passes when the embedded CX matches. `just bench` runs the 100 shipped fixtures, `just bench tmqmg
+--size N` a diverse tmQMg sample.
 
-`core.enumerate_isomers(mol, geometry)` is the matching metal enumerator.
+![pass rate by class: fixtures](benchmark/docs/fixtures_by_class.png)
+![pass rate by class: tmQMg sample](benchmark/docs/tmqmg_by_class.png)
 
-## Approximations
-
-Current limitations:
-
-| | |
-|---|---|
-| metal | RDKit sees a bond-less carbon during distance geometry and lithium during UFF. M–L targets come from the input geometry when present, otherwise from the fitted model. Final structures are validated |
-| exact cores | distance geometry biases the core; `fix` then restores its coordinates exactly |
-| `n=N` | requests N seeds. Failed structures are retried; required metal, stereo, and fixed-core requests raise if N cannot be produced |
-| g-xTB solvent | `E_gxtb(gas) + [E_gfn2(solv) − E_gfn2(gas)]`, never a silent gas-phase energy |
-| haptic axial pose | after face or winding identity is selected, `rx.metal` does not enumerate continuous rotation about the metal-centroid axis. ETKDG seeds may sample it incidentally; `mc()` pose-freezes each seeded face |
-| `mc()` pose-freeze | soft, ~0.1 Å drift. A constraint that must hold across `mc()` has to be a distance, angle or dihedral the relax also reads |
+[benchmark/README.md](benchmark/README.md) has timings, per-metal breakdowns, core RMSD and the sample's
+coverage of tmQMg.
 
 ## Development
 
 ```bash
-just setup     # uv sync + pre-commit
-just check     # lint + type + test
+just setup  # uv sync and pre-commit
+just check  # format, lint, types and tests; just test runs the tests alone
 ```
 
-`uv sync` alone is the full dev environment: the `dev` group pulls `rxembed[search,workflow]`.
-
-- [`examples/`](examples/): 13 notebooks, from the bounds matrix to transition-metal catalysts.
-- [`ARCHITECTURE.md`](ARCHITECTURE.md): how it fits together.
-- [`AGENTS.md`](AGENTS.md): how we change it.
+`uv sync` is the full development install and `uv sync --no-default-groups` the base tier. Tests that need a
+[tmQMg](https://github.com/hkneiding/tmQMg) clone skip unless `RXEMBED_TMQMG_DIR` points at its `data/`
+directory. The metal round-trip benchmark is in [benchmark/README.md](benchmark/README.md);
+[ARCHITECTURE.md](ARCHITECTURE.md) gives the package structure and [AGENTS.md](AGENTS.md) the development rules.
 
 ## License
 
@@ -329,6 +256,7 @@ just check     # lint + type + test
 - [xyzgraph](https://github.com/aligfellow/xyzgraph): `.xyz` metal and TS perception
 - [xyz2mol_tm](https://github.com/jensengroup/xyz2mol_tm): vendored, the alternative bond-order perceiver
 - [xtb](https://github.com/grimme-lab/g-xtb): GFN-FF, GFN2-xTB and g-xTB
+- [tmQMg](https://github.com/hkneiding/tmQMg): tmQMg dataset
 
 Related projects:
 

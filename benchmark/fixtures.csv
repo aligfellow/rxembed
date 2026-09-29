@@ -1,0 +1,101 @@
+id,origin,charge,focus
+ABUVUP,tmQMg,0,large chelate
+ASISAX,OIN,0,macrocycle perception
+ASUVIV,tmQMg,0,multidentate
+BEGLUU,tmQMg,0,macrocycle embedding
+BENVOG,OIN,0,slow macrocycle
+Cis-PtCl2(en),OIN,0,cis chelate
+CisPlatin,OIN,0,small cis
+CuCN2,OIN,0,small CN2
+DIXHOK,tmQMg,0,large chelate
+EJUJUP,tmQMg,0,high CN embedding
+FeCO5,OIN,0,CN5 carbonyl
+FeH2(CO)4,OIN,0,hydride
+Ferrocene-halide-face,OIN,-2,haptic face
+Ferrocene,OIN,-2,haptic symmetry
+HgI3,OIN,0,small CN3
+IROXET,tmQMg,0,perception crash
+JEGKOW,tmQMg,0,mixed donor square planar
+JOTJEK,tmQMg,0,kekulization crash
+KAXVOX,OIN,0,large
+LEZWAO,tmQMg,0,large
+NAXDOI,tmQMg,0,haptic large
+OCUGIC,tmQMg,0,regression
+POJJOP,tmQMg,0,bound N stereo
+PdCl2-R-BINAP,OIN,0,atropisomer
+PdCl2-RR-BDNN,OIN,0,N stereo
+PdCl2-RR-BDPP,OIN,0,P stereo
+PdCl2-RR-DPDME,OIN,0,meso counterexample
+PdCl2PhenPhosMe,OIN,0,mixed donor square planar
+PtMeNH3ClBr-Cis,OIN,0,four donor cis
+PtMeNH3ClBr-Trans,OIN,0,four donor trans
+RIFGUJ,tmQMg,1,charged multiple N stereo
+ROGYAO,tmQMg,0,perception
+ReF7,OIN,0,high CN7
+Rh-RR-DIPAMP-Cl2,OIN,0,P stereo
+Rh-Single-Chiral-Phosphine,OIN,0,single P stereo
+TiCat1,OIN,-2,haptic achiral
+TiCat2,OIN,-1,haptic extra donor
+TiCat3,OIN,-2,haptic racemate
+TiCat4,OIN,-2,haptic meso
+TiCat5,OIN,-2,haptic enantiomer
+TiCat6,OIN,-2,haptic enantiomer
+TransPlatin,OIN,0,small trans
+VOacac2,OIN,0,bis chelate
+YESKOZ,tmQMg,0,meso axis counterexample
+ZUMNEC,tmQMg,0,tris chelate metal hand
+Zeises_salt,OIN,0,eta2
+fac-Ir(ppy)3,OIN,0,fac chelate
+mer-Ir(ppy)3,OIN,0,mer chelate
+PdClBr-BINAP,OIN,0,atropisomer mixed halide
+PdClCFMe-BINAP,OIN,0,atropisomer chiral carbon
+HEBLOQ,tmQMg,0,Ag example
+DOCPIW,tmQMg,0,Au example
+MAJFAG,tmQMg,0,Cd example
+JAKNUE,tmQMg,0,Co example
+ABITAJ,tmQMg,0,Cr example
+EGALIK,tmQMg,1,Cu example
+ARITOK,tmQMg,0,Fe example
+GOCJIU,tmQMg,0,Hf example
+GEQXUW,tmQMg,0,Hg example
+IWOSIX,tmQMg,0,Ir example
+SIDYIP,tmQMg,0,La example
+HAJDUR,tmQMg,0,Mn example
+AHEVIU,tmQMg,0,Mo example
+FAVSAY,tmQMg,0,Nb example
+BENDOP,tmQMg,0,Ni example
+GAGSEO,tmQMg,1,Os example
+BOJQUN,tmQMg,0,Pd example
+DORYAN,tmQMg,0,Pt example
+DAFFID,tmQMg,0,Re example
+EGEGON,tmQMg,0,Rh example
+BAYCAI,tmQMg,1,Ru example
+EXADAI,tmQMg,0,Sc example
+KAGPAL,tmQMg,0,Ta example
+MOCQIE,tmQMg,0,Tc example
+CAJJEC,tmQMg,0,Ti example
+EWOSAK,tmQMg,0,V example
+ALODUB,tmQMg,0,W example
+OFUNUZ,tmQMg,0,Y example
+AFEDEV,tmQMg,0,Zn example
+CUSNIN,tmQMg,0,Zr example
+BABGET,tmQMg,-1,missing reference SMILES
+ZIBGAS,tmQMg,1,diversity
+OWAHEB,tmQMg,0,diversity
+ABARAX,tmQMg,0,missing reference SMILES
+SOLHIK,tmQMg,1,diversity
+FOGCIN,tmQMg,0,diversity
+WICHIZ,tmQMg,0,diversity
+CUHXEJ,tmQMg,-1,diversity
+ZUDWUQ,tmQMg,0,diversity
+ZACNOJ,tmQMg,0,diversity
+RUKTOG,tmQMg,0,diversity
+ZUVDOJ,tmQMg,1,diversity
+WOKWUO,tmQMg,0,diversity
+KEFCIJ,tmQMg,0,diversity
+AFAXAG,tmQMg,1,diversity
+MISJAA,tmQMg,0,diversity
+XIHXUL,tmQMg,-1,diversity
+XEBYOT,tmQMg,1,diversity
+NUSPEW,tmQMg,-1,diversity
+MnH,rxembed,0,bimetallic Mn Fe hydride

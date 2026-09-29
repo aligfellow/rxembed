@@ -6,7 +6,7 @@ repos:
     # Run the linter.
     - id: ruff-check
       args: [ --fix ]
-      files: ^(src|tests)/
+      files: ^(src|tests|benchmark)/
     # Run the formatter.
     - id: ruff-format
-      files: ^(src|tests)/
+      files: ^(src|tests|benchmark)/

@@ -16,18 +16,12 @@ Modifications here:
   other atom was plain. ``RemoveHs`` would not remove a query atom, so an explicit H could survive
   based on the index ordering of the .xyz file.
 
-The remaining upstream helpers and command-line entry point are retained for provenance but are
-not used by rxembed.
+Only the path used by rxembed (obabel-derived connectivity through AC2mol) is kept; upstream's
+Huckel and van-der-Waals connectivity routes and its CLI entry point are deleted.
 """
 
 import copy
 import itertools
-
-try:
-    from rdkit.Chem import rdEHTTools  # requires RDKit 2019.9.1 or later
-except ImportError:
-    rdEHTTools = None  # ty: ignore[invalid-assignment]
-
 import logging
 from collections import defaultdict
 
@@ -215,19 +209,20 @@ atomic_valence_electrons[52] = 6
 atomic_valence_electrons[53] = 7
 
 
-def str_atom(atom):
-    """Convert integer atom to string atom."""
-    global __ATOM_LIST__
-    atom = __ATOM_LIST__[atom - 1]
-    return atom
-
-
 def int_atom(atom):
     """Convert str atom to integer atom."""
     global __ATOM_LIST__
-    # print(atom)
     atom = atom.lower()
     return __ATOM_LIST__.index(atom) + 1
+
+
+def _allowed_valences(atomic_num, index):
+    """Return the valences xyz2mol allows `atomic_num`, raising for an element its table does not model."""
+    allowed = atomic_valence.get(atomic_num)
+    if not allowed:
+        symbol = Chem.GetPeriodicTable().GetElementSymbol(atomic_num)
+        raise ValueError(f"xyz2mol has no valence model for {symbol} (atom {index}); build the complex from a SMILES")
+    return allowed
 
 
 def get_UA(maxValence_list, valence_list):
@@ -280,9 +275,7 @@ def charge_is_OK(
     allow_charged_fragments=True,
     allow_carbenes=True,
 ):
-    # total charge
     Q = 0
-    # charge fragment list
     q_list = []
 
     if allow_charged_fragments:
@@ -294,7 +287,7 @@ def charge_is_OK(
                 number_of_single_bonds_to_C = list(BO[i, :]).count(1)
                 if not allow_carbenes and number_of_single_bonds_to_C == 2 and BO_valences[i] == 2:
                     # A carbene-pattern C in the no-carbene charge sweep: charge it instead. This is
-                    # a normal branch of the perception ladder, not an error -- no log noise.
+                    # a normal branch of the perception ladder, not an error, so it is not logged.
                     Q += 1
                     q = 2
                 if number_of_single_bonds_to_C == 3 and Q + 1 < charge:
@@ -316,22 +309,7 @@ def BO_is_OK(
     allow_charged_fragments=True,
     allow_carbenes=True,
 ):
-    """Sanity of bond-orders.
-
-    Args:
-        BO -
-        AC -
-        charge -
-        DU -
-
-
-    optional
-        allow_charges_fragments -
-
-
-    Returns:
-        boolean - true of molecule is OK, false if not
-    """
+    """Return whether a bond-order matrix has the right total charge and no over-valent atom."""
     if not valences_not_too_large(BO, valences):
         return False
 
@@ -388,24 +366,7 @@ def BO2mol(
     allow_charged_fragments=True,
     use_atom_maps=True,
 ):
-    """Based on code written by Paolo Toscani.
-
-    From bond order, atoms, valence structure and total charge, generate an
-    rdkit molecule.
-
-    Args:
-        mol - rdkit molecule
-        BO_matrix - bond order matrix of molecule
-        atoms - list of integer atomic symbols
-        atomic_valence_electrons -
-        mol_charge - total charge of molecule
-
-    optional:
-        allow_charged_fragments - bool - allow charged fragments
-
-    Returns:
-        mol - updated rdkit molecule with bond connectivity
-    """
+    """Write a bond-order matrix onto ``mol`` and assign atomic charges or radicals."""
     length_bo = len(BO_matrix)
     length_atoms = len(atoms)
     BO_valences = list(BO_matrix.sum(axis=1))
@@ -524,7 +485,7 @@ def get_bonds(UA, AC):
 
 
 def get_UA_pairs(UA, AC, DU, use_graph=True):
-    """"""
+    """Return pairing(s) of unsaturated atoms to add one bond order each."""
     N_UA = 10000
     matching_ids = dict()
     matching_ids2 = dict()
@@ -557,19 +518,12 @@ def get_UA_pairs(UA, AC, DU, use_graph=True):
             if i in matching_ids2 and j in matching_ids2:
                 remove_pairs.append(tuple([i, j]))
                 add_pairs.append(tuple([matching_ids2[i], matching_ids2[j]]))
-                # UA_pair.remove(tuple([i,j]))
-                # UA_pair.append(tuple([matching_ids2[i], matching_ids2[j]]))
             elif i in matching_ids2:
-                # UA_pair.remove(tuple([i,j]))
                 remove_pairs.append(tuple([i, j]))
                 add_pairs.append(tuple([matching_ids2[i], j]))
-                # UA_pair.append(tuple([matching_ids2[i],j]))
             elif j in matching_ids2:
                 remove_pairs.append(tuple([i, j]))
                 add_pairs.append(tuple([i, matching_ids2[j]]))
-
-                # UA_pair.remove(tuple([i,j]))
-                # UA_pair.append(tuple([i,matching_ids2[j]]))
         for p1, p2 in zip(remove_pairs, add_pairs):
             UA_pair.remove(p1)
             UA_pair.append(p2)
@@ -591,24 +545,19 @@ def get_UA_pairs(UA, AC, DU, use_graph=True):
 
 
 def AC2BO(AC, atoms, charge, allow_charged_fragments=True, use_graph=True, allow_carbenes=True):
-    """Implemenation of algorithm shown in Figure 2.
+    """Search bond orders and charges for the assignment with the fewest formal charges (Kim & Kim, Fig. 2).
 
-    UA: unsaturated atoms
-
-    DU: degree of unsaturation (u matrix in Figure)
-
-    best_BO: Bcurr in Figure
+    UA is the unsaturated-atom list, DU their degree of unsaturation, and best_BO the running-best bond
+    order matrix; these are the paper's own names.
     """
     global atomic_valence
     global atomic_valence_electrons
 
-    # make a list of valences, e.g. for CO: [[4],[2,1]]
-    valences_list_of_lists = []
+    valences_list_of_lists = []  # e.g. for CO: [[4],[2,1]]
     AC_valence = list(AC.sum(axis=1))
 
     for i, (atomicNum, valence) in enumerate(zip(atoms, AC_valence)):
-        # valence can't be smaller than number of neighbourgs
-        possible_valence = [x for x in atomic_valence[atomicNum] if x >= valence]
+        possible_valence = [x for x in _allowed_valences(atomicNum, i) if x >= valence]  # >= neighbour count
         if atomicNum == 6 and valence == 1:
             possible_valence.remove(2)
         if atomicNum == 6 and not allow_carbenes and valence == 2:
@@ -619,17 +568,13 @@ def AC2BO(AC, atoms, charge, allow_charged_fragments=True, use_graph=True, allow
             possible_valence = [1, 2]
 
         if not possible_valence:
-            # An over-valent atom the two-centre model cannot place: raise a CATCHABLE error rather
-            # than sys.exit() -- perception callers (get_lig_mol / the charge sweep) handle it as a
-            # defer, so a hard cage/hypervalent ligand never crashes the whole backend.
+            # A catchable error, not upstream's sys.exit(): perception callers defer on it.
             raise ValueError(
-                f"valence of atom {i} is {valence}, greater than the allowed max "
-                f"{max(atomic_valence[atomicNum])}"
+                f"valence of atom {i} is {valence}, greater than the allowed max {max(atomic_valence[atomicNum])}"
             )
         valences_list_of_lists.append(possible_valence)
 
-    # convert [[4],[2,1]] to [[4,2],[4,1]]
-    valences_list = itertools.product(*valences_list_of_lists)
+    valences_list = itertools.product(*valences_list_of_lists)  # e.g. [[4],[2,1]] -> [[4,2],[4,1]]
 
     best_BO = AC.copy()
 
@@ -652,20 +597,14 @@ def AC2BO(AC, atoms, charge, allow_charged_fragments=True, use_graph=True, allow
     O_sums = []
     for v_list in itertools.product(*O_valences):
         O_sums.append(v_list)
-        # if sum(v_list) not in O_sums:
-        #    O_sums.append(v_list))
 
     N_sums = []
     for v_list in itertools.product(*N_valences):
         N_sums.append(v_list)
-        # if sum(v_list) not in N_sums:
-        #    N_sums.append(sum(v_list))
 
     C_sums = []
     for v_list in itertools.product(*C_valences):
         C_sums.append(v_list)
-        # if sum(v_list) not in C_sums:
-        #    C_sums.append(sum(v_list))
 
     P_sums = []
     for v_list in itertools.product(*P_valences):
@@ -775,9 +714,7 @@ def AC2mol(
     use_atom_maps=True,
     allow_carbenes=True,
 ):
-    """"""
-
-    # convert AC matrix to bond order (BO) matrix
+    """Assign bond orders and charges to ``mol`` from its adjacency matrix ``AC``."""
     BO, atomic_valence_electrons = AC2BO(
         AC,
         atoms,
@@ -786,7 +723,6 @@ def AC2mol(
         use_graph=use_graph,
         allow_carbenes=allow_carbenes,
     )
-    # add BO connectivity and charge info to mol object
     mol = BO2mol(
         mol,
         BO,
@@ -796,38 +732,18 @@ def AC2mol(
         allow_charged_fragments=allow_charged_fragments,
         use_atom_maps=use_atom_maps,
     )
-
-    # print(Chem.GetFormalCharge(mol), charge)
-    # If charge is not correct don't return mol
     if Chem.GetFormalCharge(mol) != charge:
         return None
 
-    # BO2mol returns an arbitrary resonance form. Let's make the rest
-
-    # mols = rdchem.ResonanceMolSupplier(mol)
-    # mols = [mol for mol in mols]
-    # print(mols)
-
-    return mol
+    return mol  # one arbitrary resonance form, not the full set
 
 
 def get_proto_mol(atoms):
-    """An empty-bonded RWMol with one plain atom per element in *atoms*.
+    """Return an empty-bonded RWMol with one plain atom per element in *atoms*.
 
-    ATOM 0 MUST NOT BE A QUERY ATOM. Upstream seeded this with
-    ``Chem.MolFromSmarts("[#%d]" % atoms[0])`` -- a convenient way to get an RWMol to append to, but
-    SMARTS yields a QUERY atom, so atom 0 of every molecule we ever built carried a query while the
-    rest did not. RDKit then behaves differently for it, exactly as documented: `RemoveHs` refuses
-    to remove a hydrogen with a query (`RemoveHsParameters.removeWithQuery` is False by default).
-
-    Invisible until atom 0 happens to BE a hydrogen -- which is decided by the order of the lines in
-    the xyz file. Measured on FIHTIZ: in the file's own order all five ferrocenyl C-H suppress, and
-    in a shuffle the one that landed at index 0 SURVIVES. That stray `[H]` leads the ligand SMILES
-    (`'[H]c1cccc1'` for `'c1cccc1'`), the site key is compared as a STRING, and its `[` (0x5B) sorts
-    the Cp ahead of the phosphine's `c` (0x63) -- so the Cp and the PPh3 SWAPPED COORDINATION SLOTS
-    on a shuffle of the input file. A SMARTS seed, choosing the encoded isomer.
-
-    Plain atoms only. Nothing else about the function changes.
+    Atom 0 must not be a query atom: upstream seeded it from ``Chem.MolFromSmarts``, and `RemoveHs` keeps a
+    query hydrogen (`RemoveHsParameters.removeWithQuery` defaults to False), so the result followed the
+    file's line order whenever a hydrogen came first.
     """
     rwMol = Chem.RWMol()
     for z in atoms:
@@ -858,150 +774,14 @@ def read_xyz_file(filename, look_for_charge=True):
     return atoms, charge, xyz_coordinates
 
 
-def xyz2AC(atoms, xyz, charge, use_huckel=False, use_obabel=False):
-    """Atoms and coordinates to atom connectivity (AC)
-
-    Args:
-        atoms - int atom types
-        xyz - coordinates
-        charge - molecule charge
-
-    optional:
-        use_huckel - Use Huckel method for atom connecitivty
-        use_obabel - Use Opne Babel method for atom connectivity
-
-    Returns:
-        ac - atom connectivity matrix
-        mol - rdkit molecule
-    """
-    if use_huckel:
-        return xyz2AC_huckel(atoms, xyz, charge)
-    elif use_obabel:
-        return xyz2AC_obabel(atoms, xyz)
-    else:
-        return xyz2AC_vdW(atoms, xyz)
-
-
-def xyz2AC_vdW(atoms, xyz):
-    # Get mol template
-    mol = get_proto_mol(atoms)
-
-    # Set coordinates
-    conf = Chem.Conformer(mol.GetNumAtoms())
-    for i in range(mol.GetNumAtoms()):
-        conf.SetAtomPosition(i, (xyz[i][0], xyz[i][1], xyz[i][2]))
-    mol.AddConformer(conf)
-
-    AC = get_AC(mol)
-
-    return AC, mol
-
-
-def get_AC(mol, covalent_factor=1.3):
-    """Generate adjacent matrix from atoms and coordinates.
-
-    AC is a (num_atoms, num_atoms) matrix with 1 being covalent bond and 0 is not
-
-
-    covalent_factor - 1.3 is an arbitrary factor
-
-    Args:
-        mol - rdkit molobj with 3D conformer
-
-    optional
-        covalent_factor - increase covalent bond length threshold with facto
-
-    Returns:
-        AC - adjacent matrix
-    """
-    # Calculate distance matrix
-    dMat = Chem.Get3DDistanceMatrix(mol)
-
-    pt = Chem.GetPeriodicTable()
-    num_atoms = mol.GetNumAtoms()
-    AC = np.zeros((num_atoms, num_atoms), dtype=int)
-
-    for i in range(num_atoms):
-        a_i = mol.GetAtomWithIdx(i)
-        Rcov_i = pt.GetRcovalent(a_i.GetAtomicNum()) * covalent_factor
-        for j in range(i + 1, num_atoms):
-            a_j = mol.GetAtomWithIdx(j)
-            Rcov_j = pt.GetRcovalent(a_j.GetAtomicNum()) * covalent_factor
-            if dMat[i, j] <= Rcov_i + Rcov_j:
-                AC[i, j] = 1
-                AC[j, i] = 1
-
-    return AC
-
-
-def xyz2AC_huckel(atomicNumList, xyz, charge, tolerance=0.2):
-    """Args.
-
-        atomicNumList - atom type list
-        xyz - coordinates
-        charge - molecule charge
-
-    optional
-        tolerance - Huckel bond cutoff
-
-    Returns:
-        ac - atom connectivity
-        mol - rdkit molecule
-    """
-    # print(charge)
-    mol = get_proto_mol(atomicNumList)
-
-    conf = Chem.Conformer(mol.GetNumAtoms())
-    for i in range(mol.GetNumAtoms()):
-        conf.SetAtomPosition(i, (xyz[i][0], xyz[i][1], xyz[i][2]))
-    mol.AddConformer(conf)
-
-    num_atoms = len(atomicNumList)
-    AC = np.zeros((num_atoms, num_atoms)).astype(int)
-
-    mol_huckel = Chem.Mol(mol)
-    mol_huckel.GetAtomWithIdx(0).SetFormalCharge(charge)  # mol charge arbitrarily added to 1st atom
-
-    passed, result = rdEHTTools.RunMol(mol_huckel)
-    opop = result.GetReducedOverlapPopulationMatrix()
-    tri = np.zeros((num_atoms, num_atoms))
-    tri[np.tril(np.ones((num_atoms, num_atoms), dtype=bool))] = (
-        opop  # lower triangular to square matrix
-    )
-    for i in range(num_atoms):
-        for j in range(i + 1, num_atoms):
-            pair_pop = abs(tri[j, i])
-            if pair_pop >= tolerance:  # arbitry cutoff for bond. May need adjustment
-                AC[i, j] = 1
-                AC[j, i] = 1
-
-    dMat = Chem.Get3DDistanceMatrix(mol)
-    pt = Chem.GetPeriodicTable()
-
-    # filter adjacency matrix if max valence is exceeded
-    for i in range(num_atoms):
-        a_i = mol.GetAtomWithIdx(i)
-        N_con = np.sum(AC[i, :])
-        # print(a_i.GetAtomicNum(), N_con)
-        while N_con > max(atomic_valence[a_i.GetAtomicNum()]):
-            # print("removing longest bond")
-            AC = remove_weakest_bond(mol, i, AC, dMat, pt)
-            N_con = np.sum(AC[i, :])
-
-    return AC, mol
-
-
 def remove_weakest_bond(mol, atom_idx, AC, dMat, pt):
+    """Drop ``atom_idx``'s bond with the largest slack over its covalent-radius sum."""
     extra_bond_lengths = []
     bond_atoms = np.nonzero(AC[atom_idx, :])[0]
-    # print(bond_atoms)
     a_i = mol.GetAtomWithIdx(atom_idx)
-    # print(a_i.GetAtomicNum())
     rcovi = pt.GetRcovalent(a_i.GetAtomicNum())
     for j in bond_atoms:
-        # print(j)
         a_j = mol.GetAtomWithIdx(int(j))
-        # print(a_j.GetAtomicNum())
         rcovj = pt.GetRcovalent(a_j.GetAtomicNum())
         extra_bond_length = dMat[atom_idx, j] - rcovj - rcovi
         extra_bond_lengths.append(extra_bond_length)
@@ -1014,38 +794,20 @@ def remove_weakest_bond(mol, atom_idx, AC, dMat, pt):
 
 
 def xyz2AC_obabel(atoms, xyz, tolerance=0.45):
-    """Generate adjacent matrix from atoms and coordinates in a way similar to
-    open babels.
+    """Return the adjacency matrix connecting atoms within their covalent-radius sum plus ``tolerance``.
 
-    AC is a (num_atoms, num_atoms) matrix with 1 being covalent bond and 0 is not
-
-
-    tolerance - 0.45Å is from the open babel paper
-
-    Args:
-        mol - rdkit molobj with 3D conformer
-
-    optional
-        tolerance - atoms connected if distance is shorter than sum of atomic
-        radii + tolerance. If too many bonds to an atom; break longest bond
-
-    Returns:
-        AC - adjacency matrix
+    ``tolerance`` defaults to 0.45 A, the Open Babel paper's bond-perception cutoff. An atom left over
+    its element's max valence has its longest bond dropped until it is not (see `remove_weakest_bond`).
     """
     global atomic_valence
-    # atomic_valence[8] = [2,1]
-    # atomic_valence[7] = [3,2]
     atomic_valence[6] = [4, 2]
 
-    # Get mol template
     mol = get_proto_mol(atoms)
 
-    # Set coordinates
     conf = Chem.Conformer(mol.GetNumAtoms())
     for i in range(mol.GetNumAtoms()):
         conf.SetAtomPosition(i, (xyz[i][0], xyz[i][1], xyz[i][2]))
     mol.AddConformer(conf)
-    # Calculate distance matrix
     dMat = Chem.Get3DDistanceMatrix(mol)
 
     pt = Chem.GetPeriodicTable()
@@ -1062,204 +824,11 @@ def xyz2AC_obabel(atoms, xyz, tolerance=0.45):
                 AC[i, j] = 1
                 AC[j, i] = 1
 
-    # filter adjacency matrix if max valence is exceeded
     for i in range(num_atoms):
         a_i = mol.GetAtomWithIdx(i)
         N_con = np.sum(AC[i, :])
-        while N_con > max(atomic_valence[a_i.GetAtomicNum()]):
-            # print("removing longest bond")
+        while N_con > max(_allowed_valences(a_i.GetAtomicNum(), i)):
             AC = remove_weakest_bond(mol, i, AC, dMat, pt)
             N_con = np.sum(AC[i, :])
 
-    # print(Chem.MolToSmiles(mol))
-
     return AC, mol
-
-
-def chiral_stereo_check(mol):
-    """Find and embed chiral information into the model based on the
-    coordinates.
-
-    Args:
-        mol - rdkit molecule, with embeded conformer
-    """
-    Chem.SanitizeMol(mol)
-    Chem.DetectBondStereochemistry(mol, -1)
-    Chem.AssignStereochemistry(mol, flagPossibleStereoCenters=True, force=True)
-    Chem.AssignAtomChiralTagsFromStructure(mol, -1)
-
-    return
-
-
-def xyz2mol(
-    atoms,
-    coordinates,
-    charge=0,
-    allow_charged_fragments=True,
-    use_graph=True,
-    use_huckel=False,
-    use_obabel=False,
-    embed_chiral=True,
-    use_atom_maps=True,
-):
-    """Generate a rdkit molobj from atoms, coordinates and a total_charge.
-
-    Args:
-        atoms - list of atom types (int)
-        coordinates - 3xN Cartesian coordinates
-        charge - total charge of the system (default: 0)
-
-    optional:
-        allow_charged_fragments - alternatively radicals are made
-        use_graph - use graph (networkx)
-        use_huckel - Use Huckel method for atom connectivity prediction
-        embed_chiral - embed chiral information to the molecule
-
-    Returns:
-        mols - list of rdkit molobjects
-    """
-    # Get atom connectivity (AC) matrix, list of atomic numbers, molecular charge,
-    # and mol object with no connectivity information
-    AC, mol = xyz2AC(atoms, coordinates, charge, use_huckel=use_huckel, use_obabel=use_obabel)
-    # Convert AC to bond order matrix and add connectivity and charge info to
-    # mol object
-    new_mol = AC2mol(
-        mol,
-        AC,
-        atoms,
-        charge,
-        allow_charged_fragments=allow_charged_fragments,
-        use_graph=use_graph,
-        use_atom_maps=use_atom_maps,
-    )
-
-    # Check for stereocenters and chiral centers
-    if embed_chiral:
-        chiral_stereo_check(new_mol)
-
-    return new_mol
-
-
-def canonicalize_smiles(structure_smiles):
-    """Remove all structural info an atom mapping information."""
-    mol = Chem.MolFromSmiles(structure_smiles, sanitize=False)
-    for atom in mol.GetAtoms():
-        atom.SetAtomMapNum(0)
-    Chem.SanitizeMol(mol)
-    mol = Chem.RemoveHs(mol)
-    canonical_smiles = Chem.MolToSmiles(mol)
-
-    return canonical_smiles
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(usage="%(prog)s [options] molecule.xyz")
-    parser.add_argument("structure", metavar="structure", type=str)
-    parser.add_argument("-s", "--sdf", action="store_true", help="Dump sdf file")
-    parser.add_argument("--ignore-chiral", action="store_true", help="Ignore chiral centers")
-    parser.add_argument(
-        "--no-charged-fragments", action="store_true", help="Allow radicals to be made"
-    )
-    parser.add_argument(
-        "--no-graph",
-        action="store_true",
-        help="Run xyz2mol without networkx dependencies",
-    )
-
-    # huckel uses extended Huckel bond orders to locate bonds (requires RDKit 2019.9.1 or later)
-    # otherwise van der Waals radii are used
-    parser.add_argument(
-        "--use-huckel",
-        action="store_true",
-        help="Use Huckel method for atom connectivity",
-    )
-    parser.add_argument(
-        "--use-obabel",
-        action="store_true",
-        help="Use Open Babel way of obtaining atom connectivity; recommended for radicals",
-    )
-    parser.add_argument(
-        "-o",
-        "--output-format",
-        action="store",
-        type=str,
-        help="Output format [smiles,sdf] (default=sdf)",
-    )
-    parser.add_argument(
-        "-c",
-        "--charge",
-        action="store",
-        metavar="int",
-        type=int,
-        help="Total charge of the system",
-    )
-    parser.add_argument(
-        "--use-atom-maps",
-        action="store_true",
-        help="Label atoms with map numbers according to their order in the .xyz file",
-    )
-
-    args = parser.parse_args()
-
-    # read xyz file
-    filename = args.structure
-
-    # allow for charged fragments, alternatively radicals are made
-    charged_fragments = not args.no_charged_fragments
-
-    # quick is faster for large systems but requires networkx
-    # if you don't want to install networkx set quick=False and
-    # uncomment 'import networkx as nx' at the top of the file
-    quick = not args.no_graph
-
-    # chiral comment
-    embed_chiral = not args.ignore_chiral
-
-    # read atoms and coordinates. Try to find the charge
-    atoms, charge, xyz_coordinates = read_xyz_file(filename)
-
-    # huckel uses extended Huckel bond orders to locate bonds (requires RDKit 2019.9.1 or later)
-    # otherwise van der Waals radii are used
-    use_huckel = args.use_huckel
-
-    use_obabel = args.use_obabel
-
-    # if explicit charge from args, set it
-    if args.charge is not None:
-        charge = int(args.charge)
-
-    use_atom_maps = args.use_atom_maps
-    if not charged_fragments:
-        atomic_valence[8] = [2, 1]
-        atomic_valence[7] = [3, 2]
-        atomic_valence[6] = [4, 2]
-
-    # Get the molobjs
-    mols = xyz2mol(
-        atoms,
-        xyz_coordinates,
-        charge=charge,
-        use_graph=quick,
-        allow_charged_fragments=charged_fragments,
-        embed_chiral=embed_chiral,
-        use_huckel=use_huckel,
-        use_obabel=use_obabel,
-        use_atom_maps=use_atom_maps,
-    )
-
-    # Print output
-    for mol in [mols]:
-        if args.output_format == "sdf":
-            txt = Chem.MolToMolBlock(mol)
-            logger.debug(txt)
-
-        else:
-            # Canonical hack
-            isomeric_smiles = not args.ignore_chiral
-            smiles = Chem.MolToSmiles(mol, isomericSmiles=isomeric_smiles)
-            # m = Chem.MolFromSmiles(smiles, sanitize=False)
-            # smiles = Chem.MolToSmiles(m, isomericSmiles=isomeric_smiles)
-
-            smiles = canonicalize_smiles(smiles)

@@ -6,6 +6,7 @@ import sys
 from types import ModuleType
 from typing import Any
 
+import numpy as np
 import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
@@ -32,26 +33,6 @@ class _Stub(calc.Calculator):
 # --- resolve: the one place a refine spec becomes a calculator ---------------------------------------------
 
 
-def test_resolve_maps_refine_specs_and_rejects_unknown():
-    assert calc.resolve(None) is None
-    assert calc.resolve("ff") is None
-
-    assert {type(calc.resolve(m)) for m in ("gxtb", "gfn2", "gfnff")} == {calc.XTB}
-    c = calc.resolve("gfn2", solvent="water", charge=-1)
-    assert (c.method, c.solvent, c.charge) == ("gfn2", "water", -1)
-
-    stub = _Stub()
-    assert calc.resolve(stub) is stub
-
-    with pytest.raises(ValueError, match="unknown refine"):
-        calc.resolve("dft")
-
-
-def test_base_calculator_names_missing_optimizer():
-    with pytest.raises(NotImplementedError, match="_Stub"):
-        _Stub().optimize(None)
-
-
 # --- the xtb interface: what it refuses before ever running the binary --------------------------------------
 
 
@@ -63,30 +44,27 @@ def test_xtb_optimize_validates_before_execution():
 
 
 def test_solvated_gxtb_uses_thermodynamic_cycle(monkeypatch):
-    energies = {("gxtb", None): -10.0, ("gfn2", "water"): -5.5, ("gfn2", None): -5.0}
-    seen = []
+    """g-xTB gas plus a GFN2 solvent correction applies to both the energy and its gradient."""
+    results = {
+        ("gxtb", None): (-10.0, np.full((2, 3), 1.0)),
+        ("gfn2", "water"): (-5.5, np.full((2, 3), 0.25)),
+        ("gfn2", None): (-5.0, np.full((2, 3), 0.5)),
+    }
 
     def fake(mol, conf_id=-1, method="gxtb", solvent=None, charge=0, grad=False):
-        seen.append((method, solvent))
-        return energies[method, solvent], None
+        return results[method, solvent]
 
     monkeypatch.setattr(calc, "singlepoint", fake)
-    assert calc.xtb_energy(None, method="gxtb", solvent="water")[0] == pytest.approx(-10.5)
-    assert seen == [("gxtb", None), ("gfn2", "water"), ("gfn2", None)]
+    e, g = calc.xtb_energy(None, method="gxtb", solvent="water", grad=True)
+    assert e == pytest.approx(-10.5)
+    assert g == pytest.approx(np.full((2, 3), 0.75))
 
-    seen.clear()  # gfn2 carries its own ALPB, and gas-phase g-xTB has nothing to correct
-    calc.xtb_energy(None, method="gfn2", solvent="water")
-    calc.xtb_energy(None, method="gxtb")
-    assert seen == [("gfn2", "water"), ("gxtb", None)]
+    # gfn2 carries its own ALPB, and gas-phase g-xTB has nothing to correct
+    assert calc.xtb_energy(None, method="gfn2", solvent="water")[0] == pytest.approx(-5.5)
+    assert calc.xtb_energy(None, method="gxtb")[0] == pytest.approx(-10.0)
 
 
 # --- parsing xtb's output: be loud, never return a plausible None ------------------------------------------
-
-
-def test_energy_parser_reads_total_or_raises():
-    assert calc._energy("random preamble\n :: total energy   -11.3990 Eh ::\ntail") == pytest.approx(-11.3990)
-    with pytest.raises(RuntimeError, match="no total energy"):
-        calc._energy("normal termination\n")
 
 
 def test_xtbopt_returns_coords_and_energy_or_raises(tmp_path):

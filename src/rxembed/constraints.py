@@ -1,23 +1,14 @@
 """The `Constraints` struct every builder fills and every stage reads, plus the ``fix``/``constrain`` resolver.
 
-Two verbs, one resolver (`resolve_core`).
+Two verbs, one resolver (`resolve_core`). ``fix`` is rigid: the named atoms get this geometry, as a list
+(own coords, Kabsch graft), ``{i: (x, y, z)}`` (explicit coords), or ``{(i, j): d, ...}`` (scalar
+distance/angle/dihedral values within 0.001 A / 0.005 deg, or explicit windows; a dict may mix all three).
+``constrain`` is soft: a wider window a real energy may overrule, and the home of pi-stacks
+(``(ring_a, ring_b): separation``). Held is ``fix``; a bias the search can move off is ``constrain``.
+``template=(reference, map_or_smarts)`` is not a third verb: it dissolves into a coords-``fix`` before this
+resolver sees it. See README.md for the full vocabulary and worked examples.
 
-``fix`` is rigid: the named atoms will have this geometry.
-
-- a list of atom indices holds them at the source's own coords (Kabsch graft, needs a geometry).
-- ``{i: (x, y, z)}`` holds them at explicit coords (graft).
-- ``{(i, j): d, (i, j, k): θ, (i, j, k, l): φ}`` fixes scalar values within 0.001 Å / 0.005° and
-  explicit windows inside their stated ranges. A result that misses either contract is rejected. A dict may
-  mix all three.
-
-``constrain`` is soft: a wider window a real energy may overrule, and the home of π-stacks (a plane key
-``(ring_a, ring_b): separation``). Held? ``fix``. A bias the search can move off? ``constrain``.
-
-A template is not a third verb: ``template=(reference, map_or_smarts)`` is dissolved into a coords-``fix``
-before this resolver sees it. SMARTS is the short form when both sides have molecular graphs; an xyz or
-coordinate array needs an explicit index map.
-
-Keys are 0-based atom indices in xyz/graph order. Strictness is the fix/constrain axis, not a second user force
+Keys are 0-based atom indices in xyz/graph order. Strictness is the fix/constrain axis, not a second force
 constant: a scalar fix carries a point restraint and an acceptance gate; a soft window carries neither.
 """
 
@@ -25,14 +16,16 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 import os
 from copy import deepcopy
 from dataclasses import dataclass, field, fields, replace
+from functools import partial
 
 import numpy as np
 from rdkit import Chem
 
-from .utils import _angle, _dihedral
+from .utils import atom_label, bond_angle, dihedral_angle
 
 _STRAIGHT = 180.0  # degrees: angle ceiling and one half-turn of a periodic dihedral
 
@@ -44,34 +37,36 @@ class Constraints:
     distances: dict = field(default_factory=dict)  # (i, j) -> (lo, hi) Angstrom
     angles: dict = field(default_factory=dict)  # (i, j, k) -> (lo, hi) degrees
     planes: list = field(default_factory=list)  # soft (ring_a, ring_b, separation) parallel stack
-    coplanar: list = field(default_factory=list)  # (i, j, k, l, anchor, cap): hold i-j-k-l within `cap` deg of
-    #   its in-plane `anchor` (0 syn / 180 anti). A window, not a point, so real out-of-plane scatter survives.
+    coplanar: list = field(default_factory=list)  # (i,j,k,l,anchor,cap): hold within cap deg of the graph's
+    #   in-plane anchor; None leaves the periodic well seed-selected.
     frozen: set = field(default_factory=set)  # pin to embedded coords
-    contacts: tuple = field(default_factory=lambda: (frozenset(), frozenset()))
-    #   Distance and angular keys from soft user/NCI contacts. `relaxed()` releases exactly these.
+    contacts: tuple = field(default_factory=lambda: (frozenset(), frozenset()))  # soft user/NCI distance and
+    #   angular keys; `relaxed()` releases exactly these.
 
     # --- Coordination fields. All empty for an organic system, so the shared relax is bit-identical there
-    # rather than branching. They exist because the metal is embedded as a BOND-LESS surrogate: stripping the
+    # rather than branching. They exist because the metal is embedded as a bond-less surrogate: stripping the
     # M-donor bonds also strips every UFF term that came with them, and these put the missing ones back.
-    metals: set = field(default_factory=set)  # metal indices, re-typed to a zero-vdW element on the FF copy;
-    #   otherwise UFF reads each M-donor pair as non-bonded and applies a ~3.85 A LJ against a real 2.0-2.4 A bond
-    pulls: dict = field(default_factory=dict)  # (i, j) -> approximate target Angstrom inside a flat-bottomed
-    #   metal window. Numeric fixes have their own strict records below.
+    metals: set = field(default_factory=set)  # metal indices, re-typed to bondless Li on the FF copy (ligand
+    #   UFF stays native; Li gives weaker nonbonded contacts than the DG carbon surrogate)
+    pulls: dict = field(default_factory=dict)  # pair -> target Angstrom, triple -> preferred angle in degrees;
+    #   soft preferences that supplement windows (numeric fixes have separate strict records below)
     floors: dict = field(default_factory=dict)  # (i, j) -> minimum Angstrom: the FF anti-overbond wall
     dg_floors: dict = field(default_factory=dict)  # (i, j) -> the same distance, lowering a bounds-matrix cell:
-    #   the bond-less carbon floors every M...X at a carbon vdW contact, forbidding the real geometry. See `compose`.
-    shapes: list = field(default_factory=list)  # atom sets held as an all-pairs rigid body (a spectator sphere).
-    #   Distinguishes a modelled window, which needs a `pull`, from a rigid-body member, which must not get one.
+    #   the bond-less carbon floors every M...X at a carbon vdW contact, forbidding the real geometry (see `compose`)
+    shapes: list = field(default_factory=list)  # atom sets held as an all-pairs rigid body (a spectator sphere);
+    #   distinguishes a modelled window, which needs a `pull`, from a rigid-body member, which must not get one
     phantoms: frozenset = field(default_factory=frozenset)  # zero-volume dummies: one haptic face's centroid,
-    #   standing in as the one vertex a Cp/arene presents. Transient: materialised inside the embed and the
-    #   relax, never in a stored Mol, so nothing downstream (gate, metrics, dump, calculator) sees one.
-    haptic: dict = field(default_factory=dict)  # {centroid dummy -> its ring atoms}: transient physical
-    #   scaffolding. The stored mol and donor list stay real: the face atoms are the donors.
+    #   standing in for the vertex a Cp/arene presents. Transient (never in a stored Mol; materialised only
+    #   inside the embed/relax), so nothing downstream (gate, metrics, dump, calculator) sees one.
+    haptic: dict = field(default_factory=dict)  # {centroid dummy -> its ring atoms}: transient scaffolding;
+    #   the stored mol and donor list stay real, the face atoms are the donors
     dihedrals: dict = field(default_factory=dict)  # (i, j, k, l) -> periodic (lo, hi) degrees
-    fixed: dict = field(default_factory=dict)  # numeric fix pair/triple/quartet -> requested (lo, hi); lo == hi
-    #   is a scalar target.
-    umbrellas: dict = field(default_factory=dict)  # (base0, base1, base2, metal) -> ideal improper magnitude;
-    #   None means planar. The UFF term preserves the already-selected DG side rather than choosing a hand.
+    fixed: dict = field(default_factory=dict)  # numeric fix pair/triple/quartet -> requested (lo, hi);
+    #   lo == hi is a scalar target
+    umbrellas: dict = field(default_factory=dict)  # four atoms -> improper: None is planar, 0 keeps only the
+    #   seed-side half-space, a positive value the minimum magnitude (soft walls; validate final stereo);
+    #   (anchor, weight) is a template planar well with its fraction of the complete shell's force coefficient
+    conjugation: bool = True  # retain rxembed's organic sp2/conjugation UFF cleanup terms
 
     @property
     def is_constrained(self) -> bool:
@@ -87,7 +82,7 @@ class Constraints:
 
         Released atoms are no longer pose-frozen, so a strained contact may break or a new one form. Every
         structural hold (frozen core, metal sphere, coplanarity cap, centroid dummies) is carried
-        through by `copy`. The caller adds encounter bounds if releasing leaves a fragment unconstrained.
+        through by `copy`. The caller adds fragment contact bounds if releasing leaves a fragment unconstrained.
         """
         dk, angular = self.contacts
         return self.copy(
@@ -95,28 +90,25 @@ class Constraints:
             angles={k: v for k, v in self.angles.items() if k not in angular or k in self.fixed},
             dihedrals={k: v for k, v in self.dihedrals.items() if k not in angular or k in self.fixed},
             planes=[],
+            pulls={
+                key: value
+                for key, value in self.pulls.items()
+                if len(key) != ANGLE_ATOMS or not {key, key[::-1]} & angular or {key, key[::-1]} & self.fixed.keys()
+            },
             contacts=(frozenset(), frozenset()),
         )
 
     def constrained_atoms(self) -> set:
         """Return the atoms MC pose-mode must hold so NCI / TS / metal contacts stay intact."""
         s = set(self.frozen)
-        for i, j in self.distances:
-            s |= {i, j}
-        for t in self.angles:
-            s |= set(t)
-        for t in self.dihedrals:
+        for t in (*self.distances, *self.angles, *self.dihedrals, *self.fixed, *self.pulls):
             s |= set(t)
         for ring_a, ring_b, _ in self.planes:
             s |= set(ring_a) | set(ring_b)
         return s - set(self.phantoms)  # a haptic centroid dummy is transient embed scaffolding, never a real atom
 
 
-def _merge_last_wins(a, b):
-    return {**a, **b}
-
-
-def _graft_owns(atoms, frozen, haptic=None):
+def graft_owns(atoms, frozen, haptic=None):
     """Return whether every real atom defining a term belongs to the coordinate graft."""
     real = set()
     haptic = haptic or {}
@@ -125,14 +117,36 @@ def _graft_owns(atoms, frozen, haptic=None):
     return real.issubset(frozen)
 
 
+def canonical_key(key):
+    """Return an atom-index key in whichever direction sorts first, so a path and its reverse compare equal."""
+    key = tuple(key)
+    return min(key, key[::-1])
+
+
 def _central_bond(atoms):
     """Return the bond that owns a torsional degree of freedom."""
     return frozenset(atoms[1:3])
 
 
-def _structural_torsion_bonds(cons):
-    """Return central bonds reserved by metal coplanarity or umbrella terms."""
-    return {_central_bond(row) for row in cons.coplanar} | {_central_bond(atoms) for atoms in cons.umbrellas}
+def stated_dihedral(cons, *atoms, improper=False):
+    """Match a stated torsion by axis, or an improper by its four represented points."""
+    owner = frozenset if improper else _central_bond
+    return any(owner(key) == owner(atoms) for key in cons.dihedrals)
+
+
+def structural_dihedral_owned(cons, atoms):
+    """Protect torsional axes and umbrella support from soft replacement.
+
+    A shell improper does not own a ligand rotation merely sharing its numerical torsion axis.
+    Point handedness (zero) reserves no soft torsion. Coplanar rows retain their existing axis policy;
+    that field mixes donor-plane impropers and proper conjugated torsions.
+    """
+    axis = _central_bond(atoms)
+    return (
+        any(_central_bond(key) == axis for key in (*cons.dihedrals, *cons.coplanar))
+        or any(len(key) == DIHEDRAL_ATOMS and _central_bond(key) == axis for key in cons.fixed)
+        or any(ideal != 0.0 and frozenset(key) == frozenset(atoms) for key, ideal in cons.umbrellas.items())
+    )
 
 
 def _merge_floor(a, b):  # a wall is a physical minimum: the stricter (higher) of two claims on one pair wins
@@ -149,19 +163,15 @@ def _merge_relief(a, b):  # a relief is permission to lower, so the fullest (low
     return out
 
 
-def _merge_exclusive(name):
-    """Build a dict merge that refuses a key collision, for fields where two claims cannot be reconciled."""
-
-    def merge(a, b):
-        clash = {k for k in b if k in a and a[k] != b[k]}
-        if clash:
-            raise ValueError(f"compose: conflicting {name} on {sorted(clash)}; two sources claim one key")
-        return {**a, **b}
-
-    return merge
+def _merge_exclusive(name, a, b):
+    """Merge two dicts, refusing a key collision, for fields where two claims cannot be reconciled."""
+    clash = {k for k in b if k in a and a[k] != b[k]}
+    if clash:
+        raise ValueError(f"compose: conflicting {name} on {sorted(clash)}; give each key one value")
+    return {**a, **b}
 
 
-def _periodic_window(window):
+def periodic_window(window):
     """Return an equivalent dihedral interval centred in (-180, 180], choosing +180 at the boundary."""
     lo, hi = window
     middle = 0.5 * (lo + hi)
@@ -172,32 +182,48 @@ def _periodic_window(window):
     return lo + shift, hi + shift
 
 
-def _merge_fixed(a, b):
-    """Merge strict records after normalising equivalent periodic dihedral spellings."""
+def _periodic_keys(d):
+    """Return a copy of a fixed record with every dihedral window centred by `periodic_window`."""
+    return {k: periodic_window(v) if len(k) == DIHEDRAL_ATOMS else v for k, v in d.items()}
 
-    def norm(d):
-        return {k: _periodic_window(v) if len(k) == _DIHEDRAL_ATOMS else v for k, v in d.items()}
 
-    return _merge_exclusive("fixed")(norm(a), norm(b))
+def merge_pulls(a, b):
+    """Merge distance targets and canonical angle targets, rejecting conflicting preferences."""
+    out = {}
+    for terms in (a, b):
+        for atoms, value in terms.items():
+            key = atoms
+            if len(key) not in (DIST_ATOMS, ANGLE_ATOMS):
+                raise ValueError(f"pull {key}: expected a distance pair or angle triple")
+            if len(key) == ANGLE_ATOMS:
+                key = min(key, key[::-1])
+                if not all(np.isfinite(v) and 0 <= v <= _STRAIGHT for v in np.atleast_1d(value)):
+                    raise ValueError(f"pull {key}: expected finite angles between 0 and 180 degrees")
+            if key in out and out[key] != value:
+                raise ValueError(f"compose: conflicting pulls on {key}; give each target one value")
+            out[key] = value
+    return out
 
 
 _MERGE = {  # field -> how two sources combine. See `compose`.
-    "distances": _merge_last_wins,  # a spec landing ON a structural hold is a user override of it (dispatch)
-    "angles": _merge_last_wins,
-    "dihedrals": _merge_last_wins,
+    "distances": lambda a, b: {**a, **b},  # a spec landing ON a structural hold is a user override (dispatch)
+    "angles": lambda a, b: {**a, **b},
+    "dihedrals": lambda a, b: {**a, **b},
     "planes": lambda a, b: [*a, *b],  # never de-duplicated: two identical pi-stacks are the caller's business
     "coplanar": lambda a, b: [*a, *b],
     "frozen": lambda a, b: a | b,
     "contacts": lambda a, b: (a[0] | b[0], a[1] | b[1]),
-    "fixed": _merge_fixed,
+    # equivalent periodic dihedral spellings of one fixed value compare equal
+    "fixed": lambda a, b: _merge_exclusive("fixed", _periodic_keys(a), _periodic_keys(b)),
     "metals": lambda a, b: a | b,
-    "pulls": _merge_exclusive("pulls"),  # two harmonic targets on one pair is unresolvable, not a last-wins
+    "pulls": merge_pulls,
     "floors": _merge_floor,
     "dg_floors": _merge_relief,
     "shapes": lambda a, b: [*a, *(set(s) for s in b)],
     "phantoms": lambda a, b: a | b,
-    "haptic": _merge_exclusive("haptic"),  # a shared key = two faces claiming one reserved index = corruption
-    "umbrellas": _merge_exclusive("umbrellas"),
+    "haptic": partial(_merge_exclusive, "haptic"),  # a shared key = two faces claiming one reserved index = corruption
+    "umbrellas": partial(_merge_exclusive, "umbrellas"),
+    "conjugation": lambda a, b: a and b,
 }
 
 _names = {f.name for f in fields(Constraints)}  # a new field must be given a merge policy, not defaulted
@@ -211,56 +237,54 @@ def compose(*parts: Constraints) -> Constraints:
 
     Field-driven via ``_MERGE``, so a new field cannot be silently dropped at a merge site. Fixed numeric
     values win over derived builder windows regardless of part order; conflicting fixed values, pulls and
-    haptic claims raise.
-
-    `floors` takes the max and `dg_floors` the min, because they are opposite mechanisms sharing one number.
-    A floor is a wall the force field raises, so stricter is safer; a dg_floor is a relief that only ever
-    lowers a bounds-matrix cell, where the max would keep more of the phantom it exists to cut. Both stay
-    order-independent.
+    haptic claims raise. `floors` takes the max (the stricter wall) and `dg_floors` the min (the fullest
+    relief); the two differ in membership, not in which is stricter (see `metal_distance._tier_floor`).
     """
     out = Constraints()
     for part in parts:
         for name, merge in _MERGE.items():
             setattr(out, name, merge(getattr(out, name), getattr(part, name)))
     for key, value in out.fixed.items():
-        if len(key) == _DIST_ATOMS:
+        if len(key) == DIST_ATOMS:
             out.distances[key] = _seed_window(value, _FIX_PAD)
             out.pulls.pop(key, None)
-        elif len(key) == _ANGLE_ATOMS:
+        elif len(key) == ANGLE_ATOMS:
             out.angles.pop(key[::-1], None)
             out.angles[key] = _seed_window(value, _FIX_ANG_PAD)
+            out.pulls.pop(key, None)
+            out.pulls.pop(key[::-1], None)
         else:
             out.dihedrals.pop(key[::-1], None)
             out.dihedrals[key] = _seed_window(value, _FIX_ANG_PAD)
     return out
 
 
+def _angular_owner(key):
+    """Return the degree of freedom an angle or dihedral key claims: its angle, or its central bond."""
+    return ("dihedral", _central_bond(key)) if len(key) == DIHEDRAL_ATOMS else ("angle", canonical_key(key))
+
+
 def compose_soft(base: Constraints, soft: Constraints) -> Constraints:
     """Compose incoming soft terms without replacing a structural term or another soft owner."""
     base_d, base_a = base.contacts
-    structural_d = set(base.distances) - set(base_d)
-
-    def canonical(key):
-        key = tuple(key)
-        return min(key, key[::-1])
-
-    def angular_owner(key):
-        return ("dihedral", _central_bond(key)) if len(key) == _DIHEDRAL_ATOMS else ("angle", canonical(key))
-
-    base_soft_a = {angular_owner(key) for key in base_a}
+    base_soft_d = {canonical_key(key) for key in base_d}
+    structural_d = {canonical_key(key) for key in base.distances} - base_soft_d
+    structural_d |= {canonical_key(key) for key in base.fixed if len(key) == DIST_ATOMS}
+    base_soft_a = {_angular_owner(key) for key in base_a}
     incoming_a = [*soft.angles, *soft.dihedrals]
-    structural_a = {angular_owner(key) for terms in (base.angles, base.dihedrals) for key in terms} - base_soft_a
-    structural_a |= {angular_owner(key) for key in base.fixed if len(key) >= _ANGLE_ATOMS}
-    structural_a |= {("dihedral", bond) for bond in _structural_torsion_bonds(base)}
-    overlap = (set(base_d) & set(soft.distances)) | {key for key in incoming_a if angular_owner(key) in base_soft_a}
+    structural_a = {_angular_owner(key) for key in base.angles} - base_soft_a
+    structural_a |= {_angular_owner(key) for key in base.fixed if len(key) == ANGLE_ATOMS}
+    overlap = {key for key in soft.distances if canonical_key(key) in base_soft_d} | {
+        key for key in incoming_a if _angular_owner(key) in base_soft_a
+    }
     if overlap:
         raise ValueError(
             f"soft constraints overlap at {sorted(overlap)}; state each degree of freedom once with either "
             "constrain= or contacts="
         )
-    distances = {key: value for key, value in soft.distances.items() if key not in structural_d}
-    angles = {key: value for key, value in soft.angles.items() if angular_owner(key) not in structural_a}
-    dihedrals = {key: value for key, value in soft.dihedrals.items() if angular_owner(key) not in structural_a}
+    distances = {key: value for key, value in soft.distances.items() if canonical_key(key) not in structural_d}
+    angles = {key: value for key, value in soft.angles.items() if _angular_owner(key) not in structural_a}
+    dihedrals = {key: value for key, value in soft.dihedrals.items() if not structural_dihedral_owned(base, key)}
     d_soft, a_soft = soft.contacts
     return compose(
         base,
@@ -268,6 +292,15 @@ def compose_soft(base: Constraints, soft: Constraints) -> Constraints:
             distances=distances,
             angles=angles,
             dihedrals=dihedrals,
+            pulls={
+                key: value
+                for key, value in soft.pulls.items()
+                if (
+                    canonical_key(key) not in structural_d
+                    if len(key) == DIST_ATOMS
+                    else _angular_owner(key) not in structural_a
+                )
+            },
             contacts=(frozenset(d_soft & distances.keys()), frozenset(a_soft & (angles.keys() | dihedrals.keys()))),
         ),
     )
@@ -304,44 +337,81 @@ logger = logging.getLogger("rxembed.constraints")  # under the "rxembed" tree `s
 _FIX_PAD = 0.02  # numbers-fix distance half-window (Angstrom)
 _FIX_ANG_PAD = 2.0  # numbers-fix angular half-window (degrees)
 FIX_DISTANCE_TOL = 0.001  # Angstrom: scalar fix input and output agree to three decimal places
+# A model M-L window is a fitted target, so FIX_DISTANCE_TOL's 0.001 A would only measure UFF convergence. On
+# RITCIG's limiting pair the residual falls as C/fc with C = 0.56 A: 0.01 A needs the 100x rung, 0.001 A fc ~ 560.
+ML_WINDOW_TOL = 0.01  # Angstrom: slack on a model-derived (not user-fixed) M-L window
 FIX_ANGLE_TOL = 0.005  # angle/dihedral degrees: below two-decimal reporting precision without float equality
 _CON_PAD = 0.1  # constrain distance half-window when a scalar target is given
 _CON_ANG_PAD = 5.0  # constrain angular half-window
 _SHAPE_PAD = 0.05  # graft pairwise-shape half-window (a rigid hold; the exact graft does the real work)
 _MIN_SHAPE_ATOMS = 3  # below this a core has only a distance to pin, not an orientable 3-D shape
-_PLANE_ATOMS = 3  # the minimum number of distinct points that defines a plane
-_COORD_LEN = 3  # an (x, y, z) coordinate
-_DIST_ATOMS = 2  # a distance key names two atoms
-_ANGLE_ATOMS = 3  # an angle key names three atoms
-_DIHEDRAL_ATOMS = 4  # a dihedral key names four atoms
+DIST_ATOMS = 2  # a distance key names two atoms
+ANGLE_ATOMS = 3  # an angle key names three atoms
+DIHEDRAL_ATOMS = 4  # a dihedral key names four atoms
+_FIX_FIELD = {
+    DIST_ATOMS: ("distances", _FIX_PAD),
+    ANGLE_ATOMS: ("angles", _FIX_ANG_PAD),
+    DIHEDRAL_ATOMS: ("dihedrals", _FIX_ANG_PAD),
+}
+
+
+def _site_point(positions, haptic, atom):
+    """Return an atom's position, or its haptic face centroid, or None when either is out of range."""
+    if 0 <= atom < len(positions):
+        return positions[atom]
+    face = haptic.get(atom)
+    if not face or any(index < 0 or index >= len(positions) for index in face):
+        return None
+    return np.mean(positions[list(face)], axis=0)
 
 
 def constraint_value(positions, atoms, haptic=None, window=None):
     """Measure one distance, angle or dihedral, resolving haptic centroids when present."""
-    haptic = haptic or {}
-
-    def point(atom):
-        if 0 <= atom < len(positions):
-            return positions[atom]
-        face = haptic.get(atom)
-        if not face or any(index < 0 or index >= len(positions) for index in face):
-            return None
-        return np.mean(positions[list(face)], axis=0)
-
-    points = [point(atom) for atom in atoms]
+    points = [_site_point(positions, haptic or {}, atom) for atom in atoms]
     if any(value is None for value in points):
         return None
-    if len(atoms) == _DIST_ATOMS:
+    if len(atoms) == DIST_ATOMS:
         return float(np.linalg.norm(points[0] - points[1]))
-    if len(atoms) == _ANGLE_ATOMS:
-        return _angle(*points)
-    if len(atoms) != _DIHEDRAL_ATOMS:
+    if len(atoms) == ANGLE_ATOMS:
+        return bond_angle(*points)
+    if len(atoms) != DIHEDRAL_ATOMS:
         raise ValueError("a geometric term needs 2, 3 or 4 atoms")
-    value = _dihedral(*points)
+    value = dihedral_angle(*points)
     if window is not None:
         middle = 0.5 * sum(window)
         value = middle + (value - middle + _STRAIGHT) % (2 * _STRAIGHT) - _STRAIGHT
     return value
+
+
+def out_of_plane_row(mol, row):
+    """Return whether a coplanar row caps its first atom out of the donor's own plane: both far atoms bond the donor."""
+    donor = row[1]
+    return all(mol.GetBondBetweenAtoms(donor, atom) is not None for atom in row[2:4])
+
+
+def out_of_plane(positions, metal, donor, left, right):
+    """Return the angle in degrees between the donor-metal bond and the left-donor-right plane."""
+    normal = np.cross(positions[left] - positions[donor], positions[right] - positions[donor])
+    bond = positions[metal] - positions[donor]
+    scale = np.linalg.norm(normal) * np.linalg.norm(bond)
+    if scale == 0.0:
+        return float("nan")
+    return float(np.degrees(np.arcsin(min(1.0, abs(np.dot(normal, bond)) / scale))))
+
+
+def plane_torsion_cap(cap, angle):
+    """Return the dihedral about one donor bond that puts the metal ``cap`` degrees out of plane at that M-D-X angle.
+
+    The metal's height over the plane is sin(M-D-X) * sin(dihedral offset) bond lengths, so one axis-free cap
+    maps to a different dihedral on each donor bond; 90 means the angle leaves no dihedral to cap.
+    """
+    ratio = math.sin(math.radians(cap)) / max(math.sin(math.radians(angle)), np.finfo(float).eps)
+    return 90.0 if ratio >= 1.0 else math.degrees(math.asin(ratio))
+
+
+def metal_distance_tolerance(atoms, cons):
+    """Return the slack publication, and every screen it bounds, allows a metal distance window."""
+    return FIX_DISTANCE_TOL if atoms in cons.fixed else ML_WINDOW_TOL
 
 
 def within_window(value, window, slack=0.0):
@@ -354,30 +424,43 @@ _SHOWN_HITS = 4  # how many ambiguous matches to name before trailing off
 
 
 def resolve_atom(mol, ref):
-    """Resolve an atom reference (an int index, or a SMARTS matching one atom) to an index; a query helper."""
+    """Resolve an atom index, or the first atom of a SMARTS with exactly one match (`match`), to an index."""
     if isinstance(ref, (int, np.integer)):
         return int(ref)
-    hit = mol.GetSubstructMatch(Chem.MolFromSmarts(ref))
-    if not hit:
-        raise ValueError(f"SMARTS {ref!r} matched nothing")
-    return hit[0]
+    return match(mol, ref)[0]
+
+
+def substruct_matches(mol, query, **params):
+    """Return the query's matches in `mol` as drawn or, when that Lewis form has none, in any resonance form.
+
+    A graph carries one Lewis form, so `NC(=S)N` misses a thiourea anion drawn N=C([S-])N. RDKit's
+    `ResonanceMolSupplier` matches across the forms, but they are Kekulé: there `c1ccccc1` hits nothing and
+    `[#6]=[#6]` also hits styrene's ring bonds. Searching the drawn form first keeps every pattern that already
+    matches; one that names a single resonance-equivalent atom, such as a carboxylate's C=O oxygen, therefore
+    follows the drawn form. `params` are RDKit's `GetSubstructMatches` keywords, uniquified by default as on a Mol.
+    """
+    params = {"uniquify": True, **params}
+    if hits := mol.GetSubstructMatches(query, **params):
+        return hits
+    try:
+        return Chem.ResonanceMolSupplier(mol).GetSubstructMatches(query, **params)
+    except Chem.AtomValenceException:  # a hypervalent TS centre has no Lewis form to enumerate
+        return ()
 
 
 def match(mol, smarts):
-    """Return the atom indices of the one SMARTS match, raising if there is not exactly one.
+    """Return the atom indices of the one SMARTS match (`substruct_matches`), raising if there is not exactly one.
 
-    Both raises are the point, and the second matters more. RDKit's `GetSubstructMatch` returns () for no
-    match, so a mistyped pattern flows on as an empty index set and the caller embeds with no constraint.
-    It also returns whichever match it found first when there are several, which is how a core silently
-    flips: on 2-chlorobenzyl chloride, `[Cl]` hands back the unreactive aryl chloride. A constraint keyed on
-    the wrong atom is a wrong answer that looks right, so an ambiguous pattern is the caller's to resolve.
+    `GetSubstructMatch` returns () for no match and silently returns the first hit for several, so a
+    mistyped or ambiguous pattern can key a constraint to a wrong-but-plausible atom: on 2-chlorobenzyl
+    chloride, `[Cl]` hands back the unreactive aryl chloride. Both raises catch that before it looks right.
     """
     query = Chem.MolFromSmarts(smarts)
     if query is None:
-        raise ValueError(f"SMARTS {smarts!r} did not parse")
-    hits = mol.GetSubstructMatches(query)
+        raise ValueError(f"SMARTS {smarts!r} did not parse; check its syntax with Chem.MolFromSmarts")
+    hits = substruct_matches(mol, query)
     if not hits:
-        raise ValueError(f"SMARTS {smarts!r} matched nothing")
+        raise ValueError(f"SMARTS {smarts!r} matched nothing; check it against this molecule's atoms")
     if len(hits) > 1:
         raise ValueError(
             f"SMARTS {smarts!r} matched {len(hits)} times ({hits[:_SHOWN_HITS]}...); "
@@ -394,7 +477,7 @@ def _window(val, pad, key=None, angle=False, dihedral=False):
     """
     if isinstance(val, (tuple, list, np.ndarray)):
         given = [float(v) for v in val]
-        if len(given) != _DIST_ATOMS:
+        if len(given) != DIST_ATOMS:
             raise ValueError(
                 f"a distance/angle/dihedral value must be a scalar target or a (lo, hi) window; got {val!r} "
                 f"(a coordinate belongs under an int key: fix={{i: (x, y, z)}})"
@@ -415,11 +498,12 @@ def _window(val, pad, key=None, angle=False, dihedral=False):
             f"constraint {key!r}: {val!r} is not a valid {label}; give a scalar target or an ordered (lo, hi) window"
         )
     if dihedral:
-        return _periodic_window((lo, hi))
+        return periodic_window((lo, hi))
     return max(0.0, lo), hi if top is None else min(top, hi)
 
 
-def _is_index(x):
+def is_index(x):
+    """Return whether `x` is an integer atom index; a bool is not one."""
     return isinstance(x, (int, np.integer)) and not isinstance(x, bool)
 
 
@@ -433,28 +517,28 @@ def _index_tuple(key):
                 f"(0-based, xyz/graph order); resolve your SMARTS first, e.g. "
                 f"i = mol.GetSubstructMatch(Chem.MolFromSmarts('[F-]'))[0], then key by i"
             )
-        if not _is_index(a):
+        if not is_index(a):
             raise ValueError(f"constraint key {key!r} must be integer atom indices, got {type(a).__name__}")
     out = tuple(int(a) for a in key)
     if len(set(out)) != len(out):  # (i, i) is the (i, j) typo: it writes the bounds-matrix diagonal and no-ops
         raise ValueError(f"constraint key {key!r} names the same atom twice; geometric coordinates need distinct atoms")
-    if len(out) == _ANGLE_ATOMS and out[0] > out[2]:
+    if len(out) == ANGLE_ATOMS and out[0] > out[2]:
         out = (out[2], out[1], out[0])
-    elif len(out) == _DIHEDRAL_ATOMS and out > out[::-1]:
+    elif len(out) == DIHEDRAL_ATOMS and out > out[::-1]:
         out = out[::-1]
     return out
 
 
 def _is_plane_key(key):
     """Return True for a π-stack key: a 2-tuple of ring atom-groups (lists/tuples/None), not two indices."""
-    if not (isinstance(key, tuple) and len(key) == _DIST_ATOMS):
+    if not (isinstance(key, tuple) and len(key) == DIST_ATOMS):
         return False
     return all(isinstance(e, (list, tuple)) or e is None for e in key)
 
 
 def _as_coord(val):
     v = tuple(float(x) for x in val)
-    if len(v) != _COORD_LEN:
+    if len(v) != 3:  # noqa: PLR2004
         raise ValueError(f"a coordinate fix value must be (x, y, z); got {val!r}")
     return v
 
@@ -468,9 +552,9 @@ def _resolve_ring(mol, ring):
             "(get them with mol.GetSubstructMatch / GetRingInfo)"
         )
     atoms = tuple(ring)
-    if len(atoms) < _PLANE_ATOMS:
+    if len(atoms) < 3:  # noqa: PLR2004
         raise ValueError(f"constrain plane needs at least 3 atoms per ring; got {atoms}")
-    if any(not _is_index(atom) for atom in atoms):
+    if any(not is_index(atom) for atom in atoms):
         raise ValueError(f"constrain plane ring atoms must be integer indices; got {atoms}")
     atoms = tuple(int(atom) for atom in atoms)
     if len(set(atoms)) != len(atoms):
@@ -498,38 +582,24 @@ def _apply_fix(mol, fix, cons, coord_fix, has_geometry):
         raise ValueError(
             f"fix= takes a list of atom indices (own-coords graft) or a dict "
             f"({{i: (x,y,z)}} coords / {{(i,j): d}} numbers); got {type(fix).__name__} {fix!r}"
-            + (f"; did you mean fix=[{fix}]?" if _is_index(fix) else "")
+            + (f"; did you mean fix=[{fix}]?" if is_index(fix) else "")
         )
     if isinstance(fix, dict):
         for key, val in fix.items():
-            if _is_index(key):  # int key -> a coordinate pin (graft)
+            if is_index(key):  # int key -> a coordinate pin (graft)
                 coord_fix[int(key)] = _as_coord(val)
             else:  # tuple key -> a scalar target or explicit allowed range
                 idx = _index_tuple(key)
-                if len(idx) == _DIST_ATOMS:
-                    pair = (min(idx), max(idx))
-                    requested = _window(val, 0.0, key)
-                    if pair in cons.fixed and cons.fixed[pair] != requested:
-                        raise ValueError(f"fix= gives conflicting values for distance {pair}")
-                    add_distance(cons.distances, *idx, *_seed_window(requested, _FIX_PAD))
-                    cons.fixed[pair] = requested
-                    written.add(pair)
-                elif len(idx) == _ANGLE_ATOMS:
-                    requested = _window(val, 0.0, key, angle=True)
-                    if idx in cons.fixed and cons.fixed[idx] != requested:
-                        raise ValueError(f"fix= gives conflicting values for angle {idx}")
-                    cons.angles[idx] = _seed_window(requested, _FIX_ANG_PAD)
-                    cons.fixed[idx] = requested
-                    written.add(idx)
-                elif len(idx) == _DIHEDRAL_ATOMS:
-                    requested = _window(val, 0.0, key, dihedral=True)
-                    if idx in cons.fixed and cons.fixed[idx] != requested:
-                        raise ValueError(f"fix= gives conflicting values for dihedral {idx}")
-                    cons.dihedrals[idx] = _seed_window(requested, _FIX_ANG_PAD)
-                    cons.fixed[idx] = requested
-                    written.add(idx)
-                else:
+                if len(idx) not in _FIX_FIELD:
                     raise ValueError(f"fix number key {key!r} needs 2 (distance), 3 (angle) or 4 (dihedral) atoms")
+                name, pad = _FIX_FIELD[len(idx)]
+                idx = (min(idx), max(idx)) if len(idx) == DIST_ATOMS else idx
+                requested = _window(val, 0.0, key, angle=len(idx) == ANGLE_ATOMS, dihedral=len(idx) == DIHEDRAL_ATOMS)
+                if cons.fixed.get(idx, requested) != requested:
+                    raise ValueError(f"fix= gives conflicting values for {idx}; state it once")
+                getattr(cons, name)[idx] = _seed_window(requested, pad)
+                cons.fixed[idx] = requested
+                written.add(idx)
         return written
     # a list/tuple/set of atom indices -> hold at the source's own coords (graft)
     if not has_geometry:
@@ -540,7 +610,7 @@ def _apply_fix(mol, fix, cons, coord_fix, has_geometry):
         )
     positions = mol.GetConformer().GetPositions()
     for a in fix:
-        if isinstance(a, str) or not _is_index(a):
+        if isinstance(a, str) or not is_index(a):
             raise ValueError(
                 f"fix=[...] takes atom indices; got {a!r}. Resolve SMARTS yourself first "
                 f"(fix=/constrain= are index-driven)."
@@ -583,22 +653,18 @@ def _apply_constrain(mol, constrain, cons):
             cons.planes.append((ra, rb, separation))
             continue
         idx = _index_tuple(key)
-        if len(idx) == _DIST_ATOMS:
+        if len(idx) == DIST_ATOMS:
             add_distance(cons.distances, *idx, *_window(val, _CON_PAD, key))
             d_soft.add((min(idx), max(idx)))
-        elif len(idx) == _ANGLE_ATOMS:
+        elif len(idx) == ANGLE_ATOMS:
             cons.angles[idx] = _window(val, _CON_ANG_PAD, key, angle=True)
             angular_soft.add(idx)
-        elif len(idx) == _DIHEDRAL_ATOMS:
+        elif len(idx) == DIHEDRAL_ATOMS:
             cons.dihedrals[idx] = _window(val, _CON_ANG_PAD, key, dihedral=True)
             angular_soft.add(idx)
         else:
             raise ValueError(f"constrain key {key!r} needs 2 (distance), 3 (angle) or 4 (dihedral) atoms")
     return d_soft, angular_soft
-
-
-_XYZ_DIM = 3  # an (x, y, z) row
-_TEMPLATE_LEN = 2  # template=(reference, mapping)
 
 
 def reference_positions(reference):
@@ -615,30 +681,29 @@ def reference_positions(reference):
         path = os.fspath(reference)
         mol = Chem.MolFromXYZFile(path)
         if mol is None:
-            raise ValueError(f"could not read coordinates from {path!r}")
+            raise ValueError(f"could not read coordinates from {path!r}; give an .xyz file path")
         return mol.GetConformer().GetPositions()
     arr = np.asarray(reference, float)
-    if arr.ndim == _TEMPLATE_LEN and arr.shape[1] == _XYZ_DIM:
+    if arr.ndim == 2 and arr.shape[1] == 3:  # noqa: PLR2004  a 2D (N, 3) array
         return arr
     raise ValueError("a template reference must be a Mol with a conformer, an .xyz path, or an (N, 3) array")
 
 
-def template_to_fix(template, fix=None, own=None, target=None):
+def template_to_fix(template, fix=None, target=None):
     """Fold ``template=(reference, map_or_smarts)`` into a coordinate ``fix``; sugar, not a mechanism.
 
-    A template graft is a `fix` with coordinates read off a reference, so the resolver knows only
-    `fix`/`constrain` and this is where the sugar dissolves. Every rigid spec is one question, where do these
-    atoms' coordinates come from: your own geometry (`fix=[i, j]`, resolved against `own`), coordinates you
-    supply (`fix={i: (x, y, z)}`), or another molecule (`template=`). They compose, and an explicit `fix` on
-    the same atom wins.
+    Every rigid spec answers one question, where do these atoms' coordinates come from: your own geometry
+    (`fix=[i, j]`, read from `target`'s conformer), coordinates you supply (`fix={i: (x, y, z)}`), or another
+    molecule (`template=`). They compose, with an explicit `fix` on the same atom winning.
 
-    Coordinates carry handedness, which a distance/angle spec cannot: that spec is reflection-invariant, so
-    it may give the mirror image silently. To embed the other diastereomer deliberately, negate one axis of
-    the reference positions. A SMARTS must also have one ordered correspondence on each graph; a symmetric
-    query needs an explicit map rather than an atom-order-dependent automorphism.
+    Coordinates carry handedness, which a distance/angle spec cannot and may give the mirror image
+    silently; negate one axis of the reference to embed the other diastereomer deliberately. A SMARTS needs
+    one ordered correspondence on each graph, so a symmetric query needs an explicit map instead.
     """
     if not (
-        isinstance(template, (tuple, list)) and len(template) == _TEMPLATE_LEN and isinstance(template[1], (dict, str))
+        isinstance(template, (tuple, list))
+        and len(template) == 2  # noqa: PLR2004  template=(reference, mapping)
+        and isinstance(template[1], (dict, str))
     ):
         raise ValueError(
             "template= must be (reference, SMARTS) or (reference, {target_index: reference_index}). "
@@ -654,8 +719,8 @@ def template_to_fix(template, fix=None, own=None, target=None):
         target_match, reference_match = match(target, mapping), match(reference, mapping)
         query = Chem.MolFromSmarts(mapping)
         if (
-            len(target.GetSubstructMatches(query, uniquify=False, maxMatches=2)) > 1
-            or len(reference.GetSubstructMatches(query, uniquify=False, maxMatches=2)) > 1
+            len(substruct_matches(target, query, uniquify=False, maxMatches=2)) > 1
+            or len(substruct_matches(reference, query, uniquify=False, maxMatches=2)) > 1
         ):
             raise ValueError(
                 f"template SMARTS {mapping!r} has symmetry-equivalent atom orderings; "
@@ -663,11 +728,7 @@ def template_to_fix(template, fix=None, own=None, target=None):
             )
         mapping = dict(zip(target_match, reference_match, strict=True))
     if not mapping:
-        raise ValueError(
-            "template= was given an empty atom map, which would graft nothing and embed as if no template "
-            "were passed. If a SMARTS built the map, it matched nothing on one side; rxembed.match raises "
-            "where GetSubstructMatch returns () silently."
-        )
+        raise ValueError("template= was given an empty atom map, which grafts nothing; map at least one atom")
     positions = reference_positions(reference)
     coords = {}
     for ti, ri in mapping.items():
@@ -680,11 +741,12 @@ def template_to_fix(template, fix=None, own=None, target=None):
     if isinstance(fix, dict):
         return {**coords, **fix}
     if fix:  # a list of atoms held at the source's own coordinates: another coordinate source, so merge it
-        if own is None:
+        if target is None or not target.GetNumConformers():
             raise ValueError(
                 "template= with fix=[atoms] needs the source's own geometry to resolve that list. Give those "
                 "atoms as coordinates instead (fix={i: (x, y, z)}), or embed without the list."
             )
+        own = target.GetConformer().GetPositions()
         coords.update({int(i): tuple(own[int(i)]) for i in fix})
     return coords
 
@@ -729,16 +791,15 @@ def resolve_core(mol, *, fix=None, constrain=None, has_geometry=False):
 def _drop_determined_by_graft(cons, coord_fix, keys):
     """Drop each user window whose atoms all sit in the grafted core; return the keys dropped.
 
-    The Kabsch graft restores those atoms to their exact coordinates after the embed, so such a window can
-    never be realised. Worse, it overwrote the graft's own pairwise-shape bound, seeding the whole embed
-    against a distance the graft then contradicts. Restore the shape window (a distance) or drop it (an
-    angle/dihedral), loudly: silently ignoring it would leave the user thinking the constraint applied.
+    The Kabsch graft restores those atoms exactly after the embed, so such a window can never be realised
+    and, worse, would seed the embed against a distance the graft then contradicts. Restore the shape
+    window (a distance) or drop it (an angle/dihedral), loudly, so the user is not left thinking it applied.
     """
-    dropped = {key for key in keys if _graft_owns(key, coord_fix)}
+    dropped = {key for key in keys if graft_owns(key, coord_fix)}
     for key in sorted(dropped):
-        if len(key) == _DIST_ATOMS:
+        if len(key) == DIST_ATOMS:
             add_pairwise_shape(cons, key, coord_fix, _SHAPE_PAD)  # back to what the graft implies
-        elif len(key) == _ANGLE_ATOMS:
+        elif len(key) == ANGLE_ATOMS:
             cons.angles.pop(key, None)
         else:
             cons.dihedrals.pop(key, None)
@@ -750,13 +811,12 @@ def _drop_determined_by_graft(cons, coord_fix, keys):
 
 
 def _warn_underdetermined(cons, coord_fix, n_fix_d):
-    """Advisory (invariant 5): two shared-atom fix distances over exactly 3 atoms leave the angle free.
+    """Warn when two fix distances sharing an atom over exactly 3 atoms leave their angle free.
 
     The classic mis-fix is an SN2 pinned as ``fix={(f, c): d1, (c, cl): d2}`` with no ``(f, c, cl)`` angle,
-    which comes out bent rather than the linear TS the user meant. A richer network (more than 3 atoms, or
-    any coords or angles) is left alone as a deliberate distance web. Advisory, not fatal.
+    which comes out bent rather than linear. A richer network (more atoms, coordinates or angles) is left alone.
     """
-    if coord_fix or cons.angles or cons.dihedrals or n_fix_d < _DIST_ATOMS:
+    if coord_fix or cons.angles or cons.dihedrals or n_fix_d < DIST_ATOMS:
         return
     keys = list(cons.distances)
     atoms = {a for k in keys for a in k}
@@ -780,33 +840,30 @@ def _echo(mol, cons, coord_fix):
     d_soft, angular_soft = cons.contacts
     a_soft, t_soft = angular_soft & cons.angles.keys(), angular_soft & cons.dihedrals.keys()
 
-    def s(i):
-        return f"{mol.GetAtomWithIdx(int(i)).GetSymbol()}{int(i)}"
-
     parts = []
     if coord_fix:
-        parts.append(f"graft {', '.join(s(i) for i in sorted(coord_fix))}")
+        parts.append(f"graft {', '.join(atom_label(mol, i) for i in sorted(coord_fix))}")
     for atoms, (lo, hi) in cons.fixed.items():
-        tol, unit = (FIX_DISTANCE_TOL, "A") if len(atoms) == _DIST_ATOMS else (FIX_ANGLE_TOL, "deg")
+        tol, unit = (FIX_DISTANCE_TOL, "A") if len(atoms) == DIST_ATOMS else (FIX_ANGLE_TOL, "deg")
         requested = f"{lo:.6f}+/-{tol:g}" if lo == hi else f"[{lo:.6f},{hi:.6f}]"
         name = {2: "d", 3: "angle", 4: "dihedral"}[len(atoms)]
-        parts.append(f"fix {name}({','.join(s(i) for i in atoms)})->{requested}{unit}")
+        parts.append(f"fix {name}({','.join(atom_label(mol, i) for i in atoms)})->{requested}{unit}")
     for (i, j), (lo, hi) in cons.distances.items():
         if (i, j) in cons.fixed or (i, j) in d_soft or (i in cons.frozen and j in cons.frozen):
             continue  # already logged canonically, soft (below), or implied by the coordinate graft
-        parts.append(f"fix d({s(i)},{s(j)})->{lo:.2f}-{hi:.2f}A")
+        parts.append(f"fix d({atom_label(mol, i)},{atom_label(mol, j)})->{lo:.2f}-{hi:.2f}A")
     for name, windows, soft in (("angle", cons.angles, a_soft), ("dihedral", cons.dihedrals, t_soft)):
         for atoms, (lo, hi) in windows.items():
             if atoms in cons.fixed or atoms in soft:
                 continue
-            parts.append(f"fix {name}({','.join(s(i) for i in atoms)})->{lo:.1f}-{hi:.1f}deg")
+            parts.append(f"fix {name}({','.join(atom_label(mol, i) for i in atoms)})->{lo:.1f}-{hi:.1f}deg")
     for i, j in d_soft:
         lo, hi = cons.distances[(i, j)]
-        parts.append(f"soft d({s(i)},{s(j)})->{lo:.2f}-{hi:.2f}A")
+        parts.append(f"soft d({atom_label(mol, i)},{atom_label(mol, j)})->{lo:.2f}-{hi:.2f}A")
     for name, windows, soft in (("angle", cons.angles, a_soft), ("dihedral", cons.dihedrals, t_soft)):
         for atoms in soft:
             lo, hi = windows[atoms]
-            parts.append(f"soft {name}({','.join(s(i) for i in atoms)})->{lo:.1f}-{hi:.1f}deg")
+            parts.append(f"soft {name}({','.join(atom_label(mol, i) for i in atoms)})->{lo:.1f}-{hi:.1f}deg")
     for ra, rb, sep in cons.planes:
         parts.append(f"stack {len(ra)}x{len(rb)} ring @ {sep:.1f}A")
     for part in parts:

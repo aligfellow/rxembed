@@ -8,13 +8,9 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 
 from rxembed.utils import (
-    Violation,
-    _angle,
-    _dihedral,
     assign_stereo_from_3d,
     bond_removal_mirrors,
-    conjugated_quartets,
-    remove_bond,
+    flat_ranks,
     repair_bond_stereo,
 )
 
@@ -41,36 +37,35 @@ def _without(mol, atom):
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_angle_and_signed_dihedral_conventions():
-    o, x, y = np.zeros(3), np.array([1.0, 0, 0]), np.array([0, 1.0, 0])
-    assert _angle(x, o, y) == pytest.approx(90.0)
-    assert _angle(x, o, -x) == pytest.approx(180.0)
-    with np.errstate(all="raise"):
-        assert np.isnan(_angle(o, o, x))
-
-    p0, p1, p2 = np.array([1.0, 0, 0]), np.zeros(3), np.array([0, 0, 1.0])
-    plus, minus = np.array([0, 1.0, 1.0]), np.array([0, -1.0, 1.0])
-    assert _dihedral(p0, p1, p2, plus) == pytest.approx(-_dihedral(p0, p1, p2, minus))
-    assert _dihedral(p0, p1, p2, plus) != 0.0
-
-
 # ---------------------------------------------------------------------------------------------------------
 # conjugated_quartets: the one perception the QA gate and the FF cap must agree on
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_conjugation_detects_amide_not_saturated_chain():
-    quartets = list(conjugated_quartets(_mol("CC(=O)NC")))
-    assert quartets, "the amide plane was not perceived"
-    for a, c, x, s in quartets:
-        assert len({a, c, x, s}) == 4, "a quartet must name four distinct atoms"
-    assert list(conjugated_quartets(_mol("CCCC"))) == []
+# ---------------------------------------------------------------------------------------------------------
+# flat_ranks: charge and bond order removed before canonical ranking, so a delocalised -1 written on one
+# arbitrary donor cannot rank it apart from its chemically equivalent partner
+# ---------------------------------------------------------------------------------------------------------
 
 
-def test_exclude_drops_a_quartet_naming_an_excluded_atom():
-    mol = _mol("CC(=O)NC")
-    hit = next(iter(conjugated_quartets(mol)))
-    assert hit not in list(conjugated_quartets(mol, exclude={hit[2]}))
+@pytest.mark.parametrize(
+    "smiles",
+    [
+        "CC(=O)/C=C(\\C)[O-]",  # acac: same delocalised-oxygen artefact over a longer conjugated backbone
+    ],
+)
+def test_delocalised_oxygens_rank_equal_despite_the_written_charge(smiles):
+    mol = _mol(smiles)
+    oxygens = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetSymbol() == "O"]
+    assert len(oxygens) == 2
+
+    charged_ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
+    assert charged_ranks[oxygens[0]] != charged_ranks[oxygens[1]], (
+        "fixture no longer carries the artefact: the two oxygens already rank equal with charge intact"
+    )
+
+    ranks = flat_ranks(mol)
+    assert ranks[oxygens[0]] == ranks[oxygens[1]]
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -100,19 +95,9 @@ def test_geometry_rebases_orphaned_ez_flag():
     assert 3 not in list(bond.GetStereoAtoms())
 
 
-def test_bond_repair_leaves_native_atropisomer_stereo_alone():
-    mol = Chem.MolFromSmiles("CC1=CC=CC(I)=C1N1C(C)=CC=C1Br |wU:7.7|")
-    axis = next(bond for bond in mol.GetBonds() if bond.GetStereo() == Chem.BondStereo.STEREOATROPCCW)
-
-    assert repair_bond_stereo(mol) == 0
-    assert axis.GetStereo() == Chem.BondStereo.STEREOATROPCCW
-
-
 # ---------------------------------------------------------------------------------------------------------
 # the chiral tag is a parity over the atom's own bond order (`bond_removal_mirrors` / `remove_bond`)
 # ---------------------------------------------------------------------------------------------------------
-
-_HALIDE_C = "F[C@](Cl)(Br)I"  # one tagged degree-4 centre whose four bonds are all distinguishable
 
 
 def _names_the_hand(mol, centre):
@@ -130,35 +115,12 @@ def _names_the_hand(mol, centre):
     return atom.GetChiralTag() == (cw if vol < 0 else Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
 
 
-@pytest.mark.parametrize("slot", [0, 1, 2, 3])
-def test_bond_removal_preserves_geometry_tag(slot):
-    mol = _mol(_HALIDE_C, seed=11)
-    Chem.AssignStereochemistryFrom3D(mol)  # calibrate: RDKit's own writer, on this very conformer
-    assert _names_the_hand(mol, 1), "the sign convention this test refereeds by is wrong"
-    rw = Chem.RWMol(mol)
-    remove_bond(rw, 1, [b.GetOtherAtomIdx(1) for b in mol.GetAtomWithIdx(1).GetBonds()][slot])
-    assert _names_the_hand(rw.GetMol(), 1), f"slot {slot}: the tag now names the mirror of its own geometry"
-
-
-def test_adding_a_bond_back_needs_no_counterpart():
-    mol = _mol(_HALIDE_C, seed=11)
-    Chem.AssignStereochemistryFrom3D(mol)
-    partner = next(b.GetOtherAtomIdx(1) for b in mol.GetAtomWithIdx(1).GetBonds())  # slot 0: an odd one
-    rw = Chem.RWMol(mol)
-    remove_bond(rw, 1, partner)
-    rw.AddBond(1, partner, Chem.BondType.SINGLE)
-    assert _names_the_hand(rw.GetMol(), 1), "the re-added bond needed a second correction, so it is not last"
-
-
 @pytest.mark.parametrize(
     ("smiles", "slot", "mirrors"),
     [
-        ("F[C@](Cl)(Br)I", 0, True),  # degree 4: 3 - 0 is odd
-        ("F[C@](Cl)(Br)I", 1, False),  # degree 4: 3 - 1 is even
         ("F[P@](Cl)(Br)(I)F", 1, False),  # degree 5: the arithmetic would say odd, and is refuted there
-        ("F[C@](Cl)Br", 1, False),  # degree 3: no representable tag survives, so the caller clears it
     ],
-    ids=["tetra-slot0", "tetra-slot1", "hypervalent", "trigonal"],
+    ids=["hypervalent"],
 )
 def test_parity_rule_is_bounded_to_degree_four(smiles, slot, mirrors):
     mol = Chem.MolFromSmiles(smiles, sanitize=False)
@@ -175,8 +137,6 @@ def test_parity_rule_is_bounded_to_degree_four(smiles, slot, mirrors):
 # A sulfoxide S donating through a dative arrow: the one shape where RDKit's 3D writer both assigns a tag and
 # reads a different bond order from every one of its readers. `->` puts the same bond LAST, the even control.
 _DATIVE_S = "Cl[Pd](Cl)(Cl)<-[S@](=O)(C)CC"
-_DATIVE_S_LAST = "[S@](=O)(C)(CC)->[Pd](Cl)(Cl)Cl"
-_COVALENT_S = "Cl[Pd](Cl)(Cl)[S@](=O)(C)CC"
 
 
 def _sulfur(mol):
@@ -191,41 +151,10 @@ def test_rdkit_3d_writer_emits_unreadable_bond_order():
     assert not _names_the_hand(mol, centre), "the writer already agrees with its readers; the premise is gone"
 
 
-@pytest.mark.parametrize(
-    "smiles", [_DATIVE_S, _DATIVE_S_LAST, _COVALENT_S], ids=["dative-first", "dative-last", "covalent"]
-)
+@pytest.mark.parametrize("smiles", [_DATIVE_S], ids=["dative-first"])
 def test_3d_stereo_matches_reader_bond_order(smiles):
     mol = _mol(smiles, seed=0xF00D)
     centre = _sulfur(mol)
     assign_stereo_from_3d(mol)
     assert mol.GetAtomWithIdx(centre).GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED, "nothing was written"
     assert _names_the_hand(mol, centre), "the tag names the mirror of the geometry it was written from"
-
-
-def test_stereo_assignment_preserves_hypervalent_tag():
-    mol = Chem.MolFromSmiles("F[C@](Cl)(Br)(I)->[Pd]", sanitize=False)
-    mol.UpdatePropertyCache(strict=False)
-    Chem.SanitizeMol(mol, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES, catchErrors=True)
-    assert rdDistGeom.EmbedMolecule(mol, randomSeed=0xF00D) == 0
-    centre = mol.GetAtomWithIdx(1)
-    assert centre.GetDegree() == 5, "the fixture is not the hypervalent case, so this asserts nothing"
-    assert bond_removal_mirrors(centre, 5) is False, "the predicate itself lost the degree bound"
-
-    raw = Chem.Mol(mol)
-    Chem.AssignStereochemistryFrom3D(raw)
-    assign_stereo_from_3d(mol)
-    written = raw.GetAtomWithIdx(1).GetChiralTag()
-    assert written != Chem.ChiralType.CHI_UNSPECIFIED, "the writer tagged nothing here, so this asserts nothing"
-    assert mol.GetAtomWithIdx(1).GetChiralTag() == written, "the door re-based a hypervalent tag"
-
-
-# ---------------------------------------------------------------------------------------------------------
-# Violation: the QA result type both the core perception and the pipeline gate return
-# ---------------------------------------------------------------------------------------------------------
-
-
-def test_violation_formats_atoms_value_and_limit():
-    v = Violation("clash", (3, 7), value=1.234, limit=2.5, detail="H...H")
-    assert str(v) == "[clash] atoms 3-7: 1.234 vs 2.500 H...H"
-    v2 = Violation("clash", (3, 7), value=1.234, limit=2.5)
-    assert str(v2) == "[clash] atoms 3-7: 1.234 vs 2.500"

@@ -1,26 +1,350 @@
-"""Test source normalization and embedding dispatch."""
+"""Test the public pipeline verbs end to end, source normalization and embedding dispatch."""
 
+from __future__ import annotations
+
+import importlib
 import itertools
+import logging
+from collections import Counter
 from importlib.util import find_spec
 
 import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom
+from rdkit.Chem import rdDistGeom, rdForceFieldHelpers, rdMolTransforms
 
 import rxembed as rx
+from rxembed import bounds
+from rxembed.constraints import FIX_ANGLE_TOL, FIX_DISTANCE_TOL
+from rxembed.pipeline import dispatch
 from rxembed.pipeline import geom_check as geom
+from rxembed.pipeline.stereo_check import signature
+
+# --- baseline: clean peripheries ---------------------------------------------
+
+
+@pytest.mark.parametrize("engine", [rx.core.embed])
+def test_params_round_trips_through_both_facades(engine):
+    ethanol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
+    result = engine(ethanol, n=2, seed=5)
+    assert result.params == rx.EmbedParams(seed=5)
+
+    again = engine(ethanol, n=2, params=result.params)
+    for cid in result.ids:
+        np.testing.assert_array_equal(
+            result.mol.GetConformer(cid).GetPositions(), again.mol.GetConformer(cid).GetPositions()
+        )
+
+    by_seed = engine(ethanol, n=2, seed=7)
+    by_params = engine(ethanol, n=2, params=rx.EmbedParams(seed=7))
+    for cid in by_seed.ids:
+        np.testing.assert_array_equal(
+            by_seed.mol.GetConformer(cid).GetPositions(), by_params.mol.GetConformer(cid).GetPositions()
+        )
+
+    assert result[:1].params == result.params
+
+
+@pytest.mark.parametrize(("coplanar_14", "metal_floor_relief"), [(False, True)])
+def test_matrix_edit_controls_leave_uff_constraints_intact(monkeypatch, coplanar_14, metal_floor_relief):
+    isomer = next(
+        iso for iso in rx.metal("[Pt+2](<-[Cl-])(<-[Cl-])(<-n1ccccc1)<-n1ccccc1", "SPL") if iso.label == "cis"
+    )
+    native = rdDistGeom.KDG()
+    params = rx.EmbedParams(
+        seed=42, threads=1, native=native, coplanar_14=coplanar_14, metal_floor_relief=metal_floor_relief
+    )
+    core = importlib.import_module("rxembed.embed")
+    native_bounds, native_uff = bounds._feasible_bounds, core.restrained_uff
+    seen_dg, seen_uff = [], []
+
+    def matrix(mol, cons, used):
+        assert used is native
+        seen_dg.append((bool(cons.coplanar), bool(cons.dg_floors)))
+        return native_bounds(mol, cons, used)
+
+    def cleanup(mol, cons, **kwargs):
+        seen_uff.append((bool(cons.coplanar), bool(cons.dg_floors), bool(cons.floors)))
+        return native_uff(mol, cons, **kwargs)
+
+    monkeypatch.setattr(bounds, "_feasible_bounds", matrix)
+    monkeypatch.setattr(core, "restrained_uff", cleanup)
+    result = rx.embed(isomer, n=1, params=params)
+    result.minimize()
+    assert seen_dg
+    assert all(flags == (coplanar_14, metal_floor_relief) for flags in seen_dg)
+    assert seen_uff
+    assert all(flags == (True, True, True) for flags in seen_uff)
+    assert result.cons.coplanar
+    assert result.cons.dg_floors
+    assert (result.params.coplanar_14, result.params.metal_floor_relief) == (coplanar_14, metal_floor_relief)
+    assert (result[0].params.coplanar_14, result[0].params.metal_floor_relief) == (coplanar_14, metal_floor_relief)
+    geom.check(result.mol, donors=isomer.donors).assert_ok()
+
+
+_RELAXATION_CALLS = {
+    "embed": lambda value: rx.embed("CCO", n=1, max_iters=value),
+    "minimize": lambda value: rx.minimize("CCO", max_iters=value),
+}
+
+
+@pytest.mark.parametrize(("door", "value"), [("minimize", 0)])
+def test_relaxation_cap_rejects_non_positive_ints(door, value):
+    with pytest.raises(ValueError, match="max_iters must be a positive integer"):
+        _RELAXATION_CALLS[door](value)
+
+
+@pytest.mark.parametrize("inspect_first", [False])
+def test_macrocyclic_donor_stereo_embeds_without_read_order_dependencies(inspect_first):
+    # This tetradentate macrocycle bites all four consecutive donor pairs at once, so both diagonal rows widen
+    # to the free consequence of the relaxed shell (metal_polyhedron.relaxed_shell); the bounded bite box
+    # (metal_constraints.bounded_bites) keeps that widening inside the requested tetrahedron rather than
+    # opening a seesaw-like basin next to it, so the embed itself -- not only the compiled contract -- must
+    # survive an early read.
+    smiles = "C1C[N@@H]2->[Cu+]34<-[S](CC2)CC/[C-]->3=[NH+]/CC[S]->4C1"
+    isomer = rx.metal(smiles, "tetrahedral")[0]
+    if inspect_first:
+        assert isomer.cons.distances
+        rx.cxsmiles(isomer)
+
+    ensemble = rx.embed(isomer, n=1, seed=42, threads=1)
+
+    assert ensemble.n == 1
+    assert not ensemble.unrelaxed
+    assert rx.cxsmiles(ensemble.mol) == rx.cxsmiles(isomer)
+
+
+# --- constrain: soft windows realised ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fix",
+    [
+        {(1, 2): (2.006, 2.046), (2, 0): (1.537, 1.577)},
+    ],
+    ids=["window"],
+)
+def test_numeric_pair_fix_survives_cleanup_without_fixing_angle(fix):
+    ens = rx.embed(
+        "[O-].ClCCCCBr",
+        fix=fix,
+        n=6,
+        seed=1,
+        stereo="free",
+    ).minimize()
+
+    assert ens.ids
+    for pair, (lo, hi) in ens.cons.fixed.items():
+        measured = ens.measure(pair)
+        if lo == hi:
+            assert measured["min"] == pytest.approx(lo, abs=FIX_DISTANCE_TOL)
+            assert measured["max"] == pytest.approx(lo, abs=FIX_DISTANCE_TOL)
+        else:
+            assert lo <= measured["min"] <= measured["max"] <= hi
+    angle = ens.measure((1, 2, 0))
+    assert angle["max"] - angle["min"] > 30.0, "pair fixing became a rigid three-atom graft"
+
+
+@pytest.mark.parametrize("target", [(-5.0, 5.0)], ids=["narrow-window"])
+def test_numeric_dihedral_overrides_internal_torsion_repair(target):
+    atoms = (0, 1, 3, 4)
+    ens = rx.embed("CC(=O)NC", fix={atoms: target}, n=2, seed=2, stereo="free").minimize()
+    assert ens.ids
+    lo, hi = ens.cons.fixed[atoms]
+    for cid in ens.ids:
+        actual = rdMolTransforms.GetDihedralDeg(ens.mol.GetConformer(cid), *atoms)
+        if lo == hi:
+            assert actual == pytest.approx(lo, abs=FIX_ANGLE_TOL)
+        else:
+            assert lo <= actual <= hi
+
+
+# --- feasibility ------------------------------------------------------------
+
+
+# --- minimize records its drops, exactly as prune does -----------------------
+
+
+# --- force-field capability and optimizer failures stay distinct -------------
+
+
+def test_pipeline_minimize_takes_template_like_embed():
+    ref = rx.embed("CCO", n=1, seed=1)
+    core = [0, 1, 2]  # C, C, O: three atoms, so the graft restores a shape rather than sliding a bond
+    want = ref.mol.GetConformer(ref.ids[0]).GetPositions()
+
+    moved = Chem.Mol(ref.mol)  # same graph, the core pulled apart so a graft has something to undo
+    conf = moved.GetConformer()
+    for a in core:
+        p = conf.GetAtomPosition(a)
+        conf.SetAtomPosition(a, [p.x + 0.6 * a, p.y - 0.4 * a, p.z])
+    torn = moved.GetConformer().GetPositions()
+    off = abs(np.linalg.norm(torn[0] - torn[2]) - np.linalg.norm(want[0] - want[2]))
+    assert off > 0.5, f"the core was not distorted, so a graft would be invisible (d off by {off:.2f} A)"
+
+    out = rx.minimize(moved, template=(ref, {i: i for i in core}))
+
+    got = out.mol.GetConformer(out.ids[0]).GetPositions()
+    for i, j in ((0, 1), (1, 2), (0, 2)):
+        d_ref = float(np.linalg.norm(want[i] - want[j]))
+        d_out = float(np.linalg.norm(got[i] - got[j]))
+        assert abs(d_out - d_ref) < 0.01, f"template= did not graft d({i},{j}): {d_out:.3f} vs {d_ref:.3f} A"
+
+
+def test_minimize_composes_isomer_template_and_fix():
+    seed = rx.embed(rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0], n=1, seed=1)
+    iso = rx.metal(seed.mol, "square_planar")[0]
+    sphere = {iso.metal, *iso.donors}
+    core = [a.GetIdx() for a in iso.mol.GetAtoms() if a.GetIdx() not in sphere][:3]
+
+    out = rx.minimize(iso, template=(iso.mol, {i: i for i in core[:2]}), fix=core[2:])
+
+    assert out.n == 1
+    assert sorted(out.cons.frozen) == core
+    assert {metal: set(donors) for metal, donors in out.sphere.items()} == {iso.metal: set(iso.donors)}
+    assert rx.cxsmiles(out.iso) == rx.cxsmiles(iso), "the Isomer's coordination arrangement was lost"
+    assert rx.cxsmiles(out.mol) == rx.cxsmiles(iso)
+
+
+def test_metal_geometry_without_the_stereo_extra_says_preservation_is_off(monkeypatch, caplog):
+    geometry = rx.embed(rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0], n=1, seed=1).mol
+
+    def missing(*_args, **_kwargs):
+        raise ImportError("signature needs xyzgraph; pip install 'rxembed[workflow]'")
+
+    monkeypatch.setattr(importlib.import_module("rxembed.pipeline.dispatch"), "signature", missing)
+    with caplog.at_level("WARNING", logger="rxembed"):
+        isomers = rx.metal(geometry, "square_planar")
+
+    assert all(iso.stereo_ref is None for iso in isomers)
+    assert "stereo preservation unavailable" in caplog.text
+    assert "rxembed[workflow]" in caplog.text
+
+
+def test_explicit_invert_on_a_helical_isomer_is_not_replaced_by_preserve(monkeypatch):
+    dispatch = importlib.import_module("rxembed.pipeline.dispatch")
+    ensemble = importlib.import_module("rxembed.pipeline.ensemble")
+    geometry = rx.embed(rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0], n=1, seed=1).mol
+    monkeypatch.setattr(dispatch, "signature", lambda *_args, **_kwargs: {"helical": Counter({"M": 1})})
+    iso = rx.metal(geometry, "square_planar")[0]
+    monkeypatch.setattr(ensemble, "signature", lambda *_args, **_kwargs: {"helical": Counter({"P": 1})})
+
+    ens = rx.embed(iso, n=1, seed=1, stereo="invert")
+
+    assert ens.n == 1
+    assert ens.stereo_filter[0] == "invert"
+
+
+def test_stereoisomer_cap_names_a_remedy_the_caller_has(monkeypatch, caplog):
+    monkeypatch.setattr(importlib.import_module("rxembed.pipeline.dispatch"), "_STEREO_CAP", 1)
+    with caplog.at_level("WARNING", logger="rxembed"):
+        rx.embed("CC(O)C(C)O", n=1, seed=1)
+
+    assert "stereo='free'" in caplog.text
+
+
+def test_max_iteration_embed_keeps_valid_seed_marked_unrelaxed(caplog):
+    """A real max_iters=1 cap leaves an unconverged but still valid seed, not a rejected one."""
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        ens = rx.embed("OCCCCO", constrain={(0, 5): (2.6, 3.0)}, n=2, seed=1, max_iters=1)
+
+    assert ens.n == 2
+    assert ens.unrelaxed
+    assert all(ens._geometry_failure(cid) is None for cid in ens.unrelaxed)
+    assert any("no converged UFF geometry; see .unrelaxed" in record.getMessage() for record in caplog.records)
+    ens.minimize()
+    assert ens.n == 2
+
+
+@pytest.mark.parametrize("n", [1, 2], ids=("empty", "partial"))
+def test_embed_reports_rejection_and_keeps_partial_results(monkeypatch, caplog, n):
+    core_embed = importlib.import_module("rxembed.embed")
+
+    def stall(mol, _cons, **kwargs):
+        ids = kwargs.get("conf_ids") or [conf.GetId() for conf in mol.GetConformers()]
+        record = kwargs.get("record")
+        if record is not None:
+            record.statuses.update(dict.fromkeys(ids, 1))
+        return [0.0] * len(ids)
+
+    monkeypatch.setattr(core_embed, "restrained_uff", stall)
+    monkeypatch.setattr(
+        core_embed.Conformers,
+        "_geometry_failure",
+        lambda _self, cid, _iso=None: (
+            core_embed.Failure("structural_constraint", "missed structural constraint") if cid == 0 else None
+        ),
+    )
+    monkeypatch.setattr(core_embed.Conformers, "_replace_failed", lambda _self, failed, *_args, **_kw: list(failed))
+
+    with caplog.at_level("WARNING", logger="rxembed"):
+        if n == 1:
+            with pytest.raises(rx.EmbeddingError, match="missed structural constraint in 1/1 rejected seeds"):
+                rx.embed("OCCCCO", constrain={(0, 5): (2.6, 3.0)}, n=n, seed=1)
+        else:
+            ens = rx.embed("OCCCCO", constrain={(0, 5): (2.6, 3.0)}, n=n, seed=1)
+            assert ens.n == n - 1
+            assert "embed: kept 1/2 conformers; missed structural constraint" in caplog.text
+
+
+def test_embed_records_the_real_restrained_uff_cleanup(tmp_path):
+    smiles = "C[P]1(C)CC[P](C)(C)->[Ni+2]<-12<-[O-]C(=O)C[N-]->2C"
+    iso = rx.metal(smiles, "SPL")[0]
+    ens = rx.embed(iso, n=1, seed=19, trajectory=True)
+    trail = ens.trajectory
+
+    assert trail.GetNumConformers() > 2
+    assert trail.GetAtomWithIdx(iso.metal).GetSymbol() == "Ni"
+    assert not np.allclose(trail.GetConformer(0).GetPositions(), trail.GetConformer(1).GetPositions())
+    assert np.allclose(
+        trail.GetConformer(trail.GetNumConformers() - 1).GetPositions(), ens.mol.GetConformer().GetPositions()
+    )
+    assert all(report.ok() for report in ens.check().values())
+
+    before = [conf.GetPositions() for conf in trail.GetConformers()]
+    path = ens.dump_trajectory(tmp_path / "cleanup.xyz")
+    assert path.read_text() == "".join(Chem.MolToXYZBlock(trail, confId=conf.GetId()) for conf in trail.GetConformers())
+    for conf, positions in zip(trail.GetConformers(), before, strict=True):
+        np.testing.assert_array_equal(conf.GetPositions(), positions)
+
+    ens.minimize()
+    assert ens.trajectory.GetNumConformers() == trail.GetNumConformers()
+    assert ens[:0].trajectory is None
+
+
+# --- seed vs relax: which stage puts the geometry in the window --------------------------------------------
+#
+# `rxembed.embed()` output must satisfy the constraint windows it was embedded under. Filed here because it
+# drives the pipeline verb, which relaxes its seeds into their windows; the core verb does not. These tests
+# read `ens.ids` straight off `rx.embed` and nothing else, rather than a later stage that would relax first.
+# ---------------------------------------------------------------------------------------------------------
+
+
+# Slack, not zero. The relax honours a window to within numerical noise, but `fix={(i, j): d}` writes a
+# window narrower than UFF's own equilibrium, so a stiff pull settles a hair outside it. These bars are
+# far below the raw-seed violations they catch (17-63 deg, 0.55 A); see the module docstring.
+
 
 _GRAFT_TOL = 0.01  # a fixed core is held exactly: the frozen-core distance assertion the project guarantees
 _AMIDE_CORE = [0, 1, 2, 3]  # the conserved C-C(=O)-N motif: the same leading indices in every analogue below
-_SN2 = "examples/structures/sn2.xyz"
-_SN2_CORE = [4, 0, 5]  # F...C...Cl reacting core, from the templated-TS notebook
 
 
 def _embedded(smiles, seed=1):
     m = Chem.AddHs(Chem.MolFromSmiles(smiles))
     assert rdDistGeom.EmbedMolecule(m, randomSeed=seed) == 0
     return m
+
+
+def test_seed_budget_exhaustion_does_not_claim_geometric_infeasibility(monkeypatch):
+    def no_seeds(mol, _cons, _iso, n, _params, **_kwargs):
+        return mol, [], n
+
+    iso = rx.metal("N->[Pt+2](<-[Cl-])(<-[Br-])<-P", "SPL")[0]
+    monkeypatch.setattr(dispatch, "seed_conformers", no_seeds)
+    with pytest.raises(rx.EmbeddingError, match="found 0/1 DG seeds") as caught:
+        rx.embed(iso, n=1, seed=42)
+    assert str(caught.value).count(str(iso)) == 1, "the isomer is named once"
+    assert "infeasible" not in str(caught.value)
 
 
 def _max_core_drift(mol, ids, core, ref_pos):
@@ -32,133 +356,7 @@ def _max_core_drift(mol, ids, core, ref_pos):
     )
 
 
-def test_threads_reach_both_seed_dispatches(monkeypatch):
-    from rxembed.pipeline import dispatch
-
-    seen = []
-    real = dispatch.seed_conformers
-
-    def capture(mol, _cons, _iso, _n, **kwargs):
-        seen.append(kwargs["threads"])
-        return real(mol, _cons, _iso, _n, **kwargs)
-
-    iso = rx.metal("Br[Pd]1(Cl)NCCN1", "square_planar")[0]
-    monkeypatch.setattr(dispatch, "seed_conformers", capture)
-    monkeypatch.setattr(dispatch._nci, "auto_binding_modes", lambda _mol, seed: {})
-
-    rx.embed(_embedded("CCO"), fix=[0, 1], n=1)
-    rx.embed(_embedded("CCO"), fix=[0, 1], n=1, threads=3)
-    rx.embed("CCO", contacts="auto", n=1, threads=3)
-    rx.embed(iso, n=1, threads=3)
-
-    assert seen == [0, 3, 3, 3]
-
-
 # --- fix: the rigid graft, in each of the three forms the resolver accepts ---------------------------------
-
-
-def test_fix_grafts_indices_and_coordinate_dict():
-    mol = _embedded("CC(=O)Nc1ccccc1", seed=1)
-    own = mol.GetConformer().GetPositions()
-    ens = rx.embed(mol, fix=_AMIDE_CORE, n=6)
-    assert ens.n >= 1
-    assert _max_core_drift(ens.mol, ens.ids, _AMIDE_CORE, own) < _GRAFT_TOL
-
-    ref = _embedded("CC(=O)Nc1ccccc1", seed=7).GetConformer().GetPositions()
-    ens = rx.embed("CC(=O)Nc1ccccc1", fix={i: tuple(ref[i]) for i in _AMIDE_CORE}, n=6)
-    assert ens.n >= 1
-    assert _max_core_drift(ens.mol, ens.ids, _AMIDE_CORE, ref) < _GRAFT_TOL
-
-
-def test_numeric_fix_reaches_explicit_hydrogen():
-    mol = Chem.AddHs(Chem.MolFromSmiles("CN"))
-    n = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "N")
-    h = next(a.GetIdx() for a in mol.GetAtomWithIdx(n).GetNeighbors() if a.GetAtomicNum() == 1)
-    ens = rx.embed(mol, fix={(n, h): 1.20}, n=6).minimize()  # held past its ~1.01 A equilibrium
-    assert ens.n >= 1
-    assert ens.measure((n, h))["mean"] == pytest.approx(1.20, abs=0.1)
-
-
-def test_unqualified_coordinate_free_metal_fails_loudly():
-    with pytest.raises(ValueError, match="plain RDKit embedding does not model metals"):
-        rx.embed("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", n=1)
-
-
-def test_coordinate_free_hydride_uses_the_ml_target_through_a_metal_state():
-    from rxembed import metal_distance as distance
-    from rxembed.metal_constraints import _ML_SEED_HALF_WIDTH
-
-    params = Chem.SmilesParserParams()
-    params.removeHs = False
-    source = Chem.MolFromSmiles("[H][Ru](Cl)(Cl)Cl", params)
-    mol = Chem.AddHs(source)
-    metal, hydride = 1, 0
-    donors = {n.GetIdx() for n in mol.GetAtomWithIdx(metal).GetNeighbors()}
-    target = distance.ml_distance(
-        mol,
-        metal,
-        hydride,
-        44,
-        donors,
-        {},
-        hyb={},
-    )
-    iso = rx.metal(source, "tetrahedral")[0]
-    lo, hi = iso.cons.distances[(hydride, metal)]
-
-    assert (lo + hi) / 2 == pytest.approx(target)
-    assert hi - lo == pytest.approx(2 * _ML_SEED_HALF_WIDTH)
-
-
-def test_geometry_metal_constraint_uses_shared_preparation():
-    selected = rx.metal("CCCN->[Pd+2](<-[Cl-])(<-[Cl-])<-NCCC", "square_planar")[0]
-    source = rx.embed(selected, n=1, seed=1).mol
-    metal = next(atom.GetIdx() for atom in source.GetAtoms() if atom.GetAtomicNum() == 46)
-    donors = [atom.GetIdx() for atom in source.GetAtomWithIdx(metal).GetNeighbors()]
-    carbons = [atom.GetIdx() for atom in source.GetAtoms() if atom.GetAtomicNum() == 6]
-    pair = (carbons[0], carbons[-1])
-    pos = source.GetConformer().GetPositions()
-    target = float(np.linalg.norm(pos[pair[0]] - pos[pair[1]]))
-
-    ens = rx.embed(source, constrain={pair: (target - 0.2, target + 0.2)}, n=1, seed=2)
-
-    assert ens.iso is not None
-    assert set(ens.iso.donors) == set(donors)
-    for donor in donors:
-        lo, hi = ens.cons.distances[(min(metal, donor), max(metal, donor))]
-        assert (lo + hi) / 2 == pytest.approx(float(np.linalg.norm(pos[metal] - pos[donor])))
-    restored = ens.mol
-    assert restored.GetAtomWithIdx(metal).GetAtomicNum() == 46
-    assert all(restored.GetBondBetweenAtoms(donor, metal).GetBondType() == Chem.BondType.DATIVE for donor in donors)
-
-
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_xyz_ts_core_holds_and_passes_gate():
-    from rxembed.pipeline.dispatch import _embed_dispatch
-    from rxembed.pipeline.perceive import read_xyz
-
-    reference = read_xyz(_SN2, 0)
-    ref = reference.GetConformer().GetPositions()
-    seeds = _embed_dispatch(_SN2, fix=_SN2_CORE, n=1)
-    assert _max_core_drift(seeds.mol, seeds.ids, _SN2_CORE, ref) < _GRAFT_TOL
-    for cid in seeds.ids:
-        geom.check(seeds.mol, cid, frozen=_SN2_CORE, reference=reference).assert_ok()
-
-
-def test_rigid_core_and_a_soft_window_compose():
-    mol = _embedded("OC(=O)CCCCc1ccccc1", seed=3)
-    core = [0, 1, 2]  # the carboxyl O, C, =O
-    ref = mol.GetConformer().GetPositions()
-    soft, lo, hi = (1, 9), 3.5, 4.2  # carbonyl C to a ring carbon; free d ~ 7.5 A, so the window must pull
-
-    ens = rx.embed(mol, fix=core, constrain={soft: (lo, hi)}, n=10).minimize()
-    assert ens.n >= 1
-    assert _max_core_drift(ens.mol, ens.ids, core, ref) < _GRAFT_TOL
-    stats = ens.measure(soft)
-    assert stats["min"] >= lo - 0.15
-    assert stats["max"] <= hi + 0.15
-    assert rx.embed(mol, n=8).minimize().measure(soft)["mean"] > hi + 1.0, "the window did not bite vs a free embed"
-    assert any(geom.check(ens.mol, cid, frozen=core).ok() for cid in ens.ids)
 
 
 # --- template: the same graft, expressed as a reference plus a map -----------------------------------------
@@ -179,61 +377,7 @@ def test_smarts_template_needs_two_molecular_graphs():
         rx.embed("CCO", template=(np.zeros((3, 3)), "CCO"), n=1)
 
 
-def test_template_composes_with_source_geometry_fix():
-    ref = _embedded("CC(=O)Nc1ccccc1", seed=5)
-    mol = Chem.Mol(ref)
-    conf = mol.GetConformer()
-    for atom in (2, 3):
-        p = conf.GetAtomPosition(atom)
-        conf.SetAtomPosition(atom, (p.x + 0.4, p.y - 0.3, p.z + 0.2))
-    own = mol.GetConformer().GetPositions()
-    mixed = ref.GetConformer().GetPositions().copy()
-    mixed[[2, 3]] = own[[2, 3]]
-
-    ens = rx.embed(mol, template=(ref, {0: 0, 1: 1}), fix=[2, 3], n=2, seed=1)
-
-    assert sorted(ens.cons.frozen) == [0, 1, 2, 3], "the pipeline dropped the list fix beside template="
-    assert _max_core_drift(ens.mol, ens.ids, [0, 1, 2, 3], mixed) < _GRAFT_TOL, (
-        "the list fix did not take atoms 2/3 from the source's own geometry"
-    )
-
-
-def test_empty_ensemble_cannot_supply_template():
-    ref = rx.embed("CCO", n=1, seed=1)
-    ref.ids.clear()
-
-    with pytest.raises(ValueError, match="tracked conformer"):
-        rx.embed("CCO", template=(ref, {0: 0}), n=1, seed=1)
-
-
-def test_ensemble_template_keeps_smarts_ambiguity_guard():
-    ref = rx.embed("Cc1ccccc1", n=1, seed=1)
-
-    with pytest.raises(ValueError, match="symmetry-equivalent"):
-        rx.embed("CCc1ccccc1", template=(ref, "c1ccccc1"), n=1, seed=1)
-
-
-@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
-def test_auto_contacts_preserve_template_core():
-    smi = "CC(=O)O.n1ccccc1"
-    ref = rx.embed(smi, n=2)
-    ref_pos = ref.mol.GetConformer(ref.ids[0]).GetPositions()
-    core = [0, 1, 2, 3]  # the acetic-acid heavy core
-
-    out = rx.embed(smi, contacts="auto", n=4, template=(ref.mol, {i: i for i in core}))
-    for ens in out if isinstance(out, rx.EnsembleSet) else [out]:
-        assert sorted(ens.cons.frozen) == core, "the template never reached the auto-contacts route"
-        assert _max_core_drift(ens.mol, ens.ids[:1], core, ref_pos) < 1e-6
-
-
-def test_raw_contacts_use_the_shared_constraint_validator():
-    with pytest.raises(ValueError, match="out of range"):
-        rx.embed("CCCC", contacts={(0, 99): (2.0, 3.0)}, n=1)
-
-
 def test_cxsmiles_contacts_use_restored_metal_graph(monkeypatch):
-    from rxembed.pipeline import dispatch
-
     text = rx.cxsmiles(rx.metal("[NH3]->[Pt](<-[NH3])(Cl)Cl.O", "square_planar")[0])
     seen = {}
 
@@ -241,7 +385,7 @@ def test_cxsmiles_contacts_use_restored_metal_graph(monkeypatch):
         seen["mol"] = Chem.Mol(mol)
         return {}
 
-    monkeypatch.setattr(dispatch._nci, "auto_binding_modes", capture)
+    monkeypatch.setattr(dispatch, "auto_binding_modes", capture)
 
     rx.embed(text, contacts="auto", n=1)
 
@@ -251,10 +395,8 @@ def test_cxsmiles_contacts_use_restored_metal_graph(monkeypatch):
 
 
 def test_stated_metal_return_shape_does_not_depend_on_source_representation():
-    from rxembed.pipeline import dispatch
-
     text = rx.cxsmiles(rx.metal("[NH3]->[Pt](<-[NH3])(Cl)Cl", "square_planar")[0])
-    mol = dispatch._normalize(text)[0]
+    mol = rx.parse_smiles(text)
 
     from_text = rx.embed(text, metal="square_planar", n=1, seed=1)
     from_mol = rx.embed(mol, metal="square_planar", n=1, seed=1)
@@ -263,162 +405,99 @@ def test_stated_metal_return_shape_does_not_depend_on_source_representation():
     assert type(from_text) is type(from_mol)
 
 
-def test_metal_candidate_failure_is_not_hidden_by_siblings(monkeypatch):
-    from rxembed.pipeline import dispatch
+def _fail_relax_for(label):
+    """Return a `relax_into_windows` that raises `EmbeddingError` for the isomer with `label` (all when None)."""
+    real = rx.Ensemble.relax_into_windows
 
-    calls = 0
+    def relax(self, **kwargs):
+        if label is None or self.iso.label == label:
+            raise rx.EmbeddingError(f"{self.iso}: synthetic relax failure", isomer=self.iso)
+        return real(self, **kwargs)
 
-    def execute(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("second candidate failed")
-        mol = _embedded("CC")
-        return dispatch.Ensemble(mol, [0])
+    return relax
 
-    monkeypatch.setattr(dispatch, "_execute", execute)
 
-    with pytest.raises(ValueError, match="second candidate failed"):
-        rx.embed("Cl[Pd](Cl)(N)N", metal="square_planar", n=1)
-    assert calls == 2
+def test_multi_isomer_embed_returns_the_isomers_that_embed(monkeypatch, caplog):
+    """An isomer that cannot be built is one WARNING line and one `errors` entry; the others come back."""
+    monkeypatch.setattr(rx.Ensemble, "relax_into_windows", _fail_relax_for("cis"))
+    with caplog.at_level(logging.WARNING, logger="rxembed"):
+        result = rx.embed("Cl[Pd](Cl)(N)N", metal="square_planar", n=1, seed=1)
+
+    assert [ens.tag["label"] for ens in result] == ["trans"]
+    assert [err.isomer.label for err in result.errors] == ["cis"]
+    assert [record.getMessage() for record in caplog.records] == [str(result.errors[0])]
+    assert result.minimize().errors == result.errors, "a mapped verb keeps the record"
+
+
+def test_multi_isomer_embed_raises_only_when_no_isomer_embeds(monkeypatch, caplog):
+    monkeypatch.setattr(rx.Ensemble, "relax_into_windows", _fail_relax_for(None))
+    with pytest.raises(rx.EmbeddingError, match="none of 2 candidates could be built; first: Pd"):
+        rx.embed("Cl[Pd](Cl)(N)N", metal="square_planar", n=1, seed=1)
+
+    caplog.clear()
+    iso = rx.metal("Cl[Pd](Cl)(N)N", "square_planar")[0]
+    with caplog.at_level(logging.WARNING, logger="rxembed"), pytest.raises(rx.EmbeddingError) as caught:
+        rx.embed(iso, n=1, seed=1)
+    assert caught.value.isomer is iso
+    assert not caplog.records, "a lone isomer raises its own error instead of warning first"
+
+
+def _fail_relax_for_stereo(label):
+    """Return a `relax_into_windows` that raises `EmbeddingError` for the stereoisomer tagged `label`."""
+    real = rx.Ensemble.relax_into_windows
+
+    def relax(self, **kwargs):
+        if self.tag.get("stereo") == label:
+            raise rx.EmbeddingError(f"{label}: synthetic relax failure")
+        return real(self, **kwargs)
+
+    return relax
+
+
+def test_separate_stereo_keeps_a_failed_configuration_with_its_errors(monkeypatch):
+    monkeypatch.setattr(rx.Ensemble, "relax_into_windows", _fail_relax_for_stereo("C1:R"))
+    result = rx.embed("CC(O)CC", n=1, seed=1, stereo="separate")
+
+    assert [[ens.tag["stereo"] for ens in group] for group in result] == [["C1:S"], []]
+    assert [[str(err) for err in group.errors] for group in result] == [[], ["C1:R: synthetic relax failure"]]
 
 
 def test_empty_metal_candidate_is_not_published(monkeypatch):
-    from rxembed.pipeline import dispatch
-
     monkeypatch.setattr(dispatch, "_execute", lambda *args, **kwargs: dispatch.Ensemble(_embedded("CC"), []))
 
-    with pytest.raises(ValueError, match="no conformer satisfied"):
+    with pytest.raises(rx.EmbeddingError, match=r"no conformer satisfied the constraints; try another seed=$"):
         rx.embed("Cl[Pd](Cl)(N)N", metal="square_planar", n=1)
 
 
-def test_empty_identity_expansion_names_the_candidate_axis(monkeypatch):
-    from rxembed.pipeline import dispatch
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+def test_geometry_source_is_normalized_once_for_stereo(tmp_path):
+    """An xyz input's helical twist keeps its hand through a constrained re-embed.
 
-    monkeypatch.setattr(dispatch, "enumerate_isomers", lambda *args, **kwargs: [])
+    A [5]helicene's P/M twist is not a bonds-matrix property (unlike a tetrahedral centre), so a plain
+    re-embed can flip it; only reading the input's own signature back (dispatch._stereo_filter) catches that.
+    The check only runs while relaxing into a window, so the re-embed needs one trivial fix= to engage it.
+    """
+    helicene = Chem.AddHs(Chem.MolFromSmiles("c1ccc2c(c1)ccc1ccc3ccc4ccccc4c3c12"))
+    assert rdDistGeom.EmbedMolecule(helicene, randomSeed=1, useRandomCoords=True) == 0
+    rdForceFieldHelpers.MMFFOptimizeMolecule(helicene, maxIters=5000)
+    hand = signature(helicene, charge=0)["helical"]
 
-    with pytest.raises(ValueError, match="no feasible coordination identity"):
-        rx.embed("Cl[Pd](Cl)(N)N", metal="square_planar", n=1)
+    conf = helicene.GetConformer()
+    fix = {(0, 1): round(conf.GetAtomPosition(0).Distance(conf.GetAtomPosition(1)), 3)}
+    xyz = tmp_path / "helicene.xyz"
+    xyz.write_text(Chem.MolToXYZBlock(helicene))
 
-
-def test_geometry_source_is_normalized_once_for_stereo(monkeypatch):
-    from rxembed.pipeline import dispatch
-
-    normalized = _embedded("CC")
-    normalized_calls = []
-    signature_calls = []
-    monkeypatch.setattr(
-        dispatch, "_normalize", lambda source, charge=0: (normalized_calls.append(source) or normalized, True)
-    )
-    monkeypatch.setattr(
-        dispatch._stereo,
-        "signature",
-        lambda mol, charge=0: signature_calls.append(mol) or {},
-    )
-    monkeypatch.setattr(
-        dispatch,
-        "_execute",
-        lambda *args, **kwargs: dispatch.Ensemble(normalized, [normalized.GetConformer().GetId()]),
-    )
-
-    dispatch._embed_dispatch("input.xyz", n=1, stereo="all")
-
-    assert normalized_calls == ["input.xyz"]
-    assert signature_calls == [normalized]
+    ens = rx.embed(str(xyz), n=1, seed=3, fix=fix)
+    assert signature(ens.mol, conf_id=ens.ids[0], charge=0)["helical"] == hand
 
 
 # --- contacts: a discovered binding mode is one the embed can actually realise ------------------------------
 
 
-@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
-def test_auto_contacts_form_hydrogen_bonds():
-    es = rx.embed("OC(=O)c1ccccc1.n1ccccc1", contacts="auto", n=6)  # acid + pyridine
-    for ens in es if isinstance(es, rx.EnsembleSet) else [es]:
-        assert ens.n >= 1
-        grip = ens.cons.contacts[0]
-        assert grip, "a discovered binding mode must seed a releasable contact"
-        settled = ens.minimize()
-        for cid in settled.ids:
-            geom.check(settled.mol, cid, constraints=settled.cons).assert_ok()
-        for pair in grip:
-            lo, hi = settled.cons.distances[pair]
-            measured = settled.measure(pair)
-            positions = [(measured[key] - lo) / (hi - lo) for key in ("min", "max")]
-            assert positions[0] >= 0.0, f"the seeded grip fell below its window at position {positions[0]:.3f}"
-            assert positions[1] < 0.8, f"the seeded grip rode its upper wall at position {positions[1]:.3f}"
-
-
-def test_stereo_and_contact_candidates_compose_before_embedding(monkeypatch):
-    from rxembed.pipeline import dispatch
-
-    modes = {"near": dispatch._nci.Contact(), "far": dispatch._nci.Contact()}
-    monkeypatch.setattr(dispatch._nci, "auto_binding_modes", lambda _mol, seed: modes)
-
-    result = rx.embed("CC(N)O.N", contacts="auto", n=1, seed=1)
-
-    assert isinstance(result, rx.EnsembleSet)
-    assert {(ens.tag["stereo"], ens.tag["nci"]) for ens in result} == {
-        (hand, mode) for hand in ("C1:R", "C1:S") for mode in modes
-    }
-
-
-# --- the organic path pays nothing for the metal path ------------------------------------------------------
-
-
 # --- rx.metal: what spec the isomer enumerator hands down ---------------------------------------------------
 
 
-def test_numeric_metal_fix_needs_no_input_geometry():
-    iso = rx.metal("P->[Pd](Cl)Cl", "square_planar", fix={(0, 1): 2.1})[0]
-    assert iso.cons.fixed[(0, 1)] == (2.1, 2.1)
-
-
-@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
-def test_shape_hold_carries_the_spectator_sphere():
-    iso = rx.metal("examples/structures/mn-h2.xyz", "octahedral", center="Mn", fix=[1, 5, 63, 64, 65, 66])[0]
-    spectators = {m for m in iso.cons.metals if m != iso.metal}
-    assert spectators, "mn-h2 is bimetallic: the ferrocene Fe must be surrogated as a spectator"
-    assert spectators <= set().union(*iso.cons.shapes), "the spectator's sphere is the rigid body hold_shape pinned"
-    states = {state.atom: state for state in iso.centres}
-    assert spectators <= states.keys()
-    assert all(any(getattr(site, "winding", "") for site in states[metal].vertices) for metal in spectators)
-    assert not [k for k in iso.cons.pulls if spectators & set(k)]
-    for donor in iso.donors:
-        pair = (min(iso.metal, donor), max(iso.metal, donor))
-        assert (pair in iso.cons.pulls) != ({iso.metal, donor} <= iso.cons.frozen)
-    assert iso.cons.relaxed().shapes == iso.cons.shapes, "mc(explore=) must not release a structural shape hold"
-
-    from_smiles = rx.metal("CCCN[Pd](Cl)(Cl)NCCC", "square_planar")[0]  # no input geometry -> nothing shape-held
-    assert not from_smiles.cons.shapes
-    assert len(from_smiles.cons.pulls) == len(from_smiles.donors)
-
-
-# The subject below is the core's `bounds._bounds`; it is pinned here because the spec that reaches it is
-# the dispatch's, and this file is where that spec is otherwise exercised.
-def test_reversed_angle_preserves_distance_window():
-    from rxembed import bounds
-    from rxembed.constraints import Constraints, add_distance
-
-    mol = _embedded("CCCC", seed=1)
-
-    def window(angle_key):
-        c = Constraints()
-        add_distance(c.distances, 0, 3, 1.50, 1.56)
-        c.angles[angle_key] = (95.0, 105.0)
-        bm, _tol = bounds._bounds(mol, c)
-        return bm[3][0], bm[0][3]  # (lo, hi) for the pair (0, 3)
-
-    assert window((0, 1, 3)) == pytest.approx(window((3, 1, 0))), "angle index ORDER changed the bounds"
-    assert window((3, 1, 0)) == pytest.approx((1.50, 1.56), abs=1e-6), "the explicit window was clobbered"
-
-
 # --- rx.minimize: the search-free companion ----------------------------------------------------------------
-
-
-def test_minimize_relaxes_existing_geometry():
-    mol = _embedded("CCCCCCC", seed=1)  # heptane; pull the two ends together
-    mean = rx.minimize(mol, constrain={(0, 6): (3.0, 3.4)}).measure((0, 6))["mean"]
-    assert 2.85 <= mean <= 3.55
 
 
 def test_minimize_accepts_xyz_and_rejects_smiles(tmp_path):
@@ -435,78 +514,15 @@ def test_minimize_accepts_xyz_and_rejects_smiles(tmp_path):
 # Its graph-level contract lives in tests/test_stereo.py; these are the pipeline checks.
 
 
-def _configs(es):
-    return sorted(e.tag.get("stereo") for e in es)
+def test_unembeddable_stereoisomer_is_skipped_and_recorded(monkeypatch):
+    def execute(spec, **_kwargs):
+        if any(bond.GetStereo() == Chem.BondStereo.STEREOE for bond in spec.GetBonds()):
+            raise RuntimeError("synthetic E failure")
+        mol = _embedded("CC")
+        return dispatch.Ensemble(mol, [0])
 
-
-def test_hands_return_as_tagged_ensemble_set():
-    es = rx.embed("CC(N)C(=O)O", n=3)  # undefined alpha-carbon
-    assert isinstance(es, rx.EnsembleSet)
-    assert _configs(es) == ["C1:R", "C1:S"]  # atom-qualified, index-keyed CIP tags
-    for e in es:
-        em = e.minimize()  # the raw ETKDG seed can carry a conjugation twist; minimise, then read the hand
-        Chem.AssignStereochemistryFrom3D(em.mol, confId=em.ids[0])
-        ((idx, code),) = Chem.FindMolChiralCenters(em.mol, useLegacyImplementation=False)
-        symbol = em.mol.GetAtomWithIdx(idx).GetSymbol()
-        assert e.tag["stereo"] == f"{symbol}{idx}:{code}"
-
-
-@pytest.mark.parametrize(
-    ("smi", "kw"),
-    [
-        pytest.param("C[C@H](N)C(=O)O", {}, id="defined-centre-kept"),
-        pytest.param("CCO", {}, id="no-stereocentre"),
-        pytest.param("CC(N)C(=O)O", {"stereo": "free"}, id="stereo-free-opts-out"),
-    ],
-)
-def test_no_stereo_returns_ensemble(smi, kw):
-    assert isinstance(rx.embed(smi, n=2, **kw), rx.Ensemble)
-
-
-@pytest.mark.parametrize(
-    ("smi", "n_candidates", "why"),
-    [
-        pytest.param(
-            "CC=CC(N)O", 4, "one undefined C x one undefined C=C: the E/Z axis reaches the route too", id="alkene"
-        ),
-        pytest.param("CC(O)C(O)C", 3, "two centres, but the meso pair collapses; 3 candidates, not 4", id="meso"),
-    ],
-)
-def test_stereo_expansion_returns_candidate_count(smi, n_candidates, why):
-    es = rx.embed(smi, n=2)
-    assert isinstance(es, rx.EnsembleSet)
-    assert len(es) == n_candidates, why
-    if n_candidates == 4:
-        assert any(":E" in c for c in _configs(es))
-        assert any(":Z" in c for c in _configs(es))
-
-
-def test_stereo_axis_composes_with_metal_axis():
-    # an aminoacidate on Pd: 2 ligand enantiomers x the square-planar coordination isomers
-    r = rx.embed("CC(N)C(=O)[O-]->[Pd]([Cl])[Cl]", metal="square_planar", n=2)
-    assert isinstance(r, rx.EnsembleSet)
-    assert {"C1:R", "C1:S"} == {e.tag["stereo"] for e in r}
-    assert {"cis", "trans"} <= {e.tag["label"] for e in r}
-    for e in r:  # every candidate carries both axes
-        assert e.tag.get("stereo")
-        assert e.tag.get("label")
-
-
-def test_allene_axis_stays_a_bare_chainable_ensemble():
-    # RDKit can't enumerate allene/cumulene axial chirality from a flat SMILES -> one arbitrary hand, not an
-    # EnsembleSet-of-1 (that would break the documented rx.embed(smi).mc().prune() chain), and no '?' tag.
-    r = rx.embed("CC(F)=C=C(F)C", n=2)
-    assert isinstance(r, rx.Ensemble)
-    assert hasattr(r, "mc")
-    assert "?" not in (r.tag.get("stereo") or "")
-
-
-def test_unembeddable_stereoisomer_is_skipped():
-    # trans-cyclooctene is too strained for ETKDG (0 conformers); only the embeddable Z survives, and no
-    # dead 0-conformer candidate is kept in the result. Asserting the E is GONE, not just that whatever came
-    # back is non-empty: a kept 0-conformer E candidate satisfied the latter and left the claim untested.
+    monkeypatch.setattr(dispatch, "_execute", execute)
     r = rx.embed("C1CCC=CCCC1", n=1)
-    assert isinstance(r, rx.Ensemble), "one surviving candidate must collapse to a bare Ensemble, not a set"
-    assert r.n >= 1, "the embeddable Z was dropped too"
-    stereo = {e.tag.get("stereo") for e in r}
-    assert stereo == {"C3=C4:Z"}, f"the unembeddable E was kept as a dead candidate: {stereo}"
+
+    assert [ens.tag.get("stereo") for ens in r] == ["C3=C4:Z"]
+    assert [str(err) for err in r.errors] == ["stereoisomer [C3=C4:E]: could not embed molecule: synthetic E failure"]

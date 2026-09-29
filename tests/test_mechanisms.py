@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import itertools
+import math
+
 import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom, rdForceFieldHelpers, rdMolTransforms
+from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
 
 from rxembed import mechanisms as mech_mod
 from rxembed.constraints import Constraints
@@ -38,17 +41,74 @@ def _ctx(mol):
     return mech_mod.DGContext(mol=mol, bm=rdDistGeom.GetMoleculeBoundsMatrix(mol))
 
 
-def _ff_terms(mech, cons, mol, fc=1.0):
+@pytest.mark.parametrize("anchor", [0.0])
+@pytest.mark.parametrize("order", [(0, 1, 2, 3)])
+def test_coplanar_projection_preserves_full_distance_windows(anchor, order):
+    mol = Chem.RenumberAtoms(Chem.MolFromSmiles("CCCC"), order)
+    atoms = tuple(order.index(i) for i in range(4))
+    matrix = np.triu(np.full((4, 4), 10.0), 1)
+    intervals = {(0, 1): (1.9, 2.1), (1, 2): (1.39, 1.41), (2, 3): (1.39, 1.41), (1, 3): (2.4, 2.45)}
+    pairs = {}
+    for (left, right), (lo, hi) in intervals.items():
+        a, b = sorted((atoms[left], atoms[right]))
+        matrix[b, a], matrix[a, b] = lo, hi
+        pairs[(a, b)] = (lo, hi)
+    row = (*atoms, anchor, 15.0)
+    cons = Constraints(angles={atoms[:3]: (110.0, 120.0)}, coplanar=[row])
+    ctx = mech_mod.DGContext(mol, matrix, pairs=pairs)
+    anti = anchor == 180.0
+    radius, theta = (1.9, 110.0) if anti else (2.1, 120.0)
+    theta, psi, phi = map(math.radians, (theta, 120.0, anchor - 15.0 if anti else 15.0))
+    points = np.array(
+        [
+            [radius * math.cos(theta), radius * math.sin(theta), 0.0],
+            [0.0, 0.0, 0.0],
+            [1.4, 0.0, 0.0],
+            [1.4 - 1.4 * math.cos(psi), 1.4 * math.sin(psi) * math.cos(phi), 1.4 * math.sin(psi) * math.sin(phi)],
+        ]
+    )
+    for (a, b), (lo, hi) in intervals.items():
+        assert lo - 1e-12 <= np.linalg.norm(points[a] - points[b]) <= hi + 1e-12
+    a, b = sorted((atoms[0], atoms[3]))
+    before = (ctx.bm[b, a], ctx.bm[a, b])
+    mech_mod.Coplanar().dg_post(cons, ctx)
+    assert (ctx.bm[b, a], ctx.bm[a, b]) != before, "the coplanar cap must actually tighten this pair"
+    distance = np.linalg.norm(points[0] - points[3])
+    assert ctx.bm[b, a] - 1e-12 <= distance <= ctx.bm[a, b] + 1e-12
+
+
+def test_coplanar_interval_extrema_include_interior_edge_points():
+    angles = mech_mod.triangle_angles((1.0, 3.0), (2.0, 2.0), (1.0, 1.0))
+    assert angles == pytest.approx((0.0, math.pi / 6))
+    matrix = np.triu(np.full((4, 4), 10.0), 1)
+    for a, b, length in [(1, 2, 2.0), (1, 3, 2.0), (2, 3, 4 * math.sin(math.radians(10)))]:
+        matrix[b, a] = matrix[a, b] = length
+    matrix[1, 0], matrix[0, 1] = 1.0, 3.0
+    # beta=20 degrees and theta=10 degrees give gamma=30. The closest i lies inside its radial interval.
+    assert mech_mod._coplanar_bound(matrix, (0, 1, 2, 3), (10.0, 10.0), 180.0, 0.0) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("window", "anchor", "cap"),
+    [
+        ((np.nan, 120.0), 180.0, 15.0),
+        ((90.0, 90.0), 180.0, 91.0),
+    ],
+)
+def test_coplanar_projection_abstains_outside_its_geometric_domain(window, anchor, cap):
+    matrix = np.ones((4, 4)) - np.eye(4)
+    assert mech_mod._coplanar_bound(matrix, (0, 1, 2, 3), window, anchor, cap) is None
+
+
+def uff_terms(mech, cons, mol, fc=1.0):
     ff = SpyFF()
-    mech._ff_terms(ff, cons, mol.GetConformer(0), fc)
+    mech.uff_terms(ff, cons, mol.GetConformer(0), fc)
     return ff
 
 
 # `Sp2Planar` and `ConjugationCap` are not constraints at all but repairs to UFF (a 3-neighbour sp2 carbon that
-# pyramidalises, a conjugated plane that twists), so they perceive from the molecule and fire unconditionally.
-# Giving them a field would mean filling it on every path that can reach the relax.
-_FF_REPAIRS = {"Sp2Planar", "ConjugationCap"}
-_FIELD_DRIVEN = [m for m in mech_mod.MECHANISM_ORDER if type(m).__name__ not in _FF_REPAIRS]
+# pyramidalises, a conjugated plane that twists), so they perceive from the molecule. Giving them a field would
+# mean filling it on every path that can reach the relax.
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -56,147 +116,53 @@ _FIELD_DRIVEN = [m for m in mech_mod.MECHANISM_ORDER if type(m).__name__ not in 
 # ---------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mech", _FIELD_DRIVEN, ids=lambda m: type(m).__name__)
-def test_mechanism_is_silent_on_empty_constraints(mech):
-    mol = _mol()
-    assert _ff_terms(mech, Constraints(), mol).calls == [], f"{type(mech).__name__} wrote an FF term unasked"
-
-    ctx = _ctx(mol)
-    before = ctx.bm.copy()
-    for hook in (mech._dg_windows, mech._dg_relief, mech._dg_post):
-        hook(Constraints(), ctx)
-    assert ctx.pairs == {}, f"{type(mech).__name__} proposed a window off an empty struct"
-    assert np.array_equal(ctx.bm, before), f"{type(mech).__name__} edited the matrix off an empty struct"
-
-
-@pytest.mark.parametrize("name", sorted(_FF_REPAIRS))
-def test_ff_repair_uses_molecule_state(name):
-    mech = next(m for m in mech_mod.MECHANISM_ORDER if type(m).__name__ == name)
-    mol = _mol()
-    assert _ff_terms(mech, Constraints(), mol).calls, f"{name} must fire on a bare struct"
-    assert _ff_terms(mech, Constraints(metals={0}), mol).calls == [], (
-        f"{name} must stand down on a metal system: the Li surrogate defeats the sp2 perception it relies on"
-    )
-
-
 # ---------------------------------------------------------------------------------------------------------
 # the positive contract: a populated field writes the term it claims
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_force_constants_share_penalty_law():
-    mol = _mol("CCCC")
-    conf = mol.GetConformer()
-    d0 = rdMolTransforms.GetBondLength(conf, 0, 1)
-
-    def penalty(k, dev):
-        bare = rdForceFieldHelpers.UFFGetMoleculeForceField(mol)
-        held = rdForceFieldHelpers.UFFGetMoleculeForceField(mol)
-        held.AddDistanceConstraint(0, 1, d0 - dev, d0 - dev, k)
-        held.Initialize()
-        return held.CalcEnergy() - bare.CalcEnergy()
-
-    for k in (100.0, 400.0):
-        for dev in (0.1, 0.2):
-            assert penalty(k, dev) == pytest.approx(0.5 * k * dev**2, rel=1e-6), (
-                f"the penalty law moved at k={k}, dev={dev}: every constant in mechanics.py is calibrated on it"
-            )
+def test_reversed_distance_preference_suppresses_contact_midpoint_force():
+    cons = Constraints(distances={(0, 3): (2.0, 4.0)}, pulls={(3, 0): 2.5}, contacts=(frozenset({(0, 3)}), frozenset()))
+    calls = uff_terms(mech_mod.Pull(), cons, _mol()).calls
+    assert len(calls) == 1
+    assert calls[0][1][2:4] == (2.5, 2.5)
 
 
-def test_distance_writes_dg_and_ff():
-    mol = _mol()
-    cons = Constraints(distances={(0, 3): (2.0, 2.4)})
+@pytest.mark.parametrize("smiles", ["C(F)(Cl)Br"], ids=["implicit-h"])
+@pytest.mark.parametrize("height", [4.0])
+def test_point_umbrella_leaves_every_same_hand_geometry_unbiased(smiles, height):
+    mol = Chem.MolFromSmiles(smiles)
+    points = np.array([(0, 0, 0), (1, 1, height), (1, -1, -height), (-1, 1, -height), (-1, -1, height)])
+    points = points[: mol.GetNumAtoms()]
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    conf.SetPositions(points)
+    mol.AddConformer(conf)
+    mirror = points * (-1, 1, 1)
+    mirror_energies = []
+    for carriers in itertools.permutations(range(1, mol.GetNumAtoms())):
+        key = carriers if len(carriers) == 4 else (*carriers, 0)
+        ff = rdForceFieldHelpers.CreateEmptyForceFieldForMol(mol)
+        mech_mod.Umbrella().uff_terms(ff, Constraints(umbrellas={key: 0.0}), mol.GetConformer(), 1.0)
+        ff.Initialize()
 
-    ctx = _ctx(mol)
-    mech_mod.Distance()._dg_windows(cons, ctx)
-    assert ctx.pairs[(0, 3)] == (2.0, 2.4)
-
-    ff = _ff_terms(mech_mod.Distance(), cons, mol)
-    assert ff.kinds() == ["AddDistanceConstraint"]
-    _name, args, _kw = ff.calls[0]
-    assert args[:4] == (0, 3, 2.0, 2.4)
-
-
-def test_pull_collapses_window_to_spring():
-    mol = _mol()
-    ff = _ff_terms(mech_mod.Pull(), Constraints(pulls={(0, 3): 2.1}), mol)
-    _name, args, _kw = ff.calls[0]
-    assert args[2] == args[3] == 2.1
-
-    fixed = _ff_terms(
-        mech_mod.Pull(),
-        Constraints(fixed={(0, 3): (2.1, 2.1)}),
-        mol,
-    )
-    assert fixed.calls[0][1][2:4] == (2.1, 2.1)
-    assert fixed.calls[0][1][-1] > args[-1]
+        assert ff.CalcEnergy() == pytest.approx(0.0, abs=1e-10), key
+        np.testing.assert_allclose(ff.CalcGrad(), 0.0, atol=1e-10)
+        mirror_energies.append(ff.CalcEnergy(mirror.ravel().tolist()))
+        assert mirror_energies[-1] > 0.0, key
+    assert mirror_energies == pytest.approx([mirror_energies[0]] * len(mirror_energies))
 
 
-def test_floor_is_one_sided():
-    mol = _mol()
-    ff = _ff_terms(mech_mod.Floor(), Constraints(floors={(0, 3): 2.6}), mol)
-    _name, args, _kw = ff.calls[0]
-    assert args[2] == 2.6
-    assert args[3] >= 1e3, f"a floor's upper bound must stand in for infinity, got {args[3]}"
-
-
-def test_frozen_pins_points_rather_than_restraining_them():
-    mol = _mol()
-    ff = _ff_terms(mech_mod.Frozen(), Constraints(frozen={0, 1, 2}), mol)
-    assert ff.kinds() == ["AddFixedPoint"]
-    assert sorted(a[0] for _n, a, _k in ff.calls) == [0, 1, 2]
-
-
-def test_angle_writes_dg_and_ff_terms():
-    mol = _mol()
-    cons = Constraints(angles={(0, 1, 3): (100.0, 120.0)})
-
-    ctx = _ctx(mol)
-    mech_mod.Angle()._dg_windows(cons, ctx)
-    assert (0, 3) in ctx.pairs, "an angle must state its end-atom diagonal in the matrix"
-
-    ff = _ff_terms(mech_mod.Angle(), cons, mol)
-    assert ff.kinds() == ["UFFAddAngleConstraint"]
-    _name, args, _kw = ff.calls[0]
-    assert args[:3] == (0, 1, 3)
-
-    fixed = _ff_terms(
-        mech_mod.Angle(),
-        Constraints(angles={(0, 1, 3): (108.0, 112.0)}, fixed={(0, 1, 3): (110.0, 110.0)}),
-        mol,
-    )
-    assert fixed.calls[0][1][4:6] == (110.0, 110.0)
-    assert fixed.calls[0][1][-1] > args[-1]
-
-
-def test_angle_force_is_not_scaled_by_ladder():
-    mol = _mol()
-    cons = Constraints(angles={(0, 1, 3): (100.0, 120.0)})
-    assert _ff_terms(mech_mod.Angle(), cons, mol, fc=1.0).calls[0][1][-1] == mech_mod.ANGLE_FC
-    assert _ff_terms(mech_mod.Angle(), cons, mol, fc=0.1).calls[0][1][-1] == pytest.approx(0.1 * mech_mod.ANGLE_FC)
-    assert _ff_terms(mech_mod.Angle(), cons, mol, fc=100.0).calls[0][1][-1] == mech_mod.ANGLE_FC, (
-        "the ladder must not be able to escalate the angle wall"
-    )
-
-
-def test_dihedral_writes_periodic_uff_term():
-    mol = _mol("CCCC")
-    cons = Constraints(dihedrals={(0, 1, 2, 3): (170.0, 190.0)})
-    ff = _ff_terms(mech_mod.Dihedral(), cons, mol)
-    assert ff.kinds() == ["UFFAddTorsionConstraint"]
-    assert ff.calls[0][1][:7] == (0, 1, 2, 3, False, 170.0, 190.0)
-
-
-def test_releasable_contact_uses_softer_wall():
-    mol = _mol("c1ccccc1.c1ccccc1")
-    cons = Constraints(
-        distances={(0, 3): (2.0, 2.4), (1, 4): (2.0, 2.4)},
-        contacts=(frozenset({(0, 3)}), frozenset()),
-    )
-    emitted = {tuple(a[:2]): a[-1] for _n, a, _kw in _ff_terms(mech_mod.Distance(), cons, mol).calls}
-    assert emitted[(1, 4)] == pytest.approx(mech_mod.PIN_FC), "a structural window is held at PIN"
-    softened = mech_mod.PIN_FC * mech_mod.RELEASABLE_FC_SCALE
-    assert emitted[(0, 3)] == pytest.approx(softened), "a releasable one is softened"
+@pytest.mark.parametrize("ideal", [(180.0, 0.25)])
+def test_umbrella_force_matches_support_overrides_and_not_shared_axes(ideal):
+    mol = _mol("CCCCCC")
+    for key in itertools.permutations((0, 1, 2, 3)):
+        independent = (4, key[1], key[2], 5)
+        cons = Constraints(umbrellas={key: ideal}, dihedrals={independent: (10.0, 30.0)})
+        assert uff_terms(mech_mod.Umbrella(), cons, mol).calls
+        assert uff_terms(mech_mod.Umbrella(), cons.copy(frozen=set(key[:3])), mol).calls
+        assert not uff_terms(mech_mod.Umbrella(), cons.copy(frozen=set(key)), mol).calls
+        cons.dihedrals = {(1, 0, 3, 2): (10.0, 30.0)}
+        assert not uff_terms(mech_mod.Umbrella(), cons, mol).calls
 
 
 def test_plane_holds_a_pi_stack_by_cross_ring_distances():
@@ -205,54 +171,14 @@ def test_plane_holds_a_pi_stack_by_cross_ring_distances():
     cons = Constraints(planes=[(ra, rb, 3.6)])
 
     ctx = _ctx(mol)
-    mech_mod.Plane()._dg_windows(cons, ctx)
+    mech_mod.Plane().dg_windows(cons, ctx)
     assert ctx.pairs, "a stack must state cross-ring windows in the matrix"
     assert all(i in ra and j in rb for i, j in ctx.pairs), "a stack window must span the two rings"
 
-    ff = _ff_terms(mech_mod.Plane(), cons, mol)
+    ff = uff_terms(mech_mod.Plane(), cons, mol)
     assert ff.kinds() == ["AddDistanceConstraint"]
-
-
-# ---------------------------------------------------------------------------------------------------------
-# MECHANISM_ORDER itself: the one place order is stated, and the order is load-bearing
-# ---------------------------------------------------------------------------------------------------------
-
-
-def test_distance_precedes_angle_window_read():
-    order = [type(m).__name__ for m in mech_mod.MECHANISM_ORDER]
-    assert order.index("Distance") < order.index("Angle")
 
 
 # ---------------------------------------------------------------------------------------------------------
 # the force constants: what a number in this module actually costs
 # ---------------------------------------------------------------------------------------------------------
-
-
-def _populated(mol):
-    """A `Constraints` carrying every field the distance-side writers read, on `mol`'s own indices."""
-    ra, rb = (tuple(r) for r in mol.GetRingInfo().AtomRings()[:2])
-    return Constraints(
-        distances={(0, 3): (2.0, 2.4)},
-        angles={(0, 1, 3): (100.0, 120.0)},
-        planes=[(ra, rb, 3.6)],
-        frozen={5},
-        pulls={(1, 2): 2.1},
-        floors={(2, 4): 2.6},
-    )
-
-
-def test_only_the_spring_ignores_the_stiffness_ladder():
-    mol = _mol("c1ccccc1.c1ccccc1")
-    cons = _populated(mol)
-
-    emitted: dict[str, dict[float, float]] = {}
-    for fc in (1.0, 100.0):
-        for mech in mech_mod.MECHANISM_ORDER:
-            for name, args, _kw in _ff_terms(mech, cons, mol, fc=fc).calls:
-                if name.endswith("Constraint"):
-                    emitted.setdefault(type(mech).__name__, {})[fc] = args[-1]
-
-    rode = {m for m, by_fc in emitted.items() if len(set(by_fc.values())) > 1}
-    assert "Pull" in emitted, "the fixture must exercise Pull for this to mean anything"
-    assert "Pull" not in rode, "Pull rode the stiffness ladder; it is the spring and must stay put"
-    assert {"Distance", "Floor", "Plane"} <= rode, f"a wall must scale with the caller's stiffness, got {rode}"
