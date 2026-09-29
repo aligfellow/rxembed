@@ -18,6 +18,7 @@ from .utils import (
     DISCONNECTED,
     bond_removal_mirrors,
     cip_cache_key,
+    flat_ranks,
     mirror_tag,
     remove_bond,
     repair_bond_stereo,
@@ -482,6 +483,17 @@ def _point_capability(mol, work, cap_to_metal=(), exclude=()):
         if work.GetAtomWithIdx(index).GetAtomicNum() == 7  # noqa: PLR2004  nitrogen
         and work.GetAtomWithIdx(index).GetFormalCharge() == 0
     )
+    # Carriers only the drawn Lewis form tells apart, such as a phenyl drawn as a quinoid carbanion, are one
+    # group: bond orders and charges move no atom, so the centre has no hand, whether tagged or perceived.
+    flat = flat_ranks(work)
+    lewis_only = {
+        index
+        for index in stated | potential
+        if len({flat[n.GetIdx()] for n in work.GetAtomWithIdx(index).GetNeighbors()})
+        < len({ranks[n.GetIdx()] for n in work.GetAtomWithIdx(index).GetNeighbors()})
+    }
+    stated -= lewis_only
+    potential -= lewis_only
     candidates = stated | potential
     supported = {
         idx for idx in candidates if idx < work.GetNumAtoms() and _rdkit_3d_point_capable(work.GetAtomWithIdx(idx))

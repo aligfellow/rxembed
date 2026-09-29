@@ -265,3 +265,15 @@ Related projects:
 - [Molassembler](https://github.com/qcscine/molassembler): molecular graphs, coordination stereochemistry and conformer generation
 - [racerTS](https://github.com/digital-chemistry-laboratory/racerts): efficient conformer sampling for transition states
 - [OIN-SMILES](https://github.com/tjmustard/OIN-SMILES): lossless conversion between 3D XYZ structures and 1D SMILES
+
+## Metal performance
+
+Each structure is read from its XYZ, written as a CX SMILES, and embedded fresh from that CX string; it
+passes when the embedded CX matches. `just bench` runs the 100 shipped fixtures, `just bench tmqmg
+--size N` a diverse tmQMg sample.
+
+![pass rate by class: fixtures](benchmark/docs/fixtures_by_class.png)
+![pass rate by class: tmQMg sample](benchmark/docs/tmqmg_by_class.png)
+
+[benchmark/README.md](benchmark/README.md) has timings, per-metal breakdowns, core RMSD and the sample's
+coverage of tmQMg.

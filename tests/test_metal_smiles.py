@@ -189,6 +189,17 @@ def test_zero_order_contact_is_written_but_is_not_constitution():
     assert Chem.MolToCXSmiles(mol) == before
 
 
+def test_diphenyl_sulfonium_ylide_drawn_with_a_quinoid_phenyl_has_no_sulfur_hand():
+    """Only the drawn Lewis form tells the two phenyls apart, so S carries no hand and the CX round-trips."""
+    mol = Chem.AddHs(Chem.MolFromSmiles("[Cl-]->[Au+]<-[CH2-][S+2](c1ccccc1)=C1C=C[CH-]C=C1"))
+    assert rdDistGeom.EmbedMolecule(mol, randomSeed=7) == 0
+
+    text = rx.cxsmiles(mol)
+
+    assert "[S+2]" in text
+    assert rx.cxsmiles(rx.embed(text, n=1, seed=7).mol) == text
+
+
 def test_cx_fields_losslessly_retain_conjugated_imine_ez():
     mol = metal_smiles.parse_smiles(
         r"CC1=c2\cccc\c2=[N]2->[Ni]34<-[N](=C5\[CH-]C=CC=C5[C@H](C)\[N]->3="
