@@ -293,7 +293,7 @@ def _native_mismatch(sig, ref, spec):
     return "native stereo elements have a different relative assignment"
 
 
-def signature(mol, conf_id=-1, charge=0, native=True):
+def signature(mol, conf_id=-1, charge=None, native=True):
     """Compute a conformer's chirality fingerprint: a multiset of handedness labels per element kind.
 
     RDKit supplies graph-canonical identities for point, E/Z, and stated atrop stereo. xyzgraph supplies only
@@ -307,6 +307,8 @@ def signature(mol, conf_id=-1, charge=0, native=True):
     except ImportError as exc:
         raise ImportError("signature needs xyzgraph; pip install 'rxembed[workflow]'") from exc
 
+    if charge is None:
+        charge = Chem.GetFormalCharge(mol)
     probe = _one_conformer(mol, conf_id)
     sig = _native_signature(probe) if native else {}
     fd, path = tempfile.mkstemp(suffix=".xyz")

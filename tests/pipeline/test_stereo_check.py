@@ -111,3 +111,20 @@ def test_native_atrop_identity_survives_atom_order_and_detects_a_mirror():
     assert observed.get("axial")
     assert mismatch(observed, reference) is not None
     assert mismatch(observed, reference, {"axial": "invert", "default": "free"}) is None
+
+
+@pytest.mark.parametrize(("charge", "expected"), [(None, -1), (0, 0), (-2, -2)])
+def test_signature_uses_declared_charge(monkeypatch, charge, expected):
+    xyzgraph = pytest.importorskip("xyzgraph")
+    from xyzgraph import stereo
+
+    mol = Chem.MolFromSmiles("[Cl-]")
+    mol.AddConformer(Chem.Conformer(1))
+    seen = []
+    monkeypatch.setattr(xyzgraph, "build_graph", lambda *args, **kwargs: seen.append(kwargs["charge"]))
+    monkeypatch.setattr(stereo, "annotate_stereo", lambda graph: {})
+    if charge is None:
+        signature(mol)
+    else:
+        signature(mol, charge=charge)
+    assert seen == [expected]
