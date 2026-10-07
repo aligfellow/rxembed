@@ -14,7 +14,16 @@ from rdkit import Chem, rdBase
 from rdkit.Geometry import Point3D
 
 from .metal_polyhedron import SLOT_BOND_PROP
-from .utils import bond_removal_mirrors, flat_ranks, hydrogen_bond, remove_bond, repair_bond_stereo
+from .utils import (
+    CARBON_Z,
+    SP2_DEGREE,
+    bond_removal_mirrors,
+    flat_ranks,
+    hydrogen_bond,
+    lone_pair_electrons,
+    remove_bond,
+    repair_bond_stereo,
+)
 
 logger = logging.getLogger("rxembed.metal")  # spelled out, not __name__ ("rxembed.metal_core"): this is
 #   the name `set_verbose` configures and every caplog filter in the suite matches.
@@ -520,6 +529,20 @@ def ligands(mol):
 def ligand_degree(atom):
     """Count ligand-side neighbours, including implicit and explicit hydrogen."""
     return atom.GetTotalDegree() - sum(nb.GetAtomicNum() in COORDINATION_METALS for nb in atom.GetNeighbors())
+
+
+def no_aromatic_axis(atom):
+    """Return whether an aromatic donor lacks an inferred in-plane sigma direction.
+
+    An sp2 framework with three ligand sigma neighbours has no in-plane position left. A carbon retaining
+    a nonbonding pair keeps its existing pyramidal donor model; an aromatic heteroatom's conjugating pair
+    does not create an in-plane vacancy. Use this fact only with agreed sp2 typing for directional holds.
+    This abstention does not assign a binding mode. Nonaromatic donors can redistribute pi bonds and charges.
+    """
+    if not atom.GetIsAromatic() or ligand_degree(atom) < SP2_DEGREE:
+        return False
+    metals = {nb.GetIdx() for nb in atom.GetNeighbors() if nb.GetAtomicNum() in COORDINATION_METALS}
+    return atom.GetAtomicNum() != CARBON_Z or lone_pair_electrons(atom, metals) < 2  # noqa: PLR2004  one pair
 
 
 def ligand_valence(atom):

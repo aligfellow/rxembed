@@ -392,7 +392,7 @@ class Ensemble(Conformers):
         cons = owner.cons
         stated_geometry = cons.fixed or cons.frozen or cons.shapes or cons.planes or any(cons.contacts)
         if owner.iso is not None and not stated_geometry:
-            report = geom_check.check(mol, cid, donors=self._declared_donors())
+            report = geom_check.check(mol, cid, donors=self._declared_donors(), constraints=cons, check_windows=False)
             # A donor-orientation floor violation is not proof of folding (`metal_perceive.donor_orientation`):
             # never reject on it; `check()` reports it on the kept conformers.
             violations = [v for v in report.violations if v.kind != "donor_orientation"]
@@ -700,12 +700,16 @@ class Ensemble(Conformers):
     def check(self, **kwargs):
         """Run the geometry gate on every tracked conformer; return ``{conformer_id: report}``.
 
-        The stated metal donors are supplied unless ``donors=`` is passed.
+        The stated metal donors and carried geometry ownership are supplied by default. Pass
+        ``constraints=`` to check numeric windows too, or ``constraints=None`` to omit carried ownership.
         """
         if "donors" not in kwargs:
             donors = self._declared_donors()
             if donors:
                 kwargs["donors"] = donors
+        if "constraints" not in kwargs:
+            kwargs["constraints"] = self.cons
+            kwargs.setdefault("check_windows", False)
         mol = self.mol
         return {cid: geom_check.check(mol, cid, **kwargs) for cid in self.ids}
 
@@ -781,7 +785,7 @@ class Ensemble(Conformers):
         if by == "geometry":
             if charge is not None:
                 raise TypeError("filter('geometry') does not take charge=")
-            unknown = set(gate) - {"frozen", "reference", "constraints", "donors"}
+            unknown = set(gate) - {"frozen", "reference", "constraints", "donors", "check_windows"}
             if unknown:
                 raise TypeError(f"filter('geometry') got unexpected option(s): {', '.join(sorted(unknown))}")
             gate.setdefault("frozen", self.cons.frozen)

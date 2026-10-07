@@ -111,6 +111,14 @@ def uff_terms(mech, cons, mol, fc=1.0):
 # mean filling it on every path that can reach the relax.
 
 
+def test_aromatic_carbanion_bridge_keeps_coordination_ownership():
+    mol = _mol("[cH-]1cccc1.C.C")  # two bondless metal surrogates bind the same carbon
+    cons = Constraints(metals={5, 6}, distances={(0, 5): (2.0, 2.2), (0, 6): (2.0, 2.2)})
+    calls = uff_terms(mech_mod.Sp2Planar(), cons, mol).calls
+    assert calls, "uncoordinated ring carbons still receive ligand cleanup"
+    assert not any(args[3] == 0 for _name, args, _kwargs in calls), "the bridge owns its carbon geometry"
+
+
 # ---------------------------------------------------------------------------------------------------------
 # the negative contract: a field-driven mechanism is silent off an empty struct
 # ---------------------------------------------------------------------------------------------------------

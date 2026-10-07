@@ -166,7 +166,7 @@ def donor_fold(mol, conf_id: int = -1, *, donors=None, frozen=frozenset()) -> Fo
     return FoldReport(angles, unknown)
 
 
-def donor_orientation(mol, pos, donors=None, frozen=frozenset()) -> list[Violation]:
+def donor_orientation(mol, pos, donors=None, frozen=frozenset(), *, hyb=None) -> list[Violation]:
     """Report donor angles below their class-specific empirical floors.
 
     `metal_overbond` is blind to the commonest fold: a short D-X bond can swing fully side-on without ever
@@ -184,9 +184,10 @@ def donor_orientation(mol, pos, donors=None, frozen=frozenset()) -> list[Violati
 
     `donors` is the intended sphere and the caller must pass it: perceiving it is circular, since a folded
     atom would enter the radius, read as a co-donor, and write its own donor off as haptic.
+    Supply `hyb` to reuse assignments inferred with this sphere's bound-donor counts.
     """
     out: list[Violation] = []
-    for a in _donor_walk(mol, pos, donors, frozen)[0]:
+    for a in _donor_walk(mol, pos, donors, frozen, hyb=hyb)[0]:
         lo = FOLD_WINDOW[a.cls][0]
         if a.angle >= lo:  # floor only: gating the ceiling false-positives on a healthy phosphine at 153.9°
             continue  # (see `FOLD_WINDOW`); the overshoot is reported by `FoldReport.outside_window`
@@ -204,7 +205,7 @@ def donor_orientation(mol, pos, donors=None, frozen=frozenset()) -> list[Violati
     return out
 
 
-def _donor_walk(mol, pos, donors=None, frozen=frozenset()) -> tuple[list[DonorAngle], list[int]]:
+def _donor_walk(mol, pos, donors=None, frozen=frozenset(), *, hyb=None) -> tuple[list[DonorAngle], list[int]]:
     """Walk M -> D -> X: one judged angle per heavy donor substituent, plus the donors it refused to judge.
 
     The single source of truth for both the gate (``donor_orientation``) and the metric (``donor_fold``), so the
@@ -212,7 +213,8 @@ def _donor_walk(mol, pos, donors=None, frozen=frozenset()) -> tuple[list[DonorAn
     """
     by_metal = spheres(mol, pos, donors)
     bound = Counter(d for s in by_metal.values() for d in s)  # donor -> metal count; its keys are the co-donors
-    hyb = stripped_hybridisation(mol, bound)
+    if hyb is None:
+        hyb = stripped_hybridisation(mol, bound)
     stripped = ligand_graph(mol)
     out: list[DonorAngle] = []
     unknown: list[int] = []

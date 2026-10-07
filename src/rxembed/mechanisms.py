@@ -21,6 +21,7 @@ from .constraints import (
     DIST_ATOMS,
     FIX_ANGLE_TOL,
     FIX_DISTANCE_TOL,
+    donor_directions,
     graft_owns,
     merge_pulls,
     out_of_plane_row,
@@ -28,7 +29,7 @@ from .constraints import (
     plane_torsion_cap,
     stated_dihedral,
 )
-from .metal_core import disconnect_metal
+from .metal_core import disconnect_metal, no_aromatic_axis
 from .utils import CARBON_Z, DISCONNECTED, SP2_DEGREE, conjugated_quartets
 
 _PHANTOM_FLOOR = 0.30  # Å: a haptic centroid dummy may sit this close to any atom, living inside its own ring
@@ -416,8 +417,8 @@ class Sp2Planar(Mechanism):
     """Hold each organic sp2 carbon at its seed improper; never pull it flat.
 
     UFF puckers a planar conjugated carbon by up to 0.2 Å. A window centred on the seed value stops that
-    pucker without inventing curvature the seed did not have. A coordinated carbon is excluded because its
-    coordination state already owns that geometry. Three ordered torsions are needed because RDKit exposes no
+    pucker without inventing curvature the seed did not have. A coordination-owned carbon is excluded because
+    its coordination state already owns that geometry. Three ordered torsions are needed because RDKit exposes no
     permutation-invariant improper restraint.
     """
 
@@ -447,15 +448,27 @@ class Sp2Planar(Mechanism):
 
 
 def _coordination_owned_carbons(mol, cons):
-    """Return carbon sites whose geometry is owned by a coordination sphere."""
+    """Return carbon sites whose geometry is owned by a coordination sphere.
+
+    A filled aromatic framework uses ligand cleanup unless a haptic face or a compiled donor direction
+    owns it. Read that ownership from Constraints so a supported sigma donor or stated angle retains it.
+    """
     contacts = {tuple(sorted(pair)) for pair in cons.contacts[0]}
+    haptic = {atom for face in cons.haptic.values() for atom in face}
+    oriented = donor_directions(cons.angles, cons.coplanar, cons.metals, releasable=cons.contacts[1], fixed=cons.fixed)
     sites = set()
     for left, right in cons.distances:
         if tuple(sorted((left, right))) in contacts or (left in cons.metals) == (right in cons.metals):
             continue
         site = right if left in cons.metals else left
         sites.update(cons.haptic.get(site, (site,)))
-    return {atom for atom in sites if atom < mol.GetNumAtoms() and mol.GetAtomWithIdx(atom).GetAtomicNum() == CARBON_Z}
+    return {
+        atom
+        for atom in sites
+        if atom < mol.GetNumAtoms()
+        and mol.GetAtomWithIdx(atom).GetAtomicNum() == CARBON_Z
+        and (atom in haptic or atom in oriented or not no_aromatic_axis(mol.GetAtomWithIdx(atom)))
+    }
 
 
 class ConjugationCap(Mechanism):

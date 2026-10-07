@@ -18,14 +18,16 @@ The two coordination-sphere gates it calls live in the core's ``rxembed.metal_pe
 from __future__ import annotations
 
 import itertools
+from collections import Counter
 from dataclasses import dataclass, field
 
 import numpy as np
 from rdkit import Chem
 from rdkit.Numerics import rdAlignment
 
-from rxembed.constraints import constraint_value, within_window
-from rxembed.metal_core import COORDINATION_METALS, metal_indices
+from rxembed.constraints import constraint_value, donor_directions, within_window
+from rxembed.metal_core import COORDINATION_METALS, haptic_sites, metal_indices, no_aromatic_axis
+from rxembed.metal_donor_orient import stripped_hybridisation
 from rxembed.metal_perceive import SHAPE_PROP, declared_donors, donor_orientation, metal_overbond, spheres
 from rxembed.utils import (
     CARBON_Z,
@@ -284,8 +286,8 @@ def planarity(mol, pos, oop: float = 0.15, ring_rms: float = 0.10, exclude=froze
     Catches puckered aromatic rings and twisted sp2 carbons (C=C / C=O / aromatic C). Nitrogen is left out
     on purpose: an amine/aniline N is physically pyramidal even when RDKit labels it sp2, so a blanket rule
     false-positives. The real twisted-amide signal is caught by ``conjugation()``'s O=C-N dihedral instead.
-    A metal-coordinated carbon is passed in ``exclude`` by ``check()``: coordination sets its geometry, not
-    an sp2 rule.
+    A coordination-owned carbon is passed in ``exclude`` by ``check()``. Judge other carbons on their
+    ligand-side neighbours so a metal attachment does not suppress their local planarity check.
     """
     out = []
     for atom in mol.GetAtoms():
@@ -293,7 +295,7 @@ def planarity(mol, pos, oop: float = 0.15, ring_rms: float = 0.10, exclude=froze
             continue
         if atom.GetIdx() in exclude:
             continue
-        nbrs = [n.GetIdx() for n in atom.GetNeighbors()]
+        nbrs = [n.GetIdx() for n in atom.GetNeighbors() if n.GetAtomicNum() not in COORDINATION_METALS]
         if len(nbrs) != SP2_DEGREE:
             continue
         off = _plane_offset(pos[atom.GetIdx()], pos[nbrs])
@@ -431,13 +433,16 @@ def stereo_violations(mol, pos, reference, conf_id: int = -1) -> list[Violation]
 # --- top-level entry ---------------------------------------------------------
 
 
-def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=None, donors=None) -> GeometryReport:
+def check(
+    mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=None, donors=None, check_windows=True
+) -> GeometryReport:
     """Run the full physical gate on one conformer and collect all violations.
 
     ``frozen`` is the frozen or reacting TS core: skipped by the ground-state checks (a forming/breaking
     bond or distorted reacting sp2 is correct by design) and held to ``reference`` by an RMSD check.
-    ``reference`` also sets the stereo check. ``constraints`` gives the distance/angle windows to confirm
-    the seed was realised.
+    ``reference`` also sets the stereo check. ``constraints`` supplies coordination geometry ownership and,
+    with ``check_windows=True``, distance/angle/dihedral window diagnostics. Disable numeric checks when
+    passing carried optimizer biases as ownership context.
     """
     if isinstance(reference, str):
         reference = Chem.MolFromXYZFile(reference)  # coords only; atom order must match `mol`
@@ -458,7 +463,10 @@ def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=No
     exclude = set(frozen) if frozen is not None else set()
     exclude |= set(metals)  # dative, not vdW
     exclude = frozenset(exclude)
-    coord_c = _coordinating_carbons(mol, pos, donors)  # dative, not covalent: an organic sp2 rule would false-flag it
+    coordination = spheres(mol, pos, donors)
+    bound = Counter(d for sphere in coordination.values() for d in sphere)
+    hyb = stripped_hybridisation(mol, bound) if coordination else {}
+    coord_c = _coordinating_carbons(mol, coordination, hyb, constraints)
     v: list[Violation] = []
     v += bond_lengths(mol, pos, exclude=exclude)
     v += hydrogens(mol, pos, exclude=exclude, donors=frozenset(donors or ()))
@@ -467,10 +475,10 @@ def check(mol, conf_id: int = -1, *, frozen=None, reference=None, constraints=No
     v += planarity(mol, pos, exclude=exclude | coord_c)
     v += conjugation(mol, pos, exclude=exclude, flex=_eta2_pi_atoms(mol, pos, donors) | coord_c)
     v += metal_overbond(mol, pos, donors)  # the two gates that look INTO the sphere, unlike every check above
-    v += donor_orientation(mol, pos, donors, frozen or frozenset())
+    v += donor_orientation(mol, pos, donors, frozen or frozenset(), hyb=hyb)
     if frozen is not None and reference is not None:
         v += frozen_core(mol, pos, frozen, reference)
-    if constraints is not None:
+    if constraints is not None and check_windows:
         v += check_constraints(mol, pos, constraints)
     if reference is not None:
         v += stereo_violations(mol, pos, reference, conf_id)
@@ -510,18 +518,39 @@ def _eta2_pi_atoms(mol, pos, donors=None) -> set[int]:
     return out
 
 
-def _coordinating_carbons(mol, pos, donors=None) -> set[int]:
-    """Return carbons in a metal's coordination sphere, which get the wider planarity window.
+def _coordinating_carbons(mol, coordination, hyb, constraints=None) -> set[int]:
+    """Return carbons whose coordination permits the wider planarity window.
 
     A carbanion / carbene / eta2 carbon legitimately pyramidalises out of the flat sp2 plane RDKit assigns it,
-    so judging it by the strict sp2 rule reports a defect that is not one.
+    so judging it by the strict sp2 rule reports a defect that is not one. Supplied donor directions and
+    local impropers retain their geometry ownership.
     """
-    return {
-        i
-        for sphere in spheres(mol, pos, donors).values()
-        for i in sphere
-        if mol.GetAtomWithIdx(i).GetAtomicNum() == CARBON_Z
-    }
+    metals = set(coordination)
+    oriented = donor_directions(
+        _attr(constraints, "angles", {}),
+        _attr(constraints, "coplanar", ()),
+        metals,
+        releasable=_attr(constraints, "contacts", (frozenset(), frozenset()))[1],
+        fixed=_attr(constraints, "fixed", {}),
+    )
+    stated = {frozenset(atoms) for atoms in _attr(constraints, "dihedrals", {})}
+    out = set()
+    for sphere in coordination.values():
+        haptic = {atom for face in haptic_sites(mol, sphere) if len(face) > 1 for atom in face}
+        for i in sphere:
+            atom = mol.GetAtomWithIdx(i)
+            if atom.GetAtomicNum() != CARBON_Z:
+                continue
+            framework = frozenset((i, *(n.GetIdx() for n in atom.GetNeighbors() if n.GetIdx() not in metals)))
+            if (
+                i in haptic
+                or i in oriented
+                or framework in stated
+                or hyb.get(i) != Chem.HybridizationType.SP2
+                or not no_aromatic_axis(atom)
+            ):
+                out.add(i)
+    return out
 
 
 def _coordination_pairs(mol, pos, donors=None) -> set[tuple[int, int]]:

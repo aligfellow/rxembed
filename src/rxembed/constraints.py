@@ -123,6 +123,25 @@ def canonical_key(key):
     return min(key, key[::-1])
 
 
+def donor_directions(angles, coplanar, metals, *, releasable=(), fixed=()):
+    """Return donors whose structural direction owns their coordination geometry.
+
+    A releasable angle biases only that angle; it does not replace the ligand's planar improper. Fixed
+    records retain authority. An unrestricted angle supplies no direction. Stated dihedrals separately
+    own their torsional axis or four-point improper through `stated_dihedral`.
+    """
+    released = {canonical_key(key) for key in releasable} - {canonical_key(key) for key in fixed}
+    donors = {
+        centre
+        for (left, centre, right), window in angles.items()
+        if (left in metals or right in metals)
+        and canonical_key((left, centre, right)) not in released
+        and (np.min(window) > 0 or np.max(window) < _STRAIGHT)
+    }
+    donors.update(row[1] for row in coplanar if row[0] in metals)
+    return donors
+
+
 def _central_bond(atoms):
     """Return the bond that owns a torsional degree of freedom."""
     return frozenset(atoms[1:3])

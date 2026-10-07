@@ -1,6 +1,7 @@
 """Test the TS-aware and metal-aware geometry gate."""
 
 from importlib.util import find_spec
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -78,6 +79,28 @@ def test_geometry_check_rejects_nonfinite_coordinates():
     assert "non-finite coordinate" in report.summary()
 
 
+@pytest.mark.parametrize(
+    "smiles",
+    [
+        pytest.param("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N", id="ammine"),
+        pytest.param("O=[N+](=CC)->[Pd+2](<-[Cl-])(<-[Cl-])<-[Cl-]", id="cumulated-nitro"),
+    ],
+)
+def test_geometry_check_types_ligands_once(smiles, monkeypatch):
+    iso = rx.metal(smiles, "square_planar", stereo="free")[0]
+    ens = rx.embed(iso, n=1, seed=42, threads=1)
+    mol = ens.mol
+    cid = ens.ids[0]
+    orientation = metal_perceive.donor_orientation(mol, mol.GetConformer(cid).GetPositions(), iso.donors)
+    infer = Mock(wraps=metal_perceive.stripped_hybridisation)
+    monkeypatch.setattr(geom, "stripped_hybridisation", infer)
+    monkeypatch.setattr(metal_perceive, "stripped_hybridisation", infer)
+    report = ens.check()[cid]
+
+    assert infer.call_count == 1
+    assert [v for v in report.violations if v.kind == "donor_orientation"] == orientation
+
+
 def test_eta2_planarity_flex_is_metal_local():
     mol = Chem.AddHs(Chem.MolFromSmiles("C=CC=C"))  # butadiene, no metal -> no eta2 flex
     rdDistGeom.EmbedMolecule(mol, randomSeed=1)
@@ -88,6 +111,48 @@ def test_eta2_planarity_flex_is_metal_local():
     conf.SetPositions(pos)
 
     assert any(v.kind == "planarity" for v in geom.planarity(mol, pos)), "non-metal sp2 wrongly flexed"
+
+
+@pytest.mark.parametrize(
+    "owner", ["donor-angle", "ligand-improper", "releasable-angle", "unrestricted-angle", "fixed-angle", "scalar-angle"]
+)
+def test_aromatic_attachment_planarity_respects_geometry_ownership(owner):
+    iso = rx.metal("c1cc[cH](->[Pd+2](<-[Cl-])(<-[Cl-])<-[NH3])cc1", "square_planar", stereo="free")[0]
+    ens = rx.embed(iso, n=1, seed=42, threads=1)
+    mol = ens.mol
+    cid = ens.ids[0]
+    conf = mol.GetConformer(cid)
+    donor = next(d for d in iso.donors if mol.GetAtomWithIdx(d).GetSymbol() == "C")
+    neighbors = [n.GetIdx() for n in mol.GetAtomWithIdx(donor).GetNeighbors() if n.GetIdx() != iso.metal]
+    hydrogen = next(i for i in neighbors if mol.GetAtomWithIdx(i).GetAtomicNum() == 1)
+    pos = conf.GetPositions()
+    ring = next(r for r in mol.GetRingInfo().AtomRings() if donor in r)
+    normal = np.linalg.svd(pos[list(ring)] - pos[list(ring)].mean(axis=0))[2][-1]
+    direction = pos[hydrogen] - pos[donor]
+    length = np.linalg.norm(direction)
+    direction += length * normal
+    pos[hydrogen] = pos[donor] + direction / np.linalg.norm(direction) * length
+    conf.SetPositions(pos)  # pucker the donor's ligand-side improper while keeping its ring and C-H length
+    assert any(v.kind == "planarity" and donor in v.atoms for v in geom.check(mol, cid, donors=iso.donors).violations)
+    if owner != "ligand-improper":
+        key = (iso.metal, donor, hydrogen)
+        angle = rdMolTransforms.GetAngleDeg(conf, *key)
+        window = (0.0, 180.0) if owner == "unrestricted-angle" else (angle, angle)
+        contacts = frozenset({key[::-1]}) if owner in {"releasable-angle", "fixed-angle"} else frozenset()
+        constraints = Constraints(
+            angles={key: window},
+            contacts=(frozenset(), contacts),
+            fixed={key: window} if owner == "fixed-angle" else {},
+        )
+        if owner == "scalar-angle":
+            constraints = {"angles": {key: angle}}
+    else:
+        key = (*neighbors, donor)
+        angle = rdMolTransforms.GetDihedralDeg(conf, *key)
+        constraints = Constraints(dihedrals={key: (angle, angle)})
+    report = geom.check(mol, cid, donors=iso.donors, constraints=constraints)
+    assert ("planarity" in _kinds(report)) == (owner in {"releasable-angle", "unrestricted-angle"})
+    assert "constraint" not in _kinds(report)
 
 
 def test_declared_side_on_pair_keeps_its_window_at_an_early_metal_distance():

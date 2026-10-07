@@ -152,6 +152,44 @@ def test_graph_recovers_missed_donors(name, smi, symbol, conjugated):
     assert d in _capped(iso), f"{name} must receive a coplanarity cap"
 
 
+@pytest.mark.parametrize(
+    "smi",
+    [
+        "COc1c[cH](->[Pd+]23<-[O-]CCOc4ccc5ccc6ccc[n]->2c6c5[n]->34)cc(OC)c1OC",
+        "C[c]1(->[Pd+2](<-[Cl-])(<-[Cl-])<-[NH3])ccccc1",
+    ],
+    ids=["tethered-arene-CH", "arene-ipso-carbon"],
+)
+def test_aromatic_carbon_attachment_keeps_ligand_geometry(smi):
+    iso = rx.metal(smi, "square_planar", stereo="free")[0]
+    ens = rx.embed(iso, n=1, seed=42, threads=1)
+    mol = ens.mol
+    donor = next(d for d in iso.donors if mol.GetAtomWithIdx(d).GetSymbol() == "C")
+    neighbors = [n.GetIdx() for n in mol.GetAtomWithIdx(donor).GetNeighbors() if n.GetIdx() != iso.metal]
+    pos = mol.GetConformer(ens.ids[0]).GetPositions()
+    left, middle, right = pos[neighbors]
+    normal = np.cross(middle - left, right - left)
+    height = abs(float(np.dot(pos[donor] - left, normal))) / np.linalg.norm(normal)
+    assert height < 0.1, f"aromatic donor pyramidalised by {height:.3f} Å"
+    for neighbor in neighbors:
+        if mol.GetAtomWithIdx(neighbor).GetAtomicNum() == 1:
+            length = float(np.linalg.norm(pos[donor] - pos[neighbor]))
+            assert 1.05 < length < 1.12, f"aromatic C-H stretched to {length:.3f} Å"
+    assert rx.cxsmiles(mol) == rx.cxsmiles(iso)
+    ens.check()[ens.ids[0]].assert_ok()
+
+
+@pytest.mark.parametrize("orientation", [True, False])
+def test_eta1_cyclopentadienyl_keeps_coordination_geometry(orientation):
+    iso = rx.metal("[cH-]1(->[Pd+2](<-[Cl-])(<-[Cl-])<-[NH3])cccc1", "square_planar", stereo="free")[0]
+    ens = rx.embed(iso, n=1, params=rx.EmbedParams(seed=42, threads=1, donor_orientation=orientation))
+    mol = ens.mol
+    donor = next(d for d in iso.donors if mol.GetAtomWithIdx(d).GetSymbol() == "C")
+    hydrogen = next(n.GetIdx() for n in mol.GetAtomWithIdx(donor).GetNeighbors() if n.GetAtomicNum() == 1)
+    assert 1.05 < T.GetBondLength(mol.GetConformer(ens.ids[0]), donor, hydrogen) < 1.17
+    assert all(v.kind == "donor_orientation" for v in ens.check()[ens.ids[0]].violations)
+
+
 def test_only_an_inplane_sp2_donor_is_capped():
     for name, smi, geometry in (
         ("sp3 amine", "CCN[Pd](Cl)Cl", "square_planar"),

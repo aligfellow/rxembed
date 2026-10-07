@@ -5,9 +5,11 @@ from importlib.util import find_spec
 import numpy as np
 import pytest
 from rdkit import Chem
+from rdkit.Chem import rdMolTransforms
 
 import rxembed as rx
 from rxembed import metal_core as metal
+from rxembed.constraints import Constraints
 from rxembed.pipeline import ensemble as ensemble_module
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.calculators import Calculator
@@ -55,6 +57,31 @@ def test_puckered_aromatic_ring_remains_a_geometry_diagnostic():
     violations = ens.check()[cid].violations
 
     assert any(violation.detail == "aromatic ring puckered" for violation in violations)
+
+
+@pytest.mark.parametrize("releasable", [False, True], ids=["structural-improper", "soft-improper"])
+def test_arene_attachment_improper_survives_geometry_validation(releasable):
+    iso = rx.metal("c1cc[cH](->[Pd+2](<-[Cl-])(<-[Cl-])<-[NH3])cc1", "square_planar", stereo="free")[0]
+    donor = next(d for d in iso.donors if iso.graph.GetAtomWithIdx(d).GetAtomicNum() == 6)
+    neighbors = [n.GetIdx() for n in iso.graph.GetAtomWithIdx(donor).GetNeighbors()]
+    key, window = (*neighbors, donor), (42.0, 48.0)
+    kwargs = {"constrain": {key: window}} if releasable else {}
+    if not releasable:
+        iso = rx.Isomer.from_state(
+            iso.graph,
+            iso.centres,
+            iso.donor_bonds,
+            constraints=Constraints(dihedrals={key: window}),
+            constrained_metals=iso.constrained_metals,
+            protect_arrangement=False,
+        )
+
+    ens = rx.embed(iso, n=1, seed=42, threads=1, **kwargs)
+    angle = rdMolTransforms.GetDihedralDeg(ens.mol.GetConformer(ens.ids[0]), *key)
+
+    assert window[0] - 1.0 < angle < window[1] + 1.0
+    ens.check()[ens.ids[0]].assert_ok()
+    assert ens.filter("geometry").ids
 
 
 def test_check_flags_an_undeclared_atom_that_collapsed_onto_the_metal():
@@ -152,6 +179,9 @@ def test_geometry_filter_inherits_only_frozen_atoms():
     ens.cons.frozen.update((0, 1))
     ens.cons.distances[(0, 2)] = (100.0, 101.0)
     assert ens.filter("geometry").ids
+    assert any(v.kind == "constraint" for v in ens.check(check_windows=True)[ens.ids[0]].violations)
+    with pytest.raises(RuntimeError, match="all 1 conformer"):
+        ens.filter("geometry", check_windows=True)
     with pytest.raises(RuntimeError, match="all 1 conformer"):
         ens.filter("geometry", constraints=ens.cons)
 

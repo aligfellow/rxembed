@@ -13,14 +13,14 @@ import math
 from rdkit import Chem
 
 from .bounds import bounds_matrix
-from .metal_core import COORDINATION_METALS, haptic_sites, ligand_degree, ligand_graph
+from .metal_core import COORDINATION_METALS, haptic_sites, ligand_degree, ligand_graph, no_aromatic_axis
 from .metal_distance import APEX_DONORS
 from .utils import CARBON_Z, lone_pair_electrons
 
 _PT = Chem.GetPeriodicTable()
 
 # --- the sp2-donor coplanarity cap (`coplanar_donor`, `cons.coplanar`) -------------------------------
-# An sp2 donor binds from an in-plane sigma lone pair, so the metal sits in its sp2 framework.
+# An sp2 donor with an available sigma direction holds the metal in its own framework.
 COPLANAR_CAP = 45.0  # deg half-window off the anchor: clears the tmQM/Kulik census p95 of 40° for the metal's
 # angle out of a donor's plane. Never a point, which would annihilate the real scatter out to that tail.
 _COPLANAR_ANCHOR = 180.0  # deg: the external sector of a donor with two direct substituents
@@ -193,21 +193,13 @@ def stripped_hybridisation(mol, bound=None) -> dict[int, Chem.HybridizationType]
 def donation_axis(mol, d, all_donors, sphere=None, *, hyb=None, metals=1, stripped=None) -> list[int] | None:
     """Return donor `d`'s judgeable heavy substituents X, or `None` when it donates along no axis.
 
-    Four donors have no M-D-X axis to judge: an H donor (hydride, sigma-complex, agostic) has no lone pair; a
-    bridging donor (2+ metals) takes its axis from the bridge; a haptic donor paired or pi-bonded to a
-    co-donor donates a face, sitting ~70 deg off any M-D-X axis regardless of that pair's bond order; a
-    nonterminal sp atom has two opposing substituents, so neither can face away from the metal.
+    Hydrogen, bridging, haptic, nonterminal sp and filled aromatic sp2 frameworks have no independent axis.
+    Exclude metals, protons, co-donors, bite bridgeheads and backbone arms held by another donor. Two small,
+    independently held donors each retain their arm. Return an empty list when no eligible substituent remains.
+    Apply frozen ownership later to the complete M-D-X term.
 
-    The coordinate-space ruler (`_donor_walk`) shares this abstention list. An empty list means every
-    substituent is itself exempt (a co-donor, a kappa2 bite bridgehead, a proton, or a metal): "ask, but
-    nothing to measure", distinct from `None` meaning "do not ask". Freeze ownership is applied later, over the
-    complete M-D-X term, not here.
-
-    `sphere` is this metal's own donors, for the bite-bridgehead test, and defaults to `all_donors`. `metals` is
-    how many metals the caller declares `d` bound to, read instead of graph bonds so a stripped and a bonded
-    graph agree. A backbone arm (R_pair) whose co-donor is calibrated and has fewer than 3 heavy substituents is
-    dropped, so that co-donor holds the arm itself, unless `d` qualifies the same way, since a ring of two small
-    donors must keep one walled arm. `stripped` reuses an already-built `ligand_graph`.
+    `sphere` defaults to `all_donors` and supplies this metal's bite topology. `metals` is the declared binding
+    count, so bonded and stripped graphs agree. `hyb` and `stripped` reuse hybridisation and ligand-graph reads.
     """
     a = mol.GetAtomWithIdx(d)
     if a.GetAtomicNum() == 1:  # hydride / η²-H₂ / agostic H: no lone pair, so no donation axis
@@ -218,6 +210,8 @@ def donation_axis(mol, d, all_donors, sphere=None, *, hyb=None, metals=1, stripp
     if any(d in site and len(site) > 1 for site in haptic_sites(mol, sphere)):  # pi-face: metal is off-axis
         return None
     hyb = stripped_hybridisation(mol) if hyb is None else hyb
+    if hyb.get(d) == _SP2 and no_aromatic_axis(a):
+        return None
     if hyb.get(d) == _SP and ligand_degree(a) != 1:
         return None
     backbone = _backbone_targets(mol, d, sphere, stripped=stripped)
@@ -228,7 +222,7 @@ def donation_axis(mol, d, all_donors, sphere=None, *, hyb=None, metals=1, stripp
         if nb.GetAtomicNum() > 1  # protons have their own window (`orient_donor`)
         and nb.GetAtomicNum() not in COORDINATION_METALS
         and nb.GetIdx() not in all_donors  # co-donor
-        and not (  # R_pair, see the docstring
+        and not (  # shared backbone arm
             (other := backbone.get(nb.GetIdx())) is not None
             and (mol.GetAtomWithIdx(other).GetSymbol(), hyb.get(other)) in _ORIENT_WALL
             and _heavy_substituent_count(mol, other) < 3  # noqa: PLR2004
@@ -337,9 +331,9 @@ def coplanar_donor(mol, metal, d, donor_set, cons, *, hyb=None):
     class, and the FF torsion alone holds an uncalibrated one.
     """
     hyb = stripped_hybridisation(mol) if hyb is None else hyb
-    if hyb.get(d) != _SP2:  # no conjugation test: an isolated C=O or C=N donor is sp2 but not conjugated
-        return  # only an sp2 donor has an in-plane sigma lone pair to hold the metal to
     a = mol.GetAtomWithIdx(d)
+    if hyb.get(d) != _SP2 or no_aromatic_axis(a):
+        return
     heavy = [
         nb.GetIdx() for nb in a.GetNeighbors() if nb.GetAtomicNum() > 1 and nb.GetAtomicNum() not in COORDINATION_METALS
     ]
