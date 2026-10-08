@@ -361,7 +361,7 @@ def _write(mol, cons, params=None):
         Chem.GetSymmSSSR(native, includeDativeBonds=True)
     bm = bounds_matrix(native, params)
     _cap_fragment_contacts(native, cons, bm)
-    ctx = DGContext(mol, bm)
+    ctx = DGContext(mol, bm, basis=native)
     for m in MECHANISM_ORDER:
         m.dg_windows(cons, ctx)  # WINDOW   distances, angles, planes -> candidate windows
     for m in MECHANISM_ORDER:

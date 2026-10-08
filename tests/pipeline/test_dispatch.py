@@ -128,7 +128,7 @@ def test_numeric_pair_fix_survives_cleanup_without_fixing_angle(fix):
     ens = rx.embed(
         "[O-].ClCCCCBr",
         fix=fix,
-        n=6,
+        n=25,
         seed=1,
         stereo="free",
     ).minimize()

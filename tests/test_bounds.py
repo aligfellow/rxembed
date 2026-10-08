@@ -10,6 +10,7 @@ import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 
+import rxembed as rx
 from rxembed import bounds as bnd
 from rxembed import metal_core
 from rxembed.constraints import Constraints, add_distance
@@ -29,6 +30,36 @@ def _mol(smiles="CCO", seed=1):
 # ---------------------------------------------------------------------------------------------------------
 # embed_parameters: native model and reproducible sampling defaults
 # ---------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fix",
+    [
+        {(0, 1): 2.316, (0, 2): 2.122},
+        {0: (0.0, 0.0, 0.0), 1: (2.316, 0.0, 0.0), 2: (-2.122, 0.0, 0.0)},
+    ],
+    ids=("distance-windows", "coordinate-pins"),
+)
+def test_short_interfragment_fixes_work_from_smiles(fix):
+    mol = _graph("CBr.[Cl-]")
+
+    core = rx.core.embed(mol, fix=fix, n=4, seed=0xF00D, threads=1)
+    assert core.ids
+    core.minimize()
+    facade = rx.embed(mol, fix=fix, charge=-1, n=4, seed=0xF00D, threads=1)
+    assert facade.ids
+
+    reference = {0: np.array((0.0, 0.0, 0.0)), 1: np.array((2.316, 0.0, 0.0)), 2: np.array((-2.122, 0.0, 0.0))}
+    pinned = set(fix) & set(reference)
+    for conformers in (core.mol, facade.mol):
+        for conf in conformers.GetConformers():
+            pos = conf.GetPositions()
+            assert np.linalg.norm(pos[0] - pos[1]) == pytest.approx(2.316, abs=0.001)
+            assert np.linalg.norm(pos[0] - pos[2]) == pytest.approx(2.122, abs=0.001)
+            if pinned:
+                assert np.linalg.norm(pos[1] - pos[2]) == pytest.approx(
+                    np.linalg.norm(reference[1] - reference[2]), abs=0.001
+                )
 
 
 def test_native_parameters_reach_rdkit_without_model_fallback_or_stale_bounds():

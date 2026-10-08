@@ -87,6 +87,7 @@ class DGContext:
     bm: np.ndarray
     pairs: dict = field(default_factory=dict)  # (i, j) -> (lo, hi), committed into `bm` after RELIEVE
     _topo: np.ndarray | None = None
+    basis: Chem.Mol | None = None
 
     @property
     def topo(self):
@@ -143,6 +144,41 @@ class Distance(Mechanism):
     @override
     def dg_windows(self, cons, ctx):
         ctx.pairs.update(cons.distances)  # override only the constrained pairs; RDKit keeps the rest
+
+    @override
+    def dg_relief(self, cons, ctx):
+        """Relieve adjacent native floors for short held contacts."""
+        # A contact deficit is shared only with its direct neighbours: approaching by δ can shorten them by at
+        # most δ (triangle inequality). This local seed relief does not prove the full constraints feasible.
+        native = ctx.bm.copy()
+        basis = ctx.basis if ctx.basis is not None else ctx.mol
+        fragments = Chem.GetMolFrags(basis)
+        component = {atom: frag for frag, atoms in enumerate(fragments) for atom in atoms}
+        for atoms, window in cons.distances.items():
+            if len(atoms) != DIST_ATOMS or not (atoms in cons.fixed or cons.frozen.issuperset(atoms)):
+                continue
+            i, j = atoms
+            if component[i] == component[j]:
+                continue
+            hi = cons.fixed.get(atoms, window)[1]
+            a, b = sorted((i, j))
+            overlap = native[b, a] - hi
+            if overlap <= 0.0:
+                continue
+            for origin, opposite in ((i, j), (j, i)):
+                for neighbor in basis.GetAtomWithIdx(origin).GetNeighbors():
+                    k = neighbor.GetIdx()
+                    c, d = sorted((k, opposite))
+                    pair = (c, d)
+                    if (
+                        pair in ctx.pairs
+                        or pair in cons.floors
+                        or pair in cons.dg_floors
+                        or k in cons.phantoms
+                        or opposite in cons.phantoms
+                    ):
+                        continue
+                    ctx.bm[d, c] = min(ctx.bm[d, c], max(0.0, native[d, c] - overlap))
 
     @override
     def uff_terms(self, ff, cons, conf, stiffness):
