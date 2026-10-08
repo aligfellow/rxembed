@@ -11,7 +11,7 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
 
 from rxembed import mechanisms as mech_mod
-from rxembed.constraints import Constraints
+from rxembed.constraints import Constraints, resolve_core
 
 
 class SpyFF:
@@ -39,6 +39,29 @@ def _mol(smiles="CC(=O)NC", seed=1):
 
 def _ctx(mol):
     return mech_mod.DGContext(mol=mol, bm=rdDistGeom.GetMoleculeBoundsMatrix(mol))
+
+
+def test_distance_relief_uses_bounds_basis_and_preserves_owned_geometry():
+    mol = Chem.AddHs(Chem.MolFromSmiles("CBr.[Cl-]"))
+    pins = {0: (0.0, 0.0, 0.0), 1: (2.316, 0.0, 0.0), 2: (-2.122, 0.0, 0.0)}
+    cons, _ = resolve_core(mol, fix=pins)
+    cons = cons.copy(floors={(2, 3): 3.1})
+    native = Chem.Mol(mol)
+    connected = Chem.RWMol(mol)
+    connected.AddBond(0, 2, Chem.BondType.DATIVE)
+    graph = connected.GetMol()
+    ctx = mech_mod.DGContext(graph, rdDistGeom.GetMoleculeBoundsMatrix(native), basis=native)
+    mech_mod.Distance().dg_windows(cons, ctx)
+    before = ctx.bm.copy()
+
+    mech_mod.Distance().dg_relief(cons, ctx)
+
+    assert ctx.bm[4, 2] < before[4, 2], "a held contact can relieve its external neighbour floor"
+    assert ctx.bm[3, 2] == pytest.approx(before[3, 2]), "an explicit floor remains authoritative"
+    for pair in ((0, 1), (0, 2), (1, 2)):
+        a, b = sorted(pair)
+        assert ctx.bm[b, a] == pytest.approx(before[b, a])
+        assert ctx.bm[a, b] == pytest.approx(before[a, b])
 
 
 @pytest.mark.parametrize("anchor", [0.0])
