@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rxembed"
-version = "0.1.3"
+version = "0.1.4"
 description = "Constrained conformer embedding for reactive chemistry."
 authors = [{name = "Alister S. Goodfellow"}]
 readme = "README.md"
