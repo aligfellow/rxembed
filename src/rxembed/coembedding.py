@@ -17,11 +17,14 @@ from rdkit import Chem
 
 from .bounds import resolve_params, seed_bounds, seed_count
 from .embed import Conformers, coordination_state_failure, prepare, require_seed_count, seed_conformers
-from .metal_core import metal_indices
+from .metal_core import VACANT, HapticSite, materialized_states, metal_indices
 from .metal_isomer import Isomer, paired_isomer
+from .metal_polyhedron import vertex_dirs
+from .metal_stereo import chelate_links, equivalent_site_assignments, site_classes
 from .utils import combined
 
 TIE_FLOOR = 0.3  # Å: a spectator's budget, nonzero so DG is not degenerate; unmeasured
+_SAME = 1e-6  # a slot-motion change below this is rounding, not motion
 logger = logging.getLogger(__name__)
 
 
@@ -34,10 +37,13 @@ def coembed(left, right, *, constrain=None, contacts=None, n=None, seed=None, th
     non-covalent terms in the same form, such as an assembly's H-bonds; the right copy holds each term whose atoms
     its graph bonds alike, so an H-bond that becomes the bond holds only where it is a contact. ``n=None`` takes
     the count one copy would embed with, since the tied copies share one conformer space.
-    A pair is kept only when both copies pass their own acceptance. The copies carry no energies: a pair's
-    restrained energy ranks neither endpoint.
+    Two Isomers keep their stereoisomers, while their equivalent sites take the slots that move least between the
+    copies (`_least_motion`). A pair is kept only when both copies pass their own acceptance. The copies carry no
+    energies: a pair's restrained energy ranks neither endpoint.
     """
     _check_pair(left, right)
+    if isinstance(left, Isomer):
+        left, right = _least_motion(left, right)
     constrain, contacts = _index_keys(constrain), _index_keys(contacts)
     params = resolve_params(params, seed, threads)
     held = _alike(contacts, *(spec.graph if isinstance(spec, Isomer) else spec for spec in (left, right)))
@@ -104,6 +110,81 @@ def _check_pair(left, right):
             "the copies differ in atom count or element order; put one on the other's order (rx.coembed overlays "
             "two graphs)"
         )
+
+
+def _least_motion(left, right):
+    """Return the two Isomers relabelled so the sites both copies bind keep their slots.
+
+    An Isomer names a stereoisomer; which of its equivalent sites fills which slot is a labelling that the shared
+    atom order makes physical. From the given labellings, each copy in turn takes its least-motion labelling for
+    the other's, until neither improves; a tie keeps the given labelling.
+    """
+    options = [_labellings(iso) for iso in (left, right)]
+    best = [left.centres, right.centres]
+    score = _slot_motion(*best)
+    improved = True
+    while improved:
+        improved = False
+        for side in (1, 0):
+            for centres in options[side]:
+                trial = [centres, best[1]] if side == 0 else [best[0], centres]
+                motion = _slot_motion(*trial)
+                if motion < score - _SAME:
+                    best, score, improved = trial, motion, True
+    return tuple(
+        iso if centres == iso.centres else iso.with_stereo(centres)
+        for iso, centres in zip((left, right), best, strict=True)
+    )
+
+
+def _labellings(iso):
+    """Return the centres of `iso` and of each relabelling that keeps its stereoisomer; coordinates bind it.
+
+    A relabelling moves sites between slots of equal class, winding and chelate links (`equivalent_site_assignments`).
+    """
+    if iso.mol.GetNumConformers():
+        return [iso.centres]
+    parts = materialized_states(iso.graph, iso.centres)
+    per_state = []
+    for state in iso.centres:
+        vertices, haptic, winding, _donors = parts[state.atom]
+        classes = site_classes(iso.graph, vertices, haptic, iso.roles)
+        keys = [None if site == VACANT else (classes[site], winding.get(site, "")) for site in vertices]
+        per_state.append(
+            [
+                state._replace(vertices=tuple(state.vertices[assignment.get(slot, slot)] for slot in range(len(keys))))
+                for assignment in equivalent_site_assignments(keys, chelate_links(iso.graph, vertices, haptic))
+            ]
+        )
+    return list(itertools.product(*per_state))
+
+
+def _slot_motion(left, right):
+    """Return the summed RMS shift of the slot directions of the sites bound in both copies, one rotation per metal."""
+    total = 0.0
+    for state in left:
+        other = next((s for s in right if s.atom == state.atom), None)
+        if other is None:
+            continue
+        a, b = _slot_dirs(state), _slot_dirs(other)
+        shared = sorted(a.keys() & b.keys(), key=sorted)
+        if len(shared) < 2:  # noqa: PLR2004 - a rotation needs two directions
+            continue
+        x, y = np.array([a[key] for key in shared]), np.array([b[key] for key in shared])
+        u, _s, vt = np.linalg.svd(x.T @ y)
+        rotation = u @ np.diag([1.0, 1.0, np.sign(np.linalg.det(u @ vt))]) @ vt
+        total += float(np.sqrt(np.mean(np.sum((x @ rotation - y) ** 2, axis=1))))
+    return total
+
+
+def _slot_dirs(state):
+    """Return each bound site's polyhedron direction, keyed by its atoms."""
+    dirs = vertex_dirs(state.geometry)
+    return {
+        frozenset(site.atoms if isinstance(site, HapticSite) else (site,)): np.asarray(dirs[k])
+        for k, site in enumerate(state.vertices)
+        if site is not None
+    }
 
 
 def _tie_budgets(copies, count, params):

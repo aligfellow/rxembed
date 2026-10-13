@@ -7,7 +7,10 @@ import pytest
 from rdkit import Chem
 
 import rxembed as rx
+from rxembed import coembedding
 from rxembed.coembedding import coembed
+from rxembed.metal_isomer import Isomer
+from rxembed.utils import without_atom_maps
 
 
 def _bromobutane_and_chlorobutane():
@@ -68,6 +71,27 @@ def test_hexammine_potassium_co_embeds_where_every_eigenvector_start_is_rejected
     left, _right = coembed(hexammine, Chem.Mol(hexammine), n=2, seed=7)
 
     assert len(left.ids) == 2
+
+
+def _stereoisomer(iso):
+    """Return `iso` as canonical CXSMILES without its atom maps: the stereoisomer, whatever the labelling."""
+    plain = Isomer.from_state(without_atom_maps(iso.graph), iso.centres, iso.donor_bonds, stereo_label=iso.stereo_label)
+    return rx.cxsmiles(plain)
+
+
+def test_relabelling_keeps_each_copy_with_two_side_on_propenes_its_stereoisomer():
+    """Two equivalent eta2-propene faces of opposite winding are not interchangeable: a swap is a diastereomer."""
+    faces = "(<-[CH2:7]=[CH:8]([CH3:9])->1)<-[CH2:10]=[CH:11]([CH3:12])->2"
+    ammine = rx.metal(f"[Cl-:1]->[W:2]12(<-[C-:3]#[O+:4])(<-[PH3:5])(<-[NH3:6]){faces}.[OH2:13]", "OCT")
+    aqua = rx.metal(f"[Cl-:1]->[W:2]12(<-[C-:3]#[O+:4])(<-[PH3:5])(<-[OH2:13]){faces}.[NH3:6]", "OCT")
+
+    def opposite(isomers):  # the two faces carry opposite windings
+        return [iso for iso in isomers if {getattr(s, "winding", "") for s in iso.centres[0].vertices} >= {"+", "-"}]
+
+    left = opposite(ammine)[0]
+    for right in opposite(aqua)[:10]:
+        relabelled = coembedding._least_motion(left, right)
+        assert [_stereoisomer(iso) for iso in relabelled] == [_stereoisomer(left), _stereoisomer(right)]
 
 
 def test_copies_must_share_one_atom_order():

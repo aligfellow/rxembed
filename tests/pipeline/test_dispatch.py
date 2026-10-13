@@ -674,6 +674,19 @@ def test_coembed_keeps_every_atom_map_of_two_mapped_isomers(reactant, product, g
     assert _bonds_by_map(pair[0].mol) ^ _bonds_by_map(pair[1].mol) == _bonds_by_map(mols[0]) ^ _bonds_by_map(mols[1])
 
 
+@pytest.mark.parametrize(("label", "angle"), [("cis", 90.0), ("trans", 180.0)])
+def test_coembed_seats_the_leaving_ammine_where_the_entering_chloride_binds(label, angle):
+    """[Co(NH3)5Cl]2+ + Cl- -> [Co(NH3)4Cl2]+ + NH3: the ammine N6 leaves, the chloride Cl8 enters."""
+    reactant = rx.metal("[NH3:1]->[Co+3:2](<-[NH3:3])(<-[NH3:4])(<-[NH3:5])(<-[NH3:6])<-[Cl-:7].[Cl-:8]", "OCT")
+    products = rx.metal("[NH3:1]->[Co+3:2](<-[NH3:3])(<-[NH3:4])(<-[NH3:5])(<-[Cl-:8])<-[Cl-:7].[NH3:6]", "OCT")
+
+    left, _right = rx.coembed((reactant.select(), next(iso for iso in products if iso.label == label)), n=1, seed=1)
+
+    at = {atom.GetAtomMapNum(): atom.GetIdx() for atom in left.mol.GetAtoms()}
+    conf = left.mol.GetConformer(left.ids[0])
+    assert rdMolTransforms.GetAngleDeg(conf, at[6], at[2], at[7]) == pytest.approx(angle, abs=15)
+
+
 def test_coembed_overlays_a_platinum_ethylene_insertion_from_a_mapped_cxsmiles_pair():
     hydride = rx.metal("[Pt+2:1]1(<-[H-:2])(<-[Cl-:3])(<-[PH3:4])<-[CH2:5]=[CH2:6]->1", "SPL")[0]
     ethyl = rx.metal("[Pt+2:1](<-[Cl-:3])(<-[PH3:4])<-[CH2-:6][CH2:5][H:2]", "SPL")[0]  # the H slot left vacant

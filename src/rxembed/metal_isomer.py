@@ -330,7 +330,7 @@ class Isomer:
         return _state_arrangement(self, self.centres[0])
 
     def with_stereo(self, centres):
-        """Return a shallow copy with hand or winding metadata replaced on unchanged seatings."""
+        """Return a shallow copy with its metal states replaced: a hand, a winding, or an equivalent seating."""
         centres = tuple(centres)
         by_metal = {state.atom: state for state in centres}
         if set(by_metal) != {state.atom for state in self.centres}:
