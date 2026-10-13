@@ -18,6 +18,7 @@ import numpy as np
 from rdkit import Chem
 
 from rxembed.bounds import probe_conformer
+from rxembed.constraints import constraint_value
 from rxembed.metal_core import frag_map, metal_indices
 from rxembed.utils import atom_label
 
@@ -429,14 +430,32 @@ def auto_binding_modes(mol, kinds=_AUTO_KINDS, inter_fragment=True, acceptor_cap
 
     modes = OrderedDict()
     for sk in ranked[:max_modes]:
-        combo = _augment_with_aux(list(sk), aux, acceptor_cap) if augment else list(sk)
-        m = Contact()
-        for c in combo:
-            m.distances.update(c.distances)
-            m.angles.update(c.angles)
-        m.label = _mode_label(mol, combo)
+        m = _mode(mol, _augment_with_aux(list(sk), aux, acceptor_cap) if augment else list(sk))
         modes[m.label] = m
     return modes
+
+
+def input_contacts(mol):
+    """Return the inter-fragment contacts of the automatic kinds `mol`'s geometry makes, as one mode or None.
+
+    A contact is made when each of its distances is within its window's upper bound; all its windows are held.
+    """
+    pos = mol.GetConformer().GetPositions()
+    made = [
+        c
+        for c in candidate_contacts(mol, kinds=_AUTO_KINDS).values()
+        if all(constraint_value(pos, key) <= hi for key, (_lo, hi) in c.distances.items())
+    ]
+    return _mode(mol, made) if made else None
+
+
+def _mode(mol, contacts):
+    """Return `contacts` merged into one `Contact`, labelled as a binding mode."""
+    mode = Contact(label=_mode_label(mol, contacts))
+    for c in contacts:
+        mode.distances.update(c.distances)
+        mode.angles.update(c.angles)
+    return mode
 
 
 def _atom_contacts(work, an, pos, frag, seen, inter_fragment, kind):

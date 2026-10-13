@@ -377,8 +377,9 @@ def test_smarts_template_needs_two_molecular_graphs():
         rx.embed("CCO", template=(np.zeros((3, 3)), "CCO"), n=1)
 
 
-def test_cxsmiles_contacts_use_restored_metal_graph(monkeypatch):
-    text = rx.cxsmiles(rx.metal("[NH3]->[Pt](<-[NH3])(Cl)Cl.O", "square_planar")[0])
+@pytest.mark.parametrize("as_source", [rx.cxsmiles, lambda iso: iso], ids=("cxsmiles", "isomer"))
+def test_contacts_are_discovered_on_the_restored_metal_graph(monkeypatch, as_source):
+    source = as_source(rx.metal("[NH3]->[Pt](<-[NH3])(Cl)Cl.O", "square_planar")[0])
     seen = {}
 
     def capture(mol, seed):
@@ -387,11 +388,27 @@ def test_cxsmiles_contacts_use_restored_metal_graph(monkeypatch):
 
     monkeypatch.setattr(dispatch, "auto_binding_modes", capture)
 
-    rx.embed(text, contacts="auto", n=1)
+    rx.embed(source, contacts="auto", n=1)
 
     discovered = seen["mol"]
     assert any(a.GetAtomicNum() == 78 for a in discovered.GetAtoms()), "contact discovery saw the carbon surrogate"
     assert len(Chem.GetMolFrags(discovered)) == 2, "the coordinated ligands were presented as separate fragments"
+
+
+def test_embed_holds_the_h_bond_its_input_geometry_makes():
+    pair = Chem.Mol(rx.embed("CC(=O)O.CN", contacts="auto", n=1, seed=1)[0].mol)  # acid H9 H-bonds amine N5
+
+    held = rx.embed(pair, contacts="input", n=2, seed=2)
+
+    assert "H9->N5" in held.tag["nci"]
+    for cid in held.ids:
+        pos = held.mol.GetConformer(cid).GetPositions()
+        assert np.linalg.norm(pos[5] - pos[9]) < 2.2
+
+
+def test_contacts_from_the_input_need_an_input_geometry():
+    with pytest.raises(ValueError, match="input geometry"):
+        rx.embed("CC(=O)O.CN", contacts="input")
 
 
 def test_stated_metal_return_shape_does_not_depend_on_source_representation():

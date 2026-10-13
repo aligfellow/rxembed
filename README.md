@@ -56,6 +56,7 @@ or raises.
 | a coordination polyhedron | `rx.metal(smiles, "octahedral")` |
 | a stated NCI grip or π stack | `constrain={(ring_a, ring_b): 3.5}` |
 | automatically proposed NCI contacts | `contacts="auto"` |
+| the NCI contacts between fragments that an input geometry makes | `contacts="input"` |
 
 ```python
 ref = rx.embed("OCCCCO", n=1)

@@ -34,7 +34,14 @@ from rxembed.embed import (  # module functions, not the package facade
     seed_conformers,
     stereo_donor_bonds,
 )
-from rxembed.metal_core import VACANT, donor_chirality_sign, metal_index, metal_indices, reject_metal_bonds
+from rxembed.metal_core import (
+    VACANT,
+    connect_metal,
+    donor_chirality_sign,
+    metal_index,
+    metal_indices,
+    reject_metal_bonds,
+)
 from rxembed.metal_isomer import Isomer, from_geometry
 from rxembed.metal_polyhedron import describe
 from rxembed.metal_smiles import parse_smiles
@@ -42,7 +49,7 @@ from rxembed.relax import MAX_ITERS
 from rxembed.stereo import enumerate_unassigned
 
 from .ensemble import Ensemble, EnsembleSet
-from .nci import Contact, auto_binding_modes
+from .nci import Contact, auto_binding_modes, input_contacts
 from .perceive import read_xyz
 from .stereo_check import signature
 
@@ -221,10 +228,21 @@ def _expand_isomers(isomers, coordinate, fix):
 
 
 def _contact_modes(source, contacts, params):
-    """Return explicit contacts or discover independent automatic contact modes."""
+    """Return explicit contacts, the contacts an input geometry makes, or automatic contact modes."""
+    disc = (
+        connect_metal(source.restore(Chem.Mol(source.mol)), source.donor_bonds)
+        if isinstance(source, Isomer)
+        else source
+    )
+    if contacts == "input":
+        if not disc.GetNumConformers():
+            raise ValueError("contacts='input' holds the contacts an input geometry makes; pass an .xyz or use 'auto'")
+        mode = input_contacts(disc)
+        if mode is None:
+            logger.info("contacts='input': the input geometry makes no NCI contact -> plain embed")
+        return [(mode.label, mode) if mode else (None, None)]
     if contacts != "auto":
         return [(None, contacts)]
-    disc = source.mol if isinstance(source, Isomer) else source
     try:
         modes = auto_binding_modes(disc, seed=params.seed)
     except ImportError:  # a missing extra names its own remedy
@@ -551,8 +569,8 @@ def embed(
 
     ``fix`` / ``constrain`` are the core verbs, documented in the `constraints` module docstring. ``template``
     is sugar for a coords-``fix``: ``(reference, SMARTS_or_map)``, matched by SMARTS or by an explicit
-    ``{target_i: ref_i}`` index map. ``contacts=`` reaches `nci_modes`; ``metal=`` / ``coordinate=`` reach
-    `rx.metal`.
+    ``{target_i: ref_i}`` index map. ``contacts=`` reaches `nci_modes` (``'auto'``) or `input_contacts`
+    (``'input'``); ``metal=`` / ``coordinate=`` reach `rx.metal`.
 
     ``stereo=`` governs point R/S, double-bond E/Z, and native atropisomer M/P (meso dropped, chiral-at-P
     included, metal never enumerated):
@@ -601,7 +619,7 @@ def embed(
                 except ValueError as err:
                     if nci_label is None:
                         raise
-                    failed.append(EmbeddingError(f"contacts='auto' mode {nci_label!r}: {err}"))
+                    failed.append(EmbeddingError(f"contacts={contacts!r} mode {nci_label!r}: {err}"))
         except (ValueError, RuntimeError) as err:
             if not expanded:
                 raise
