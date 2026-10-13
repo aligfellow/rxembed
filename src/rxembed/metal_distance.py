@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import defaultdict
 
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import GetPeriodicTable
 
+from .constraints import Constraints, add_distance
 from .metal_core import COORDINATION_METALS, ETA2, frag_map, haptic_sites, ligand_degree, ligand_valence
 
 _PT = GetPeriodicTable()
@@ -291,3 +293,23 @@ def nondonor_floors(mol, metal, real_z, real, cons, *, topology=None):
         z = mol.GetAtomWithIdx(i).GetAtomicNum()
         floor = _tier_floor(z, overbond_tier(mol, real, i), r_m, real_z)
         cons.dg_floors[(min(metal, i), max(metal, i))] = floor
+
+
+_ALKALI = frozenset({3, 11, 19, 37, 55, 87})  # Li, Na, K, Rb, Cs, Fr
+_ION_CONTACT = (-0.2, 0.1)  # Å around the covalent radius sum; a relaxed ion rests on the upper wall; unmeasured
+
+
+def ionic_contacts(mol):
+    """Return `Constraints` holding each alkali ion within contact of its dative partners, as a bond-less atom."""
+    cons, partners = Constraints(), defaultdict(list)
+    for bond in mol.GetBonds():
+        ions = [atom for atom in (bond.GetBeginAtom(), bond.GetEndAtom()) if atom.GetAtomicNum() in _ALKALI]
+        if bond.GetBondType() != Chem.BondType.DATIVE or len(ions) != 1:
+            continue
+        ion, partner = ions[0], bond.GetOtherAtom(ions[0])
+        r_sum = _PT.GetRcovalent(ion.GetAtomicNum()) + _PT.GetRcovalent(partner.GetAtomicNum())
+        add_distance(cons.distances, partner.GetIdx(), ion.GetIdx(), r_sum + _ION_CONTACT[0], r_sum + _ION_CONTACT[1])
+        partners[ion.GetIdx()].append(partner.GetIdx())
+    for ion, bound in partners.items():
+        ff_terms(mol, cons, ion, mol.GetAtomWithIdx(ion).GetAtomicNum(), bound)
+    return cons

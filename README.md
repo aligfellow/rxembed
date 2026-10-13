@@ -97,6 +97,8 @@ Geometries by coordination number, default first: 1 `MCO`; 2 `LIN`; 3 `TPL`, `TS
 and full names (`octahedral`, `t_shape`) are case-insensitive, and an unknown name lists them all. Without a
 geometry, rxembed classifies the input coordinates or takes the default. Each haptic face (a side-on bond, Cp,
 an arene) is one site bound through its centroid; four sites with an η3 or larger face default to tetrahedral.
+An alkali ion needs no geometry: `rx.embed("C1CC[O](C1)->[Li+](<-[O]1CCCC1)(<-[O]1CCCC1)<-[O]1CCCC1")` holds
+each dative donor at ionic contact, in no fixed direction.
 
 A `fix` on the coordination sphere decides which arrangements exist, so give it to `rx.metal`. A ligand core
 away from the metal does not, so template it after selection. `coordinate=` binds a fragment's donor, as SMARTS

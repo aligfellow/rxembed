@@ -51,6 +51,7 @@ from .metal_core import (
     metal_indices,
     surrogate_all_metals,
 )
+from .metal_distance import ionic_contacts
 from .metal_donor_orient import stripped_hybridisation
 from .metal_enumeration import enumerate_isomers
 from .metal_isomer import Isomer, from_geometry, winding_signature
@@ -1686,6 +1687,8 @@ def prepare(spec, *, fix=None, constrain=None, external=None, params=None):
         ref = graft_ref
     else:
         cons = cons.copy(conjugation=params.conjugation)
+    if (ions := ionic_contacts(mol)).metals:
+        cons = compose(ions, cons)
     return mol, cons, iso, ref
 
 

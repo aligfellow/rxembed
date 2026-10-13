@@ -182,8 +182,11 @@ def ff_energies(mol, minimize=True, max_iters=MAX_ITERS, statuses=None):
 def _ff_surrogate(mol, metals, phantoms=()):
     """Retype unsupported centres and remove non-valence contacts on a private UFF graph."""
     metals = {int(m) for m in metals}
-    partial = [
-        (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()) for bond in mol.GetBonds() if not bond.GetBondTypeAsDouble()
+    partial = [  # zero-order contacts, and dative bonds to a restrained metal, which its windows hold
+        (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+        for bond in mol.GetBonds()
+        if not bond.GetBondTypeAsDouble()
+        or (bond.GetBondType() == Chem.BondType.DATIVE and {bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()} & metals)
     ]
     if not metals and not phantoms and not partial:
         return mol  # an organic system: the identical object, so this whole path is a strict no-op

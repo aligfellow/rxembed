@@ -73,3 +73,26 @@ def test_coordinate_backed_chelate_windows_use_the_same_radial_policy():
     without_coordinates = rx.Constraints(distances=distances)
     metal_distance.ff_terms(mol, without_coordinates, metal, 46, [n_left, n_right, chloride, bromide])
     assert cons == without_coordinates
+
+
+@pytest.mark.parametrize(
+    ("smiles", "ion", "contact"),
+    [
+        ("C1C[O]2CC[O]3CC[O]4CC[O]5CC[O](C1)->[Na+]<-2<-3<-4<-5", 11, (2.2, 2.6)),
+        ("O->[K+](<-O)(<-O)(<-O)(<-O)<-O", 19, (2.5, 2.9)),
+        ("CC1=[O]->[Na+]<-[O-]1", 11, (2.2, 2.6)),
+        ("O->[Na+](<-O)(<-O)->[Cl]", 11, (2.1, 2.9)),
+    ],
+    ids=("sodium-crown", "potassium-hexaaqua", "sodium-acetate-chelate", "sodium-chloride-arrow-from-the-ion"),
+)
+def test_alkali_ion_binds_its_donors_at_ionic_contact(smiles, ion, contact):
+    ens = rx.embed(smiles, n=3, seed=1)
+
+    assert len(ens.ids) == 3
+    mol = ens.mol
+    metal = next(atom for atom in mol.GetAtoms() if atom.GetAtomicNum() == ion)
+    for cid in ens.ids:
+        conf = mol.GetConformer(cid)
+        for donor in metal.GetNeighbors():
+            length = (conf.GetAtomPosition(metal.GetIdx()) - conf.GetAtomPosition(donor.GetIdx())).Length()
+            assert contact[0] < length < contact[1]

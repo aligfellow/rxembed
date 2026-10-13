@@ -335,16 +335,16 @@ def _write(mol, cons, params=None):
     """
     # `seed_conformers` temporarily restores the real metal and adds dative M-L edges so RDKit sees a labelled
     # donor's full CIP basis and a terminal sp donor's linear axis. The bounds basis stays the surrogate graph
-    # every other seed uses: on a private copy, remove the edges owned by a selected metal's explicit M-L
-    # distance and give each metal left bondless its surrogate carbon, whose floors the metal model assumes.
+    # every other seed uses: on a private copy, remove each dative edge a restrained metal's window owns (an
+    # alkali ion's included) and give each coordination metal its surrogate carbon, whose floors it assumes.
     owned = {tuple(sorted(atoms)) for atoms in cons.distances}
     removable = []
     for bond in mol.GetBonds():
         if bond.GetBondType() != Chem.BondType.DATIVE:
             continue
         begin, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        metals = [idx for idx in (begin, end) if mol.GetAtomWithIdx(idx).GetAtomicNum() in COORDINATION_METALS]
-        if len(metals) == 1 and metals[0] in cons.metals and tuple(sorted((begin, end))) in owned:
+        metals = [idx for idx in (begin, end) if idx in cons.metals]
+        if len(metals) == 1 and tuple(sorted((begin, end))) in owned:
             removable.append((begin, end))
     native = mol
     if removable or any(atom.GetAtomicNum() in COORDINATION_METALS for atom in mol.GetAtoms()):

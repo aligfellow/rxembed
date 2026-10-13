@@ -28,7 +28,7 @@ except optional dependencies at their point of use.
 | shapes | `metal_polyhedron` | the `POLYHEDRA` registry, proper rotations, slot notes and hand frames |
 | metal graph | `metal_core` | metal state records, surrogate swap and restore, haptic sites, the ligand graph |
 | graph chemistry | `stereo` | ligand stereo, including coordination-locked centres: read from 3D, written, enumerated |
-| | `metal_distance` | the fitted M-L length model and the floors for non-donor atoms near the metal |
+| | `metal_distance` | the fitted M-L length model, the alkali ion contact and the floors for non-donor atoms near the metal |
 | DG and FF engine | `mechanisms` | each `Constraints` field as DG bounds and restrained-UFF terms (`Mechanism`) |
 | | `relax` | one restrained UFF attempt on a private force-field graph (`restrained_uff`, `UFFRecord`) |
 | | `bounds` | `EmbedParams`, native bounds and their edits, ligand reach, fragment contacts, DG seeding |
