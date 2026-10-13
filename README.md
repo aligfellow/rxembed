@@ -177,7 +177,8 @@ product.dump("p.xyz", align=False)  # frame k pairs with frame k of r.xyz
 
 The reaction is a `"reactant>>product"` SMILES, atom-mapped or not, or a pair of `rx.embed` sources such as two
 `.xyz` frames. The product takes the reactant's atom order from the graph overlay that keeps the most bonds; atom
-maps pin atoms where that overlay allows two reactions, and two `Isomer`s must already share one order.
+maps pin atoms where that overlay allows two reactions and stay on the returned molecules. Two `Isomer`s
+either share one order or carry atom maps.
 `constrain=` and `contacts=` take reactant indices and hold both copies. See
 [reaction endpoints](examples/15_coembed.ipynb).
 

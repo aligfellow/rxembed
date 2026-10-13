@@ -361,7 +361,7 @@ _MAX_REMAINDERS = 20_000  # remainders canonicalised in one overlay search; unme
 
 
 def map_reaction(reactant, product, frames=False):
-    """Return both sides on the reactant's atom order, with any atom maps cleared.
+    """Return both sides on the reactant's atom order; any atom maps stay on both.
 
     Two `.xyz` `frames` on one element order keep it: an .xyz carries no atom map, frames of one path already share
     their atoms, and only that order tells a degenerate exchange apart. Otherwise the product is renumbered by its
@@ -376,9 +376,6 @@ def map_reaction(reactant, product, frames=False):
         raise ValueError("give each atom-map number to one atom on each side, and the same numbers on both sides")
     if not (frames and elements[0] == elements[1]):
         sides[1] = Chem.RenumberAtoms(sides[1], _overlay_order(*sides))
-    for mol in sides:
-        for atom in mol.GetAtoms():
-            atom.SetAtomMapNum(0)
     return sides
 
 

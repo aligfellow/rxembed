@@ -20,6 +20,7 @@ from rxembed.constraints import FIX_ANGLE_TOL, FIX_DISTANCE_TOL
 from rxembed.pipeline import dispatch
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.stereo_check import signature
+from rxembed.utils import map_reaction
 
 # --- baseline: clean peripheries ---------------------------------------------
 
@@ -628,6 +629,49 @@ def test_coembed_holds_the_h_bonds_its_reactant_geometry_makes():
     assert 1.6 < np.linalg.norm(r[5] - r[9]) < 2.2  # the H-bond the proton crosses
     assert np.linalg.norm(p[5] - p[9]) < 1.1  # the ammonium N-H bond
     assert all(1.6 < np.linalg.norm(x[2] - x[13]) < 2.2 for x in (r, p))  # an amine N-H to the acid C=O
+
+
+_BETA_HYDRIDE = (
+    "C[P:5](C)(C)->[Pd+2:4](<-[CH2-:1][CH:2]([H:3])c1ccccc1)<-[P:6](C)(C)C "
+    "|atomProp:1.atomNote.s0:4.atomNote.SPL:5.atomNote.s1:14.atomNote.s3|",
+    "C[P:5](C)(C)->[Pd+2:4]1(<-[CH2:1]=[CH:2]->1c1ccccc1)(<-[H-:3])<-[P:6](C)(C)C "
+    "|atomProp:1.atomNote.s0:4.atomNote.SPL:5.atomNote.s1+:6.atomNote.s1+:13.atomNote.s2:14.atomNote.s3|",
+    None,
+)
+_PALLADIUM_CMD = (
+    "COC1=C[CH](->[Pd+2]23<-[N]4=C(C5=[N]->2C(CC2=[N]->3C([O-])=CC=C2)=CC=C5)C=CC=C4)=CC(OC)=C1OC",
+    "[H]OC1=CC=CC2CC3=CC=CC4C5=[N](->[Pd+2](<-[C-]6=CC(OC)=C(OC)C(OC)=C6)(<-[N]=21)<-[N]=43)C=CC=C5",
+    "SPL",
+)
+
+
+def _bonds_by_map(mol):
+    """Return `mol`'s bonds as pairs of atom-map numbers."""
+    return {
+        frozenset(mol.GetAtomWithIdx(i).GetAtomMapNum() for i in (b.GetBeginAtomIdx(), b.GetEndAtomIdx()))
+        for b in mol.GetBonds()
+    }
+
+
+@pytest.mark.parametrize(
+    ("reactant", "product", "geometry"), [_BETA_HYDRIDE, _PALLADIUM_CMD], ids=("beta-hydride", "pd-cmd")
+)
+def test_coembed_keeps_every_atom_map_of_two_mapped_isomers(reactant, product, geometry):
+    mols = map_reaction(*(Chem.AddHs(rx.parse_smiles(side, remove_hs=False)) for side in (reactant, product)))
+    for mol in mols:
+        for atom in mol.GetAtoms():
+            atom.SetAtomMapNum(atom.GetIdx() + 1)
+    mols[1] = Chem.RenumberAtoms(mols[1], list(range(mols[1].GetNumAtoms()))[::-1])  # the product in its own order
+    isomers = [rx.metal(mol, geometry).select() for mol in mols]
+
+    pair = rx.coembed(tuple(isomers), n=1, seed=1)
+
+    for ens, mol, iso in zip(pair, mols, isomers, strict=True):
+        assert {a.GetAtomMapNum(): a.GetSymbol() for a in ens.mol.GetAtoms()} == {
+            a.GetAtomMapNum(): a.GetSymbol() for a in mol.GetAtoms()
+        }
+        assert rx.cxsmiles(ens.iso) == rx.cxsmiles(iso)
+    assert _bonds_by_map(pair[0].mol) ^ _bonds_by_map(pair[1].mol) == _bonds_by_map(mols[0]) ^ _bonds_by_map(mols[1])
 
 
 def test_coembed_overlays_a_platinum_ethylene_insertion_from_a_mapped_cxsmiles_pair():

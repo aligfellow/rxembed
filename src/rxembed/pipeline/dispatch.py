@@ -34,7 +34,7 @@ from rxembed.embed import (  # module functions, not the package facade
 from rxembed.metal_core import VACANT, connect_metal, metal_index, metal_indices, reject_metal_bonds
 from rxembed.metal_isomer import Isomer, from_geometry
 from rxembed.metal_polyhedron import describe
-from rxembed.metal_smiles import parse_smiles
+from rxembed.metal_smiles import cxsmiles, parse_smiles
 from rxembed.relax import MAX_ITERS
 from rxembed.stereo import enumerate_unassigned
 from rxembed.utils import map_reaction
@@ -652,7 +652,7 @@ def coembed(
 
     `reaction` is a ``'reactant>>product'`` SMILES, or a ``(reactant, product)`` pair of anything `embed` reads:
     SMILES or CXSMILES strings, ``.xyz`` paths, Mols or selected Isomers. The product takes the reactant's atom
-    order from their maximal graph overlay (`utils.map_reaction`); two Isomers must already share one.
+    order from their maximal graph overlay (`utils.map_reaction`); two Isomers share one unless both carry atom maps.
     Each side's metal identity comes from its CXSMILES notes, its geometry or ``metal=`` (one geometry for both),
     and must resolve to one Isomer; otherwise select one per side with `rx.metal` and pass the pair. `constrain`
     and `contacts` take atom indices in the reactant's order and hold both copies (`rxembed.core.coembed`).
@@ -674,6 +674,8 @@ def coembed(
             raise ValueError("coembed() takes 'reactant>>product' without agents or CX extensions, or a pair")
     if len(reaction) != 2:  # noqa: PLR2004 - two endpoints
         raise ValueError(f"coembed() takes one reactant and one product; got {len(reaction)} sources")
+    # A mapped Isomer travels as its CX, whose atom notes carry its state through the overlay's reorder.
+    reaction = [cxsmiles(side) if isinstance(side, Isomer) and _has_maps(side.mol) else side for side in reaction]
     sides = [side if isinstance(side, Isomer) else _normalize(side, charge)[0] for side in reaction]
     if not any(isinstance(side, Isomer) for side in sides):
         frames = all(_is_xyz(side) for side in reaction)
@@ -712,6 +714,11 @@ def _coembed_pair(left, right, **kwargs):
     return published_pair(*copies)
 
 
+def _has_maps(mol):
+    """Return whether any atom of `mol` carries an atom-map number."""
+    return any(atom.GetAtomMapNum() for atom in mol.GetAtoms())
+
+
 def _one_identity(side, metal, name):
     """Return the one Isomer or Mol that `embed` would build for `side`, or raise naming how to select one."""
     _discovery, candidates, _expanded = _source_candidates(
@@ -720,6 +727,6 @@ def _one_identity(side, metal, name):
     if len(candidates) != 1:
         raise ValueError(
             f"the {name} has {len(candidates)} coordination identities; select one per side with rx.metal(...) "
-            "and pass the pair as mapped rx.cxsmiles strings"
+            "and pass the two Isomers, atom-mapped unless they share one atom order"
         )
     return candidates[0].spec
