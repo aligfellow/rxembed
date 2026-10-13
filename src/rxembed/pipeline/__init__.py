@@ -2,7 +2,7 @@
 
 from . import geom_check
 from .calculators import ASE
-from .dispatch import embed, minimize
+from .dispatch import coembed, embed, minimize
 
 # The workflow name accepts strings and paths; the engine name accepts a Mol.
 from .dispatch import enumerate_isomers as metal
@@ -17,6 +17,7 @@ __all__ = [
     "Contact",
     "Ensemble",
     "EnsembleSet",
+    "coembed",
     "embed",
     "geom_check",
     "metal",

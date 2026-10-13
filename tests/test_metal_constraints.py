@@ -15,7 +15,7 @@ from rdkit.Geometry import Point3D
 import rxembed as rx
 from rxembed import metal_core, stereo
 from rxembed.bounds import bounds_matrix
-from rxembed.embed import _coordination_state_failure
+from rxembed.embed import coordination_state_failure
 from rxembed.metal_constraints import (
     CoordinationSphere,
     _bite_window_and_reach,
@@ -94,7 +94,7 @@ def test_secondary_planar_centre_is_checked():
     pos = conf.GetPositions()
     donor = secondary.vertices[0]
     conf.SetAtomPosition(donor, Point3D(*(pos[donor] + np.array([0.0, 0.0, 2.0]))))
-    assert _coordination_state_failure(ens._mol, 0, iso) is not None, "the puckered secondary plane passed the gate"
+    assert coordination_state_failure(ens._mol, 0, iso) is not None, "the puckered secondary plane passed the gate"
 
 
 def test_donor_orientation_walls_cannot_collapse_two_protons_together():

@@ -1,8 +1,8 @@
 """Expand pipeline inputs into candidates and run each through one embed executor.
 
-This module owns the public `embed`, `minimize` and `enumerate_isomers` (the facade's `metal`) verbs. It adapts
-sources, templates, stereo, metal identities, vacant-site seating and NCI modes. Those axes only produce candidate
-data. `_execute` then prepares constraints and calls the shared core seeding seam once per candidate.
+This module owns the public `embed`, `coembed`, `minimize` and `enumerate_isomers` (the facade's `metal`) verbs.
+It adapts sources, templates, stereo, metal identities, vacant-site seating and NCI modes. Those axes only produce
+candidate data. `_execute` then prepares constraints and calls the shared core seeding seam once per candidate.
 """
 
 from __future__ import annotations
@@ -16,11 +16,9 @@ from rdkit import Chem
 
 from rxembed import metal_enumeration
 from rxembed.bounds import resolve_params
+from rxembed.coembedding import coembed as core_coembed
 from rxembed.constraints import (
-    Constraints,
-    compose_soft,
     resolve_atom,
-    resolve_core,
     substruct_matches,
     template_to_fix,
 )
@@ -32,23 +30,16 @@ from rxembed.embed import (  # module functions, not the package facade
     remedy,
     require_seed_count,
     seed_conformers,
-    stereo_donor_bonds,
 )
-from rxembed.metal_core import (
-    VACANT,
-    connect_metal,
-    donor_chirality_sign,
-    metal_index,
-    metal_indices,
-    reject_metal_bonds,
-)
+from rxembed.metal_core import VACANT, connect_metal, metal_index, metal_indices, reject_metal_bonds
 from rxembed.metal_isomer import Isomer, from_geometry
 from rxembed.metal_polyhedron import describe
 from rxembed.metal_smiles import parse_smiles
 from rxembed.relax import MAX_ITERS
 from rxembed.stereo import enumerate_unassigned
+from rxembed.utils import map_reaction
 
-from .ensemble import Ensemble, EnsembleSet
+from .ensemble import Ensemble, EnsembleSet, published_pair
 from .nci import Contact, auto_binding_modes, input_contacts
 from .perceive import read_xyz
 from .stereo_check import signature
@@ -66,6 +57,12 @@ class _Candidate:
     coordinated: tuple = ()
 
 
+def _is_xyz(source):
+    """Return whether `source` names an .xyz file, as a str or a path."""
+    path = os.fspath(source) if isinstance(source, os.PathLike) else source
+    return isinstance(path, str) and path.lower().endswith(".xyz")
+
+
 def _default_stereo(source, stereo):
     """Retain stereo from coordinates by default; enumerate unspecified stereo from a graph."""
     if stereo is not None:
@@ -75,8 +72,7 @@ def _default_stereo(source, stereo):
     elif isinstance(source, Chem.Mol):
         has_geometry = bool(source.GetNumConformers())
     else:
-        path = os.fspath(source) if isinstance(source, os.PathLike) else source
-        has_geometry = isinstance(path, str) and path.lower().endswith(".xyz")
+        has_geometry = _is_xyz(source)
     return "all" if has_geometry else "unassigned"
 
 
@@ -99,7 +95,7 @@ def _normalize(source, charge=0):
         source = os.fspath(source)  # accept pathlib.Path, not just str
     if isinstance(source, Chem.Mol):
         mol = source
-    elif isinstance(source, str) and source.lower().endswith(".xyz"):
+    elif _is_xyz(source):
         mol = read_xyz(source, charge)
     else:
         mol = parse_smiles(source)
@@ -107,33 +103,24 @@ def _normalize(source, charge=0):
     return Chem.AddHs(mol, addCoords=has_geom), has_geom
 
 
-def _contact_constraints(mol, contacts):
-    """Resolve contact inputs through the validated soft-constraint path."""
-    distances, angles = {}, {}
+def _contact_terms(contacts):
+    """Return `contacts` as one ``{key: window}`` dict of distance and angle terms, or None for no contacts."""
     if contacts is None:
-        return Constraints()
-    items: list[Contact] = []
+        return None
     if isinstance(contacts, Contact):
         items = [contacts]
     elif isinstance(contacts, dict):
-        vals = [v for v in contacts.values() if isinstance(v, Contact)]
-        if vals and len(vals) != len(contacts):  # {label: Contact} must be all Contacts
+        items = [v for v in contacts.values() if isinstance(v, Contact)]
+        if items and len(items) != len(contacts):  # {label: Contact} must be all Contacts
             raise TypeError("contacts: dict mixes Contact and non-Contact values")
-        if vals:
-            items = vals
-        else:
-            distances.update(contacts)  # a raw {(i,j):(lo,hi)} distance dict
+        if not items:
+            return dict(contacts)  # a raw {(i,j):(lo,hi)} distance dict
     else:
         values = list(contacts)
         items = [c for c in values if isinstance(c, Contact)]
         if len(items) != len(values):
             raise TypeError("contacts: list must contain Contact objects (from rx.nci_candidates)")
-    for ct in items:
-        distances.update(ct.distances)
-        angles.update(ct.angles)
-    if not distances and not angles:
-        return Constraints()
-    return resolve_core(mol, constrain={**distances, **angles}, has_geometry=bool(mol.GetNumConformers()))[0]
+    return {key: value for ct in items for key, value in (*ct.distances.items(), *ct.angles.items())} or None
 
 
 def _coordination_choices(iso, coordinate, nvac):
@@ -171,39 +158,12 @@ def _coordination_choices(iso, coordinate, nvac):
 
 def _execute(spec, *, fix, constrain, contacts, n, params):
     """Compile and seed one candidate, returning its pipeline ensemble."""
-    mol, cons, iso, graft_ref = prepare(spec, fix=fix, constrain=constrain, params=params)
-    soft = _contact_constraints(mol, contacts)
-    cons = compose_soft(cons, soft)
-    if iso is not None and soft.is_constrained:
-        accepted = set().union(*cons.contacts)
-        active = Constraints(
-            planes=soft.planes,
-            distances={key: value for key, value in soft.distances.items() if key in accepted},
-            angles={key: value for key, value in soft.angles.items() if key in accepted},
-            dihedrals={key: value for key, value in soft.dihedrals.items() if key in accepted},
-        )
-        if active.is_constrained:
-            # Resolve ownership first: an ignored contact must not change an unrelated model preference.
-            mol, cons, iso, graft_ref = prepare(spec, fix=fix, constrain=constrain, external=active, params=params)
-            cons = compose_soft(cons, soft)
+    mol, cons, iso, graft_ref = prepare(
+        spec, fix=fix, constrain=constrain, contacts=_contact_terms(contacts), params=params
+    )
     mol, ids, target = seed_conformers(mol, cons, iso, n, params, graft_ref=graft_ref)
     require_seed_count(ids, target, iso)
-    ens = Ensemble(mol, list(ids), cons, iso, params=params)
-    if iso is not None:
-        for donor, metal_idx in iso.donor_bonds:
-            ens.sphere.setdefault(metal_idx, []).append(donor)
-        if ids:
-            donors = sorted({donor for donor, _metal_idx in stereo_donor_bonds(mol, iso)})
-            ens.donor_hand = {
-                d: donor_chirality_sign(
-                    mol,
-                    ids[0],
-                    d,
-                    [metal for donor, metal in iso.donor_bonds if donor == d],
-                )
-                for d in donors
-            }
-    return ens
+    return Ensemble(mol, list(ids), cons, iso, params=params).record_metal_context()
 
 
 def _expand_isomers(isomers, coordinate, fix):
@@ -683,3 +643,83 @@ def minimize(
     # with a `Conformers` result); this only wraps it as an `Ensemble` so the pipeline verbs chain off it.
     mol, ids, cons, iso = prepare_relax(spec, fix=fix, constrain=constrain)
     return Ensemble(mol, ids, cons, iso).minimize(stiffness=stiffness, max_iters=max_iters)
+
+
+def coembed(
+    reaction, *, metal=None, constrain=None, contacts=None, charge=0, n=None, seed=None, threads=None, params=None
+):
+    """Embed a reaction's two endpoints as paired, aligned conformers; return ``(reactant, product)``.
+
+    `reaction` is a ``'reactant>>product'`` SMILES, or a ``(reactant, product)`` pair of anything `embed` reads:
+    SMILES or CXSMILES strings, ``.xyz`` paths, Mols or selected Isomers. The product takes the reactant's atom
+    order from their maximal graph overlay (`utils.map_reaction`); two Isomers must already share one.
+    Each side's metal identity comes from its CXSMILES notes, its geometry or ``metal=`` (one geometry for both),
+    and must resolve to one Isomer; otherwise select one per side with `rx.metal` and pass the pair. `constrain`
+    and `contacts` take atom indices in the reactant's order and hold both copies (`rxembed.core.coembed`).
+    `contacts` reads as in `embed`: ``'auto'`` co-embeds one pair per binding mode `rx.nci_modes` finds on the
+    reactant, and ``'input'`` holds the contacts its geometry makes.
+
+    Conformer ids pair the two Ensembles, which share one frame (`rxembed.core.coembed`). A
+    pair is kept only when both copies pass `embed`'s per-conformer workflow gate (`published_pair`).
+    `minimize()` on either Ensemble relaxes that endpoint alone, which releases the tie to its partner. When
+    several contact modes return, or one fails, each side is an `EnsembleSet` tagged by ``nci`` mode, and
+    candidate k of one set pairs with candidate k of the other.
+
+        reactant, product = rx.coembed("CBr.[Cl-]>>CCl.[Br-]", n=4)
+    """
+    params = resolve_params(params, seed, threads)
+    if isinstance(reaction, str):  # a dative arrow '->' is not a reaction arrow, so split on '>>' alone
+        reaction = tuple(reaction.split(">>"))
+        if len(reaction) != 2 or any("|" in side for side in reaction):  # noqa: PLR2004 - two sides
+            raise ValueError("coembed() takes 'reactant>>product' without agents or CX extensions, or a pair")
+    if len(reaction) != 2:  # noqa: PLR2004 - two endpoints
+        raise ValueError(f"coembed() takes one reactant and one product; got {len(reaction)} sources")
+    sides = [side if isinstance(side, Isomer) else _normalize(side, charge)[0] for side in reaction]
+    if not any(isinstance(side, Isomer) for side in sides):
+        frames = all(_is_xyz(side) for side in reaction)
+        sides = map_reaction(*sides, frames=frames)
+    left, right = (_one_identity(side, metal, name) for side, name in zip(sides, ("reactant", "product"), strict=True))
+    pairs, failed = [], []
+    for label, contact in _contact_modes(sides[0], contacts, params):
+        try:
+            pair = _coembed_pair(left, right, constrain=constrain, contacts=_contact_terms(contact), n=n, params=params)
+        except ValueError as err:
+            if label is None:
+                raise
+            failed.append(EmbeddingError(f"contacts={contacts!r} mode {label!r}: {err}"))
+            logger.warning("%s", failed[-1])
+            continue
+        if label is not None:
+            for ens in pair:
+                ens.tag = {"nci": label}
+        pairs.append(pair)
+    if not pairs:
+        raise EmbeddingError(f"none of {len(failed)} contact modes could be co-embedded; first: {failed[0]}")
+    if len(pairs) == 1 and not failed:
+        return pairs[0]
+    sets = tuple(EnsembleSet(pair[side] for pair in pairs) for side in (0, 1))
+    for group in sets:
+        group.errors = tuple(failed)
+    return sets
+
+
+def _coembed_pair(left, right, **kwargs):
+    """Return one co-embedded pair as Ensembles (`published_pair`), a bounds contradiction as `ValueError`."""
+    try:
+        copies = core_coembed(left, right, **kwargs)
+    except RuntimeError as err:  # as `_embed_mode`: a contradiction in the pair's bounds is a bad request
+        raise ValueError(f"could not co-embed this pair: {err}") from err
+    return published_pair(*copies)
+
+
+def _one_identity(side, metal, name):
+    """Return the one Isomer or Mol that `embed` would build for `side`, or raise naming how to select one."""
+    _discovery, candidates, _expanded = _source_candidates(
+        side, metal=metal, fix=None, coordinate=None, stereo=_default_stereo(side, None)
+    )
+    if len(candidates) != 1:
+        raise ValueError(
+            f"the {name} has {len(candidates)} coordination identities; select one per side with rx.metal(...) "
+            "and pass the pair as mapped rx.cxsmiles strings"
+        )
+    return candidates[0].spec

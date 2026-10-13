@@ -7,6 +7,7 @@ import itertools
 import logging
 from collections import Counter
 from importlib.util import find_spec
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -543,3 +544,100 @@ def test_unembeddable_stereoisomer_is_skipped_and_recorded(monkeypatch):
 
     assert [ens.tag.get("stereo") for ens in r] == ["C3=C4:Z"]
     assert [str(err) for err in r.errors] == ["stereoisomer [C3=C4:E]: could not embed molecule: synthetic E failure"]
+
+
+def test_coembed_overlays_an_unmapped_palladium_c_h_activation_onto_the_reactant_order():
+    reactant = "COC1=C[CH](->[Pd+2]23<-[N]4=C(C5=[N]->2C(CC2=[N]->3C([O-])=CC=C2)=CC=C5)C=CC=C4)=CC(OC)=C1OC"
+    product = "[H]OC1=CC=CC2CC3=CC=CC4C5=[N](->[Pd+2](<-[C-]6=CC(OC)=C(OC)C(OC)=C6)(<-[N]=21)<-[N]=43)C=CC=C5"
+
+    reactant, product = rx.coembed((reactant, product), metal="SPL", n=2, seed=7)
+
+    parents = [
+        {atom.GetIdx(): atom.GetNeighbors()[0].GetIdx() for atom in ens.mol.GetAtoms() if atom.GetAtomicNum() == 1}
+        for ens in (reactant, product)
+    ]
+    moved = [h for h in parents[0] if parents[0][h] != parents[1][h]]
+    assert [(parents[0][h], parents[1][h]) for h in moved] == [(4, 15)]  # the aryl C-H proton onto the phenoxide O
+    for cid in reactant.ids:
+        r, p = reactant.mol.GetConformer(cid).GetPositions(), product.mol.GetConformer(cid).GetPositions()
+        assert np.linalg.norm(r[4] - r[moved[0]]) < 1.2
+        assert np.linalg.norm(p[15] - p[moved[0]]) < 1.1
+
+
+@pytest.mark.parametrize("as_path", [str, Path], ids=("str", "pathlib"))
+def test_coembed_keeps_the_atom_order_of_two_xyz_frames_of_a_degenerate_proton_transfer(tmp_path, as_path):
+    malonate = rx.embed("OC(=O)CC(=O)[O-]", n=1, seed=1).mol  # O0-H on one carboxyl, O6 the other's anion
+    hydrogen = next(nb.GetIdx() for nb in malonate.GetAtomWithIdx(0).GetNeighbors() if nb.GetAtomicNum() == 1)
+    pos = malonate.GetConformer().GetPositions()
+    frames = [pos, pos.copy()]
+    outward = pos[6] - pos[4]
+    frames[1][hydrogen] = pos[6] + 0.97 * outward / np.linalg.norm(outward)  # the proton moved onto O6
+    paths = []
+    for name, frame in zip(("r.xyz", "p.xyz"), frames, strict=True):
+        conf = malonate.GetConformer()
+        conf.SetPositions(frame)
+        paths.append(as_path(tmp_path / name))
+        Chem.MolToXYZFile(malonate, str(paths[-1]))
+
+    _reactant, product = rx.coembed(tuple(paths), charge=-1, n=1, seed=1)  # one graph by symmetry
+
+    assert product.mol.GetBondBetweenAtoms(6, hydrogen) is not None
+
+
+def test_coembed_refuses_a_geometry_for_selected_isomers():
+    cisplatin = rx.metal("N->[Pt+2](<-N)(<-[Cl-])<-[Cl-]", "SPL")[0]
+
+    with pytest.raises(ValueError, match="OR metal="):
+        rx.coembed((cisplatin, cisplatin), metal="TET")
+
+
+def test_coembed_holds_each_h_bond_mode_in_both_copies_unless_the_h_bond_becomes_the_bond():
+    acid_amine = "CC(=O)O.CN>>CC(=O)[O-].C[NH3+]"  # the acid proton H9 moves onto the amine N5
+
+    reactants, products = rx.coembed(acid_amine, contacts="auto", n=1, seed=1)
+
+    labels = [ens.tag["nci"] for ens in reactants]
+    assert labels == [ens.tag["nci"] for ens in products]
+    assert any("H9->N5" in label for label in labels)
+    assert any("H13->O3" in label for label in labels)
+    for reactant, product in zip(reactants, products, strict=True):
+        r = reactant.mol.GetConformer(reactant.ids[0]).GetPositions()
+        p = product.mol.GetConformer(product.ids[0]).GetPositions()
+        if "H9->N5" in reactant.tag["nci"]:
+            assert 1.6 < np.linalg.norm(r[5] - r[9]) < 2.2  # an H-bond in the acid-amine pair
+            assert np.linalg.norm(p[5] - p[9]) < 1.1  # the ammonium N-H bond
+        if "H13->O3" in reactant.tag["nci"]:  # an amine N-H to the hydroxyl O, a spectator held in both
+            assert all(1.6 < np.linalg.norm(x[3] - x[13]) < 2.2 for x in (r, p))
+            for ens in (reactant, product):  # and by each endpoint relaxed alone
+                x = ens.minimize().mol.GetConformer(ens.ids[0]).GetPositions()
+                assert 1.6 < np.linalg.norm(x[3] - x[13]) < 2.2
+
+
+def test_coembed_holds_the_h_bonds_its_reactant_geometry_makes():
+    acid_amine = Chem.Mol(rx.embed("CC(=O)O.CN", contacts="auto", n=1, seed=1)[0].mol)  # acid H9 H-bonds amine N5
+    ammonium = Chem.RWMol(acid_amine)  # the same geometry with H9 moved onto N5
+    ammonium.RemoveBond(3, 9)
+    ammonium.AddBond(5, 9, Chem.BondType.SINGLE)
+    ammonium.GetAtomWithIdx(3).SetFormalCharge(-1)
+    ammonium.GetAtomWithIdx(5).SetFormalCharge(1)
+    Chem.SanitizeMol(ammonium)
+
+    reactant, product = rx.coembed((acid_amine, ammonium.GetMol()), contacts="input", n=1, seed=1)
+
+    r, p = (ens.mol.GetConformer(ens.ids[0]).GetPositions() for ens in (reactant, product))
+    assert 1.6 < np.linalg.norm(r[5] - r[9]) < 2.2  # the H-bond the proton crosses
+    assert np.linalg.norm(p[5] - p[9]) < 1.1  # the ammonium N-H bond
+    assert all(1.6 < np.linalg.norm(x[2] - x[13]) < 2.2 for x in (r, p))  # an amine N-H to the acid C=O
+
+
+def test_coembed_overlays_a_platinum_ethylene_insertion_from_a_mapped_cxsmiles_pair():
+    hydride = rx.metal("[Pt+2:1]1(<-[H-:2])(<-[Cl-:3])(<-[PH3:4])<-[CH2:5]=[CH2:6]->1", "SPL")[0]
+    ethyl = rx.metal("[Pt+2:1](<-[Cl-:3])(<-[PH3:4])<-[CH2-:6][CH2:5][H:2]", "SPL")[0]  # the H slot left vacant
+
+    reactant, product = rx.coembed((rx.cxsmiles(hydride), rx.cxsmiles(ethyl)), n=2, seed=1)
+
+    heavy = [atom.GetIdx() for atom in reactant.mol.GetAtoms() if atom.GetAtomicNum() > 1]
+    for cid in reactant.ids:
+        r = reactant.mol.GetConformer(cid).GetPositions()[heavy]
+        p = product.mol.GetConformer(cid).GetPositions()[heavy]
+        assert np.sqrt(((r - p) ** 2).sum(1).mean()) < 0.8

@@ -115,7 +115,7 @@ def test_coordination_gate_rejects_a_different_named_shell(
         mol.AddConformer(conf)
         assert classify_geometry(mol, iso.metal, list(iso.vertices), cid) == observed_polyhedron
 
-    failure = emb._coordination_state_failure(mol, cid, iso)
+    failure = emb.coordination_state_failure(mol, cid, iso)
 
     assert failure is not None
     requested_code, observed_code = POLYHEDRA[request_geometry].code, POLYHEDRA[observed_polyhedron].code
@@ -139,7 +139,7 @@ def test_coordination_gate_rejects_a_better_exact_search_slot_assignment():
         conf.SetAtomPosition(donor, tuple(2.0 * direction))
 
     assert classify_geometry(confs._mol, iso.metal, list(iso.vertices), confs.ids[0]) == "square_pyramidal"
-    assert emb._coordination_state_failure(confs._mol, confs.ids[0], iso) is not None
+    assert emb.coordination_state_failure(confs._mol, confs.ids[0], iso) is not None
 
 
 def test_coordination_gate_rejects_nonfinite_donor_coordinates():
@@ -147,7 +147,7 @@ def test_coordination_gate_rejects_nonfinite_donor_coordinates():
     confs = embed(iso, n=1, seed=1)
     confs._mol.GetConformer(confs.ids[0]).SetAtomPosition(iso.donors[0], (float("nan"), 0.0, 0.0))
 
-    assert emb._coordination_state_failure(confs._mol, confs.ids[0], iso) is not None
+    assert emb.coordination_state_failure(confs._mol, confs.ids[0], iso) is not None
 
 
 def test_structural_gate_rejects_undefined_coplanarity():
@@ -528,7 +528,7 @@ def test_square_pyramid_with_an_empty_apex_is_judged_by_its_shape_not_a_flat_tol
         radius = np.linalg.norm(pos[donor] - pos[iso.metal])
         conf.SetAtomPosition(donor, tuple(pos[iso.metal] + radius * np.asarray(direction, float)))
 
-    failure = emb._coordination_state_failure(conformers._mol, conformers.ids[0], iso)
+    failure = emb.coordination_state_failure(conformers._mol, conformers.ids[0], iso)
 
     assert (failure is None) == accepted, failure
 
@@ -546,7 +546,7 @@ def test_relax_gate_rejects_inverted_ligand_point_stereo(monkeypatch):
         return f"{symbol}{atom}:{found}"
 
     monkeypatch.setattr(emb, "stereo_from_3d", inverted)
-    monkeypatch.setattr(emb, "_coordination_state_failure", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(emb, "coordination_state_failure", lambda *_args, **_kwargs: None)
 
     failure = conformers._geometry_failure(conformers.ids[0])
 

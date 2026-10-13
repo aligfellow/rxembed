@@ -50,6 +50,7 @@ TARGET_FC = 1e4  # kcal/mol/Å²: holds an M-L target to 0.004 Å against a meas
 _ANGLE_TARGET_FC = 0.001 * ANGLE_FC
 FIX_DISTANCE_FC = 3e7  # kcal/mol/Å²: measured 1.557 -> 1.55760 Å against the reactive-pair LJ repulsion
 FIX_ANGLE_FC = 1e3  # kcal/mol/deg²: measured 123.456 -> 123.45543 degrees before the acceptance gate
+TIE_FC = 5.0  # kcal/mol/Å² past a co-embedded atom's budget
 _COPLANAR_FC = 10.0  # kcal/mol/deg²: below 5 tears a diphosphine on a rigid diene
 _UMBRELLA_FC = 3.0  # kcal/mol/deg²: shortest M-L systems need 2-3 to retain the declared side of the plane
 # deg: wide enough for a real crystal plane's own spread, narrow enough to stay outside the pyramid basin
@@ -582,6 +583,31 @@ class Umbrella(Mechanism):
                 ff.UFFAddTorsionConstraint(*atoms, False, lo, hi, _UMBRELLA_FC / len(orders))
 
 
+class Tie(Mechanism):
+    """Tie each atom to its copy past its budget in a co-embedded pair; the copies share no excluded volume.
+
+    The tie is the one coupling between the copies, so it is soft past the budget and not scaled by the ladder:
+    a stiffer rung strengthens each copy's own holds against it. `relax` builds the force field with the right
+    copy displaced, so UFF adds no nonbonded term between the copies.
+    """
+
+    @override
+    def dg_windows(self, cons, ctx):
+        for pair, budget in cons.ties.items():
+            ctx.pairs[pair] = (0.0, budget)
+
+    @override
+    def dg_relief(self, cons, ctx):
+        left, right = cons.tied_copies
+        if left:  # every right index exceeds every left one, so bm[right, left] holds the cross lower bounds
+            ctx.bm[np.ix_(sorted(right), sorted(left))] = 0.0
+
+    @override
+    def uff_terms(self, ff, cons, conf, stiffness):
+        for (i, j), budget in cons.ties.items():
+            ff.AddDistanceConstraint(i, j, 0.0, budget, TIE_FC)
+
+
 # One order for both drivers. DG needs distance before angle and coplanar after COMMIT; later FF-only repairs
 # have no ordering dependency.
 MECHANISM_ORDER = (
@@ -598,6 +624,7 @@ MECHANISM_ORDER = (
     Sp2Planar(),
     ConjugationCap(),
     Umbrella(),
+    Tie(),
 )
 
 

@@ -163,7 +163,9 @@ def parse_smiles(smi, *, remove_hs=True):
     encoded_bond_stereo(mol)  # raises on a malformed CX E/Z record
     _bind_slot_notes(mol)
     if remove_hs and "atomProp" not in smi:
-        mol = Chem.RemoveHs(mol)
+        keep = Chem.RemoveHsParameters()
+        keep.removeMapped = False  # a mapped hydrogen is one the caller names
+        mol = Chem.RemoveHs(mol, keep)
     return mol
 
 

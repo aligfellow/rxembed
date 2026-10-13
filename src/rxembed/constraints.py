@@ -67,11 +67,17 @@ class Constraints:
     #   seed-side half-space, a positive value the minimum magnitude (soft walls; validate final stereo);
     #   (anchor, weight) is a template planar well with its fraction of the complete shell's force coefficient
     conjugation: bool = True  # retain rxembed's organic sp2/conjugation UFF cleanup terms
+    ties: dict = field(default_factory=dict)  # (i, j) -> Å budget: j is i's co-embedded copy (`coembed`), i < j
 
     @property
     def is_constrained(self) -> bool:
         """True when any geometric or coordinate constraint is set."""
-        return bool(self.distances or self.angles or self.dihedrals or self.planes or self.frozen)
+        return bool(self.distances or self.angles or self.dihedrals or self.planes or self.frozen or self.ties)
+
+    @property
+    def tied_copies(self) -> tuple[frozenset, frozenset]:
+        """Return the left and right real-atom sets of a co-embedded pair, both empty without ties."""
+        return frozenset(i for i, _j in self.ties), frozenset(j for _i, j in self.ties)
 
     def copy(self, **overrides) -> "Constraints":
         """Return a field-complete deep copy, with any keyword replacing that field outright."""
@@ -243,6 +249,7 @@ _MERGE = {  # field -> how two sources combine. See `compose`.
     "haptic": partial(_merge_exclusive, "haptic"),  # a shared key = two faces claiming one reserved index = corruption
     "umbrellas": partial(_merge_exclusive, "umbrellas"),
     "conjugation": lambda a, b: a and b,
+    "ties": partial(_merge_exclusive, "ties"),
 }
 
 _names = {f.name for f in fields(Constraints)}  # a new field must be given a merge policy, not defaulted

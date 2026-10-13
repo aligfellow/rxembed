@@ -26,6 +26,7 @@ from .constraints import (
     Constraints,
     canonical_key,
     compose,
+    compose_soft,
     constraint_value,
     metal_distance_tolerance,
     out_of_plane,
@@ -477,7 +478,7 @@ def _centre_state_failure(pos, prep, lines=None, requests=None):
     return None
 
 
-def _coordination_state_failure(mol, cid, iso, states=None):
+def coordination_state_failure(mol, cid, iso, states=None):
     """Return the first reason a conformer does not retain its selected polyhedron.
 
     Every centre's accepted shape record is written as `mol`'s `SHAPE_PROP` conformer property when all pass,
@@ -1030,7 +1031,10 @@ class Conformers:
             names = "-".join(atom_label(graph, atom) for atom in atoms)
             return Failure("numeric_fix", f"fix= {names} not held ({actual:.3f} {unit})")
         # Seed selection and publication share ligand integrity; metal and stated pairs are already exempt.
-        if bonding := bonding_failure(self._mol, cid, exclude=self.cons.frozen, constrained=self.cons.distances):
+        bonding = bonding_failure(
+            self._mol, cid, exclude=self.cons.frozen, constrained=self.cons.distances, copies=self.cons.tied_copies
+        )
+        if bonding:
             return Failure("bonding", bonding.detail, atoms=bonding.atoms)
         pos = self._mol.GetConformer(int(cid)).GetPositions()
         for body in self.cons.shapes:
@@ -1041,7 +1045,7 @@ class Conformers:
                         graph = _restore_connected(self._mol, self.iso, cid)
                         return Failure("rigid_body", f"fixed core {atom_label(graph, i)}-{atom_label(graph, j)} torn")
         states = self._coordination_states(self.iso)
-        if reason := _coordination_state_failure(self._mol, cid, self.iso, states=states):
+        if reason := coordination_state_failure(self._mol, cid, self.iso, states=states):
             return reason
         if self.iso is not None and (
             reason := _ligand_stereo_failure(_restore_connected(self._mol, self.iso, cid), self.iso)
@@ -1653,14 +1657,36 @@ def embed(spec, *, fix=None, constrain=None, template=None, n=None, seed=None, t
     return Conformers(mol, ids, cons, iso, params=params)
 
 
-def prepare(spec, *, fix=None, constrain=None, external=None, params=None):
+def prepare(spec, *, fix=None, constrain=None, contacts=None, params=None):
     """Prepare a copied Mol and its constraints for embedding or relaxation.
 
     Return ``(mol, constraints, isomer, graft_reference)``. A metal geometry becomes one retained `Isomer`;
-    a coordinate-free metal must arrive as an explicitly selected `Isomer`. `external` exposes downstream
-    constraint ownership to model compilation without changing how those constraints are applied. `params`
+    a coordinate-free metal must arrive as an explicitly selected `Isomer`. `contacts` takes soft non-covalent
+    terms keyed as `constrain`: each is kept unless a structural term owns its degree of freedom, and a metal
+    model compiles again around the kept ones, so a dropped contact changes no model preference. `params`
     supplies the `donor_orientation`/`conjugation` switches; both default True when `params` is omitted.
     """
+    mol, cons, iso, ref = _compiled(spec, fix, constrain, None, params)
+    if not contacts:
+        return mol, cons, iso, ref
+    soft = resolve_core(mol, constrain=contacts, has_geometry=mol.GetNumConformers() > 0)[0]
+    composed = compose_soft(cons, soft)
+    if iso is not None and soft.is_constrained:
+        accepted = set().union(*composed.contacts)
+        active = Constraints(
+            planes=soft.planes,
+            distances={key: value for key, value in soft.distances.items() if key in accepted},
+            angles={key: value for key, value in soft.angles.items() if key in accepted},
+            dihedrals={key: value for key, value in soft.dihedrals.items() if key in accepted},
+        )
+        if active.is_constrained:
+            mol, cons, iso, ref = _compiled(spec, fix, constrain, active, params)
+            composed = compose_soft(cons, soft)
+    return mol, composed, iso, ref
+
+
+def _compiled(spec, fix, constrain, external, params):
+    """Return `prepare`'s result before soft contacts; `external` exposes kept contacts to the metal model."""
     iso = spec if isinstance(spec, Isomer) else None
     mol = Chem.Mol(iso.mol if iso is not None else spec)  # our own copy: never the caller's conformers
     has_geometry = mol.GetNumConformers() > 0

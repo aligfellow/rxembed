@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from rdkit import Chem, rdBase
 from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers, rdtrajectory
+from rdkit.Geometry import Point3D
 
 from .mechanisms import MECHANISM_ORDER
 from .metal_core import COORDINATION_METALS, materialise_phantoms, strip_phantoms
@@ -16,6 +17,7 @@ from .utils import CARBON_Z, Violation, atom_label
 
 FF_SURROGATE = 3  # Bondless Li avoids the singular CN>=3 UFF angle term while retaining a soft vdW sphere.
 UFF_GHOST = 54  # Untypeable Xe gives a haptic centroid no UFF terms inside its ring.
+_COPY_OFFSET = 1e3  # Å: past UFF's nonbonded cutoff, so co-embedded copies share no vdW terms
 
 logger = logging.getLogger("rxembed.relax")
 
@@ -52,12 +54,13 @@ def error_summary(error):
     return next((line for line in lines if not line.startswith(noise)), lines[-1] if lines else "unknown error")
 
 
-def bonding_failure(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset(), constrained=()):
+def bonding_failure(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset(), constrained=(), copies=()):
     """Return the first heavy-atom bond or clash violation as a `Violation`, or ``None``.
 
     Frozen-core, metal and explicitly constrained pairs are exempt because covalent radii do not define their
-    intended distances. The exemption is per pair, so broken free-periphery bonds still fail. `atoms` names the
-    pair, `()` for the whole-conformer non-finite case.
+    intended distances, and so is a pair across two co-embedded `copies`, which never interact. The exemption is
+    per pair, so broken free-periphery bonds still fail. `atoms` names the pair, `()` for the whole-conformer
+    non-finite case.
     """
     pos = mol.GetConformer(conf_id).GetPositions()
     if not np.all(np.isfinite(pos)):
@@ -65,12 +68,15 @@ def bonding_failure(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset
     heavy = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
     metals = {i for i in heavy if mol.GetAtomWithIdx(i).GetAtomicNum() in COORDINATION_METALS}
     exclude = set(exclude)
+    copy_of = {atom: side for side, atoms in enumerate(copies) for atom in atoms}
     stated = {frozenset(p) for p in constrained}
     rcov = {i: _PT.GetRcovalent(mol.GetAtomWithIdx(i).GetAtomicNum()) for i in heavy}
     bonded = {frozenset((b.GetBeginAtomIdx(), b.GetEndAtomIdx())) for b in mol.GetBonds()}
     for n, i in enumerate(heavy):
         for j in heavy[n + 1 :]:
             if (i in exclude and j in exclude) or i in metals or j in metals:
+                continue
+            if i in copy_of and j in copy_of and copy_of[i] != copy_of[j]:
                 continue
             if frozenset((i, j)) in stated:
                 continue
@@ -396,14 +402,20 @@ def restrained_uff(
         work = _ff_surrogate(work, cons.metals, cons.phantoms)
         target, effective_cons, dative_edges, replacements = _select_uff_graph(work, cons, frozen)
         _report_uff_typing(mol, dative_edges, replacements, out)
+        apart = sorted(cons.tied_copies[1])  # a haptic centroid is an untyped ghost with no nonbonded terms
         for conf in confs:
             cid = conf.GetId()
             stage = "force-field construction"
             try:
+                held = target.GetConformer(cid)
+                for atom in apart:  # in place: the force field keeps pointers to these positions
+                    held.SetAtomPosition(atom, held.GetAtomPosition(atom) + Point3D(_COPY_OFFSET, 0.0, 0.0))
                 with rdBase.BlockLogs():
                     ff = rdForceFieldHelpers.UFFGetMoleculeForceField(
                         target, confId=cid, ignoreInterfragInteractions=False
                     )
+                for atom in apart:
+                    held.SetAtomPosition(atom, held.GetAtomPosition(atom) - Point3D(_COPY_OFFSET, 0.0, 0.0))
                 stage = "constraint setup"
                 with rdBase.BlockLogs():
                     for mechanism in MECHANISM_ORDER:

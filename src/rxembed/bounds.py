@@ -419,6 +419,33 @@ def _bring_real_confs(mol, work, ids):
         mol.AddConformer(conf, assignId=False)
 
 
+def _native_params(params):
+    """Return the RDKit embedding parameters `params` selects and the RMS prune threshold to seed with."""
+    prune_rms = params.prune_rms
+    if prune_rms is None:  # rxembed's own KDG model prunes by default; an unset native object keeps RDKit's off
+        prune_rms = -1.0 if params.native is not None else 0.1
+    if params.native is not None:
+        return params.native, prune_rms
+    knowledge = True if params.knowledge is None else params.knowledge
+    return embed_parameters(params.seed, knowledge=knowledge, threads=params.threads, prune_rms=prune_rms), prune_rms
+
+
+def _bounds_constraints(cons, params):
+    """Return `cons` with the matrix-only ablation switches applied; UFF and publication keep the full payload."""
+    if params.coplanar_14 and params.metal_floor_relief:
+        return cons
+    return cons.copy(
+        coplanar=cons.coplanar if params.coplanar_14 else [],
+        dg_floors=cons.dg_floors if params.metal_floor_relief else {},
+    )
+
+
+def seed_bounds(mol, cons, params):
+    """Return the smoothed bounds matrix `seed_coordinates` draws `mol` from, haptic centroid rows last."""
+    native, _prune_rms = _native_params(params)
+    return _feasible_bounds(materialise_phantoms(mol, cons.haptic), _bounds_constraints(cons, params), native)[0]
+
+
 def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attempts=0):
     """Generate ``n`` new conformers with native RDKit parameters and edited bounds."""
     work = materialise_phantoms(mol, cons.haptic)  # transient centroid dummies for a haptic face; `mol` else
@@ -426,15 +453,7 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
     search_count = int(n)
     embed_params = params.native
     seed, threads = params.seed, params.threads
-    knowledge = True if params.knowledge is None else params.knowledge
-    prune_rms = params.prune_rms
-    if prune_rms is None:  # rxembed's own KDG model prunes by default; an unset native object keeps RDKit's off
-        prune_rms = -1.0 if embed_params is not None else 0.1
-    p = (
-        embed_params
-        if embed_params is not None
-        else embed_parameters(seed, knowledge=knowledge, threads=threads, prune_rms=prune_rms)
-    )
+    p, prune_rms = _native_params(params)
     if embed_params is None:
         p.enforceChirality = enforce_chirality
         p.maxIterations = int(max_attempts)
@@ -442,16 +461,7 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
     multi_fragment = len(Chem.GetMolFrags(work)) > 1
     if embed_params is not None or edits_bounds or multi_fragment:
         # Always replace a supplied object's matrix: it may belong to a previous candidate or helper graph.
-        # These switches affect only our matrix edits. UFF and publication retain the complete Constraints.
-        dg = (
-            cons
-            if params.coplanar_14 and params.metal_floor_relief
-            else cons.copy(
-                coplanar=cons.coplanar if params.coplanar_14 else [],
-                dg_floors=cons.dg_floors if params.metal_floor_relief else {},
-            )
-        )
-        bm, _tol = _feasible_bounds(work, dg, p)
+        bm, _tol = _feasible_bounds(work, _bounds_constraints(cons, params), p)
         p.SetBoundsMat(bm)  # a custom (edited) bounds matrix
     overrides = {
         "randomSeed": seed,

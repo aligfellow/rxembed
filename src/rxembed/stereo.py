@@ -186,6 +186,11 @@ def axis_stereo(label):
     }
 
 
+def shifted_label(label, offset):
+    """Return a ligand-stereo label with every atom index raised by `offset`, its codes unchanged."""
+    return re.sub(r"([A-Z][a-z]?)(\d+)", lambda match: f"{match[1]}{int(match[2]) + offset}", label)
+
+
 def apply_point_stereo(mol, label, centers):
     """Apply absolute point labels as local tags in ``mol``'s current full-graph bond order."""
     centers = set(centers)

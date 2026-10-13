@@ -40,6 +40,7 @@ def remove_routine_hydrogens(mol, keep=()):
     params = Chem.RemoveHsParameters()
     params.removeDegreeZero = True
     params.removeDefiningBondStereo = True
+    params.removeMapped = False  # as `parse_smiles`
     params.updateExplicitCount = True
     params.showWarnings = False  # protected donor hydrides are deliberately isotope-marked and retained
     out = Chem.RemoveHs(out, params, sanitize=False)

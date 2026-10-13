@@ -43,10 +43,12 @@ from .stereo import (
     clear_ez,
     coordination_locked_double_bonds,
     matches_stereo,
+    shifted_label,
     stereo_from_3d,
     unassigned_centres,
     without_bond_stereo,
 )
+from .utils import combined
 
 _PT = GetPeriodicTable()
 
@@ -432,6 +434,43 @@ class Isomer:
     def __repr__(self):
         """Return a compact notebook representation."""
         return f"Isomer({str(self)!r})"
+
+
+def paired_isomer(left, right):
+    """Return one `Isomer` holding two copies' selected states, `right`'s atoms numbered after `left`'s.
+
+    The co-embedding unit (`coembed`): each copy keeps its own centres, donors and ligand stereo, and the pair is
+    compiled, seeded and validated as one system. A caller's ``fix=`` is not carried, so neither copy may hold one.
+    """
+    for iso in (left, right):
+        if iso.base_cons != Constraints() or iso.graft_ref:
+            raise ValueError(f"{iso}: co-embedding takes an isomer without fix=; select it with rx.metal(...) alone")
+    if left.lengths != right.lengths:
+        raise ValueError(f"the copies take M-L lengths from {left.lengths!r} and {right.lengths!r}; use one source")
+    n = left.graph.GetNumAtoms()
+
+    def moved(state):
+        sites = tuple(
+            None
+            if site is None
+            else HapticSite(tuple(atom + n for atom in site.atoms), site.winding)
+            if isinstance(site, HapticSite)
+            else site + n
+            for site in state.vertices
+        )
+        return state._replace(atom=state.atom + n, vertices=sites)
+
+    pair = Isomer.from_state(
+        combined(left.graph, right.graph),
+        (*left.centres, *map(moved, right.centres)),
+        [*left.donor_bonds, *((donor + n, metal + n) for donor, metal in right.donor_bonds)],
+        constrained_metals=left.constrained_metals | {metal + n for metal in right.constrained_metals},
+        lengths=left.lengths,
+        stereo_label=",".join(label for label in (left.stereo_label, shifted_label(right.stereo_label, n)) if label),
+        protect_arrangement=left.protect_arrangement and right.protect_arrangement,
+    )
+    pair.length_mol = combined(left.length_mol, right.length_mol)
+    return pair
 
 
 def coordination_roles(donor_bonds, metals):

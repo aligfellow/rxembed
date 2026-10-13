@@ -4,6 +4,7 @@ import logging
 from importlib.metadata import PackageNotFoundError, version
 
 from .bounds import EmbedParams
+from .coembedding import coembed
 from .constraints import Constraints, compose, match, resolve_core
 from .embed import Conformers, EmbeddingError, embed, minimize
 from .metal_core import Ligand, ligands
@@ -40,6 +41,7 @@ __all__ = [
     "Ligand",
     "UFFRecord",
     "__version__",
+    "coembed",
     "compose",
     "cxsmiles",
     "dative_smiles",

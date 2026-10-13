@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from functools import cache
 from pathlib import Path
 
@@ -15,7 +15,7 @@ from rdkit.Chem import rdMolAlign
 
 from rxembed.bounds import bounds_matrix, fragment_contacts
 from rxembed.constraints import constraint_value, graft_owns, match, resolve_atom, within_window
-from rxembed.embed import BASE_STIFFNESS, Conformers, Failure
+from rxembed.embed import BASE_STIFFNESS, Conformers, EmbeddingError, Failure, stereo_donor_bonds
 from rxembed.metal_core import connect_metal, donor_chirality_sign, frag_map, metal_index, metal_indices
 from rxembed.metal_perceive import SHAPE_PROP, shape_clause, shape_gap
 from rxembed.metal_polyhedron import resolve_geometry
@@ -367,6 +367,25 @@ class Ensemble(Conformers):
                 )
             except RuntimeError:  # keep the raw ETKDG seeds for this group (openconf still searches around them)
                 logger.debug("mc: seed-settle relax diverged on a group; keeping the raw seeds")
+
+    def record_metal_context(self):
+        """Record each metal's donors and every labile coordinated donor's hand, read from the first conformer.
+
+        The workflow gate compares later geometry against these, so record them before a stage can move atoms.
+        """
+        if self.iso is None:
+            return self
+        for donor, metal_idx in self.iso.donor_bonds:
+            self.sphere.setdefault(metal_idx, []).append(donor)
+        if self.ids:
+            donors = sorted({donor for donor, _metal_idx in stereo_donor_bonds(self._mol, self.iso)})
+            self.donor_hand = {
+                donor: donor_chirality_sign(
+                    self._mol, self.ids[0], donor, [metal for d, metal in self.iso.donor_bonds if d == donor]
+                )
+                for donor in donors
+            }
+        return self
 
     def _workflow_failure(self, owner, cid):
         """Return the first pipeline-only publication failure for one conformer."""
@@ -1080,6 +1099,35 @@ class Ensemble(Conformers):
         state = self._stage
         tag = f", {self.tag}" if self.tag else ""
         return f"<Ensemble: {n} conformer{'s' if n != 1 else ''}, {state}{de}{tag}>"
+
+
+def published_pair(left, right):
+    """Return co-embedded core copies as Ensembles, keeping each pair whose copies pass `embed`'s per-conformer gate.
+
+    A pair is one conformer id on both sides; a pair failing on either side leaves both, and no fresh seed replaces
+    it. Raise `EmbeddingError` when none survives. The copies stay seeded: each holds geometry, not an endpoint
+    minimum, so a later `minimize()` relaxes it alone.
+    """
+    sides = tuple(Ensemble(**{f.name: getattr(copy, f.name) for f in fields(Conformers)}) for copy in (left, right))
+    for ens in sides:
+        ens.record_metal_context()
+    failed = {}
+    for cid in sides[0].ids:
+        for ens in sides:
+            if reason := ens._workflow_failure(ens, cid):
+                failed[cid] = reason
+                break
+    if failed:
+        logger.warning(
+            "coembed: dropped %d/%d pair(s); first: %s", len(failed), len(sides[0].ids), next(iter(failed.values()))
+        )
+    for ens in sides:
+        ens.discarded += list(failed)
+        ens._remove(failed)
+    if not sides[0].ids:
+        detail = f"; first workflow failure: {next(iter(failed.values()))}" if failed else ""
+        raise EmbeddingError(f"coembed: no pair passed acceptance{detail}")
+    return sides
 
 
 def wrap(mol, ids=None, *, energies=None, minimized=False):

@@ -7,10 +7,12 @@ import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 
+from rxembed.metal_smiles import parse_smiles
 from rxembed.utils import (
     assign_stereo_from_3d,
     bond_removal_mirrors,
     flat_ranks,
+    map_reaction,
     repair_bond_stereo,
 )
 
@@ -158,3 +160,46 @@ def test_3d_stereo_matches_reader_bond_order(smiles):
     assign_stereo_from_3d(mol)
     assert mol.GetAtomWithIdx(centre).GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED, "nothing was written"
     assert _names_the_hand(mol, centre), "the tag names the mirror of the geometry it was written from"
+
+
+def _changes(reaction):
+    """Return the bonds `map_reaction` breaks and forms for a ``'reactant>>product'`` SMILES."""
+    sides = map_reaction(*(Chem.AddHs(parse_smiles(side)) for side in reaction.split(">>")))
+    bonds = [{tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))) for b in mol.GetBonds()} for mol in sides]
+    return bonds[0] - bonds[1], bonds[1] - bonds[0]
+
+
+@pytest.mark.parametrize(
+    ("reaction", "broken", "formed"),
+    [
+        ("CC(=O)O.[O-]c1ccccc1>>CC(=O)[O-].Oc1ccccc1", {(3, 14)}, {(4, 14)}),  # O-H count balances: a spare pair
+        ("CC(C)O>>CC(C)=O.[H][H]", {(1, 7), (3, 11)}, {(7, 11)}),  # the two leaving H differ, yet form one H2
+        ("[CH2:1]=C[CH2:2]OC=C>>[CH2:2]=C[CH2:1]CC=O", {(2, 3)}, {(0, 5)}),  # mapped allyl ends pin a [3,3] shift
+    ],
+    ids=("acetic-acid-protonates-phenoxide", "isopropanol-dehydrogenates-to-acetone", "mapped-claisen"),
+)
+def test_map_reaction_keeps_the_most_bonds(reaction, broken, formed):
+    assert _changes(reaction) == (broken, formed)
+
+
+@pytest.mark.parametrize(
+    "reaction",
+    ["C=CCOC=C>>C=CCCC=O", "CC(=O)C.CC(=O)C>>C=C(O)C.C=C(O)C"],
+    ids=("claisen-as-3-3-or-1-3-shift", "acetone-pair-with-either-proton-on-either-oxygen"),
+)
+def test_map_reaction_asks_for_a_map_where_the_graphs_allow_two_reactions(reaction):
+    with pytest.raises(ValueError, match="map the reacting atoms"):
+        _changes(reaction)
+
+
+def test_map_reaction_follows_a_fully_mapped_proton_relay_through_three_waters():
+    pyridone = (
+        "[O:1]=[c:2]1[c:3]([H:11])[c:4]([H:12])[c:5]([H:13])[c:6]([H:14])[n:7]1[H:15]"
+        ".[O:8]([H:16])[H:17].[O:9]([H:18])[H:19].[O:10]([H:20])[H:21]"
+    )
+    hydroxypyridine = (
+        "[O:1]([H:20])[c:2]1[c:3]([H:11])[c:4]([H:12])[c:5]([H:13])[c:6]([H:14])[n:7]1"
+        ".[O:8]([H:15])[H:17].[O:9]([H:16])[H:19].[O:10]([H:18])[H:21]"
+    )
+    broken, formed = _changes(f"{pyridone}>>{hydroxypyridine}")
+    assert len(broken) == len(formed) == 4  # the map's relay, not the direct N-H to O transfer

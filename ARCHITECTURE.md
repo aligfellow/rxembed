@@ -23,7 +23,7 @@ except optional dependencies at their point of use.
 
 | layer | module | owns |
 |---|---|---|
-| base | `utils` | coordinate math, small RDKit facts and the QA `Violation`; nothing about metals or constraints |
+| base | `utils` | coordinate math, small RDKit facts, the reaction graph overlay and the QA `Violation`; nothing about metals or constraints |
 | | `constraints` | the `Constraints` payload, the `fix`/`constrain`/`template` resolver, `match` and measurement |
 | shapes | `metal_polyhedron` | the `POLYHEDRA` registry, proper rotations, slot notes and hand frames |
 | metal graph | `metal_core` | metal state records, surrogate swap and restore, haptic sites, the ligand graph |
@@ -41,6 +41,7 @@ except optional dependencies at their point of use.
 | enumeration | `metal_enumeration` | ligand, haptic and coordination states as screened `Isomer` candidates |
 | strings | `metal_smiles` | reading and writing dative SMILES and CXSMILES |
 | orchestration | `embed` | `prepare`, seeding, acceptance and recovery: `Conformers`, `Failure`, `EmbeddingError` |
+| | `coembedding` | two graphs on one atom order embedded as tied copies of one system (`coembed`) |
 | facade | `core` | the low-level API, logging setup and the version lookup |
 | pipeline | `calculators` | the xtb executable and the `Calculator` and `ASE` scoring surface |
 | | `search` | Monte Carlo search through openconf |
@@ -53,7 +54,7 @@ except optional dependencies at their point of use.
 | | `stereo_check` | stereo fingerprints for chirality-aware selection |
 | | `geom_check` | the physical geometry gate (`check`, `GeometryReport`) |
 | | `ensemble` | `Ensemble`, `EnsembleSet` and `wrap`: chainable search, scoring and workflow checks |
-| | `dispatch` | the `embed`, `metal` and `minimize` verbs and candidate expansion |
+| | `dispatch` | the `embed`, `coembed`, `metal` and `minimize` verbs and candidate expansion |
 | facades | `pipeline/__init__`, `rxembed/__init__` | public names only |
 
 The engine sits below the metal compile on purpose: `mechanisms`, `relax` and `bounds` read `Constraints` as
@@ -80,10 +81,16 @@ candidates, one that raises `EmbeddingError` is skipped with one warning line an
 candidate, such as one selected `Isomer`, raises its own error. An expanded stereoisomer or contact mode also
 records any other `ValueError` or `RuntimeError` there, as an `EmbeddingError` naming it.
 
-`embed.prepare` turns a `Mol` or selected `Isomer` plus `fix` and `constrain` into one `Constraints` value.
+`embed.prepare` turns a `Mol` or selected `Isomer` plus `fix`, `constrain` and soft `contacts` into one
+`Constraints` value.
 `seed_conformers` edits RDKit's bounds matrix, embeds, grafts fixed coordinates and picks seeds with the
 requested metal hand and haptic winding. `embed.prepare_relax` and `pipeline.dispatch.minimize` share the same
 preparation and graft to relax existing coordinates without a search.
+
+`coembedding.coembed` runs the same path once on the union of two copies: `Constraints.ties` ties each atom
+to its copy past a budget, and the copies share no excluded volume, nonbonded term or clash check.
+`utils.map_reaction` first puts the product on the reactant's atom order by the overlay of their graphs that keeps
+the most bonds.
 
 ## Rules
 

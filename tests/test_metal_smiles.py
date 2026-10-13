@@ -98,6 +98,16 @@ def test_parse_smiles_removes_explicit_hydrogens_by_default():
     assert not any(atom.GetAtomicNum() == 1 for atom in mol.GetAtoms())
 
 
+def test_a_mapped_hydrogen_survives_parsing_and_cxsmiles():
+    smiles = "[NH3:1]->[Cu+:2]<-[NH2:3][H:4]"  # a reaction map naming the hydrogen that moves
+
+    parsed = metal_smiles.parse_smiles(smiles)
+    ens = rx.embed(smiles, metal="linear", n=1, seed=1)[0]
+
+    assert any(atom.GetAtomicNum() == 1 and atom.GetAtomMapNum() == 4 for atom in parsed.GetAtoms())
+    assert "[H:4]" in rx.cxsmiles(ens.mol)
+
+
 def test_writer_keeps_the_nonmetal_leg_of_a_bridging_hydrogen():
     written = set()
     for edges in (((0, 1), (1, 2)), ((1, 2), (0, 1))):
@@ -371,7 +381,7 @@ def test_cadmium_near_tie_conformer_round_trips_in_its_requested_frame():
     emb = importlib.import_module("rxembed.embed")
     iso, mol, cid = _cd_fan_near_tie_conformer()
 
-    assert emb._coordination_state_failure(mol, cid, iso) is None, "rule B must accept the near-tie request"
+    assert emb.coordination_state_failure(mol, cid, iso) is None, "rule B must accept the near-tie request"
     conf = mol.GetConformer(cid)
     assert conf.HasProp(SHAPE_REQUEST_PROP), "an accepted conformer must carry the machine-readable record"
 
