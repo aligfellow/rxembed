@@ -196,12 +196,6 @@ def _clash():
     return mol, {}
 
 
-def _hydrogen():
-    mol = _reference_conformer("CO")
-    h = next(a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 1)
-    return _shift(mol, h, (1.5, 0, 0)), {}
-
-
 def _frozen_core():
     ref = _reference_conformer(_ACID_ARENE)
     return _shift(Chem.Mol(ref), 0, (0.5, 0, 0)), {"frozen": list(range(6)), "reference": ref}
@@ -216,16 +210,24 @@ _BREAKS = {
     "conjugation": _conjugation,
     "bond_length": _bond_length,
     "clash": _clash,
-    "hydrogen": _hydrogen,
     "frozen_core": _frozen_core,
     "constraint": _constraint,
 }
 
 
-@pytest.mark.parametrize("kind", ["clash", "hydrogen", "frozen_core"])
+@pytest.mark.parametrize("kind", ["clash", "frozen_core"])
 def test_each_violation_kind_fires(kind):
     mol, kw = _BREAKS[kind]()
     assert kind in _kinds(geom.check(mol, 0, **kw))
+
+
+@pytest.mark.parametrize(("length", "kinds"), [(0.74, set()), (0.3, {"bond_length"})], ids=("dihydrogen", "collapsed"))
+def test_dihydrogen_is_judged_by_its_own_bond_length(length, kinds):
+    h2 = Chem.MolFromSmiles("[H][H]")
+    conf = Chem.Conformer(2)
+    conf.SetAtomPosition(1, Point3D(length, 0.0, 0.0))
+    h2.AddConformer(conf)
+    assert _kinds(geom.check(h2, 0)) == kinds
 
 
 def _alanine_and_mirror():

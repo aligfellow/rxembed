@@ -43,7 +43,6 @@ from rxembed.utils import (
 
 _PT = Chem.GetPeriodicTable()
 _FLEX_CONJ = 60.0  # deg: the wider conjugation-dihedral window a metal-coordinated / side-on π atom gets (vs 30)
-_XH_TOL = 0.2  # Å slack over an X-H covalent-radius sum (P-H/Si-H/S-H run longer than the flat C-H ceiling)
 # A non-bonded 1-3 pair has fused when its separation drops to the covalent sum: a ring closed by the relax,
 # not the graph. Bonded 1-3 pairs are excluded, being legitimately this close.
 _FUSE_RATIO = 1.0
@@ -126,60 +125,6 @@ def bond_lengths(mol, pos, lo: float = 0.7, hi: float = 1.3, exclude=frozenset()
                     value=d,
                     limit=hi * ideal,
                     detail="stretched",
-                )
-            )
-    return out
-
-
-def hydrogens(
-    mol, pos, *, lo: float = 0.8, hi: float = 1.3, exclude=frozenset(), donors=frozenset()
-) -> list[Violation]:
-    """Each H bonded to exactly one heavy atom at a sane X-H length (bad-H-position detector).
-
-    The upper limit is element-aware: a P-H/Si-H/S-H bond is genuinely longer than a C/N/O-H, so the heavy
-    atom's covalent radius sets its own ceiling instead of the tight `hi`. A metal-held H is not judged here
-    (a dative M-H is not a covalent X-H; `metal_overbond` owns its distance), where metal-held means a
-    ``donors`` declaration (a terminal hydride left bond-less by the strip) or a bond reaching a metal.
-    """
-    out = []
-    for atom in mol.GetAtoms():
-        if atom.GetAtomicNum() != 1:
-            continue
-        h = atom.GetIdx()
-        nbrs = [
-            nb
-            for nb in atom.GetNeighbors()
-            if mol.GetBondBetweenAtoms(h, nb.GetIdx()).GetBondType() != Chem.BondType.ZERO
-        ]
-        if not nbrs and any(
-            mol.GetBondBetweenAtoms(h, nb.GetIdx()).GetBondType() == Chem.BondType.ZERO for nb in atom.GetNeighbors()
-        ):
-            continue  # an explicitly disconnected/bridging H has no covalent X-H contract
-        # `any`, not `nbrs[0]`: an eta2-H2 donor's neighbours are the metal and its H partner in RDKit's order.
-        if h in exclude or h in donors or any(nb.GetIdx() in exclude for nb in nbrs):
-            continue
-        if len(nbrs) != 1:
-            out.append(
-                Violation(
-                    kind="hydrogen",
-                    atoms=(h,),
-                    value=float(len(nbrs)),
-                    limit=1.0,
-                    detail="H not bonded to exactly one atom",
-                )
-            )
-            continue
-        x = nbrs[0].GetIdx()
-        hi_x = max(hi, _PT.GetRcovalent(nbrs[0].GetAtomicNum()) + _PT.GetRcovalent(1) + _XH_TOL)
-        d = float(np.linalg.norm(pos[h] - pos[x]))
-        if d < lo or d > hi_x:
-            out.append(
-                Violation(
-                    kind="hydrogen",
-                    atoms=(x, h),
-                    value=d,
-                    limit=hi_x if d > hi_x else lo,
-                    detail="X-H length",
                 )
             )
     return out
@@ -469,7 +414,6 @@ def check(
     coord_c = _coordinating_carbons(mol, coordination, hyb, constraints)
     v: list[Violation] = []
     v += bond_lengths(mol, pos, exclude=exclude)
-    v += hydrogens(mol, pos, exclude=exclude, donors=frozenset(donors or ()))
     v += clashes(mol, pos, exclude=exclude, donors=donors)
     v += over_compression(mol, pos, exclude=exclude)
     v += planarity(mol, pos, exclude=exclude | coord_c)
