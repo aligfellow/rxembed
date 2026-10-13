@@ -48,7 +48,7 @@ from .stereo import (
     unassigned_centres,
     without_bond_stereo,
 )
-from .utils import combined
+from .utils import combined, without_atom_maps
 
 _PT = GetPeriodicTable()
 
@@ -558,7 +558,8 @@ def measured_haptic_windings(mol, metal, donors, haptic):
     pos = mol.GetConformer().GetPositions()
     ranks = donor_classes(mol, donors)
     # An eta2 face has two atoms.
-    eta2_ranks = list(Chem.ComputeAtomCIPRanks(mol)) if any(len(face) == 2 for face in haptic.values()) else None  # noqa: PLR2004
+    eta2 = any(len(face) == 2 for face in haptic.values())  # noqa: PLR2004
+    eta2_ranks = list(Chem.ComputeAtomCIPRanks(without_atom_maps(mol))) if eta2 else None
     return {
         dummy: sign
         for dummy, face in haptic.items()
@@ -568,7 +569,7 @@ def measured_haptic_windings(mol, metal, donors, haptic):
 
 def canonical_metals(mol, metals, *, allow_ties=False):
     """Return metal indices in graph-canonical order, optionally retaining tied identical centres."""
-    ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
+    ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False, includeAtomMaps=False))
     if not allow_ties and len({ranks[metal] for metal in metals}) != len(metals):
         raise ValueError("cannot canonicalize symmetry-equivalent metal centres; select one centre")
     return sorted(metals, key=lambda metal: (ranks[metal], metal))
@@ -687,7 +688,9 @@ def _ligand_smiles(mol, donor):
     """Return the donor-rooted heavy-atom SMILES of its ligand fragment."""
     mappings = []
     fragments = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False, fragsMolAtomMapping=mappings)
-    fragment, mapping = next((Chem.Mol(f), m) for f, m in zip(fragments, mappings, strict=True) if donor in m)
+    fragment, mapping = next(
+        (Chem.Mol(without_atom_maps(f)), m) for f, m in zip(fragments, mappings, strict=True) if donor in m
+    )
     marker = max((atom.GetAtomMapNum() for atom in fragment.GetAtoms()), default=0) + 1
     fragment.GetAtomWithIdx(mapping.index(donor)).SetAtomMapNum(marker)
     fragment = Chem.RemoveHs(fragment, sanitize=False)

@@ -18,7 +18,7 @@ from .metal_core import (
 )
 from .metal_polyhedron import DELTA, LAMBDA, handedness, orientation_parity, vertex_dirs
 from .stereo import apply_encoded_bond_stereo, coordination_locked_double_bonds
-from .utils import dihedral_angle, without_zero_bonds
+from .utils import dihedral_angle, without_atom_maps, without_zero_bonds
 
 _FACE_EPS = 1e-8
 _HALF_TURN = 180
@@ -106,7 +106,7 @@ def _root_classes(mol, roots):
             atom.SetFormalCharge(0)
             atom.SetIsAromatic(False)
         flat.UpdatePropertyCache(strict=False)
-        ranks = list(Chem.CanonicalRankAtoms(flat, breakTies=False))
+        ranks = list(Chem.CanonicalRankAtoms(flat, breakTies=False, includeAtomMaps=False))
     except (RuntimeError, ValueError) as exc:
         raise ValueError("RDKit could not canonicalize coordination-site identity") from exc
     # The flat rank also names each class: handedness and face walks order classes by these values, so a
@@ -261,7 +261,7 @@ def eta2_signatures(mol, face, ranks=None):
         mol = Chem.AddHs(mol, onlyOnAtoms=list(face))
         ranks = None
     try:
-        ranks = list(Chem.ComputeAtomCIPRanks(mol)) if ranks is None else ranks
+        ranks = list(Chem.ComputeAtomCIPRanks(without_atom_maps(mol))) if ranks is None else ranks
     except (RuntimeError, ValueError):
         return (), ()
     centres = _eta2_centres(mol, face, ranks)
@@ -366,7 +366,7 @@ def face_winding(mol, pos, metal, face, ranks, eta2_ranks=None):
     """
     if len(face) == ETA2:
         try:
-            eta2_ranks = list(Chem.ComputeAtomCIPRanks(mol)) if eta2_ranks is None else eta2_ranks
+            eta2_ranks = list(Chem.ComputeAtomCIPRanks(without_atom_maps(mol))) if eta2_ranks is None else eta2_ranks
         except (RuntimeError, ValueError):
             return ""
         signature = []
@@ -422,10 +422,10 @@ def face_descriptors(mol, donors, haptic, windings):
     if not windings:
         return {}
     try:
-        priorities = Chem.ComputeAtomCIPRanks(mol)
+        priorities = Chem.ComputeAtomCIPRanks(without_atom_maps(mol))
         unmarked = Chem.Mol(mol)
         Chem.RemoveStereochemistry(unmarked)
-        constitutional = Chem.ComputeAtomCIPRanks(unmarked)
+        constitutional = Chem.ComputeAtomCIPRanks(without_atom_maps(unmarked))
     except (RuntimeError, ValueError):
         return {}
     classes = donor_classes(mol, donors)

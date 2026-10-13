@@ -86,7 +86,7 @@ from .stereo import (
     point_stereo,
     stereo_from_3d,
 )
-from .utils import atom_label
+from .utils import atom_label, without_atom_maps
 
 logger = logging.getLogger(__name__)  # under the "rxembed" tree `set_verbose` configures
 
@@ -649,7 +649,7 @@ def _winding_ranks(mol, targets):
         donors += [atom for face in haptic.values() for atom in face]
         ranks[state.atom] = donor_classes(rank_mol, donors) if winding else {}
     eta2 = any(len(haptic[dummy]) == ETA2 for _state, _vertices, haptic, winding in targets for dummy in winding)
-    return ranks, list(Chem.ComputeAtomCIPRanks(rank_mol)) if eta2 else None
+    return ranks, list(Chem.ComputeAtomCIPRanks(without_atom_maps(rank_mol))) if eta2 else None
 
 
 def _seed_stereo_matches(mol, cid, iso, targets, winding_ranks, eta2_ranks, check_ligand=False):

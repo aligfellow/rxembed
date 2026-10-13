@@ -88,6 +88,16 @@ def flat_ranks(mol, *, break_ties=False):
     return list(Chem.CanonicalRankAtoms(flat, breakTies=break_ties))
 
 
+def without_atom_maps(mol):
+    """Return `mol` without atom maps, a copy only when it has some; RDKit's ranks read maps as identity."""
+    if not any(atom.GetAtomMapNum() for atom in mol.GetAtoms()):
+        return mol
+    out = Chem.Mol(mol)
+    for atom in out.GetAtoms():
+        atom.SetAtomMapNum(0)
+    return out
+
+
 def hydrogen_neighbor_order(mol, hydrogen, *, metals, positions=None, ranks=None):
     """Order a multibound hydrogen's neighbours with its nonmetal ligand leg first."""
     if ranks is None:

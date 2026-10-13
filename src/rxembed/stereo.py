@@ -22,6 +22,7 @@ from .utils import (
     mirror_tag,
     remove_bond,
     repair_bond_stereo,
+    without_atom_maps,
     without_zero_bonds,
 )
 
@@ -72,7 +73,7 @@ def metal_referenced_ez(mol, label, donor_bonds):
     for donor, metal in donor_bonds:
         metals.setdefault(donor, set()).add(metal)
     metal_atoms = {metal for bound in metals.values() for metal in bound}
-    ranks = list(Chem.ComputeAtomCIPRanks(mol))
+    ranks = list(Chem.ComputeAtomCIPRanks(without_atom_maps(mol)))
     out = {}
     for pair, wanted in bond_stereo(label).items():
         donors = [atom for atom in pair if atom in metals]
@@ -460,13 +461,13 @@ def _point_capability(mol, work, cap_to_metal=(), exclude=()):
         for cap, record in cap_to_metal.items()
         if cap in cap_donors and any({cap_donors[cap], record[3]} <= atoms for atoms, _bonds in rings)
     }
-    ranks = list(Chem.CanonicalRankAtoms(work, breakTies=False, includeChirality=False))
+    ranks = list(Chem.CanonicalRankAtoms(work, breakTies=False, includeChirality=False, includeAtomMaps=False))
     # A neutral N inverts unless RDKit's own rule holds it on the metal-free graph (a bridgehead or three-ring N)
     # with three distinct carriers and, for a bridgehead, a hand the cage leaves free. The coordination
     # convention also retains a bound amine hand for a metal-closed chelate with four distinct carriers. The
     # graph cannot infer inversion kinetics further; stereo='free' is the explicit opt-out.
     free = _free_graph(mol, metals)
-    free_ranks = list(Chem.CanonicalRankAtoms(free, breakTies=False, includeChirality=False))
+    free_ranks = list(Chem.CanonicalRankAtoms(free, breakTies=False, includeChirality=False, includeAtomMaps=False))
     held = {index for index in _tetrahedral_centres(free) if _distinct_carriers(free, free_ranks, index, 3)}
     held -= _cage_fixed_nitrogens(free, held)
     held.update(index for index in chelated_nitrogen if _distinct_carriers(work, ranks, index))
@@ -490,7 +491,7 @@ def _point_capability(mol, work, cap_to_metal=(), exclude=()):
     )
     # Carriers only the drawn Lewis form tells apart, such as a phenyl drawn as a quinoid carbanion, are one
     # group: bond orders and charges move no atom, so the centre has no hand, whether tagged or perceived.
-    flat = flat_ranks(work)
+    flat = flat_ranks(without_atom_maps(work))
     lewis_only = {
         index
         for index in stated | potential
@@ -689,7 +690,7 @@ def _coordination_atrop_bonds(mol, metals, work):
         return []
     _closed, rings = _metal_closed_rings(mol, metals)
     ring_bonds = set().union(*(bonds for _atoms, bonds in rings))
-    ranks = list(Chem.CanonicalRankAtoms(work, breakTies=False, includeChirality=True))
+    ranks = list(Chem.CanonicalRankAtoms(work, breakTies=False, includeChirality=True, includeAtomMaps=False))
     axes = []
     for bond in mol.GetBonds():
         i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
@@ -1409,7 +1410,7 @@ def enumerate_unassigned(
     """
     n_real = mol.GetNumAtoms()
     work, cap_to_metal, locked, unassigned, atrop_centers, unsupported = _unassigned_elements(
-        mol,
+        without_atom_maps(mol),
         exclude,
         include,
         set(skip_points),
@@ -1472,7 +1473,7 @@ def enumerate_unassigned(
             cap_to_metal,
             _point_cip_codes(full, atom_centers),
         )
-        keyed = Chem.RWMol(full)
+        keyed = Chem.RWMol(without_atom_maps(full))
         keyed.RemoveAllConformers()  # coordinates would break the symmetry the key must see
         for metal, donor in metal_bonds:
             if donor in faces:

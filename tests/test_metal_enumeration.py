@@ -681,3 +681,34 @@ def test_berry_pseudorotation_intermediate_reads_back_in_its_requested_frame():
     reread = rx.metal(mol, geometry="square_pyramidal", observed_only=True)
     assert len(reread) >= 1
     assert reread[0].geometry == "square_pyramidal"
+
+
+def _mapped(smiles):
+    """Return `smiles` with explicit Hs and every atom carrying an atom-map number."""
+    mol = Chem.AddHs(rx.parse_smiles(smiles, remove_hs=False))
+    for atom in mol.GetAtoms():
+        atom.SetAtomMapNum(atom.GetIdx() + 1)
+    return mol
+
+
+@pytest.mark.parametrize(
+    ("smiles", "geometry"),
+    [
+        ("N->[Pt+2](<-N)(<-[Cl-])<-[Cl-]", "SPL"),
+        ("[O+]#[C-]->[Fe]1(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-C=C->1", "TBP"),
+    ],
+    ids=("dichlorodiammineplatinum", "ethylene-iron-tetracarbonyl"),
+)
+def test_atom_maps_do_not_split_symmetric_donors(smiles, geometry):
+    assert len(rx.metal(_mapped(smiles), geometry)) == 2  # cis/trans, or axial/equatorial ethylene
+
+
+def test_a_mapped_side_on_styrene_keeps_its_stated_face_and_its_maps():
+    beta_p = (
+        "C[P:5](C)(C)->[Pd+2:4]1(<-[CH2:1]=[CH:2]->1c1ccccc1)(<-[H-:3])<-[P:6](C)(C)C "
+        "|atomProp:1.atomNote.s0:4.atomNote.SPL:5.atomNote.s1+:6.atomNote.s1+:13.atomNote.s2:14.atomNote.s3|"
+    )
+    iso = rx.metal(_mapped(beta_p)).select()
+
+    assert str(iso) == str(rx.metal(beta_p).select())
+    assert all(atom.GetAtomMapNum() == atom.GetIdx() + 1 for atom in iso.mol.GetAtoms())

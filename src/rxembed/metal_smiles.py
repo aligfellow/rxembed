@@ -524,7 +524,7 @@ def _dative_hydrogens(mol):
     """
     rw = Chem.RWMol(mol)
     pos = mol.GetConformer().GetPositions() if mol.GetNumConformers() else None
-    ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
+    ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False, includeAtomMaps=False))
     for atom in mol.GetAtoms():
         h = atom.GetIdx()
         nbrs = [bond.GetOtherAtomIdx(h) for bond in atom.GetBonds() if bond.GetValenceContrib(atom) > 0]
@@ -965,7 +965,7 @@ def cxsmiles(source):
     centre_notes = {}
     for record_iso, state in records:
         centre_notes[state.atom] = _arrangement_notes(record_iso, state, at)
-    ranks = list(Chem.CanonicalRankAtoms(complexed, breakTies=False))
+    ranks = list(Chem.CanonicalRankAtoms(complexed, breakTies=False, includeAtomMaps=False))
     by_rank = {}
     for m in centres:
         signature = (centre_notes[m][m], tuple(sorted((ranks[d], centre_notes[m][d]) for d in bound[m])))

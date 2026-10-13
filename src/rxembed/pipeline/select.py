@@ -21,7 +21,7 @@ from rdkit.Chem import TorsionFingerprints, rdMolTransforms
 from rxembed.metal_core import COORDINATION_METALS, frag_map, metal_index
 from rxembed.metal_perceive import coordinating_atoms
 from rxembed.metal_slots import realised_label
-from rxembed.utils import bond_angle
+from rxembed.utils import bond_angle, without_atom_maps
 
 from .nci import analyzer
 
@@ -148,7 +148,7 @@ def _relpose_features(mol, ids):
     hf = [[a for a in f if mol.GetAtomWithIdx(a).GetAtomicNum() > 1] or list(f) for f in frags]
     anchor = max(range(len(frags)), key=lambda i: (len(hf[i]), -min(frags[i])))  # largest, ties->low idx
     a_atoms = hf[anchor]
-    smi = [Chem.MolToSmiles(m) for m in Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False)]
+    smi = [Chem.MolToSmiles(m) for m in Chem.GetMolFrags(without_atom_maps(mol), asMols=True, sanitizeFrags=False)]
     others = [i for i in range(len(frags)) if i != anchor]
     groups = [[o for o in others if smi[o] == s] for s in sorted({smi[o] for o in others})]  # fixed order
     rows = []

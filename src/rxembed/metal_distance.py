@@ -110,7 +110,11 @@ def delocalised_charges(mol):
         a.SetIsAromatic(False)
     fm = flat.GetMol()
     fm.UpdatePropertyCache(strict=False)
-    klass = list(Chem.CanonicalRankAtoms(fm, breakTies=False, includeChirality=False, includeIsotopes=False))
+    klass = list(
+        Chem.CanonicalRankAtoms(
+            fm, breakTies=False, includeChirality=False, includeIsotopes=False, includeAtomMaps=False
+        )
+    )
     members: dict = {}
     for local, parent in enumerate(keep):
         members.setdefault(klass[local], []).append(parent)

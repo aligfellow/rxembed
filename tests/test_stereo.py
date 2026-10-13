@@ -33,6 +33,10 @@ def _labels(mol, **kw):
     return sorted(label for _variant, label in stereo.enumerate_unassigned(mol, **kw)[0])
 
 
+def test_atom_maps_do_not_split_meso_butanediol():
+    assert len(_labels(_mol("[CH3:1][CH:2]([OH:5])[CH:3]([OH:6])[CH3:4]"))) == 3  # R,R, S,S and meso
+
+
 # ---------------------------------------------------------------------------------------------------------
 # nothing to enumerate: the pass-through, which must be exact
 # ---------------------------------------------------------------------------------------------------------
