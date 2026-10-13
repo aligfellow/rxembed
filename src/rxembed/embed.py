@@ -809,12 +809,11 @@ def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
 
 
 def require_seed_count(ids, target, iso=None):
-    """Raise `EmbeddingError` when the seeds underfill the requested metal hand, haptic face or ligand stereo."""
-    if target is not None and len(ids) < target:
+    """Raise `EmbeddingError` when no seed has the requested metal hand, haptic face or ligand stereo."""
+    if target is not None and not ids:
         who = "embed" if iso is None else iso
         raise EmbeddingError(
-            f"{who}: found {len(ids)}/{target} DG seeds with the requested metal and ligand stereo; try another isomer",
-            isomer=iso,
+            f"{who}: no DG seed has the requested metal and ligand stereo; try another isomer", isomer=iso
         )
 
 

@@ -25,6 +25,7 @@ from rxembed.metal_polyhedron import POLYHEDRA
 from rxembed.metal_smiles import cxsmiles, parse_smiles
 from rxembed.relax import bonding_failure
 from rxembed.stereo import axis_stereo, point_stereo, stereo_from_3d
+from tests.metal_fixtures import BUTADIENE_FE_CO3
 
 emb = importlib.import_module("rxembed.embed")  # the engine implementation module, not the public facade
 
@@ -739,6 +740,12 @@ def test_stereo_seed_selection_prefers_a_seed_with_the_requested_geometry(monkey
     assert len(ids) == target == n
     assert len({seeded.GetConformer(cid).GetAtomPosition(0).x for cid in ids}) == n
     assert seeded.GetConformer(ids[0]).GetAtomPosition(0).x == 2.0
+
+
+def test_rigid_butadiene_iron_tricarbonyl_returns_the_distinct_seeds_it_found():
+    """Each diene face has fewer distinct seeds than n=8; like an unselected embed, keep those rather than raise."""
+    for iso in rx.metal(BUTADIENE_FE_CO3):
+        assert rx.embed(iso, n=8, seed=1).ids, iso
 
 
 def test_terminal_carbonyls_seed_linear_and_relax_inside_the_linear_window():

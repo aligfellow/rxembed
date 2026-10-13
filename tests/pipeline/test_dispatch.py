@@ -341,7 +341,7 @@ def test_seed_budget_exhaustion_does_not_claim_geometric_infeasibility(monkeypat
 
     iso = rx.metal("N->[Pt+2](<-[Cl-])(<-[Br-])<-P", "SPL")[0]
     monkeypatch.setattr(dispatch, "seed_conformers", no_seeds)
-    with pytest.raises(rx.EmbeddingError, match="found 0/1 DG seeds") as caught:
+    with pytest.raises(rx.EmbeddingError, match="no DG seed has the requested") as caught:
         rx.embed(iso, n=1, seed=42)
     assert str(caught.value).count(str(iso)) == 1, "the isomer is named once"
     assert "infeasible" not in str(caught.value)
