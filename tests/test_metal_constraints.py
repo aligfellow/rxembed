@@ -9,7 +9,7 @@ import math
 import numpy as np
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom
+from rdkit.Chem import rdDistGeom, rdMolTransforms
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
@@ -208,6 +208,25 @@ def test_eta4_naphthalene_hinge_folds_its_fusion_carbons_off_the_metal():
         for x in fusion_carbons:
             ratio = float(np.linalg.norm(pos[x] - pos[rh])) / r_rh_c
             assert ratio >= 1.20, f"seed {seed}: fusion carbon {x} at {ratio:.3f}x the Rh-C covalent sum"
+
+
+def test_side_on_styrene_keeps_its_substituents_off_the_metal():
+    """eta2-styrene on Pd(H)(PMe3)2: the side-on bond must not roll a substituent in toward the metal."""
+    smi = (
+        "C[P:5](C)(C)->[Pd+2:4]1(<-[CH2:1]=[CH:2]->1c1ccccc1)(<-[H-:3])<-[P:6](C)(C)C "
+        "|atomProp:1.atomNote.s0:4.atomNote.SPL:5.atomNote.s1+:6.atomNote.s1+:13.atomNote.s2:14.atomNote.s3|"
+    )
+    ens = rx.embed(smi, n=5, seed=7)
+    mol = ens.mol
+    pd = next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "Pd")
+    face = {n.GetIdx() for n in mol.GetAtomWithIdx(pd).GetNeighbors() if n.GetSymbol() == "C"}
+    substituents = [
+        (c, x.GetIdx()) for c in face for x in mol.GetAtomWithIdx(c).GetNeighbors() if x.GetIdx() not in {pd, *face}
+    ]
+    for cid in ens.ids:
+        conf = mol.GetConformer(cid)
+        for c, x in substituents:
+            assert rdMolTransforms.GetAngleDeg(conf, pd, c, x) >= 90, f"conformer {cid}: substituent {x} rolled in"
 
 
 def test_chelate_bite_window_intersects_a_partial_rdkit_reach_window():

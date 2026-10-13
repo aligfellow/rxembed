@@ -163,31 +163,32 @@ def _centroid_constraints(sphere, dummy, qdel, hyb, c):
     _hinge_push(sphere, ring, c)
 
 
-# deg: the hinge of a partly bound ring rehybridises toward sp3, so its unbound ring neighbour sits at the
+# deg: a partly bound ring's hinge or a side-on atom rehybridises toward sp3, so its unbound neighbour sits at the
 # tetrahedral angle from the metal. tmQMg census (2026-09-27) of M-h-x at 888 conjugated hinges of rings
 # bound through part of their atoms (400 structures): median 108.6, p5 85.6.
 _HINGE_ANGLE = math.degrees(math.acos(-1.0 / 3.0))
 
 
 def _hinge_push(sphere, face, c):
-    """Push each face atom's conjugated, non-donor ring neighbour toward the tetrahedral M-h-x angle.
+    """Push the face substituents its distances leave free toward the tetrahedral M-a-x angle.
 
-    The one-sided window lets a partly bound ring fold at its hinge instead of staying flat against the
-    metal, without dragging an in-plane side-on pair inward; an sp3 flap (COD, cyclohexadienyl) already folds
-    freely and is excluded by the conjugated-bond test.
+    A partly bound ring can fold at its conjugated hinge, and a two-atom face can roll about its own axis. The
+    one-sided window bends each such substituent back from the metal without dragging an in-plane side-on pair
+    inward; a larger face's sp3 flap (cyclohexadienyl) already folds freely and is not pushed.
     """
     mol, metal = sphere.mol, sphere.metal
     stripped = _fact(sphere.context, "stripped", lambda: ligand_graph(mol))
     rings = _fact(sphere.context, "ligand_rings", lambda: [frozenset(r) for r in Chem.GetSymmSSSR(stripped)])
     face = set(face)
-    for ring in rings:
-        if not face < ring:
-            continue
-        for a in face:
-            for bond in mol.GetAtomWithIdx(a).GetBonds():
-                x = bond.GetOtherAtomIdx(a)
-                if x in ring and x not in sphere.real and bond.GetIsConjugated():
-                    c.pulls[(metal, a, x)] = (_HINGE_ANGLE, _STRAIGHT)
+    hinge_rings = [ring for ring in rings if face < ring]
+    for a in face:
+        for bond in mol.GetAtomWithIdx(a).GetBonds():
+            x = bond.GetOtherAtomIdx(a)
+            if x == metal or x in sphere.real:
+                continue
+            hinge = bond.GetIsConjugated() and any(x in ring for ring in hinge_rings)
+            if hinge or len(face) == ETA2:
+                c.pulls[(metal, a, x)] = (_HINGE_ANGLE, _STRAIGHT)
 
 
 LENGTHS = ("model", "input")
