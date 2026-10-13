@@ -10,6 +10,7 @@ import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
 
+import rxembed as rx
 from rxembed import mechanisms as mech_mod
 from rxembed.constraints import Constraints, resolve_core
 
@@ -208,6 +209,12 @@ def test_plane_holds_a_pi_stack_by_cross_ring_distances():
 
     ff = uff_terms(mech_mod.Plane(), cons, mol)
     assert ff.kinds() == ["AddDistanceConstraint"]
+
+
+def test_side_on_dihydrogen_seeds_beside_four_cis_carbonyls():
+    """Cr(CO)5(H2): each H's floor to a cis carbonyl carbon must fit the H2 site's angle to it."""
+    iso = rx.metal("[O+]#[C-]->[Cr]1(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[H][H]->1", "OCT")[0]
+    assert rx.embed(iso, n=1, seed=1).ids
 
 
 # ---------------------------------------------------------------------------------------------------------

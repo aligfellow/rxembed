@@ -398,6 +398,16 @@ class Haptic(Mechanism):
                 if x == p or (a, b) in ctx.pairs:  # itself, or an explicit centroid window -> leave it
                     continue
                 ctx.bm[b][a] = min(ctx.bm[b][a], _PHANTOM_FLOOR)  # bm[b][a] is the lower bound; only ever lower
+        # A face atom sits near its site's angle to a donor; cap its cross-fragment floor at that angle's distance.
+        for (i, metal, k), (lo, _hi) in cons.angles.items():
+            for dummy, donor in ((i, k), (k, i)):
+                if dummy not in cons.haptic or donor in cons.phantoms:
+                    continue
+                for atom in cons.haptic[dummy]:
+                    a, b = sorted((atom, donor))
+                    if ctx.topo[a][b] >= DISCONNECTED:  # a backbone floor is real
+                        floor = law_of_cosines(ctx.leg(metal, atom), ctx.leg(metal, donor), lo)
+                        ctx.bm[b][a] = min(ctx.bm[b][a], floor)
 
     @override
     def uff_terms(self, ff, cons, conf, stiffness):
