@@ -474,13 +474,16 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
             setattr(p, name, value)
         with rdBase.BlockLogs() if isolated_h else nullcontext():
             ids = list(rdDistGeom.EmbedMultipleConfs(work, search_count, p))
-        # Counts describe rejected native attempts, even in a successful search, not failed conformers.
-        counts = p.GetFailureCounts() if p.trackFailures else ()
-        failures = {
-            name: counts[int(cause)]
-            for name, cause in rdDistGeom.EmbedFailureCauses.names.items()
-            if int(cause) < len(counts) and counts[int(cause)]
-        }
+            rejected = _failures(p)
+            if (
+                len(ids) < search_count
+                and embed_params is None
+                and 2 * rejected.get("INITIAL_COORDS", 0) > sum(rejected.values())
+            ):
+                # The eigenvector start rejects any atom sampled at the centroid; top up from random starts.
+                p.useRandomCoords, p.clearConfs = True, False
+                ids += rdDistGeom.EmbedMultipleConfs(work, search_count - len(ids), p)
+        failures = _failures(p)
         logger.debug(
             "DG random=%s knowledge=%s chirality=%s legacy=%s: %d/%d conformers; rejected attempts %s%s",
             p.useRandomCoords,
@@ -490,7 +493,7 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
             len(ids),
             search_count,
             failures if p.trackFailures else "not tracked",
-            "" if ids else "; random starts: EmbedParams(native=...), useRandomCoords=True",
+            "" if ids or p.useRandomCoords else "; random starts: EmbedParams(native=...), useRandomCoords=True",
         )
         if any(cid < 0 for cid in ids):
             raise TimeoutError(
@@ -509,6 +512,16 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
     if work is not mol:  # discard the phantom: bring only the real-atom coords back onto the real molecule
         _bring_real_confs(mol, work, ids)
     return ids
+
+
+def _failures(p):
+    """Return RDKit's rejected-attempt counts by cause, which a successful search also accumulates."""
+    counts = p.GetFailureCounts() if p.trackFailures else ()
+    return {
+        name: counts[int(cause)]
+        for name, cause in rdDistGeom.EmbedFailureCauses.names.items()
+        if int(cause) < len(counts) and counts[int(cause)]
+    }
 
 
 def seed_count(mol, constrained=False):

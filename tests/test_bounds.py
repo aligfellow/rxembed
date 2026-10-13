@@ -184,24 +184,34 @@ def test_carried_nitrile_bond_and_real_iron_seed_from_the_surrogate_basis():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_native_failure_counts_are_reported_once_with_a_random_start_remedy(monkeypatch, caplog):
+def test_rejected_eigenvector_starts_retry_from_random_starts_unless_the_model_is_the_callers(monkeypatch, caplog):
     counts = [0] * (max(map(int, rdDistGeom.EmbedFailureCauses.names.values())) + 1)
     counts[int(rdDistGeom.EmbedFailureCauses.INITIAL_COORDS)] = 2
+    counts[int(rdDistGeom.EmbedFailureCauses.CLASH)] = 1
+    starts = []
 
     def reject(_mol, _n, params):
-        assert params.trackFailures
+        starts.append(params.useRandomCoords)
         return []
 
     monkeypatch.setattr(rdDistGeom, "EmbedMultipleConfs", reject)
     monkeypatch.setattr(rdDistGeom.EmbedParameters, "GetFailureCounts", lambda _self: tuple(counts))
     with caplog.at_level("DEBUG", logger="rxembed.bounds"):
         assert not bnd.seed_coordinates(_graph("CC"), Constraints(), 1, bnd.EmbedParams(seed=42))
+        assert starts == [False, True]
+        native = rdDistGeom.KDG()
+        native.trackFailures = True
+        assert not bnd.seed_coordinates(_graph("CC"), Constraints(), 1, bnd.EmbedParams(seed=42, native=native))
+        assert starts == [False, True, False]
+        counts[int(rdDistGeom.EmbedFailureCauses.CLASH)] = 3
+        assert not bnd.seed_coordinates(_graph("CC"), Constraints(), 1, bnd.EmbedParams(seed=42))
+        assert starts == [False, True, False, False], "starts rejected mostly for other causes are not retried"
 
     messages = [record.message for record in caplog.records if record.name == "rxembed.bounds"]
-    assert len(messages) == 1
-    assert "random=False" in messages[0]
-    assert "{'INITIAL_COORDS': 2}" in messages[0]
-    assert "EmbedParams(native=...), useRandomCoords=True" in messages[0]
+    assert len(messages) == 3
+    assert "random=True" in messages[0]
+    assert "{'INITIAL_COORDS': 2, 'CLASH': 1}" in messages[0]
+    assert "EmbedParams(native=...), useRandomCoords=True" in messages[1]
 
 
 # ---------------------------------------------------------------------------------------------------------
