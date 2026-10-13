@@ -166,8 +166,8 @@ order or the charge; `fallback=False` raises instead.
 
 ## Reaction Endpoints
 
-`rx.coembed` embeds a reactant and a product as paired conformers in one frame, start points for NEB or a TS
-search: each endpoint reads as its own graph, and the two overlay wherever the graphs agree.
+`rx.coembed` embeds a reactant and a product as paired conformers in one frame, as start points for NEB or a TS
+search.
 
 ```python
 reactant, product = rx.coembed("CC(=O)C>>C=C(O)C", n=4)
@@ -175,12 +175,11 @@ reactant.dump("r.xyz", align=False)
 product.dump("p.xyz", align=False)  # frame k pairs with frame k of r.xyz
 ```
 
-The product takes the reactant's atom order from the graph overlay that keeps the most bonds, so map atoms only
-where the graphs allow two reactions. Any pair of `rx.embed` sources works, including two `.xyz` frames or two
-`Isomer`s. `constrain=` and `contacts=` take indices in the reactant's order and hold both copies;
-`contacts="auto"` co-embeds one pair per binding mode of an H-bonded assembly, and `contacts="input"` holds those
-a reactant geometry makes.
-See [reaction endpoints](examples/15_coembed.ipynb).
+The reaction is a `"reactant>>product"` SMILES, atom-mapped or not, or a pair of `rx.embed` sources such as two
+`.xyz` frames. The product takes the reactant's atom order from the graph overlay that keeps the most bonds; atom
+maps pin atoms where that overlay allows two reactions, and two `Isomer`s must already share one order.
+`constrain=` and `contacts=` take reactant indices and hold both copies. See
+[reaction endpoints](examples/15_coembed.ipynb).
 
 ## Save Results
 
