@@ -245,6 +245,22 @@ def test_xyz_path_reference_still_checks_stereo(tmp_path):
     assert "stereo" in _kinds(geom.check(mirror, 0, reference=path))
 
 
+def test_reference_checks_double_bond_geometry():
+    trans = _reference_conformer("C/C=C/C")
+
+    assert "stereo" in _kinds(geom.check(trans, 0, reference=_reference_conformer("C/C=C\\C")))
+    assert "stereo" not in _kinds(geom.check(trans, 0, reference=trans))
+
+
+def test_reference_checks_a_palladium_bound_amine_hand():
+    ens = rx.embed("C[N@H](CC)->[Pd+2](<-[Cl-])(<-[Cl-])<-[NH3]", metal="square_planar", n=1, seed=42, threads=1)[0]
+    amine = Chem.Mol(ens.mol, confId=ens.ids[0])
+    mirror = Chem.Mol(amine)
+    mirror.GetConformer().SetPositions(-amine.GetConformer().GetPositions())
+
+    assert "stereo" in _kinds(geom.check(mirror, 0, reference=amine))
+
+
 def test_kwarg_checks_accept_matching_geometry():
     ref = _reference_conformer(_ACID_ARENE)
     d = float(np.linalg.norm(ref.GetConformer(0).GetPositions()[1] - ref.GetConformer(0).GetPositions()[9]))

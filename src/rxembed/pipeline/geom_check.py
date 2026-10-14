@@ -18,6 +18,7 @@ The two coordination-sphere gates it calls live in the core's ``rxembed.metal_pe
 from __future__ import annotations
 
 import itertools
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -29,12 +30,12 @@ from rxembed.constraints import constraint_value, donor_directions, within_windo
 from rxembed.metal_core import COORDINATION_METALS, haptic_sites, metal_indices, no_aromatic_axis
 from rxembed.metal_donor_orient import stripped_hybridisation
 from rxembed.metal_perceive import SHAPE_PROP, declared_donors, donor_orientation, metal_overbond, spheres
+from rxembed.stereo import stereo_from_3d
 from rxembed.utils import (
     CARBON_Z,
     SP2_DEGREE,
     Violation,
     as_positions,
-    assign_stereo_from_3d,
     atom_label,
     bond_angle,
     conjugated_quartets,
@@ -354,25 +355,24 @@ def check_constraints(mol, pos, spec, dist_slack: float = 0.15, ang_slack: float
 
 
 def stereo_violations(mol, pos, reference, conf_id: int = -1) -> list[Violation]:
-    """No stereocentre inverted vs ``reference`` (CIP tags from 3D).
+    """Report each stereo element whose label in ``reference`` the conformer at ``pos`` does not keep.
 
-    Both sides are read on `mol`'s own graph, so a bond-less reference (an ``.xyz`` path) still has labels.
+    Labels are `stereo_from_3d`'s point centres (metal-bound donors included), E/Z bonds and atropisomer axes, both
+    read on `mol`'s own graph, so a bond-less reference (an ``.xyz`` path) still has labels.
     """
-    got = _cip(mol, conf_id)
-    want = _cip(mol, conf_id, as_positions(reference))
-    out = []
-    for idx, tag in want.items():
-        if got.get(idx) != tag:
-            out.append(
-                Violation(
-                    kind="stereo",
-                    atoms=(idx,),
-                    value=0.0,
-                    limit=0.0,
-                    detail=f"{tag} -> {got.get(idx)}",
-                )
-            )
-    return out
+    got = _stereo(mol, conf_id, pos)
+    want = _stereo(mol, conf_id, as_positions(reference))
+    return [
+        Violation(
+            kind="stereo",
+            atoms=tuple(int(i) for i in re.findall(r"\d+", element)),
+            value=0.0,
+            limit=0.0,
+            detail=f"{element} {tag} -> {got.get(element)}",
+        )
+        for element, tag in want.items()
+        if got.get(element) != tag
+    ]
 
 
 # --- top-level entry ---------------------------------------------------------
@@ -519,15 +519,9 @@ def _attr(obj, name, default):
     return getattr(obj, name, default)
 
 
-def _cip(mol, conf_id: int = -1, positions=None) -> dict[int, str]:
-    m = Chem.Mol(mol)
-    if positions is not None:
-        m.GetConformer(conf_id).SetPositions(np.asarray(positions, float))
-    # through `utils`: the CIP labeller counts a dative bond leaving the centre and RDKit's 3D writer does
-    # not, so reading a label off a raw write mirrors the R/S at every dative-bonded donor.
-    assign_stereo_from_3d(m, conf_id)
-    out = {}
-    for atom in m.GetAtoms():
-        if atom.HasProp("_CIPCode"):
-            out[atom.GetIdx()] = atom.GetProp("_CIPCode")
-    return out
+def _stereo(mol, conf_id, positions) -> dict[str, str]:
+    """Return the code `stereo_from_3d` reads at `positions` for each stereo element, keyed like ``'C1=C2'``."""
+    m = Chem.Mol(mol, confId=conf_id)  # one conformer: stereo_from_3d reads the first
+    m.GetConformer().SetPositions(np.asarray(positions, float))
+    label = stereo_from_3d(m, metal_indices(m))
+    return dict(part.rsplit(":", 1) for part in label.split(",") if part)
