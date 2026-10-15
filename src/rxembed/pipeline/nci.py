@@ -19,13 +19,14 @@ from rdkit import Chem
 
 from rxembed.bounds import probe_conformer
 from rxembed.constraints import constraint_value
-from rxembed.metal_core import frag_map, metal_indices
+from rxembed.metal_core import COORDINATION_METALS, frag_map, metal_indices
 from rxembed.utils import atom_label
 
 if TYPE_CHECKING:
     from xyzgraph.nci import NCIAnalyzer
 
 logger = logging.getLogger("rxembed")
+_PT = Chem.GetPeriodicTable()
 
 
 def _graph(mol: Chem.Mol, conf_id: int = -1) -> nx.Graph:
@@ -92,6 +93,7 @@ class ContactKind:
       (the anti-periplanar R of an R-X···A sigma-hole), ``'metal'`` (M-H), else ``None``.
     - ``anchor``: the near atom. Atom family: ``'donor_h'`` (HB) | ``'heavy'`` (sigma-hole/ionic);
       ring family: ``'ring_h'`` (the donor H) | ``'ring_ion'`` (the ion); hydride family: the hydride.
+    - ``lone_pair``: the far atom must keep a lone pair (`_keeps_lone_pair`); an ionic pair needs only charge.
     """
 
     name: str
@@ -100,6 +102,7 @@ class ContactKind:
     orient: tuple | None = None
     apex: str | None = None
     anchor: str = "heavy"
+    lone_pair: bool = False
 
 
 # One row per contact type. Ring values are centroid heights, expanded to atom windows downstream. No row's
@@ -108,18 +111,24 @@ class ContactKind:
 KINDS = {
     k.name: k
     for k in [
-        ContactKind("HB", "atom", (1.6, 2.2), orient=(140.0, 180.0), apex="donor", anchor="donor_h"),  # unmeasured
-        ContactKind("XB", "atom", (2.5, 3.1), orient=(160.0, 180.0), apex="sigma"),  # unmeasured; same for Cl, Br, I
-        ContactKind("ChB", "atom", (3.0, 3.6), orient=(155.0, 180.0), apex="sigma"),  # unmeasured
-        ContactKind("PnB", "atom", (3.0, 3.6), orient=(155.0, 180.0), apex="sigma"),  # unmeasured
+        ContactKind(
+            "HB", "atom", (1.6, 2.2), orient=(140.0, 180.0), apex="donor", anchor="donor_h", lone_pair=True
+        ),  # unmeasured
+        ContactKind(
+            "XB", "atom", (2.5, 3.1), orient=(160.0, 180.0), apex="sigma", lone_pair=True
+        ),  # unmeasured; same for Cl, Br, I
+        ContactKind("ChB", "atom", (3.0, 3.6), orient=(155.0, 180.0), apex="sigma", lone_pair=True),  # unmeasured
+        ContactKind("PnB", "atom", (3.0, 3.6), orient=(155.0, 180.0), apex="sigma", lone_pair=True),  # unmeasured
         ContactKind("IONIC", "atom", (2.6, 3.8)),  # unmeasured
-        ContactKind("CATLP", "atom", (2.6, 3.4)),  # unmeasured
+        ContactKind("CATLP", "atom", (2.6, 3.4), lone_pair=True),  # unmeasured
         ContactKind("CHPI", "ring", 3.0, anchor="ring_h"),  # unmeasured
         ContactKind("HBPI", "ring", 3.0, anchor="ring_h"),  # unmeasured
         ContactKind("CATPI", "ring", 3.5, anchor="ring_ion"),  # unmeasured; one height for every cation
         ContactKind("ANPI", "ring", 3.5, anchor="ring_ion"),  # unmeasured
         ContactKind("HALPI", "ring", 3.5, anchor="ring_ion"),  # unmeasured
-        ContactKind("MH", "hydride", (1.6, 2.2), orient=(140.0, 180.0), apex="metal", anchor="hydride"),  # unmeasured
+        ContactKind(
+            "MH", "hydride", (1.6, 2.2), orient=(140.0, 180.0), apex="metal", anchor="hydride", lone_pair=True
+        ),  # unmeasured
     ]
 }
 
@@ -146,14 +155,28 @@ def _donor_h(mol, heavy):
     return next((a.GetIdx() for a in mol.GetAtomWithIdx(heavy).GetNeighbors() if a.GetAtomicNum() == 1), None)
 
 
+def _keeps_lone_pair(atom):
+    """Return whether `atom` has a lone pair left after its bonds; each dative bond it donates spends one."""
+    donated = sum(
+        b.GetBondType() == Chem.BondType.DATIVE and b.GetBeginAtomIdx() == atom.GetIdx() for b in atom.GetBonds()
+    )
+    spare = _PT.GetNOuterElecs(atom.GetAtomicNum()) - atom.GetFormalCharge() - atom.GetTotalValence() - 2 * donated
+    return spare >= 2  # noqa: PLR2004 - two electrons make a pair
+
+
 def _sigma_apex(mol, x, acceptor, pos):
     """Pick the heavy R bonded to `x` that best caps the R-x...acceptor sigma-hole cone.
 
     The most *anti-periplanar* neighbour to the x->acceptor direction. A chalcogen/pnictogen bears several
     sigma-holes (one anti to each X-R bond), so pick by geometry in the rough conformer `pos`, not
-    topological order. None if `x` has no heavy neighbour other than the acceptor.
+    topological order. A sigma hole sits opposite a covalent bond, so R is never a metal: None if `x` has no
+    such R other than the acceptor, as for a free or metal-bound halide.
     """
-    nbrs = [n.GetIdx() for n in mol.GetAtomWithIdx(x).GetNeighbors() if n.GetAtomicNum() > 1 and n.GetIdx() != acceptor]
+    nbrs = [
+        n.GetIdx()
+        for n in mol.GetAtomWithIdx(x).GetNeighbors()
+        if n.GetAtomicNum() > 1 and n.GetAtomicNum() not in COORDINATION_METALS and n.GetIdx() != acceptor
+    ]
     if not nbrs:
         return None
     va = pos[acceptor] - pos[x]
@@ -487,16 +510,17 @@ def _atom_contacts(work, an, pos, frag, seen, inter_fragment, kind):
                 # a pi-bonded chalcogen (a thione/thiourea C=S) is electron-rich (an H-bond acceptor),
                 # not a sigma-hole donor: its constraint would just pucker the sp2 group
                 continue
+        apex = a if eff.apex == "donor" else _sigma_apex(work, a, b, pos) if eff.apex == "sigma" else None
+        if (eff.apex == "sigma" and apex is None) or (eff.lone_pair and not _keeps_lone_pair(work.GetAtomWithIdx(b))):
+            continue
         anchor = _donor_h(work, a) if eff.anchor == "donor_h" else a
         if anchor is None or (eff.name, anchor, b) in seen:
             continue
         seen.add((eff.name, anchor, b))
         label = f"{eff.name}:{atom_label(work, a)}->{atom_label(work, b)}"
         angles = {}
-        if eff.orient:  # hold the contact linear, not just close
-            apex = a if eff.apex == "donor" else _sigma_apex(work, a, b, pos) if eff.apex == "sigma" else None
-            if apex is not None and apex not in (anchor, b) and frag[apex] != frag[b]:
-                angles = {(apex, anchor, b): eff.orient}  # inter-fragment only (else smoothing can fail)
+        if eff.orient and apex is not None and apex not in (anchor, b) and frag[apex] != frag[b]:
+            angles = {(apex, anchor, b): eff.orient}  # hold it linear; inter-fragment only (else smoothing can fail)
         out[label] = Contact(
             distances={(min(anchor, b), max(anchor, b)): eff.window}, angles=angles, label=label, near=anchor, far=b
         )
@@ -547,6 +571,7 @@ def _metal_hydride_contacts(work, an, pos, frag, seen, inter_fragment, kind):
             if a.GetAtomicNum() in _ACCEPTOR_Z
             and a.GetIdx() != metal
             and not (inter_fragment and frag[h] == frag[a.GetIdx()])
+            and (not kind.lone_pair or _keeps_lone_pair(a))
         ]
         if not accs:
             continue

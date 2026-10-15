@@ -50,6 +50,39 @@ def test_acceptor_quality_prefers_localised_lone_pair(smiles, stronger_first):
         assert accepted.index(strong) < accepted.index(weak), f"acceptor {strong} must outrank {weak}: {accepted}"
 
 
+_PD_AMMINE_WATER = "[Cl-]->[Pd+2](<-[NH3])(<-[NH3])<-[NH3].O"  # Cl0 Pd1 N2 N3 N4, then water O5
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
+@pytest.mark.parametrize(
+    ("smiles", "acceptor", "accepts"),
+    [
+        pytest.param(_PD_AMMINE_WATER, 2, False, id="Pd-bound-ammine-N"),
+        pytest.param(_PD_AMMINE_WATER, 0, True, id="Pd-bound-chloride"),
+        pytest.param("CS(=O)(=O)C.O", 1, False, id="sulfone-S"),
+        pytest.param("n1ccccc1.O", 0, True, id="pyridine-N"),
+    ],
+)
+def test_an_acceptor_needs_a_lone_pair_left_after_its_bonds(smiles, acceptor, accepts):
+    """A dative bond spends its donor's lone pair: a Pd-bound ammine accepts no H-bond, a bound chloride does."""
+    acceptors = {c.far for c in nci.candidate_contacts(_mol(smiles), kinds=("HB",)).values()}
+    assert (acceptor in acceptors) is accepts
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None or find_spec("networkx") is None, reason="needs rxembed[workflow]")
+@pytest.mark.parametrize(
+    ("smiles", "fires"),
+    [
+        pytest.param("[Cl-].CO", False, id="free-chloride"),
+        pytest.param(_PD_AMMINE_WATER, False, id="Pd-bound-chloride"),
+        pytest.param("CI.CN(C)C", True, id="iodomethane"),
+    ],
+)
+def test_a_sigma_hole_sits_opposite_a_covalent_bond(smiles, fires):
+    """A free or metal-bound halide has no sigma hole to donate; a C-I bond leaves one on iodine."""
+    assert bool(nci.candidate_contacts(_mol(smiles), kinds=("XB",))) is fires
+
+
 # --- enumeration ------------------------------------------------------------------------------------------
 
 
