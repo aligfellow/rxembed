@@ -809,7 +809,7 @@ def resolve_core(mol, *, fix=None, constrain=None, has_geometry=False):
         | {a for ra, rb, _ in cons.planes for a in (*ra, *rb)},
     )
     cons.contacts = (frozenset(d_soft), frozenset(angular_soft))
-    _warn_underdetermined(cons, coord_fix, len(fixed & set(cons.distances)))
+    _warn_underdetermined(mol, cons, coord_fix, len(fixed & set(cons.distances)))
     _echo(mol, cons, coord_fix)
     return cons, coord_fix
 
@@ -836,21 +836,25 @@ def _drop_determined_by_graft(cons, coord_fix, keys):
     return dropped
 
 
-def _warn_underdetermined(cons, coord_fix, n_fix_d):
-    """Warn when two fix distances sharing an atom over exactly 3 atoms leave their angle free.
+def _warn_underdetermined(mol, cons, coord_fix, n_fix_d):
+    """Warn when the only two fix distances share an atom and leave their angle free.
 
     The classic mis-fix is an SN2 pinned as ``fix={(f, c): d1, (c, cl): d2}`` with no ``(f, c, cl)`` angle,
-    which comes out bent rather than linear. A richer network (more atoms, coordinates or angles) is left alone.
+    which comes out bent rather than linear. A richer network (a third distance, coordinates or angles) is left
+    alone.
     """
-    if coord_fix or cons.angles or cons.dihedrals or n_fix_d < DIST_ATOMS:
-        return
     keys = list(cons.distances)
-    atoms = {a for k in keys for a in k}
-    shares = any(len(set(a) & set(b)) == 1 for i, a in enumerate(keys) for b in keys[i + 1 :])
-    if len(atoms) <= _MIN_SHAPE_ATOMS and shares:
+    if coord_fix or cons.angles or cons.dihedrals or not n_fix_d == len(keys) == 2:  # noqa: PLR2004
+        return
+    shared = set(keys[0]) & set(keys[1])
+    if len(shared) == 1:
+        (centre,) = shared
+        angle = (*(set(keys[0]) - shared), centre, *(set(keys[1]) - shared))
         logger.warning(
-            "fix has two distances sharing an atom over %d atom(s); no angle is fixed, so the angle is free",
-            len(atoms),
+            "fix holds two distances at %s and no angle is fixed, so %s is free; add fix={%s: degrees}",
+            atom_label(mol, centre),
+            "-".join(atom_label(mol, i) for i in angle),
+            angle,
         )
 
 

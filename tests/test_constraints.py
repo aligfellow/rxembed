@@ -202,7 +202,14 @@ def test_two_distances_warn_free_angle(caplog):
     m = _mol()
     with caplog.at_level("WARNING", logger="rxembed"):
         resolve_core(m, fix={(0, 1): 1.5, (1, 2): 1.4}, has_geometry=True)
-    assert any("no angle is fixed" in r.getMessage() for r in caplog.records)
+    assert "C0-C1-O2 is free; add fix={(0, 1, 2): degrees}" in caplog.text
+
+
+def test_three_distances_closing_a_triangle_do_not_warn_free_angle(caplog):
+    m = _mol()
+    with caplog.at_level("WARNING", logger="rxembed"):
+        resolve_core(m, fix={(0, 1): 1.5, (1, 2): 1.4, (0, 2): 2.4}, has_geometry=True)
+    assert "no angle is fixed" not in caplog.text
 
 
 def test_resolve_atom_rejects_an_ambiguous_or_unparsable_smarts():
