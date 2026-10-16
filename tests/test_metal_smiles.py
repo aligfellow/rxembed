@@ -22,11 +22,11 @@ from rxembed.metal_polyhedron import SLOT_BOND_PROP, point_group, record, vertex
 from rxembed.metal_stereo import donor_classes, eta2_signatures, face_winding
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.perceive import read_xyz
-from tests.conftest import EXAMPLES_DIR
+from tests.conftest import TEST_STRUCTURES_DIR
 from tests.metal_fixtures import BUTADIENE_FE_CO3
 
-_MN_H2 = str(EXAMPLES_DIR / "mn-h2.xyz")  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
-_MNH = str(EXAMPLES_DIR / "mnh.xyz")  # the corresponding Mn hydride minimum
+_MN_H2 = str(TEST_STRUCTURES_DIR / "mn-h2.xyz")  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
+_MNH = str(TEST_STRUCTURES_DIR / "mnh.xyz")  # the corresponding Mn hydride minimum
 _MA3B3_SEATS = {"fac": [1, 4, 2, 5, 3, 6], "mer": [1, 2, 3, 4, 5, 6]}  # octahedral: 0/1, 2/3, 4/5 are trans
 _ETA2_ASYM_E = r"C/[CH]1=[CH](/F)->[Pt+2](<-[Cl-])(<-[Br-])(<-[NH3])<-1"
 _BINAP_PD = (

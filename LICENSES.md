@@ -80,6 +80,11 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## Metal regression structures
+
+`tests/structures/{mn-h2,mnh,ru-co}.xyz` retain the upstream rxembed structures under the project's
+[MIT licence](LICENSE), copyright (c) 2026 Alister S. Goodfellow. See `benchmark/README.md` for their origin.
+
 ## Notebook endpoint inputs
 
 Scope: endpoint inputs embedded in `examples/15_coembedding.ipynb`.

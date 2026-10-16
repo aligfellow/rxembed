@@ -263,6 +263,16 @@ def _native_mismatch(sig, ref, spec):
     ref_isotopes, ref_text = ref[_NATIVE_KEY]
     sig_mol = Chem.MolFromSmiles(sig_text, params)
     ref_mol = Chem.MolFromSmiles(ref_text, params)
+    if sig_mol is None:
+        params.sanitize = False
+        sig_mol = Chem.MolFromSmiles(sig_text, params)
+        if sig_mol is not None:
+            sig_mol.UpdatePropertyCache(strict=False)
+    if ref_mol is None:
+        params.sanitize = False
+        ref_mol = Chem.MolFromSmiles(ref_text, params)
+        if ref_mol is not None:
+            ref_mol.UpdatePropertyCache(strict=False)
     if sig_mol is None or ref_mol is None:
         raise ValueError("invalid internal native stereo key")
 

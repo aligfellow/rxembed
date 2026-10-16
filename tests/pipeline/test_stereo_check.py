@@ -5,11 +5,12 @@ from importlib.util import find_spec
 
 import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
+from rdkit.Chem import rdDistGeom, rdForceFieldHelpers, rdMolHash
 
 from rxembed import metal_core
 from rxembed.pipeline.stereo_check import (
     _independent_summary,
+    _native_mismatch,
     _native_signature,
     mismatch,
     signature,
@@ -88,6 +89,20 @@ def test_native_point_can_be_inverted_without_holding_other_kinds():
 
     assert mismatch(left, right, {"point": "invert", "default": "free"}) is None
     assert mismatch(left, right, {"point": "preserve", "default": "free"}) is not None
+
+
+def test_native_stereo_preservation_handles_unsanitized_aluminum_graphs():
+    def key(hand):
+        graph = Chem.MolFromSmiles(f"[Al](N)(O)(S)[C{hand}H](F)Cl", sanitize=False)
+        graph.UpdatePropertyCache(strict=False)
+        return (), rdMolHash.MolHash(graph, rdMolHash.HashFunction.CanonicalSmiles, True)
+
+    expected = {"_native": key("@"), "point": Counter({"R": 1})}
+    same = {"_native": key("@"), "point": Counter({"R": 1})}
+    inverted = {"_native": key("@@"), "point": Counter({"S": 1})}
+
+    assert _native_mismatch(same, expected, "all") is None
+    assert "point expected R, found S" == _native_mismatch(inverted, expected, "all")
 
 
 # --- signature: read the handedness back out of the coordinates -------------------------------------------

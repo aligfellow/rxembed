@@ -16,7 +16,7 @@ from rxembed.constraints import Constraints
 from rxembed.metal_core import COORDINATION_METALS
 from rxembed.pipeline import geom_check as geom
 from rxembed.utils import conjugated_quartets
-from tests.conftest import EXAMPLES_DIR
+from tests.conftest import TEST_STRUCTURES_DIR
 
 _DFT = (
     pytest.param("mn-h2", {"metal_charges": {0: 2, 1: 1}}, id="mn-h2"),
@@ -294,7 +294,7 @@ def test_constraint_gate_checks_periodic_dihedrals():
 @pytest.mark.parametrize(("name", "read_kw"), _DFT)
 def test_floors_accept_reference_geometries(name, read_kw):
     pt = GetPeriodicTable()
-    mol = rx.read_xyz(str(EXAMPLES_DIR / f"{name}.xyz"), 0, **read_kw)
+    mol = rx.read_xyz(str(TEST_STRUCTURES_DIR / f"{name}.xyz"), 0, **read_kw)
     pos = mol.GetConformer().GetPositions()
     metals = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() in COORDINATION_METALS]
     assert metals, f"{name} carries no transition metal: the fixture exercises no floor at all"

@@ -15,14 +15,17 @@ from rdkit.Geometry import Point3D
 import rxembed as rx
 from rxembed.metal_core import COORDINATION_METALS
 from rxembed.pipeline import perceive
-from tests.conftest import EXAMPLES_DIR
+from tests.conftest import EXAMPLES_DIR, TEST_STRUCTURES_DIR
 
-_BIMP = str(EXAMPLES_DIR / "bimp.xyz")  # a metal-free TS with a stretched reacting core
+
+@pytest.fixture(params=["nazarov_start", "nazarov_end"])
+def nazarov_xyz(request):
+    return str(EXAMPLES_DIR / f"{request.param}.xyz")
 
 
 @pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
 def test_xyzgraph_metal_bonds_round_trip_as_dative(tmp_path):
-    source = perceive.read_xyz(str(EXAMPLES_DIR / "mnh.xyz"), 0)
+    source = perceive.read_xyz(str(TEST_STRUCTURES_DIR / "mnh.xyz"), 0)
     metals = {atom.GetIdx() for atom in source.GetAtoms() if atom.GetAtomicNum() in COORDINATION_METALS}
     coordination = [
         bond for bond in source.GetBonds() if (bond.GetBeginAtomIdx() in metals) != (bond.GetEndAtomIdx() in metals)
@@ -40,32 +43,31 @@ def test_xyzgraph_metal_bonds_round_trip_as_dative(tmp_path):
     assert rx.cxsmiles(recovered) == rx.cxsmiles(source)
 
 
-def test_missing_xyzgraph_warns_and_names_each_fallback(monkeypatch, caplog, tmp_path):
+def test_missing_xyzgraph_warns_and_names_each_fallback(monkeypatch, caplog, nazarov_xyz):
     monkeypatch.setitem(sys.modules, "xyzgraph", None)
     caplog.set_level(logging.WARNING, logger="rxembed")
-    mol = perceive.read_xyz(str(EXAMPLES_DIR / "ru-co.xyz"), 0)
+    mol = perceive.read_xyz(str(TEST_STRUCTURES_DIR / "ru-co.xyz"), 0)
     assert any(a.GetSymbol() == "Ru" for a in mol.GetAtoms())
     assert "xyzgraph unavailable; using xyz2mol" in caplog.text
 
     caplog.clear()
-    water = tmp_path / "water.xyz"
-    water.write_text("3\nwater\nO 0 0 0\nH 0.96 0 0\nH -0.24 0.93 0\n")
-    mol = perceive.read_xyz(str(water), 0)
-    assert mol.GetNumBonds() == 2
+    mol = perceive.read_xyz(nazarov_xyz, 0)
+    assert mol.GetNumAtoms() == Chem.MolFromXYZFile(nazarov_xyz).GetNumAtoms()
+    assert any(bond.GetBondTypeAsDouble() > 1 for bond in mol.GetBonds())
     assert "xyzgraph unavailable; using RDKit" in caplog.text
 
     with pytest.raises(ValueError, match="multiple metals"):
-        perceive.read_xyz(str(EXAMPLES_DIR / "mn-h2.xyz"), 0)
+        perceive.read_xyz(str(TEST_STRUCTURES_DIR / "mn-h2.xyz"), 0)
 
-    perceive.read_xyz(str(EXAMPLES_DIR / "ru-co.xyz"), 0, bond_orders="xyz2mol")
+    perceive.read_xyz(str(TEST_STRUCTURES_DIR / "ru-co.xyz"), 0, bond_orders="xyz2mol")
 
     for argument in ("connectivity", "bond_orders"):
         with pytest.raises(ValueError, match=argument):
-            perceive.read_xyz(_BIMP, 0, **{argument: "typo"})
+            perceive.read_xyz(nazarov_xyz, 0, **{argument: "typo"})
 
 
-def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog):
-    fallback = Chem.MolFromXYZFile(_BIMP)
+def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog, nazarov_xyz):
+    fallback = Chem.MolFromXYZFile(nazarov_xyz)
     assert fallback is not None
 
     def fail(*_args, **_kwargs):
@@ -75,8 +77,8 @@ def test_runtime_perceiver_failure_warns_and_uses_the_other(monkeypatch, caplog)
     monkeypatch.setattr(perceive, "_from_xyzgraph", lambda *_args, **_kwargs: fallback)
     caplog.set_level(logging.WARNING, logger="rxembed")
     with pytest.raises(ValueError, match="no assignment"):
-        perceive.read_xyz(_BIMP, 0, connectivity="xyz2mol", bond_orders="xyz2mol", fallback=False)
-    assert perceive.read_xyz(_BIMP, 0, connectivity="xyz2mol", bond_orders="xyz2mol") is fallback
+        perceive.read_xyz(nazarov_xyz, 0, connectivity="xyz2mol", bond_orders="xyz2mol", fallback=False)
+    assert perceive.read_xyz(nazarov_xyz, 0, connectivity="xyz2mol", bond_orders="xyz2mol") is fallback
     assert "xyz2mol failed (no assignment); using xyzgraph" in caplog.text
     assert fallback.GetProp("_rxembedConnectivity") == "xyzgraph"
     assert fallback.GetBoolProp("_rxembedPerceptionFallback")
@@ -505,14 +507,14 @@ def test_connectivity_read_has_the_bonds_of_its_smiles_without_placing_charges(t
     assert _bond_graph(mol) == _bond_graph(Chem.AddHs(Chem.MolFromSmiles(smiles)))
 
 
-def test_rdkit_connectivity_uses_native_bond_orders_for_an_organic_graph(caplog):
+def test_rdkit_connectivity_uses_native_bond_orders_for_an_organic_graph(caplog, nazarov_xyz):
     with caplog.at_level(logging.WARNING, logger="rxembed"):
-        mol = perceive.read_xyz(_BIMP, 0, connectivity="rdkit", bond_orders="xyz2mol")
+        mol = perceive.read_xyz(nazarov_xyz, 0, connectivity="rdkit", bond_orders="xyz2mol")
 
     assert any(bond.GetBondTypeAsDouble() > 1 for bond in mol.GetBonds())
     assert "xyz2mol bond-order assignment is metal-only; using RDKit" in caplog.text
     with pytest.raises(ValueError, match=r"xyz2mol.*does not support"):
-        perceive.read_xyz(_BIMP, 0, connectivity="rdkit", bond_orders="xyz2mol", fallback=False)
+        perceive.read_xyz(nazarov_xyz, 0, connectivity="rdkit", bond_orders="xyz2mol", fallback=False)
 
 
 def test_read_xyz_rejects_a_final_charge_different_from_the_request(monkeypatch):

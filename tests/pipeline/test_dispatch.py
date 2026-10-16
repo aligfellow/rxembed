@@ -763,17 +763,23 @@ def test_coembed_refuses_a_geometry_for_selected_isomers():
         rx.coembed((cisplatin, cisplatin), metal="TET")
 
 
-def test_coembed_xyz_frames_honor_explicit_hydrogen_correspondence(tmp_path):
+def test_coembed_xyz_frames_honor_explicit_hydrogen_correspondence_and_only_budget_ts_pairs(tmp_path, monkeypatch):
     water = rx.embed("O", n=1, seed=1).mol
     paths = [tmp_path / name for name in ("reactant.xyz", "product.xyz")]
     Chem.MolToXYZFile(water, str(paths[0]))
     Chem.MolToXYZFile(Chem.RenumberAtoms(water, [0, 2, 1]), str(paths[1]))
+    monkeypatch.setattr(
+        dispatch,
+        "correspondence_budgets",
+        lambda _molecules, _terms, correspondence, _params: dict.fromkeys(correspondence, 0.8),
+    )
 
     result = rx.coembed(paths, spectator_atoms={0: 0, 1: 2}, ts_atoms={2: 1}, n=1, seed=1)
 
     assert dict(result.correspondence) == {0: 0, 1: 2, 2: 1}
     assert result.ts_pairs == ((2, 1),)
     assert set(result.budgets) == {(0, 0), (1, 2), (2, 1)}
+    assert result.budgets == {(0, 0): 0.0, (1, 2): 0.0, (2, 1): 0.8}
 
 
 @pytest.mark.parametrize("atom", [True, 0.5, "0", 100])

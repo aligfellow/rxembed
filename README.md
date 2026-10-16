@@ -212,128 +212,29 @@ one of rxembed's additions, for study ([07_metal](examples/07_metal.ipynb)). `ma
 
 ## Coembedding reaction endpoints
 
+`rx.coembed` generates paired reactant and product conformers in a shared coordinate frame, as starting
+points for reaction-path or transition-state searches. It aligns unchanged atoms while allowing the reaction
+center to move, retaining each endpoint's geometry and stereochemistry.
+
 ```python
 reactant = "[CH3:1][CH2:2][CH2:3][NH2:4].[OH:5][H:99]"
 product = "[CH3:1][CH2:2][CH2:3][NH2+:4]([H:99]).[OH-:5]"
-pairs = rx.coembed(reactant, product, n=10, seed=42, threads=1)
+pairs = rx.coembed(reactant, product, n=4, seed=42)
 reactant_mol, product_mol = pairs[0]
-print(pairs.alignment_scores)  # aligned spectator-atom RMSD, Angstrom
-print(pairs.ts_rmsds)          # reacting-atom RMSD, including mapped H99
-print(pairs.ts_pairs)          # endpoint-local atom-index pairs used for TS RMSD
-print(pairs.reactant.energies, pairs.product.energies)  # each endpoint's UFF energy
+print(pairs.alignment_scores)  # spectator-atom RMSD, Angstrom
+pairs.reactant.dump("reactant.xyz", align=False)
+pairs.product.dump("product.xyz", align=False)  # matching frames form a pair
 ```
 
-The two-argument call also accepts a `"reactant>>product"` reaction SMILES or a `(reactant, product)` pair.
-`metal=` supplies a coordination geometry when each endpoint resolves to one identity; otherwise select one
-isomer per endpoint first. `charge=` supplies the conserved charge for XYZ perception. Two XYZ frames on the
-same element order keep their atom correspondence, including a degenerate proton exchange.
+Inputs can be SMILES, XYZ paths, RDKit molecules or selected metal isomers. A single `"reactant>>product"`
+SMILES is also accepted. Both endpoints must contain the same atom inventory; atom maps resolve ambiguous
+correspondence. `charge=` supplies the charge for XYZ inputs.
 
-`constrain=` and explicit `contacts=` use reactant atom-index keys and are mapped onto the product's own order.
-A contact that becomes a bond is held only in the reactant. `contacts="input"` retains contacts measured from
-the reactant geometry; `contacts="auto"` discovers contact modes. Several successful modes return a
-`list[Coembedded]`, each tagged by `nci` on both endpoints. Failed modes warn and remain in each result's
-`errors`. Single-pair calls keep the `Coembedded` result used by the example notebook.
+`constrain=` and `contacts=` use reactant atom indices and apply to both endpoints where applicable.
+Start with `n=1` for large flexible molecules; fewer pairs than requested may survive validation. Preserve
+the shared frame with `align=False` when exporting and `auto_align=False` when visualizing with `xyzrender`.
 
-Automatic correspondence overlays the complete explicit-H graphs while keeping the most bonds. Atom maps
-and explicit selections pin identities; equally good overlays that describe different reactions raise with a
-request to map the reacting atoms. Input bond graphs and atom orders are preserved. `pairs.correspondence`
-contains endpoint-local pairs for every atom when the inventories match, including ordinary hydrogens.
-The default spectators are heavy atoms whose bonded neighborhoods, charge and declared stereo stay the same.
-`spectator_atoms={reactant_index: product_index}` selects another spectator correspondence, using 0-based
-input indices. An axial inversion includes the complete rotating group, with its substituents and hydrogens,
-in the TS selection. Cyclic axes require explicit `spectator_atoms=` and `ts_atoms=` selections.
-
-For metals, select one isomer with `rx.metal(...)[index]` before calling `coembed`. To retain explicit hydrogen
-maps when selecting an isomer, parse first with `rx.parse_smiles(smiles, remove_hs=False)`. Select one ligand
-stereoisomer as well as one coordination arrangement, for example `rx.metal(mol, "SPL", stereo="unassigned")[0]`.
-Declared point, E/Z and axial identities are checked against coordinates for both endpoints; failures use
-whole-pair recovery. Undefined ligand stereo in a selected metal isomer raises by default. `stereo="free"`
-explicitly permits unspecified hands.
-Explicit stereo remains authoritative with `stereo="free"`.
-
-Every inferred reacting atom outside the alignment receives a soft joint restraint, including implicit transferring hydrogens. `ts_atoms={reactant_index: product_index}` adds atoms
-to this set and cannot omit inferred reacting atoms. Coembedding requires matching atom inventories; embed
-endpoints separately when their inventories differ.
-`pairs.ts_pairs` names the TS selection, and `pairs.ts_rmsds` measures its displacement in the shared frame
-without another fit. `pairs.alignment_scores` measures only spectator displacement. An empty TS set has RMSD zero.
-
-Each endpoint retains its own bounds edits and chemistry constraints. Compare native distance windows
-through the correspondence to estimate each atom's largest incompatible gap. This determines its coupling
-budget directly, with no added floor. Zero-budget pairs use a harmonic joint penalty. For example:
-
-```python
-pairs = rx.coembed(reactant, product, n=1, seed=42)
-```
-
-`pairs.budgets` gives the estimated budgets for all restrained pairs. Distance gaps are a heuristic rather
-than a proof of 3D or stereo feasibility.
-
-Coembedding uses shared seeding exclusively. It embeds and relaxes the endpoint with more bonds, then
-transfers real-atom coordinates through the complete correspondence. Bond-count ties prefer fewer centroid
-helpers, then the reactant. Each endpoint rebuilds its own haptic helpers and retains its chemistry and stereo
-checks. Before enabling seed-centred conjugation holds, the copied endpoint runs native constrained UFF
-without those holds so changed hybridisation can relax. Its ordinary endpoint recovery may re-embed a copy
-with incompatible declared stereo.
-Subsequent passes use the original endpoint constraints. Initial and replacement
-batches use the same seeder. No combined DG seed matrix or seed slack is needed.
-
-`n=None` uses the larger endpoint's normal sampling target, counting each endpoint once. Start with `n=1`
-for large flexible molecules. Enable `rx.set_verbose("INFO")` to see the source endpoint and pair count:
-
-```python
-pairs = rx.coembed(reactant, product, n=1, seed=42, threads=1)
-```
-
-The default coupling strengths are `alignment_weight=25` and `ts_weight=1.25`. They are sampling choices,
-not an alignment guarantee. Coembedding always uses shared seeding; the bounds seeder and `seed_slack`
-argument have been removed. A supplied `params.native` controls the source endpoint's native
-embedding; its per-conformer DG timeout does not limit the complete coembedding workflow.
-
-The existing RDKit UFF optimizer alternately minimizes each endpoint against the other's corresponding atoms.
-It minimizes the sum of endpoint energies plus separately normalized squared-excess penalties for spectators
-and TS atoms. The weights set strength in kcal/mol/Angstrom². Each group contributes
-`weight * mean(max(distance - budget, 0)**2)`; an empty TS group contributes zero. Adding TS atoms does not
-dilute spectator strength. No additional optimizer dependency is required.
-
-Before each joint pass, rigidly fit the product on spectator correspondence only if the complete coupling
-penalty decreases. Each endpoint then freely relaxes through the original UFF workflow, followed by a final
-coupled polish. Missed metal-distance walls retry through the existing native stiffness ladder. A coupled pass
-that fails validation retains the last validated pair, including a valid starting pair, before searching
-fresh seeds. Final displacements can
-exceed their budgets; `pairs.budget_excesses` reports the excess by pair and conformer. Native validation, whole-pair
-replacement and the normal endpoint energy window follow. `pairs.scores` combines final endpoint energies
-with the current spectator and TS penalties. These scores are sampling objectives, not reaction energies.
-Neither API guarantees every requested conformer survives.
-Copied endpoints that settle into another coordination shape or donor seating are discarded before independent
-endpoint reseeding. Omit both `seed` and `params` to enable bounded fresh-seed retries for missing or rejected
-pairs; retained pairs stay fixed. An explicit `seed=` or supplied `EmbedParams` keeps the RNG seed fixed
-throughout stereo selection and recovery. Same-seed resampling can still repair copied endpoint geometry.
-`pairs.source_seeds` records the shared-seed attempt associated with each returned pair.
-Stronger-restraint polishing retries also touch only pairs that still miss a metal-distance window.
-
-`joint_gtol=0.1` controls the joint maximum-gradient criterion; native minimizations keep RDKit's own tolerances.
-`joint_energy_tol=0.001` additionally permits a non-increasing cycle-score plateau. Set the latter to zero
-for force-based stopping only. `max_iters=5000` caps actual native steps across both endpoints per joint pass
-and each endpoint cleanup attempt.
-`pairs.joint_results` describes final polishing after independent relaxation, including `stopping_reason`,
-`max_force`, `score_change`, `score_history`, `iterations` and `iteration_budget_used`. `iterations` counts
-actual native optimizer steps across both endpoints in that pass, including rejected half-steps; it is
-unavailable if optimization raises. `iteration_budget_used` retains the same count for compatibility.
-An energy plateau does not guarantee the force tolerance was reached.
-Structural publication remains a separate gate. `pairs.source_seeds` identifies accepted replacement seeds;
-`pairs.optimizer_attempts` retains initial and polishing diagnostics from original and replacement batches,
-identified by `stage` and `seed_method`. Each joint pass has its own `max_iters` work budget.
-If validation corrects endpoint coordinates after polishing, the last result has
-`stopping_reason="validation_adjusted"` and no converged joint-force claim. Earlier optimizer records remain
-in `optimizer_attempts`.
-
-Use the same seed and conformer count to compare several cutoffs and joint tolerances, checking accepted
-counts, endpoint energy distributions, final alignment RMSD and runtime. A small pilot cannot establish
-identical conformational coverage. [15_coembedding](examples/15_coembedding.ipynb) demonstrates coembedding
-with mapped SMILES and XYZ endpoints, and overlays the endpoints with separately installed `xyzrender`.
-Set `auto_align=False` in the renderer to inspect the returned shared coordinates.
-Frozen endpoints and expansion into several stereo identities currently raise with instructions to select an
-identity or embed separately.
+See [15_coembedding](examples/15_coembedding.ipynb) for worked examples and the algorithm.
 
 ## Errors and How It Works
 

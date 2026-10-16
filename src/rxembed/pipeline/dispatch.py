@@ -816,9 +816,9 @@ def coembed(
     ``EmbedParams`` keeps its RNG seed fixed, including stereo selection and replacement batches;
     same-seed resampling remains available to repair copied endpoint geometry.
 
-    Derive each coupled atom's budget from its largest incompatible endpoint distance-window gap, with no
-    added floor. These are soft penalty thresholds and do not establish 3D or stereo feasibility.
-    Inspect effective budgets through ``Coembedded.budgets``.
+    Derive TS-pair budgets from each atom's largest incompatible endpoint distance-window gap, with no
+    added floor. Spectator pairs use zero budget. These are soft penalty thresholds and do not establish 3D
+    or stereo feasibility. Inspect effective budgets through ``Coembedded.budgets``.
 
     Alternate native RDKit minimizations on the sum of endpoint energies and separately normalized
     spectator and TS squared-excess penalties. ``alignment_weight=25`` and ``ts_weight=1.25`` control the
@@ -944,7 +944,8 @@ def _coembed_pair(
         [owner._mol for owner in owners], [owner.cons for owner in owners], correspondence, params
     )
     coupled = (*pairs, *reactive)
-    effective = {pair: allowances[pair] for pair in coupled}
+    ts_pairs = set(reactive)
+    effective = {pair: allowances[pair] if pair in ts_pairs else 0.0 for pair in coupled}
     endpoint_graphs = [materialise_phantoms(owner._mol, owner.cons.haptic) for owner in owners]
     joint = Chem.CombineMols(*endpoint_graphs)
     Chem.GetSymmSSSR(joint)

@@ -14,11 +14,11 @@ import rxembed as rx
 from rxembed import bounds, core, metal_core, stereo
 from rxembed.bounds import bounds_matrix
 from rxembed.pipeline.perceive import read_xyz
-from tests.conftest import EXAMPLES_DIR
+from tests.conftest import TEST_STRUCTURES_DIR
 
 emb = importlib.import_module("rxembed.embed")
 
-_MN_H2 = str(EXAMPLES_DIR / "mn-h2.xyz")  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
+_MN_H2 = str(TEST_STRUCTURES_DIR / "mn-h2.xyz")  # a frozen-TS bimetallic: Mn centre + a spectator ferrocene Fe
 
 
 @pytest.mark.parametrize("operation", ["materialise"])

@@ -143,8 +143,8 @@ the selected coordinates. Public graphs keep real atoms and bonds; surrogate met
 stay private.
 
 Coembedding resolves complete graph correspondence in `utils`, preserving input atom orders.
-`coembedding` derives movement budgets from native endpoint bounds and carries them with coupling
-coefficients and correspondence in `Constraints`. It seeds and relaxes the more bonded endpoint through
+`coembedding` derives movement budgets for TS pairs from native endpoint bounds, gives spectator pairs zero
+budget, and carries them with coupling coefficients and correspondence in `Constraints`. It seeds and relaxes the more bonded endpoint through
 `embed`, transfers mapped real coordinates and rebuilds each endpoint's own haptic centroids. Native UFF
 repairs the copy without seed-centred conjugation holds, using ordinary endpoint recovery for incompatible
 declared stereo, before restoring its original constraints.

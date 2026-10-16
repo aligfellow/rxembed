@@ -51,3 +51,7 @@ sample bar beside it stacks fail on pass by the same category.
 |---|---|---|---|
 | tmQMg | 65 | github.com/hkneiding/tmQMg | MIT, (c) 2024 Hannes Kneiding |
 | OIN | 34 | github.com/tjmustard/OIN-SMILES | MIT, (c) 2025 Thomas J. L. Mustard |
+
+The metal regression structures `tests/structures/{mn-h2,mnh,ru-co}.xyz` were copied unchanged from
+`examples/structures/` in upstream rxembed commit `1c372a3`, under the repository's MIT licence
+(see `LICENSE` and `LICENSES.md`). They are test inputs, outside the benchmark cohort.
