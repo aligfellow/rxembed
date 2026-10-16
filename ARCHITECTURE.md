@@ -7,6 +7,7 @@ owns package boundaries and data flow.
 
 `rxembed` is the workflow facade. It accepts strings, paths, RDKit molecules and selected metal isomers, and
 returns a chainable `Ensemble` or `EnsembleSet`, or a `list[EnsembleSet]` for `stereo="separate"`.
+`coembed` returns a `Coembedded` result holding two finalized endpoint ensembles with matching conformer ids.
 
 `rxembed.core` is the low-level API for a caller that already has an explicit-H RDKit `Mol` or an `Isomer`. It
 returns `Conformers` and has no pipeline operations.
@@ -23,25 +24,25 @@ except optional dependencies at their point of use.
 
 | layer | module | owns |
 |---|---|---|
-| base | `utils` | coordinate math, small RDKit facts, the reaction graph overlay and the QA `Violation`; nothing about metals or constraints |
+| base | `utils` | the reaction graph correspondence, coordinate math, small RDKit facts and the QA `Violation`; nothing about metals or constraints |
 | | `constraints` | the `Constraints` payload, the `fix`/`constrain`/`template` resolver, `match` and measurement |
 | shapes | `metal_polyhedron` | the `POLYHEDRA` registry, proper rotations, slot notes and hand frames |
 | metal graph | `metal_core` | metal state records, surrogate swap and restore, haptic sites, the ligand graph |
 | graph chemistry | `stereo` | ligand stereo, including coordination-locked centres: read from 3D, written, enumerated |
-| | `metal_distance` | the fitted M-L length model, the alkali ion contact and the floors for non-donor atoms near the metal |
+| | `metal_distance` | the fitted M-L length model and the floors for non-donor atoms near the metal |
 | DG and FF engine | `mechanisms` | each `Constraints` field as DG bounds and restrained-UFF terms (`Mechanism`) |
-| | `relax` | one restrained UFF attempt on a private force-field graph (`restrained_uff`, `UFFRecord`) |
+| | `relax` | restrained UFF fields and native minimization, including a coupled endpoint objective |
 | | `bounds` | `EmbedParams`, native bounds and their edits, ligand reach, fragment contacts, DG seeding |
 | metal models | `metal_donor_orient` | donor hybridisation and the soft holds that point each donor at the metal |
 | | `metal_perceive` | read-only judgement of a sphere: shape readings and the shape gate, overbonding, donor fold |
 | | `metal_stereo` | coordination-site identity, metal hand, haptic winding and face descriptors |
 | | `metal_slots` | distinct donor-to-slot assignments under rotations, and chelate bite windows |
 | compile | `metal_constraints` | one metal state to `Constraints`: M-L windows, L-M-L angles and chelate bites |
-| identity | `metal_isomer` | `Isomer` and `IsomerSet`, and the isomer read from coordinates |
+| identity | `metal_isomer` | `Isomer` and `IsomerSet`, and the isomer read from coordinates and least-motion relabelling of equivalent sites |
 | enumeration | `metal_enumeration` | ligand, haptic and coordination states as screened `Isomer` candidates |
 | strings | `metal_smiles` | reading and writing dative SMILES and CXSMILES |
 | orchestration | `embed` | `prepare`, seeding, acceptance and recovery: `Conformers`, `Failure`, `EmbeddingError` |
-| | `coembedding` | two graphs on one atom order embedded as tied copies of one system (`coembed`) |
+| | `coembedding` | shared endpoint seeding, correspondence budgets and `PairedConformers` on native `Conformers` workflows |
 | facade | `core` | the low-level API, logging setup and the version lookup |
 | pipeline | `calculators` | the xtb executable and the `Calculator` and `ASE` scoring surface |
 | | `search` | Monte Carlo search through openconf |
@@ -53,8 +54,8 @@ except optional dependencies at their point of use.
 | | `metrics` | bond sanity and connectivity diffs |
 | | `stereo_check` | stereo fingerprints for chirality-aware selection |
 | | `geom_check` | the physical geometry gate (`check`, `GeometryReport`) |
-| | `ensemble` | `Ensemble`, `EnsembleSet` and `wrap`: chainable search, scoring and workflow checks |
-| | `dispatch` | the `embed`, `coembed`, `metal` and `minimize` verbs and candidate expansion |
+| | `ensemble` | `Ensemble`, `EnsembleSet`, `Coembedded` and `wrap`: publication and workflow operations |
+| | `dispatch` | the `embed`, `coembed`, `metal` and `minimize` verbs and input adaptation |
 | facades | `pipeline/__init__`, `rxembed/__init__` | public names only |
 
 The engine sits below the metal compile on purpose: `mechanisms`, `relax` and `bounds` read `Constraints` as
@@ -81,16 +82,10 @@ candidates, one that raises `EmbeddingError` is skipped with one warning line an
 candidate, such as one selected `Isomer`, raises its own error. An expanded stereoisomer or contact mode also
 records any other `ValueError` or `RuntimeError` there, as an `EmbeddingError` naming it.
 
-`embed.prepare` turns a `Mol` or selected `Isomer` plus `fix`, `constrain` and soft `contacts` into one
-`Constraints` value.
+`embed.prepare` turns a `Mol` or selected `Isomer` plus `fix` and `constrain` into one `Constraints` value.
 `seed_conformers` edits RDKit's bounds matrix, embeds, grafts fixed coordinates and picks seeds with the
 requested metal hand and haptic winding. `embed.prepare_relax` and `pipeline.dispatch.minimize` share the same
 preparation and graft to relax existing coordinates without a search.
-
-`coembedding.coembed` runs the same path once on the union of two copies: `Constraints.ties` ties each atom
-to its copy past a budget, and the copies share no excluded volume, nonbonded term or clash check.
-`utils.map_reaction` first puts the product on the reactant's atom order by the overlay of their graphs that keeps
-the most bonds.
 
 ## Rules
 
@@ -146,6 +141,22 @@ payload.
 `relax` owns one restrained UFF attempt, including private typing and optimizer status; an exception restores
 the selected coordinates. Public graphs keep real atoms and bonds; surrogate metals and haptic centroid helpers
 stay private.
+
+Coembedding resolves complete graph correspondence in `utils`, preserving input atom orders.
+`coembedding` derives movement budgets from native endpoint bounds and carries them with coupling
+coefficients and correspondence in `Constraints`. It seeds and relaxes the more bonded endpoint through
+`embed`, transfers mapped real coordinates and rebuilds each endpoint's own haptic centroids. Native UFF
+repairs the copy without seed-centred conjugation holds, using ordinary endpoint recovery for incompatible
+declared stereo, before restoring its original constraints.
+There is one seeder for initial and replacement batches. No combined DG matrix or joined seed isomer is built.
+
+`relax` constructs separate endpoint force fields and alternates RDKit minimizations on their combined score.
+`coembedding.PairedConformers` subclasses `Conformers` to reuse acceptance and bounded recovery. It registers
+spectators only when the full coupling penalty decreases, runs initial coupling, native endpoint cleanup and
+final coupled polishing, and rejects a failure of either endpoint as a whole-pair failure. `embed` has no
+coembedding branches or dependency. `pipeline.dispatch` adapts inputs and selected identities;
+`pipeline.ensemble` owns publication and paired result access. Alignment and TS RMSDs measure the returned
+shared frame without an additional fit. Organic and metal ligand stereo retain the core publication gate.
 
 ### Acceptance and recovery
 

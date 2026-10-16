@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 from dataclasses import dataclass, field
+from time import perf_counter
 
 import numpy as np
 from rdkit import Chem, rdBase
 from rdkit.Chem import GetPeriodicTable, rdForceFieldHelpers, rdtrajectory
-from rdkit.Geometry import Point3D
 
 from .mechanisms import MECHANISM_ORDER
 from .metal_core import COORDINATION_METALS, materialise_phantoms, strip_phantoms
@@ -17,7 +18,6 @@ from .utils import CARBON_Z, Violation, atom_label
 
 FF_SURROGATE = 3  # Bondless Li avoids the singular CN>=3 UFF angle term while retaining a soft vdW sphere.
 UFF_GHOST = 54  # Untypeable Xe gives a haptic centroid no UFF terms inside its ring.
-_COPY_OFFSET = 1e3  # Å: past UFF's nonbonded cutoff, so co-embedded copies share no vdW terms
 
 logger = logging.getLogger("rxembed.relax")
 
@@ -54,13 +54,12 @@ def error_summary(error):
     return next((line for line in lines if not line.startswith(noise)), lines[-1] if lines else "unknown error")
 
 
-def bonding_failure(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset(), constrained=(), copies=()):
+def bonding_failure(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset(), constrained=()):
     """Return the first heavy-atom bond or clash violation as a `Violation`, or ``None``.
 
     Frozen-core, metal and explicitly constrained pairs are exempt because covalent radii do not define their
-    intended distances, and so is a pair across two co-embedded `copies`, which never interact. The exemption is
-    per pair, so broken free-periphery bonds still fail. `atoms` names the pair, `()` for the whole-conformer
-    non-finite case.
+    intended distances. The exemption is per pair, so broken free-periphery bonds still fail. `atoms` names the
+    pair, `()` for the whole-conformer non-finite case.
     """
     pos = mol.GetConformer(conf_id).GetPositions()
     if not np.all(np.isfinite(pos)):
@@ -68,15 +67,12 @@ def bonding_failure(mol, conf_id, bond_tol=1.3, clash_tol=0.7, exclude=frozenset
     heavy = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
     metals = {i for i in heavy if mol.GetAtomWithIdx(i).GetAtomicNum() in COORDINATION_METALS}
     exclude = set(exclude)
-    copy_of = {atom: side for side, atoms in enumerate(copies) for atom in atoms}
     stated = {frozenset(p) for p in constrained}
     rcov = {i: _PT.GetRcovalent(mol.GetAtomWithIdx(i).GetAtomicNum()) for i in heavy}
     bonded = {frozenset((b.GetBeginAtomIdx(), b.GetEndAtomIdx())) for b in mol.GetBonds()}
     for n, i in enumerate(heavy):
         for j in heavy[n + 1 :]:
             if (i in exclude and j in exclude) or i in metals or j in metals:
-                continue
-            if i in copy_of and j in copy_of and copy_of[i] != copy_of[j]:
                 continue
             if frozenset((i, j)) in stated:
                 continue
@@ -372,6 +368,158 @@ def _report_uff_typing(mol, retyped, replacements, record):
         )
 
 
+def _prepare_uff(mol, cons, record):
+    """Prepare the shared private UFF graph and report its typing changes."""
+    work = materialise_phantoms(mol, cons.haptic)
+    work = _ff_surrogate(work, cons.metals, cons.phantoms)
+    target, effective, retyped, replacements = _select_uff_graph(work, cons, set(cons.frozen))
+    _report_uff_typing(mol, retyped, replacements, record)
+    return target, effective, retyped, replacements
+
+
+def _restrained_field(target, cons, conf_id, stiffness):
+    """Construct and initialize one native UFF field with the registered restraint terms."""
+    stage = "force-field construction"
+    try:
+        with rdBase.BlockLogs():
+            ff = rdForceFieldHelpers.UFFGetMoleculeForceField(target, confId=conf_id, ignoreInterfragInteractions=False)
+            stage = "constraint setup"
+            for mechanism in MECHANISM_ORDER:
+                mechanism.uff_terms(ff, cons, target.GetConformer(conf_id), stiffness)
+            ff.Initialize()
+    except RuntimeError as error:
+        typing = stage == "force-field construction"
+        error_type = UFFTypingError if typing else UFFOptimizationError
+        remedy = "use a different relaxation backend" if typing else "try another seed="
+        raise error_type(f"UFF {stage} failed: {error_summary(error)}; {remedy}") from error
+    return ff
+
+
+def _coupling_coefficients(cons, weight):
+    """Resolve correspondence coefficients, retaining the mean penalty for legacy low-level callers."""
+    return np.asarray([cons.coupling_weights.get(pair, weight / len(cons.distances)) for pair in cons.distances])
+
+
+def _alignment_terms(positions, cons, weight):
+    """Evaluate weighted flat-bottomed correspondence energy and its Cartesian gradient."""
+    left, right = np.asarray(tuple(cons.distances), dtype=int).T
+    ceilings = np.asarray([window[1] for window in cons.distances.values()])
+    delta = positions[left] - positions[right]
+    distances = np.linalg.norm(delta, axis=1)
+    excess = np.maximum(distances - ceilings, 0.0)
+    coefficients = _coupling_coefficients(cons, weight)
+    energy = float(np.sum(coefficients * excess**2))
+    gradient = np.zeros_like(positions)
+    force = (2 * coefficients * excess / np.maximum(distances, 1e-12))[:, None] * delta
+    np.add.at(gradient, left, force)
+    np.add.at(gradient, right, -force)
+    return energy, gradient
+
+
+def _coupled_uff(graphs, terms, alignment, conf_id, *, weight, stiffness, gtol, energy_tol, max_iters):
+    """Alternate native UFF minimizations of two blocks on one fixed combined objective.
+
+    The other endpoint supplies fixed position-restraint targets. Each field uses the original seed's
+    restraint reference and nonbonded list. Base fields evaluate E_left + E_right + alignment exactly once.
+    Count completed native steps across both endpoints toward the iteration limit.
+    A small cycle energy change is a plateau criterion, not a guarantee on the reported maximum gradient.
+    """
+    started = perf_counter()
+    fields = [_restrained_field(graph, cons, conf_id, stiffness) for graph, cons in zip(graphs, terms, strict=True)]
+    split = graphs[0].GetNumAtoms()
+    positions = np.concatenate([graph.GetConformer(conf_id).GetPositions() for graph in graphs])
+    left, right = np.asarray(tuple(alignment.distances), dtype=int).T
+    ceilings = [window[1] for window in alignment.distances.values()]
+    coefficients = _coupling_coefficients(alignment, weight)
+
+    def evaluate():
+        chunks = tuple(positions[:split].ravel()), tuple(positions[split:].ravel())
+        energy, gradient = _alignment_terms(positions, alignment, weight)
+        energy += sum(ff.CalcEnergy(chunk) for ff, chunk in zip(fields, chunks, strict=True))
+        gradient += np.concatenate([ff.CalcGrad(chunk) for ff, chunk in zip(fields, chunks, strict=True)]).reshape(
+            -1, 3
+        )
+        if not np.isfinite(energy) or not np.all(np.isfinite(gradient)):
+            raise FloatingPointError("non-finite joint energy or gradient")
+        return energy, float(np.max(np.abs(gradient)))
+
+    score, force = evaluate()
+    cycles, iterations = 0, 0
+    change = math.inf
+    reason = "force" if force <= gtol else "iteration_limit"
+    history = [score]
+    while force > gtol and iterations < max_iters:
+        previous = score
+        previous_iterations = iterations
+        completed = True
+        for endpoint in (0, 1):
+            if iterations == max_iters:
+                completed = False
+                break
+            graph = Chem.Mol(graphs[endpoint])
+            ff = _restrained_field(graph, terms[endpoint], conf_id, stiffness)
+            conf = graph.GetConformer(conf_id)
+            local = left if endpoint == 0 else right - split
+            opposite = right if endpoint == 0 else left
+            # Capture targets after constructing molecular terms, preserving their seed reference.
+            for index, target, cutoff, coefficient in zip(local, opposite, ceilings, coefficients, strict=True):
+                conf.SetAtomPosition(int(index), positions[target])
+                ff.UFFAddPositionConstraint(int(index), float(cutoff), float(2 * coefficient))
+            current = positions[:split] if endpoint == 0 else positions[split:]
+            conf.SetPositions(current)
+            ff.Initialize()
+            allowance = min(100, max_iters - iterations)
+            # RDKit records one snapshot per completed step, excluding the starting coordinates.
+            # Keep native tolerances: its scaled force test is not the raw joint-gradient criterion.
+            _status, snapshots = ff.MinimizeTrajectory(1, maxIts=allowance)
+            iterations += len(snapshots)
+            old = current.copy()
+            current[:] = conf.GetPositions()
+            updated, updated_force = evaluate()
+            if updated > score + 1e-8 * max(1.0, abs(score)):
+                current[:] = old
+                reason = "stalled"
+                completed = False
+                break
+            score, force = updated, updated_force
+        if not completed:
+            if force <= gtol:
+                reason = "force"
+            break
+        cycles += 1
+        change = previous - score
+        history.append(score)
+        if force <= gtol:
+            reason = "force"
+            break
+        if iterations == previous_iterations:
+            reason = "stalled"
+            break
+        if energy_tol > 0 and 0 <= change <= energy_tol:
+            reason = "energy"
+            break
+    return positions, {
+        "converged": reason in ("force", "energy"),
+        "stopping_reason": reason,
+        "message": {
+            "force": "joint force tolerance reached",
+            "energy": "joint score plateau reached",
+            "iteration_limit": "joint native iteration budget exhausted",
+            "stalled": "native minimizations could not advance the joint objective",
+        }[reason],
+        "cycles": cycles,
+        "iterations": iterations,
+        "iteration_budget_used": iterations,
+        "max_force": force,
+        "gtol": gtol,
+        "energy_tol": energy_tol,
+        "score_change": change,
+        "score": score,
+        "score_history": tuple(history),
+        "seconds": perf_counter() - started,
+    }
+
+
 def restrained_uff(
     mol,
     cons,
@@ -392,36 +540,16 @@ def restrained_uff(
     ``record``, a `UFFRecord`, receives each minimised conformer's optimizer status and frames and the private
     typing changes; a single point records no status.
     """
-    frozen = set(cons.frozen)
     confs = list(mol.GetConformers()) if conf_ids is None else [mol.GetConformer(int(i)) for i in conf_ids]
     out = UFFRecord() if record is None else record
     original = {conf.GetId(): conf.GetPositions().copy() for conf in confs}
     energies = []
     try:
-        work = materialise_phantoms(mol, cons.haptic)
-        work = _ff_surrogate(work, cons.metals, cons.phantoms)
-        target, effective_cons, dative_edges, replacements = _select_uff_graph(work, cons, frozen)
-        _report_uff_typing(mol, dative_edges, replacements, out)
-        apart = sorted(cons.tied_copies[1])  # a haptic centroid is an untyped ghost with no nonbonded terms
+        target, effective_cons, dative_edges, replacements = _prepare_uff(mol, cons, out)
         for conf in confs:
             cid = conf.GetId()
-            stage = "force-field construction"
+            ff = _restrained_field(target, effective_cons, cid, stiffness)
             try:
-                held = target.GetConformer(cid)
-                for atom in apart:  # in place: the force field keeps pointers to these positions
-                    held.SetAtomPosition(atom, held.GetAtomPosition(atom) + Point3D(_COPY_OFFSET, 0.0, 0.0))
-                with rdBase.BlockLogs():
-                    ff = rdForceFieldHelpers.UFFGetMoleculeForceField(
-                        target, confId=cid, ignoreInterfragInteractions=False
-                    )
-                for atom in apart:
-                    held.SetAtomPosition(atom, held.GetAtomPosition(atom) - Point3D(_COPY_OFFSET, 0.0, 0.0))
-                stage = "constraint setup"
-                with rdBase.BlockLogs():
-                    for mechanism in MECHANISM_ORDER:
-                        mechanism.uff_terms(ff, effective_cons, target.GetConformer(cid), stiffness)
-                ff.Initialize()
-                stage = "minimization"
                 if out.snapshots is None:
                     status = ff.Minimize(maxIts=max_iters)
                 else:
@@ -436,13 +564,9 @@ def restrained_uff(
                 # Explicit coordinates clear native distance caches left by a rejected line-search trial.
                 energy = ff.CalcEnergy(ff.Positions())
             except RuntimeError as error:
-                typing = stage == "force-field construction"
-                error_type, remedy = (
-                    (UFFTypingError, "use a different relaxation backend")
-                    if typing
-                    else (UFFOptimizationError, "try another seed=")
-                )
-                raise error_type(f"UFF {stage} failed: {error_summary(error)}; {remedy}") from error
+                raise UFFOptimizationError(
+                    f"UFF minimization failed: {error_summary(error)}; try another seed="
+                ) from error
             energies.append(energy)
             if target is not mol:  # copy only real atoms off the metal/phantom/fixed-core FF graph
                 conf.SetPositions(target.GetConformer(cid).GetPositions()[: mol.GetNumAtoms()])

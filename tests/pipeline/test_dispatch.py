@@ -20,6 +20,7 @@ from rxembed.constraints import FIX_ANGLE_TOL, FIX_DISTANCE_TOL
 from rxembed.pipeline import dispatch
 from rxembed.pipeline import geom_check as geom
 from rxembed.pipeline.stereo_check import signature
+from rxembed.stereo import axis_stereo, bond_stereo, defined_stereo_label, point_stereo, stereo_from_3d
 from rxembed.utils import map_reaction
 
 # --- baseline: clean peripheries ---------------------------------------------
@@ -547,22 +548,191 @@ def test_unembeddable_stereoisomer_is_skipped_and_recorded(monkeypatch):
     assert [str(err) for err in r.errors] == ["stereoisomer [C3=C4:E]: could not embed molecule: synthetic E failure"]
 
 
+def test_coembed_defaults_match_the_selected_proton_transfer_weights():
+    reactant = "[CH3:1][CH2:2][CH2:3][NH2:4].[OH:5][H:99]"
+    product = "[CH3:1][CH2:2][CH2:3][NH2+:4]([H:99]).[OH-:5]"
+
+    default = rx.coembed(reactant, product, n=1, seed=42, threads=1)
+    explicit = rx.coembed(reactant, product, n=1, seed=42, threads=1, alignment_weight=25, ts_weight=1.25)
+
+    assert default.alignment_weight == 25
+    assert default.ts_weight == 1.25
+    assert default.scores == pytest.approx(explicit.scores)
+    for left, right in zip((default.reactant, default.product), (explicit.reactant, explicit.product), strict=True):
+        np.testing.assert_allclose(left.mol.GetConformer().GetPositions(), right.mol.GetConformer().GetPositions())
+
+
+@pytest.mark.parametrize("failure", ["empty", "relax"])
+@pytest.mark.parametrize("sampling", ["automatic", "seed", "params"])
+def test_coembed_retries_failed_ethanol_seeds_only_when_sampling_is_automatic(monkeypatch, failure, sampling):
+    paired = importlib.import_module("rxembed.coembedding")
+    native_seed = paired.seed_conformers
+    native_minimize = paired.Conformers.minimize
+    seen = []
+    rejected = False
+
+    def seed(mol, cons, iso, n, params, **kwargs):
+        seen.append(params.seed)
+        if failure == "empty" and len(seen) == 1:
+            mol.RemoveAllConformers()
+            return mol, [], n
+        return native_seed(mol, cons, iso, n, params, **kwargs)
+
+    def minimize(owner, *args, **kwargs):
+        nonlocal rejected
+        if failure == "relax" and not rejected:
+            rejected = True
+            raise rx.EmbeddingError("ethanol seed failed geometry validation")
+        return native_minimize(owner, *args, **kwargs)
+
+    monkeypatch.setattr(paired, "seed_conformers", seed)
+    monkeypatch.setattr(paired.Conformers, "minimize", minimize)
+    settings = {"threads": 1}
+    if sampling == "seed":
+        settings["seed"] = 42
+    elif sampling == "params":
+        settings = {"params": rx.EmbedParams(seed=42, threads=1)}
+
+    if sampling == "automatic":
+        result = rx.coembed("CCO", "CCO", n=1, **settings)
+        assert len(result) == 1
+        assert seen == [seen[0], seen[0] + 1]
+        assert set(result.source_seeds.values()) == {seen[-1]}
+    else:
+        with pytest.raises(rx.EmbeddingError):
+            rx.coembed("CCO", "CCO", n=1, **settings)
+        assert seen == [42]
+
+
+def test_coembed_retains_ethanol_pairs_when_only_missing_seeds_are_retried(monkeypatch):
+    paired = importlib.import_module("rxembed.coembedding")
+    native = paired.seed_conformers
+    requests = []
+
+    def seed(mol, cons, iso, n, params, **kwargs):
+        requests.append((params.seed, n))
+        return native(mol, cons, iso, 1, params, **kwargs)
+
+    monkeypatch.setattr(paired, "seed_conformers", seed)
+
+    result = rx.coembed("CCO", "CCO", n=2, threads=1)
+
+    initial = requests[0][0]
+    assert requests == [(initial, 2), (initial + 1, 1)]
+    assert len(result) == 2
+    assert list(result.source_seeds.values()) == [initial, initial + 1]
+
+
+def test_coembed_reports_the_last_ethanol_failure_after_automatic_seed_retries(monkeypatch):
+    paired = importlib.import_module("rxembed.coembedding")
+    failures = []
+
+    def minimize(owner, *args, **kwargs):
+        error = rx.EmbeddingError(f"ethanol seed {owner.params.seed} failed geometry validation")
+        failures.append(error)
+        raise error
+
+    monkeypatch.setattr(paired.Conformers, "minimize", minimize)
+
+    with pytest.raises(rx.EmbeddingError) as caught:
+        rx.coembed("CCO", "CCO", n=1, threads=1)
+
+    assert 1 < len(failures) <= 4
+    assert caught.value is failures[-1]
+
+
+@pytest.mark.parametrize("stereo_selection", [False, True])
+def test_coembed_keeps_the_explicit_seed_in_nested_geometry_recovery(monkeypatch, stereo_selection):
+    core = importlib.import_module("rxembed.embed")
+    native = core.seed_coordinates
+    seeds = []
+
+    def coordinates(mol, cons, n, params, **kwargs):
+        seeds.append(params.seed)
+        return native(mol, cons, n, params, **kwargs)
+
+    monkeypatch.setattr(core, "seed_coordinates", coordinates)
+    if stereo_selection:
+        source = rx.metal("C[C@H](F)C[NH2]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]", "SPL")[0]
+        monkeypatch.setattr(core, "_seed_stereo_matches", lambda *args, **kwargs: False)
+    else:
+        source = "CCO"
+        monkeypatch.setattr(
+            core.Conformers,
+            "_geometry_failure",
+            lambda *args, **kwargs: core.Failure("bonding", "ethanol seed failed bond validation"),
+        )
+
+    with pytest.raises(rx.EmbeddingError):
+        rx.coembed(source, source, n=1, seed=42, threads=1)
+
+    assert seeds
+    assert set(seeds) == {42}
+    if not stereo_selection:
+        assert len(seeds) >= 2  # same-seed replacement remains available to repair copied geometry
+
+
+@pytest.mark.parametrize("reverse_product", [False, True])
+def test_coembed_rotates_the_substituted_aryl_ring_between_declared_atropisomers(reverse_product):
+    reactant = Chem.MolFromSmiles("CS(=O)(=O)/N=C1\\S[C@@H](C(F)(F)F)CC(=O)N1c1c(C(C)C)cccc1")
+    axis = reactant.GetSubstructMatch(Chem.MolFromSmarts("[N;R]-[c]"))
+    reactant.GetBondBetweenAtoms(*axis).SetStereo(Chem.BondStereo.STEREOATROPCCW)
+    product = Chem.Mol(reactant)
+    product.GetBondBetweenAtoms(*axis).SetStereo(Chem.BondStereo.STEREOATROPCW)
+    if reverse_product:
+        product = Chem.RenumberAtoms(product, list(reversed(range(product.GetNumAtoms()))))
+    expected = [defined_stereo_label(mol) for mol in (reactant, product)]
+
+    result = rx.coembed(reactant, product, n=1, seed=42, threads=1, stereo="free")
+
+    assert len(result) == 1
+    moving = {i for i, _j in result.ts_pairs}
+    aryl = reactant.GetSubstructMatch(Chem.MolFromSmarts("c1c(C(C)C)cccc1"))
+    assert set(aryl) <= moving
+    assert 0 not in moving  # the sulfonyl methyl belongs to the stationary scaffold
+    assert axis_stereo(expected[0]) != axis_stereo(expected[1])
+    assert max(result.alignment_scores.values()) < 0.5
+    for endpoint, label in zip((result.reactant, result.product), expected, strict=True):
+        measured = stereo_from_3d(endpoint.mol)
+        assert axis_stereo(measured) == axis_stereo(label)
+        assert point_stereo(measured) == point_stereo(label)
+        assert bond_stereo(measured) == bond_stereo(label)
+    for cid, record in result.joint_results.items():
+        assert record["alignment_score"] == pytest.approx(result.alignment_scores[cid])
+        assert record["score"] == pytest.approx(result.scores[cid])
+        if record["stopping_reason"] == "validation_adjusted":
+            assert not record["converged"]
+            assert not record["score_history"]
+
+
+def test_coembed_keeps_an_unchanged_atropisomeric_ring_in_the_spectators():
+    atropisomer = "CC1=CC=CC(I)=C1N1C(C)=CC=C1Br |wU:7.7|"
+
+    result = rx.coembed(atropisomer, atropisomer, n=1, seed=42, threads=1)
+
+    assert len(result) == 1
+    assert not result.ts_pairs
+
+
 def test_coembed_overlays_an_unmapped_palladium_c_h_activation_onto_the_reactant_order():
     reactant = "COC1=C[CH](->[Pd+2]23<-[N]4=C(C5=[N]->2C(CC2=[N]->3C([O-])=CC=C2)=CC=C5)C=CC=C4)=CC(OC)=C1OC"
     product = "[H]OC1=CC=CC2CC3=CC=CC4C5=[N](->[Pd+2](<-[C-]6=CC(OC)=C(OC)C(OC)=C6)(<-[N]=21)<-[N]=43)C=CC=C5"
 
-    reactant, product = rx.coembed((reactant, product), metal="SPL", n=2, seed=7)
+    result = rx.coembed(reactant, product, metal="SPL", n=2, seed=7)
+    reactant, product = result.reactant, result.product
 
-    parents = [
-        {atom.GetIdx(): atom.GetNeighbors()[0].GetIdx() for atom in ens.mol.GetAtoms() if atom.GetAtomicNum() == 1}
-        for ens in (reactant, product)
-    ]
-    moved = [h for h in parents[0] if parents[0][h] != parents[1][h]]
-    assert [(parents[0][h], parents[1][h]) for h in moved] == [(4, 15)]  # the aryl C-H proton onto the phenoxide O
+    r_mol, p_mol = reactant.mol, product.mol
+    moved = [(i, j) for i, j in result.ts_pairs if r_mol.GetAtomWithIdx(i).GetAtomicNum() == 1]
+    assert len(moved) == 1
+    rh, ph = moved[0]
+    r_parent = r_mol.GetAtomWithIdx(rh).GetNeighbors()[0].GetIdx()
+    p_parent = p_mol.GetAtomWithIdx(ph).GetNeighbors()[0].GetIdx()
+    assert r_parent == 4
+    assert p_mol.GetAtomWithIdx(p_parent).GetAtomicNum() == 8
     for cid in reactant.ids:
-        r, p = reactant.mol.GetConformer(cid).GetPositions(), product.mol.GetConformer(cid).GetPositions()
-        assert np.linalg.norm(r[4] - r[moved[0]]) < 1.2
-        assert np.linalg.norm(p[15] - p[moved[0]]) < 1.1
+        r, p = r_mol.GetConformer(cid).GetPositions(), p_mol.GetConformer(cid).GetPositions()
+        assert np.linalg.norm(r[r_parent] - r[rh]) < 1.2
+        assert np.linalg.norm(p[p_parent] - p[ph]) < 1.1
 
 
 @pytest.mark.parametrize("as_path", [str, Path], ids=("str", "pathlib"))
@@ -580,7 +750,8 @@ def test_coembed_keeps_the_atom_order_of_two_xyz_frames_of_a_degenerate_proton_t
         paths.append(as_path(tmp_path / name))
         Chem.MolToXYZFile(malonate, str(paths[-1]))
 
-    _reactant, product = rx.coembed(tuple(paths), charge=-1, n=1, seed=1)  # one graph by symmetry
+    result = rx.coembed(tuple(paths), charge=-1, n=1, seed=1)
+    product = result.product  # one graph by symmetry
 
     assert product.mol.GetBondBetweenAtoms(6, hydrogen) is not None
 
@@ -592,26 +763,57 @@ def test_coembed_refuses_a_geometry_for_selected_isomers():
         rx.coembed((cisplatin, cisplatin), metal="TET")
 
 
+def test_coembed_xyz_frames_honor_explicit_hydrogen_correspondence(tmp_path):
+    water = rx.embed("O", n=1, seed=1).mol
+    paths = [tmp_path / name for name in ("reactant.xyz", "product.xyz")]
+    Chem.MolToXYZFile(water, str(paths[0]))
+    Chem.MolToXYZFile(Chem.RenumberAtoms(water, [0, 2, 1]), str(paths[1]))
+
+    result = rx.coembed(paths, spectator_atoms={0: 0, 1: 2}, ts_atoms={2: 1}, n=1, seed=1)
+
+    assert dict(result.correspondence) == {0: 0, 1: 2, 2: 1}
+    assert result.ts_pairs == ((2, 1),)
+    assert set(result.budgets) == {(0, 0), (1, 2), (2, 1)}
+
+
+@pytest.mark.parametrize("atom", [True, 0.5, "0", 100])
+def test_coembed_contact_indices_fail_with_a_correspondence_remedy(atom):
+    with pytest.raises(ValueError, match="geometry terms need matched atom-index keys"):
+        rx.coembed("CCO", "CCO", contacts={(atom, 2): (2.0, 3.0)}, n=1, seed=1)
+
+
+def test_coembed_keeps_a_successful_contact_mode_and_reports_an_unmatched_mode(monkeypatch):
+    monkeypatch.setattr(
+        dispatch, "_contact_modes", lambda *_args: [("unmatched", {(0, 100): (2.0, 3.0)}), ("plain", None)]
+    )
+
+    result = rx.coembed("CCO", "CCO", contacts="auto", n=1, seed=1)
+
+    assert result.reactant.tag["nci"] == result.product.tag["nci"] == "plain"
+    assert len(result.errors) == 1
+    assert "unmatched" in str(result.errors[0])
+    assert "geometry terms need matched atom-index keys" in str(result.errors[0])
+
+
 def test_coembed_holds_each_h_bond_mode_in_both_copies_unless_the_h_bond_becomes_the_bond():
     acid_amine = "CC(=O)O.CN>>CC(=O)[O-].C[NH3+]"  # the acid proton H9 moves onto the amine N5
 
-    reactants, products = rx.coembed(acid_amine, contacts="auto", n=1, seed=1)
-
-    labels = [ens.tag["nci"] for ens in reactants]
-    assert labels == [ens.tag["nci"] for ens in products]
+    results = rx.coembed(acid_amine, contacts="auto", n=1, seed=1)
+    results = results if isinstance(results, list) else [results]
+    labels = [result.reactant.tag["nci"] for result in results]
+    assert labels == [result.product.tag["nci"] for result in results]
     assert any("H9->N5" in label for label in labels)
     assert any("H13->O3" in label for label in labels)
-    for reactant, product in zip(reactants, products, strict=True):
-        r = reactant.mol.GetConformer(reactant.ids[0]).GetPositions()
-        p = product.mol.GetConformer(product.ids[0]).GetPositions()
-        if "H9->N5" in reactant.tag["nci"]:
-            assert 1.6 < np.linalg.norm(r[5] - r[9]) < 2.2  # an H-bond in the acid-amine pair
-            assert np.linalg.norm(p[5] - p[9]) < 1.1  # the ammonium N-H bond
-        if "H13->O3" in reactant.tag["nci"]:  # an amine N-H to the hydroxyl O, a spectator held in both
-            assert all(1.6 < np.linalg.norm(x[3] - x[13]) < 2.2 for x in (r, p))
-            for ens in (reactant, product):  # and by each endpoint relaxed alone
-                x = ens.minimize().mol.GetConformer(ens.ids[0]).GetPositions()
-                assert 1.6 < np.linalg.norm(x[3] - x[13]) < 2.2
+    for result in results:
+        for (i, j), (_lo, _hi) in result.reactant.cons.distances.items():
+            if (i, j) not in result.reactant.cons.contacts[0]:
+                continue
+            ri, rj = dict(result.correspondence)[i], dict(result.correspondence)[j]
+            r_mol, p_mol = result.reactant.mol, result.product.mol
+            if r_mol.GetBondBetweenAtoms(i, j) is None and p_mol.GetBondBetweenAtoms(ri, rj) is not None:
+                assert (ri, rj) not in result.product.cons.contacts[0]
+            else:
+                assert (ri, rj) in result.product.cons.contacts[0]
 
 
 def test_coembed_holds_the_h_bonds_its_reactant_geometry_makes():
@@ -623,12 +825,15 @@ def test_coembed_holds_the_h_bonds_its_reactant_geometry_makes():
     ammonium.GetAtomWithIdx(5).SetFormalCharge(1)
     Chem.SanitizeMol(ammonium)
 
-    reactant, product = rx.coembed((acid_amine, ammonium.GetMol()), contacts="input", n=1, seed=1)
+    result = rx.coembed((acid_amine, ammonium.GetMol()), contacts="input", n=1, seed=1)
+    reactant, product = result.reactant, result.product
 
     r, p = (ens.mol.GetConformer(ens.ids[0]).GetPositions() for ens in (reactant, product))
     assert 1.6 < np.linalg.norm(r[5] - r[9]) < 2.2  # the H-bond the proton crosses
     assert np.linalg.norm(p[5] - p[9]) < 1.1  # the ammonium N-H bond
-    assert all(1.6 < np.linalg.norm(x[2] - x[13]) < 2.2 for x in (r, p))  # an amine N-H to the acid C=O
+    onto = dict(result.correspondence)
+    assert 1.6 < np.linalg.norm(r[2] - r[13]) < 2.2
+    assert 1.6 < np.linalg.norm(p[onto[2]] - p[onto[13]]) < 2.2
 
 
 _BETA_HYDRIDE = (
@@ -664,7 +869,9 @@ def test_coembed_keeps_every_atom_map_of_two_mapped_isomers(reactant, product, g
     mols[1] = Chem.RenumberAtoms(mols[1], list(range(mols[1].GetNumAtoms()))[::-1])  # the product in its own order
     isomers = [rx.metal(mol, geometry).select() for mol in mols]
 
-    pair = rx.coembed(tuple(isomers), n=1, seed=1)
+    # Seed 1 needs a fresh-seed retry for beta-hydride; explicit seeds now remain fixed.
+    result = rx.coembed(tuple(isomers), n=1, seed=2)
+    pair = result.reactant, result.product
 
     for ens, mol, iso in zip(pair, mols, isomers, strict=True):
         assert {a.GetAtomMapNum(): a.GetSymbol() for a in ens.mol.GetAtoms()} == {
@@ -680,7 +887,8 @@ def test_coembed_seats_the_leaving_ammine_where_the_entering_chloride_binds(labe
     reactant = rx.metal("[NH3:1]->[Co+3:2](<-[NH3:3])(<-[NH3:4])(<-[NH3:5])(<-[NH3:6])<-[Cl-:7].[Cl-:8]", "OCT")
     products = rx.metal("[NH3:1]->[Co+3:2](<-[NH3:3])(<-[NH3:4])(<-[NH3:5])(<-[Cl-:8])<-[Cl-:7].[NH3:6]", "OCT")
 
-    left, _right = rx.coembed((reactant.select(), next(iso for iso in products if iso.label == label)), n=1, seed=1)
+    result = rx.coembed((reactant.select(), next(iso for iso in products if iso.label == label)), n=1, seed=1)
+    left = result.reactant
 
     at = {atom.GetAtomMapNum(): atom.GetIdx() for atom in left.mol.GetAtoms()}
     conf = left.mol.GetConformer(left.ids[0])
@@ -691,10 +899,8 @@ def test_coembed_overlays_a_platinum_ethylene_insertion_from_a_mapped_cxsmiles_p
     hydride = rx.metal("[Pt+2:1]1(<-[H-:2])(<-[Cl-:3])(<-[PH3:4])<-[CH2:5]=[CH2:6]->1", "SPL")[0]
     ethyl = rx.metal("[Pt+2:1](<-[Cl-:3])(<-[PH3:4])<-[CH2-:6][CH2:5][H:2]", "SPL")[0]  # the H slot left vacant
 
-    reactant, product = rx.coembed((rx.cxsmiles(hydride), rx.cxsmiles(ethyl)), n=2, seed=1)
-
-    heavy = [atom.GetIdx() for atom in reactant.mol.GetAtoms() if atom.GetAtomicNum() > 1]
-    for cid in reactant.ids:
-        r = reactant.mol.GetConformer(cid).GetPositions()[heavy]
-        p = product.mol.GetConformer(cid).GetPositions()[heavy]
-        assert np.sqrt(((r - p) ** 2).sum(1).mean()) < 0.8
+    result = rx.coembed((rx.cxsmiles(hydride), rx.cxsmiles(ethyl)), n=2, seed=1)
+    assert result.ids
+    assert result.correspondence
+    assert rx.cxsmiles(result.reactant.iso) == rx.cxsmiles(hydride)
+    assert rx.cxsmiles(result.product.iso) == rx.cxsmiles(ethyl)

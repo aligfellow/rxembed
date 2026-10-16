@@ -105,6 +105,28 @@ def test_stated_native_atrop_axis_is_racemized_and_measured_from_3d():
     assert after[pair] == {"M": "P", "P": "M"}[code]
 
 
+def test_atrop_axis_next_to_an_imine_is_measured_without_direction_flag_conflicts():
+    mol = Chem.AddHs(_mol("CS(=O)(=O)/N=C1\\SCCC(=O)N1c1c(C)cccc1"))
+    pair = mol.GetSubstructMatch(Chem.MolFromSmarts("[N;R]-[c]"))
+    mol.GetBondBetweenAtoms(*pair).SetStereo(Chem.BondStereo.STEREOATROPCW)
+    assert rdDistGeom.EmbedMolecule(mol, randomSeed=42) == 0
+    expected_ez = stereo.bond_stereo(stereo.defined_stereo_label(mol))
+    directions = [bond.GetBondDir() for bond in mol.GetBonds()]
+
+    measured = stereo.stereo_from_3d(mol)
+    before = stereo.axis_stereo(measured)
+    assert set(before) == {pair}
+    assert stereo.bond_stereo(measured) == expected_ez
+    assert [bond.GetBondDir() for bond in mol.GetBonds()] == directions
+
+    positions = mol.GetConformer().GetPositions()
+    positions[:, 0] *= -1
+    mol.GetConformer().SetPositions(positions)
+    after = stereo.axis_stereo(stereo.stereo_from_3d(mol))
+    assert after[pair] == {"M": "P", "P": "M"}[before[pair]]
+    assert [bond.GetBondDir() for bond in mol.GetBonds()] == directions
+
+
 @pytest.mark.parametrize(
     "smiles",
     ["C[P@](CC)c1ccccc1", "C[P@H]c1ccccc1", "C[As@@](CC)c1ccccc1", "C[N@]1C[C@H]1C"],

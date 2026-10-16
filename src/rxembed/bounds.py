@@ -335,8 +335,8 @@ def _write(mol, cons, params=None):
     """
     # `seed_conformers` temporarily restores the real metal and adds dative M-L edges so RDKit sees a labelled
     # donor's full CIP basis and a terminal sp donor's linear axis. The bounds basis stays the surrogate graph
-    # every other seed uses: on a private copy, remove each dative edge a restrained metal's window owns (an
-    # alkali ion's included) and give each coordination metal its surrogate carbon, whose floors it assumes.
+    # every other seed uses: on a private copy, remove the edges owned by a selected metal's explicit M-L
+    # distance and give each metal left bondless its surrogate carbon, whose floors the metal model assumes.
     owned = {tuple(sorted(atoms)) for atoms in cons.distances}
     removable = []
     for bond in mol.GetBonds():
@@ -430,8 +430,8 @@ def _native_params(params):
     return embed_parameters(params.seed, knowledge=knowledge, threads=params.threads, prune_rms=prune_rms), prune_rms
 
 
-def _bounds_constraints(cons, params):
-    """Return `cons` with the matrix-only ablation switches applied; UFF and publication keep the full payload."""
+def _dg_constraints(cons, params):
+    """Apply DG ablations to a constraint copy."""
     if params.coplanar_14 and params.metal_floor_relief:
         return cons
     return cons.copy(
@@ -441,9 +441,10 @@ def _bounds_constraints(cons, params):
 
 
 def seed_bounds(mol, cons, params):
-    """Return the smoothed bounds matrix `seed_coordinates` draws `mol` from, haptic centroid rows last."""
+    """Read the endpoint bounds used for seeding, including the requested native engine and DG ablations."""
     native, _prune_rms = _native_params(params)
-    return _feasible_bounds(materialise_phantoms(mol, cons.haptic), _bounds_constraints(cons, params), native)[0]
+    work = materialise_phantoms(mol, cons.haptic)
+    return _feasible_bounds(work, _dg_constraints(cons, params), native)[0]
 
 
 def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attempts=0):
@@ -461,7 +462,9 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
     multi_fragment = len(Chem.GetMolFrags(work)) > 1
     if embed_params is not None or edits_bounds or multi_fragment:
         # Always replace a supplied object's matrix: it may belong to a previous candidate or helper graph.
-        bm, _tol = _feasible_bounds(work, _bounds_constraints(cons, params), p)
+        # These switches affect only our matrix edits. UFF and publication retain the complete Constraints.
+        dg = cons if params.coplanar_14 and params.metal_floor_relief else _dg_constraints(cons, params)
+        bm, _tol = _feasible_bounds(work, dg, p)
         p.SetBoundsMat(bm)  # a custom (edited) bounds matrix
     overrides = {
         "randomSeed": seed,
@@ -477,6 +480,8 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
         previous = {name: getattr(p, name) for name in overrides}
         # Native embedding materialises these defaults in place; do not leak them across molecules.
         previous.update(maxIterations=p.maxIterations, basinThresh=p.basinThresh)
+        if hasattr(p, "initialEmbeddingMode"):
+            previous["initialEmbeddingMode"] = p.initialEmbeddingMode
     # Disconnected hydrides are intentional. Suppress their native implicit-H warning only during embedding.
     isolated_h = any(a.GetAtomicNum() == 1 and not a.GetDegree() for a in work.GetAtoms())
     try:

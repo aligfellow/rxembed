@@ -9,7 +9,7 @@ dist/
 *.egg-info/
 
 # Virtual environment
-.venv/
+.venv
 venv/
 ENV/
 env/
@@ -53,4 +53,6 @@ coverage.xml
 
 # Ignore temporary local notebooks/output
 output/
+examples/path.gif
+examples/path.xyz
 benchmark/results/

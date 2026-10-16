@@ -26,6 +26,7 @@ from .core import (
 )
 from .pipeline import (
     ASE,
+    Coembedded,
     Contact,
     Ensemble,
     EnsembleSet,
@@ -42,6 +43,7 @@ from .pipeline import (
 
 __all__ = [
     "ASE",
+    "Coembedded",
     "Conformers",
     "Constraints",
     "Contact",

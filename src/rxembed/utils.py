@@ -360,22 +360,37 @@ _MAX_SPARE = 2  # bond pairs broken and re-formed beyond the element-pair balanc
 _MAX_REMAINDERS = 20_000  # remainders canonicalised in one overlay search; unmeasured
 
 
-def map_reaction(reactant, product, frames=False):
-    """Return both sides on the reactant's atom order; any atom maps stay on both.
+def reaction_correspondence(reactant, product):
+    """Match all explicit atoms by the graph overlay that keeps the most bonds, honoring atom maps.
 
-    Two `.xyz` `frames` on one element order keep it: an .xyz carries no atom map, frames of one path already share
-    their atoms, and only that order tells a degenerate exchange apart. Otherwise the product is renumbered by its
-    maximal overlay onto the reactant's graph (`_overlay_order`).
+    Return endpoint-local index pairs without reordering either input. Reject overlays that describe different
+    reactions equally well, requiring maps for the reacting atoms instead of choosing their identities.
     """
-    sides = [Chem.Mol(reactant), Chem.Mol(product)]
-    elements = [[(atom.GetAtomicNum(), atom.GetIsotope()) for atom in mol.GetAtoms()] for mol in sides]
+    elements = [[(atom.GetAtomicNum(), atom.GetIsotope()) for atom in mol.GetAtoms()] for mol in (reactant, product)]
     if sorted(elements[0]) != sorted(elements[1]):
-        raise ValueError("the two sides hold different atoms; a reaction's endpoints share one formula")
-    maps = [Counter(atom.GetAtomMapNum() for atom in mol.GetAtoms() if atom.GetAtomMapNum()) for mol in sides]
+        raise ValueError("the endpoints have different atom inventories; supply matching atom inventories")
+    maps = [
+        Counter(atom.GetAtomMapNum() for atom in mol.GetAtoms() if atom.GetAtomMapNum()) for mol in (reactant, product)
+    ]
     if maps[0].keys() != maps[1].keys() or any(uses > 1 for numbers in maps for uses in numbers.values()):
         raise ValueError("give each atom-map number to one atom on each side, and the same numbers on both sides")
-    if not (frames and elements[0] == elements[1]):
-        sides[1] = Chem.RenumberAtoms(sides[1], _overlay_order(*sides))
+    # Identical chemical identities need no reaction overlay. RDKit's isomeric canonical order retains
+    # stereo, bond orders and charge, avoiding apparent changes under symmetry-related atom permutations.
+    copies = [Chem.Mol(mol) for mol in (reactant, product)]
+    if Chem.MolToSmiles(copies[0]) == Chem.MolToSmiles(copies[1]):
+        orders = [mol.GetPropsAsDict(True, True)["_smilesAtomOutputOrder"] for mol in copies]
+        return tuple(sorted(zip(*orders, strict=True)))
+    return tuple(enumerate(_overlay_order(reactant, product)))
+
+
+def map_reaction(reactant, product, frames=False):
+    """Return copied endpoints on the reactant's atom order, retaining existing XYZ frame correspondence."""
+    sides = [Chem.Mol(mol) for mol in (reactant, product)]
+    elements = [[(a.GetAtomicNum(), a.GetIsotope()) for a in mol.GetAtoms()] for mol in sides]
+    if frames and elements[0] == elements[1]:
+        return sides
+    order = [j for _i, j in reaction_correspondence(*sides)]
+    sides[1] = Chem.RenumberAtoms(sides[1], order)
     return sides
 
 

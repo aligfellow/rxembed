@@ -78,7 +78,14 @@ from .metal_stereo import (
     realised_chirality,
     site_classes,
 )
-from .relax import MAX_ITERS, UFFRecord, UFFTypingError, bonding_failure, error_summary, restrained_uff
+from .relax import (
+    MAX_ITERS,
+    UFFRecord,
+    UFFTypingError,
+    bonding_failure,
+    error_summary,
+    restrained_uff,
+)
 from .stereo import (
     apply_point_stereo,
     axis_stereo,
@@ -510,11 +517,6 @@ def _ligand_stereo_fault(site, expected, found, atoms):
     return Failure("ligand_stereo", f"{site} reads {found}, not {expected}", atoms=atoms)
 
 
-def stated_stereo(mol, iso):
-    """Return the stereo label conformers of `mol` must keep: `iso`'s, or an organic Mol's own tags."""
-    return defined_stereo_label(mol) if iso is None else iso.stereo_label
-
-
 def _ligand_stereo_failure(mol, label):
     """Return the first point, E/Z or axial mismatch with stereo `label` on the restored public graph."""
     wanted_points = point_stereo(label)
@@ -713,7 +715,7 @@ def stereo_donor_bonds(mol, iso):
     ]
 
 
-def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
+def seed_conformers(mol, cons, iso, n, params, graft_ref=None, *, reseed=True):
     """Seed `n` conformers, selecting metal and donor hands before cleanup and grafting a fixed core exactly."""
     if n is not None and int(n) <= 0:  # `n or seed_count(...)` below would treat 0 as "use the default"
         raise ValueError(f"n={n}: give a positive conformer count, or None for the flexibility-scaled default")
@@ -772,7 +774,7 @@ def seed_conformers(mol, cons, iso, n, params, graft_ref=None):
         max_attempts = 30 if has_point_stereo else 0
         trial_prune = -1 if len(targets) > 1 else params.prune_rms
         used = attempt = generated = 0
-        while kept.GetNumConformers() < target and used < budget:
+        while kept.GetNumConformers() < target and used < budget and (reseed or attempt == 0):
             need = target - kept.GetNumConformers()
             batch_n = min(_REPLACEMENT_FACTOR * need, pool, budget - used)
             trial = replace(params, seed=params.seed + attempt, prune_rms=trial_prune)
@@ -919,6 +921,7 @@ class Conformers:
     uff: UFFRecord = field(default_factory=UFFRecord, kw_only=True)  # every relax's statuses and private typing
     # what reproduces this batch's seeds; None means search-free (minimize(), wrap()), so replacement is off
     params: EmbedParams | None = field(default=None, kw_only=True)
+    _reseed: bool = field(default=True, kw_only=True, repr=False)  # False permits only same-seed recovery.
     # seed plus snapshots from the accepted restrained-UFF attempt; recorded only when explicitly requested
     trajectory: Chem.Mol | None = field(default=None, kw_only=True)
     # {isomer identity: its per-centre coordination-state prep}; a plain init field so replace() and a fresh
@@ -927,8 +930,8 @@ class Conformers:
 
     @cached_property
     def _stated_stereo(self):
-        """Return the stereo label every conformer must keep (`stated_stereo`)."""
-        return stated_stereo(self._mol, self.iso)
+        """Return the stereo label every conformer must keep."""
+        return defined_stereo_label(self._mol) if self.iso is None else self.iso.stereo_label
 
     def _coordination_states(self, iso):
         """Return `iso`'s per-centre coordination-state prep, cached by `iso`'s identity."""
@@ -1044,9 +1047,7 @@ class Conformers:
             names = "-".join(atom_label(graph, atom) for atom in atoms)
             return Failure("numeric_fix", f"fix= {names} not held ({actual:.3f} {unit})")
         # Seed selection and publication share ligand integrity; metal and stated pairs are already exempt.
-        bonding = bonding_failure(
-            self._mol, cid, exclude=self.cons.frozen, constrained=self.cons.distances, copies=self.cons.tied_copies
-        )
+        bonding = bonding_failure(self._mol, cid, exclude=self.cons.frozen, constrained=self.cons.distances)
         if bonding:
             return Failure("bonding", bonding.detail, atoms=bonding.atoms)
         pos = self._mol.GetConformer(int(cid)).GetPositions()
@@ -1228,9 +1229,10 @@ class Conformers:
             )
         return typed
 
-    def _rescore_restrained(self, stiffness):
+    def _rescore_restrained(self, stiffness, *, ids=None):
         """Record comparable restrained-UFF single points for settled conformers."""
-        settled = [cid for cid in self.ids if cid not in self.unrelaxed]
+        selected = self.ids if ids is None else ids
+        settled = [cid for cid in selected if cid not in self.unrelaxed]
         if not settled:
             self.energies = {}
             return
@@ -1256,6 +1258,30 @@ class Conformers:
         ranks, eta2 = _winding_ranks(mol, targets)
         return {c: _seed_stereo_matches(mol, c, self.iso, targets, ranks, eta2) for c in self.ids}
 
+    def _replacement_batch(self, count, params):
+        """Seed one recovery batch, allowing coupled workflows to retain their coordinate relationships."""
+        mol, ids, _target = seed_conformers(
+            Chem.Mol(self._mol), self.cons, self.iso, count, params, reseed=self._reseed
+        )
+        return Conformers(
+            mol, ids, self.cons, self.iso, params=params, _reseed=self._reseed, _coord_state_prep=self._coord_state_prep
+        )
+
+    def _adopt_replacement(self, cid, batch, src):
+        """Copy a replacement into its original id, allowing adapters to carry additional optimizer metadata."""
+        pos = batch._mol.GetConformer(int(src)).GetPositions()
+        self._mol.GetConformer(int(cid)).SetPositions(pos)
+        if cid not in self.ids:
+            self.ids.append(cid)
+        self.energies.pop(cid, None)
+        if src in batch.energies:
+            self.energies[cid] = batch.energies[src]
+        if src in batch.unrelaxed:
+            if cid not in self.unrelaxed:
+                self.unrelaxed.append(cid)
+        elif cid in self.unrelaxed:
+            self.unrelaxed.remove(cid)
+
     def _replace_failed(self, failed, stiffness, max_iters, *, operation="minimize", validator=None):
         """Replace failed conformers from bounded fresh seed batches; return ids not replaced.
 
@@ -1268,19 +1294,16 @@ class Conformers:
             return list(failed)
         left = list(failed)
         previous_signature = None
-        for batch_index in range(_REPLACEMENT_ROUNDS):
+        for batch_index in range(_REPLACEMENT_ROUNDS if self._reseed else 1):
             if not left:
                 break
             count = _REPLACEMENT_FACTOR * len(left)
-            trial_params = replace(self.params, seed=self.params.seed + 1 + batch_index)
-            mol, ids, _target = seed_conformers(Chem.Mol(self._mol), self.cons, self.iso, count, trial_params)
-            if not ids:
+            trial_params = replace(self.params, seed=self.params.seed + (1 + batch_index if self._reseed else 0))
+            batch = self._replacement_batch(count, trial_params)
+            if not batch.ids:
                 previous_signature = None
                 _log_replacement_round(operation, batch_index, 0, count)
                 continue
-            batch = Conformers(
-                mol, ids, self.cons, self.iso, params=trial_params, _coord_state_prep=self._coord_state_prep
-            )
             # A constrained replacement must use the same stiffness ladder as the original batch.  A single
             # base-force pass can reject a seed that a higher rung would satisfy, while silently making fresh
             # seeds weaker than the batch they replace.
@@ -1339,18 +1362,7 @@ class Conformers:
             }
             order = sorted(batch.ids, key=lambda cid: scores.get(cid, math.inf))
             for cid, src in zip(list(left), order, strict=False):
-                pos = batch._mol.GetConformer(int(src)).GetPositions()
-                self._mol.GetConformer(int(cid)).SetPositions(pos)
-                if cid not in self.ids:
-                    self.ids.append(cid)
-                self.energies.pop(cid, None)
-                if src in batch.energies:
-                    self.energies[cid] = batch.energies[src]
-                if src in batch.unrelaxed:
-                    if cid not in self.unrelaxed:
-                        self.unrelaxed.append(cid)
-                elif cid in self.unrelaxed:
-                    self.unrelaxed.remove(cid)
+                self._adopt_replacement(cid, batch, src)
                 left.remove(cid)
         return left
 

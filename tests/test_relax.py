@@ -7,6 +7,7 @@ import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
 from rdkit.Chem.rdMolTransforms import GetBondLength
+from rdkit.ForceField import rdForceField
 
 from rxembed import relax as relax_module
 from rxembed.constraints import Constraints
@@ -191,3 +192,128 @@ def test_ff_surrogate_removes_only_private_zero_order_contacts():
 
     assert mol.GetBondBetweenAtoms(0, 1).GetBondType() == bond_type
     assert np.isfinite(restrained_uff(mol, Constraints(), max_iters=0)).all()
+
+
+@pytest.mark.parametrize("weighted", [False, True], ids=("uniform", "individual-budgets-and-weights"))
+@pytest.mark.parametrize("cutoff", [0.0, 0.3], ids=("zero-budget", "flat-bottom"))
+@pytest.mark.parametrize("separated", [False, True], ids=("coincident", "separated"))
+def test_native_alignment_restraint_matches_joint_energy_and_gradient(weighted, cutoff, separated):
+    """Check RDKit target capture and spring normalization against its actual field energy."""
+    left, right = _mol("CO"), _mol("CO")
+    shift = np.array([2.0, 0.2, -0.1]) if separated else np.zeros(3)
+    right.GetConformer().SetPositions(right.GetConformer().GetPositions() + shift)
+    split = left.GetNumAtoms()
+    alignment = Constraints(distances={(0, split): (0.0, cutoff)})
+    if weighted:
+        alignment = Constraints(
+            distances={(0, split): (0.0, cutoff), (1, split + 1): (0.0, 0.8)},
+            coupling_weights={(0, split): 1.7, (1, split + 1): 0.4},
+        )
+    positions = np.concatenate([graph.GetConformer().GetPositions() for graph in (left, right)])
+    penalty, gradient = relax_module._alignment_terms(positions, alignment, 5.0)
+    for endpoint, graph in enumerate((left, right)):
+        base = relax_module._restrained_field(graph, Constraints(), 0, 1.0)
+        augmented = relax_module._restrained_field(graph, Constraints(), 0, 1.0)
+        conf = graph.GetConformer()
+        original = conf.GetPositions().copy()
+        for (i, j), (_floor, ceiling) in alignment.distances.items():
+            index = i if endpoint == 0 else j - split
+            opposite = positions[j] if endpoint == 0 else positions[i]
+            coefficient = alignment.coupling_weights.get((i, j), 5.0 / len(alignment.distances))
+            conf.SetAtomPosition(index, opposite)
+            augmented.UFFAddPositionConstraint(index, ceiling, 2 * coefficient)
+        conf.SetPositions(original)
+        augmented.Initialize()
+        assert augmented.CalcEnergy() - base.CalcEnergy() == pytest.approx(penalty)
+        field_delta = np.asarray(augmented.CalcGrad()) - base.CalcGrad()
+        expected = gradient[:split] if endpoint == 0 else gradient[split:]
+        np.testing.assert_allclose(field_delta.reshape(-1, 3), expected, atol=1e-10)
+
+
+def test_native_joint_optimizer_descends_one_fixed_endpoint_objective(monkeypatch):
+    native = rdForceField.ForceField.MinimizeTrajectory
+    steps = []
+
+    def capture(field, *args, **kwargs):
+        status, snapshots = native(field, *args, **kwargs)
+        steps.append(len(snapshots))
+        return status, snapshots
+
+    monkeypatch.setattr(rdForceField.ForceField, "MinimizeTrajectory", capture)
+    left, right = _mol("CO"), _mol("CO")
+    right.GetConformer().SetPositions(right.GetConformer().GetPositions() + np.array([2.0, 0.2, 0.1]))
+    split = left.GetNumAtoms()
+    alignment = Constraints(distances={(0, split): (0.0, 0.3)})
+    fields = [relax_module._restrained_field(graph, Constraints(), 0, 1.0) for graph in (left, right)]
+    positions, record = relax_module._coupled_uff(
+        (left, right),
+        (Constraints(), Constraints()),
+        alignment,
+        0,
+        weight=5.0,
+        stiffness=1.0,
+        gtol=0.1,
+        energy_tol=1e-3,
+        max_iters=1000,
+    )
+    expected = sum(
+        ff.CalcEnergy(tuple(chunk.ravel()))
+        for ff, chunk in zip(fields, (positions[:split], positions[split:]), strict=True)
+    )
+    expected += relax_module._alignment_terms(positions, alignment, 5.0)[0]
+    assert record["score"] == pytest.approx(expected)
+    assert record["score"] < record["score_history"][0]
+    assert np.all(np.diff(record["score_history"]) <= 1e-6)
+    assert 0 < record["iterations"] == sum(steps) == record["iteration_budget_used"]
+    assert record["iteration_budget_used"] <= 1000
+    assert np.linalg.norm(positions[0] - positions[split]) < 0.4
+
+
+@pytest.mark.parametrize("max_iters", [100, 101])
+def test_native_joint_limit_counts_completed_methanol_steps(max_iters):
+    left, right = _mol("CO"), _mol("CO")
+    right.GetConformer().SetPositions(right.GetConformer().GetPositions() + np.array([2.0, 0.2, 0.1]))
+    _positions, record = relax_module._coupled_uff(
+        (left, right),
+        (Constraints(), Constraints()),
+        Constraints(distances={(0, left.GetNumAtoms()): (0.0, 0.3)}),
+        0,
+        weight=5.0,
+        stiffness=1.0,
+        gtol=0.1,
+        energy_tol=0.0,
+        max_iters=max_iters,
+    )
+
+    assert record["iterations"] <= max_iters
+    assert record["iteration_budget_used"] == record["iterations"]
+    if record["stopping_reason"] == "iteration_limit":
+        assert record["iterations"] == max_iters
+
+
+def test_native_joint_zero_step_cycle_stalls_without_claiming_energy_convergence(monkeypatch):
+    calls = []
+
+    def no_steps(*args, **kwargs):
+        calls.append(kwargs["maxIts"])
+        return 0, []
+
+    monkeypatch.setattr(rdForceField.ForceField, "MinimizeTrajectory", no_steps)
+    left, right = _mol("CO"), _mol("CO")
+    right.GetConformer().SetPositions(right.GetConformer().GetPositions() + np.array([2.0, 0.2, 0.1]))
+    _positions, record = relax_module._coupled_uff(
+        (left, right),
+        (Constraints(), Constraints()),
+        Constraints(distances={(0, left.GetNumAtoms()): (0.0, 0.3)}),
+        0,
+        weight=5.0,
+        stiffness=1.0,
+        gtol=0.1,
+        energy_tol=1e-3,
+        max_iters=1000,
+    )
+
+    assert len(calls) == 2
+    assert not record["converged"]
+    assert record["stopping_reason"] == "stalled"
+    assert record["iterations"] == record["iteration_budget_used"] == 0

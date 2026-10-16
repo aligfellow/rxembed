@@ -6,7 +6,7 @@ from .dispatch import coembed, embed, minimize
 
 # The workflow name accepts strings and paths; the engine name accepts a Mol.
 from .dispatch import enumerate_isomers as metal
-from .ensemble import Ensemble, EnsembleSet, wrap
+from .ensemble import Coembedded, Ensemble, EnsembleSet, wrap
 from .nci import Contact
 from .nci import auto_binding_modes as nci_modes
 from .nci import candidate_contacts as nci_candidates
@@ -14,6 +14,7 @@ from .perceive import read_xyz
 
 __all__ = [
     "ASE",
+    "Coembedded",
     "Contact",
     "Ensemble",
     "EnsembleSet",

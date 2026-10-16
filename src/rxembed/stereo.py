@@ -8,6 +8,7 @@ import re
 
 import numpy as np
 from rdkit import Chem, rdBase
+from rdkit.Chem import rdMolTransforms
 from rdkit.Chem.EnumerateStereoisomers import (
     EnumerateStereoisomers,
     StereoEnumerationOptions,
@@ -667,6 +668,33 @@ def _apply_atrop_stereo(mol, axes):
             raise ValueError(f"could not apply {target} atropisomer stereo on bond {pair}")
 
 
+def rotate_axial_stereo(mol, label, stationary):
+    """Rotate a copied conformer's mismatched axial hands while retaining its stationary scaffold."""
+    wanted = axis_stereo(label)
+    if not wanted:
+        return
+    conf = mol.GetConformer()
+    for axis, target in wanted.items():
+        realised = axis_stereo(stereo_from_3d(mol)).get(axis)
+        if realised is None or realised == target:
+            continue
+        left, right = sorted(axis)
+        cut = Chem.RWMol(mol)
+        cut.RemoveBond(left, right)
+        fragments = Chem.GetMolFrags(cut)
+        sides = [set(next(part for part in fragments if atom in part)) for atom in (left, right)]
+        if left in sides[1]:
+            continue  # A cyclic axis has no independently rotatable side; leave it to native recovery.
+        if len(sides[1] & stationary) > len(sides[0] & stationary):
+            left, right = right, left
+        first = next(atom.GetIdx() for atom in mol.GetAtomWithIdx(left).GetNeighbors() if atom.GetIdx() != right)
+        last = next(atom.GetIdx() for atom in mol.GetAtomWithIdx(right).GetNeighbors() if atom.GetIdx() != left)
+        quartet = first, left, right, last
+        # Reflect the torsion, not the molecule: rotate one connected group without changing its local stereo.
+        phi = rdMolTransforms.GetDihedralDeg(conf, *quartet)
+        rdMolTransforms.SetDihedralDeg(conf, *quartet, -phi)
+
+
 def clear_ez(mol, pairs=None):
     """Clear selected double-bond stereo and adjacent slash bonds; return whether anything changed."""
     if pairs is not None and not pairs:
@@ -695,8 +723,10 @@ def assign_atrop_from_3d(mol, atrop_centers, *, required=True):
     if not atrop_centers:
         return []
     probe = Chem.Mol(mol)
+    # Measure coordinates, not retained drawing directions. An E/Z slash next to the axis can collide
+    # with the MolBlock writer's generated atrop wedge. Keep the input graph and its stereo tags intact.
     for bond in probe.GetBonds():
-        bond.SetBondDir(Chem.BondDir.NONE)  # RDKit will not wedge an axis beside an E/Z slash bond
+        bond.SetBondDir(Chem.BondDir.NONE)
     for pair in atrop_centers:
         probe.GetBondBetweenAtoms(*pair).SetStereo(Chem.BondStereo.STEREOATROPCW)
     block = Chem.MolToMolBlock(probe, confId=probe.GetConformer().GetId(), includeStereo=True)

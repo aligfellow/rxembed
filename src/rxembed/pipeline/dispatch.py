@@ -7,17 +7,27 @@ candidate data. `_execute` then prepares constraints and calls the shared core s
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
+import numpy as np
 from rdkit import Chem
 
 from rxembed import metal_enumeration
-from rxembed.bounds import resolve_params
-from rxembed.coembedding import coembed as core_coembed
+from rxembed.bounds import resolve_params, seed_count
+from rxembed.coembedding import (
+    ALIGNMENT_WEIGHT,
+    TS_WEIGHT,
+    PairedConformers,
+    correspondence_budgets,
+    seed_paired_conformers,
+)
 from rxembed.constraints import (
+    Constraints,
+    is_index,
     resolve_atom,
     substruct_matches,
     template_to_fix,
@@ -31,15 +41,29 @@ from rxembed.embed import (  # module functions, not the package facade
     require_seed_count,
     seed_conformers,
 )
-from rxembed.metal_core import VACANT, connect_metal, metal_index, metal_indices, reject_metal_bonds
-from rxembed.metal_isomer import Isomer, from_geometry
+from rxembed.metal_core import (
+    VACANT,
+    connect_metal,
+    materialise_phantoms,
+    metal_index,
+    metal_indices,
+    reject_metal_bonds,
+)
+from rxembed.metal_isomer import Isomer, from_geometry, least_motion_pair
 from rxembed.metal_polyhedron import describe
-from rxembed.metal_smiles import cxsmiles, parse_smiles
+from rxembed.metal_smiles import parse_smiles
 from rxembed.relax import MAX_ITERS
-from rxembed.stereo import enumerate_unassigned
-from rxembed.utils import map_reaction
+from rxembed.stereo import (
+    axis_stereo,
+    bond_stereo,
+    defined_stereo_label,
+    enumerate_unassigned,
+    point_stereo,
+    unassigned_centres,
+)
+from rxembed.utils import reaction_correspondence
 
-from .ensemble import Ensemble, EnsembleSet, published_pair
+from .ensemble import Coembedded, Ensemble, EnsembleSet
 from .nci import Contact, auto_binding_modes, input_contacts
 from .perceive import read_xyz
 from .stereo_check import signature
@@ -86,7 +110,7 @@ def _validate_relax(max_iters, trajectory=False, n=None):
         raise ValueError("max_iters must be a positive integer")
 
 
-def _normalize(source, charge=0):
+def _normalize(source, charge=0, *, remove_hs=True):
     """Normalise SMILES / an .xyz path / an RDKit Mol to ``(mol with Hs, has_geometry)``.
 
     `charge` is used for xyz bond perception (a charged metal complex / ion).
@@ -98,7 +122,7 @@ def _normalize(source, charge=0):
     elif _is_xyz(source):
         mol = read_xyz(source, charge)
     else:
-        mol = parse_smiles(source)
+        mol = parse_smiles(source, remove_hs=remove_hs)
     has_geom = mol.GetNumConformers() > 0
     return Chem.AddHs(mol, addCoords=has_geom), has_geom
 
@@ -493,6 +517,494 @@ def _relax_seeded(groups, stereo_filter, trajectory, max_iters):
     return kept, errors
 
 
+def _mapped_neighborhood(atom):
+    """Read mapped bonds, charges and explicit hydrogen neighbors from an endpoint graph."""
+    neighbors = []
+    for bond in atom.GetBonds():
+        other = bond.GetOtherAtom(atom)
+        neighbors.append(
+            (
+                other.GetAtomMapNum(),
+                other.GetAtomicNum(),
+                other.GetIsotope(),
+                bond.GetBondTypeAsDouble(),
+                bond.GetBeginAtomIdx() == atom.GetIdx() if bond.GetBondType() == Chem.BondType.DATIVE else False,
+            )
+        )
+    return atom.GetFormalCharge(), tuple(sorted(neighbors))
+
+
+def _mapped_atoms(molecules):
+    """Resolve unique map numbers to real endpoint atoms without assuming the same atom order."""
+    mapped = []
+    for mol in molecules:
+        atoms = [atom for atom in mol.GetAtoms() if atom.GetAtomMapNum()]
+        numbers = [atom.GetAtomMapNum() for atom in atoms]
+        if len(set(numbers)) != len(numbers):
+            raise ValueError("coembed found duplicate atom maps; assign a unique map number to each atom")
+        mapped.append(dict(zip(numbers, atoms, strict=True)))
+    if mapped[0].keys() != mapped[1].keys():
+        raise ValueError("mapped endpoints must use the same atom-map numbers; correct the atom mapping")
+    for number in mapped[0].keys() & mapped[1].keys():
+        a, b = mapped[0][number], mapped[1][number]
+        if (a.GetAtomicNum(), a.GetIsotope()) != (b.GetAtomicNum(), b.GetIsotope()):
+            raise ValueError(f"atom map {number} changes element or isotope; correct the atom mapping")
+    return mapped
+
+
+def _mapped_stereo(mol):
+    """Associate declared point, E/Z and axial identities with their mapped participating atoms."""
+    label = defined_stereo_label(mol, exclude=metal_indices(mol))
+    out = {}
+    for index, code in point_stereo(label).items():
+        number = mol.GetAtomWithIdx(index).GetAtomMapNum()
+        if number:
+            out.setdefault(number, []).append(("point", code))
+    for kind, labels in (("ez", bond_stereo(label)), ("axis", axis_stereo(label))):
+        for pair, code in labels.items():
+            numbers = tuple(sorted(mol.GetAtomWithIdx(index).GetAtomMapNum() for index in pair))
+            if all(numbers):
+                for number in numbers:
+                    out.setdefault(number, []).append((kind, numbers, code))
+    return {number: tuple(sorted(records)) for number, records in out.items()}
+
+
+def _coembed_pairs(molecules, selection, name):
+    """Adapt an explicit one-to-one atom-index correspondence for alignment or TS measurement."""
+    if not isinstance(selection, dict):
+        raise TypeError(f"{name} must be a {{reactant_index: product_index}} mapping")
+    pairs = tuple((resolve_atom(molecules[0], i), resolve_atom(molecules[1], j)) for i, j in selection.items())
+    if len({i for i, _j in pairs}) != len(pairs) or len({j for _i, j in pairs}) != len(pairs):
+        raise ValueError(f"{name} must be one-to-one; select each endpoint atom once")
+    for i, j in pairs:
+        a, b = molecules[0].GetAtomWithIdx(i), molecules[1].GetAtomWithIdx(j)
+        if (a.GetAtomicNum(), a.GetIsotope()) != (b.GetAtomicNum(), b.GetIsotope()):
+            raise ValueError(f"{name} pair ({i}, {j}) changes element or isotope; correct the correspondence")
+    return pairs
+
+
+def _atrop_rotating_atoms(molecules, *, alignment):
+    """Return mapped moving groups for changes between declared axial hands."""
+    axes = [
+        {
+            tuple(sorted(mol.GetAtomWithIdx(index).GetAtomMapNum() for index in axis)): code
+            for axis, code in axis_stereo(defined_stereo_label(mol)).items()
+        }
+        for mol in molecules
+    ]
+    heavy_labels = {atom.GetAtomMapNum() for atom in molecules[0].GetAtoms() if atom.GetAtomicNum() != 1}
+    moving = set()
+    for axis in axes[0].keys() & axes[1].keys():
+        if axes[0][axis] == axes[1][axis]:
+            continue
+        sides = [set(), set()]
+        for mol in molecules:
+            indices = {atom.GetAtomMapNum(): atom.GetIdx() for atom in mol.GetAtoms()}
+            cut = Chem.RWMol(mol)
+            cut.RemoveBond(*(indices[label] for label in axis))
+            fragments = Chem.GetMolFrags(cut)
+            for side, label in enumerate(axis):
+                fragment = next(part for part in fragments if indices[label] in part)
+                sides[side].update(mol.GetAtomWithIdx(index).GetAtomMapNum() for index in fragment)
+        if set(axis) <= sides[0] or set(axis) <= sides[1]:
+            if alignment is None:
+                raise ValueError(
+                    "an atropisomeric axis lies in a cycle; select stationary atoms with spectator_atoms= "
+                    "and moving atoms with ts_atoms="
+                )
+            continue
+        # Rotating an axis moves its whole attached group. Keep the larger scaffold as the reference frame;
+        # use both endpoints' fragments so a substituent cannot remain a strongly coupled spectator.
+        rotating = min(
+            sides,
+            key=lambda labels: (
+                len(labels & (alignment or set())),
+                len(labels & heavy_labels),
+                len(labels),
+                tuple(sorted(labels)),
+            ),
+        )
+        moving.update(rotating)
+    return moving
+
+
+def _coembed_correspondence(molecules, spectator_atoms, ts_atoms, *, frames=False):
+    """Resolve full reaction identity and keep spectator alignment separate from all identified TS atoms."""
+    mapped = _mapped_atoms(molecules)
+    selected = None if spectator_atoms is None else _coembed_pairs(molecules, spectator_atoms, "spectator_atoms")
+    requested = None if ts_atoms is None else _coembed_pairs(molecules, ts_atoms, "ts_atoms")
+    if selected == ():
+        raise ValueError("spectator_atoms must contain at least one atom pair")
+    if (
+        selected is not None
+        and requested is not None
+        and (
+            {i for i, _j in selected} & {i for i, _j in requested}
+            or {j for _i, j in selected} & {j for _i, j in requested}
+        )
+    ):
+        raise ValueError("ts_atoms must be outside spectator_atoms; remove TS atoms from the spectator selection")
+    graphs = [Chem.Mol(mol) for mol in molecules]
+    number = max((atom.GetAtomMapNum() for mol in graphs for atom in mol.GetAtoms()), default=0)
+    for i, j in (*(selected or ()), *(requested or ())):
+        a, b = graphs[0].GetAtomWithIdx(i), graphs[1].GetAtomWithIdx(j)
+        partners = mapped[1].get(a.GetAtomMapNum()), mapped[0].get(b.GetAtomMapNum())
+        if (partners[0] is not None and partners[0].GetIdx() != j) or (
+            partners[1] is not None and partners[1].GetIdx() != i
+        ):
+            raise ValueError("explicit correspondence disagrees with atom maps; correct spectator_atoms= or ts_atoms=")
+        if a.GetAtomMapNum() and b.GetAtomMapNum() and a.GetAtomMapNum() != b.GetAtomMapNum():
+            raise ValueError("explicit correspondence disagrees with atom maps; correct spectator_atoms= or ts_atoms=")
+        number += 1
+        label = a.GetAtomMapNum() or b.GetAtomMapNum() or number
+        a.SetAtomMapNum(label)
+        b.SetAtomMapNum(label)
+    inventories = [sorted((atom.GetAtomicNum(), atom.GetIsotope()) for atom in mol.GetAtoms()) for mol in graphs]
+    if inventories[0] != inventories[1]:
+        raise ValueError("coembed needs matching atom inventories; embed endpoints separately for partial systems")
+    if frames and all(
+        (a.GetAtomicNum(), a.GetIsotope(), a.GetAtomMapNum()) == (b.GetAtomicNum(), b.GetIsotope(), b.GetAtomMapNum())
+        for a, b in zip(*[mol.GetAtoms() for mol in graphs], strict=True)
+    ):
+        correspondence = tuple((i, i) for i in range(graphs[0].GetNumAtoms()))
+    else:
+        correspondence = reaction_correspondence(*graphs)
+    # Temporary complete maps let neighborhood and stereo readers compare identities, including implicit Hs.
+    for label, (i, j) in enumerate(correspondence, 1):
+        graphs[0].GetAtomWithIdx(i).SetAtomMapNum(label)
+        graphs[1].GetAtomWithIdx(j).SetAtomMapNum(label)
+    stereo = [_mapped_stereo(mol) for mol in graphs]
+    changed = {
+        (i, j)
+        for label, (i, j) in enumerate(correspondence, 1)
+        if _mapped_neighborhood(graphs[0].GetAtomWithIdx(i)) != _mapped_neighborhood(graphs[1].GetAtomWithIdx(j))
+        or stereo[0].get(label) != stereo[1].get(label)
+    }
+    alignment = None if selected is None else {graphs[0].GetAtomWithIdx(i).GetAtomMapNum() for i, _j in selected}
+    rotating = _atrop_rotating_atoms(graphs, alignment=alignment)
+    changed.update(pair for label, pair in enumerate(correspondence, 1) if label in rotating)
+    if selected is None:
+        unchanged = tuple(pair for pair in correspondence if pair not in changed)
+        heavy = tuple(pair for pair in unchanged if graphs[0].GetAtomWithIdx(pair[0]).GetAtomicNum() != 1)
+        mapped_hydrogens = tuple(
+            (left.GetIdx(), mapped[1][number].GetIdx())
+            for number, left in mapped[0].items()
+            if left.GetAtomicNum() == 1 and (left.GetIdx(), mapped[1][number].GetIdx()) in unchanged
+        )
+        pairs = tuple(dict.fromkeys((*heavy, *mapped_hydrogens))) or unchanged
+    else:
+        pairs = selected
+    if not pairs:
+        raise ValueError("coembed cannot align the endpoints: the mapped correspondence has no unchanged atoms")
+    if requested and (
+        {i for i, _j in pairs} & {i for i, _j in requested} or {j for _i, j in pairs} & {j for _i, j in requested}
+    ):
+        raise ValueError("ts_atoms must be outside spectator_atoms; remove TS atoms from the spectator selection")
+    reactive = tuple(
+        dict.fromkeys((*(pair for pair in correspondence if pair in changed and pair not in pairs), *(requested or ())))
+    )
+    return pairs, reactive, correspondence
+
+
+def _coembed_endpoint(source, stereo, params, *, metal=None, charge=0, constrain=None, contacts=None):
+    """Adapt one selected endpoint to its native workflow owner without changing its atom order."""
+    if not isinstance(source, (str, os.PathLike, Chem.Mol, Isomer)):
+        raise TypeError("coembed takes one SMILES, Mol or selected Isomer per endpoint; select a single identity")
+    selected_stereo = _default_stereo(source, stereo)
+    metal_enumeration.validate_stereo(selected_stereo)
+    source = source if isinstance(source, Isomer) else _normalize(source, charge, remove_hs=False)[0]
+    if metal is not None or (not isinstance(source, Isomer) and metal_indices(source)):
+        _discovery, candidates, _expanded = _source_candidates(
+            source, metal=metal, fix=None, coordinate=None, stereo=selected_stereo
+        )
+        if len(candidates) != 1:
+            raise ValueError("coembed needs one coordination identity; select one endpoint with rx.metal(...)[index]")
+        source = candidates[0].spec
+    variants, _expanded = _stereo_variants(source, selected_stereo)
+    if len(variants) != 1:
+        raise ValueError("coembed needs one stereo identity per endpoint; specify stereo or pass stereo='free'")
+    source = variants[0][0]
+    work, terms, iso, _ref = prepare(source, constrain=constrain, contacts=contacts, params=params)
+    if terms.frozen:
+        raise ValueError("coembed needs free endpoint geometries; select unfrozen Isomers or embed separately")
+    owner = Ensemble(work, [conf.GetId() for conf in work.GetConformers()], terms, iso, params=params)
+    owner.stereo_filter = _stereo_filter(source, 0, selected_stereo)
+    if iso is not None and selected_stereo != "free":
+        known = {frozenset((index,)) for index in point_stereo(iso.stereo_label)}
+        known.update(bond_stereo(iso.stereo_label))
+        known.update(axis_stereo(iso.stereo_label))
+        public = owner.restored_mol()
+        undefined = {frozenset(site) for site in unassigned_centres(public, exclude=metal_indices(public))} - known
+        if undefined:
+            raise ValueError(
+                "coembed needs a defined ligand stereoisomer; select rx.metal(..., stereo='unassigned')[index] "
+                "or explicitly allow mixed hands with stereo='free'"
+            )
+    if iso is not None:
+        for donor, metal_atom in iso.donor_bonds:
+            owner.sphere.setdefault(metal_atom, []).append(donor)
+    return owner
+
+
+def _coembed_inputs(reactant, product):
+    """Adapt two endpoint arguments, a pair, or a reaction SMILES without changing their atom orders."""
+    if product is None:
+        if isinstance(reactant, str):
+            sources = reactant.split(">>")
+            if len(sources) != 2 or any("|" in side for side in sources):  # noqa: PLR2004 - two endpoints
+                raise ValueError("coembed takes 'reactant>>product' without agents or CX extensions, or two sources")
+        elif isinstance(reactant, (tuple, list)) and len(reactant) == 2:  # noqa: PLR2004 - two endpoints
+            sources = reactant
+        else:
+            raise TypeError("coembed needs two endpoint sources or a 'reactant>>product' SMILES")
+        reactant, product = sources
+    return reactant, product
+
+
+def _coembed_geometry_terms(terms, onto):
+    """Map reactant-index geometry terms into the product's own atom order."""
+    try:
+        if any(not is_index(atom) for key in terms or {} for atom in key):
+            raise ValueError("non-index geometry key")
+        return {tuple(onto[int(atom)] for atom in key): value for key, value in (terms or {}).items()}
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("coembed geometry terms need matched atom-index keys; complete the correspondence") from error
+
+
+def coembed(
+    reactant,
+    product=None,
+    *,
+    spectator_atoms=None,
+    ts_atoms=None,
+    n=None,
+    alignment_weight=ALIGNMENT_WEIGHT,
+    ts_weight=TS_WEIGHT,
+    metal=None,
+    charge=0,
+    constrain=None,
+    contacts=None,
+    joint_gtol=0.1,
+    joint_energy_tol=1e-3,
+    max_iters=5000,
+    seed=None,
+    threads=None,
+    params=None,
+    stereo=None,
+):
+    """Coembed endpoints from a shared mapped geometry using native UFF and whole-pair recovery.
+
+    Accept two SMILES, XYZ paths, RDKit molecules or selected Isomers, a pair, or a 'reactant>>product'
+    SMILES. ``metal`` selects a unique geometry; ``charge`` supplies XYZ charge. ``constrain`` and
+    ``contacts`` use reactant atom-index keys mapped to the product, with the normal ``embed`` discovery.
+    Contacts that become bonds hold only the reactant. Multiple surviving contact modes return a list of
+    paired results with NCI tags; failures remain in their ``errors``.
+
+    Match complete explicit-H inventories by the graph overlay that keeps the most bonds, honoring maps
+    and explicit selections. Ambiguous overlays require reacting-atom maps. Preserve input atom orders and
+    connectivity. Different inventories require separate embedding. ``spectator_atoms`` selects spectator index pairs;
+    otherwise use unchanged heavy atoms and unchanged explicitly mapped hydrogens. Changed neighborhoods,
+    charges and declared stereo identify TS atoms, including transferring hydrogens. ``ts_atoms`` adds
+    one-to-one pairs outside the alignment; inferred reacting pairs are always included.
+
+    Use shared seeding. Seed and relax
+    the more bonded endpoint, transfer its mapped coordinates, repair the copied endpoint and rebuild its
+    own haptic helpers. Drop wrong copied coordination shapes or donor seatings; bounded shared-seed retries
+    refill only missing pairs. Initial and replacement batches use this same native endpoint workflow. With
+    ``n=None``, use the larger endpoint's normal sampling target, counting each endpoint once.
+    Omit ``seed`` and ``params`` to try fresh seeds after failures. An explicit ``seed`` or supplied
+    ``EmbedParams`` keeps its RNG seed fixed, including stereo selection and replacement batches;
+    same-seed resampling remains available to repair copied endpoint geometry.
+
+    Derive each coupled atom's budget from its largest incompatible endpoint distance-window gap, with no
+    added floor. These are soft penalty thresholds and do not establish 3D or stereo feasibility.
+    Inspect effective budgets through ``Coembedded.budgets``.
+
+    Alternate native RDKit minimizations on the sum of endpoint energies and separately normalized
+    spectator and TS squared-excess penalties. ``alignment_weight=25`` and ``ts_weight=1.25`` control the
+    two groups independently. Run native endpoint cleanup between initial coupling and a final coupled
+    polish. Retry missed metal-distance walls through the native stiffness ladder before reseeding; retain
+    the last validated coordinates if polishing fails. Before each joint pass, rigidly register spectators
+    only when the complete coupling penalty decreases. Final displacements can exceed their budgets;
+    ``budget_excesses`` reports them.
+    ``alignment_scores`` and ``ts_rmsds`` measure returned coordinates without an additional fit.
+
+    ``joint_gtol`` controls the maximum joint-gradient criterion; native minimizations keep RDKit tolerances.
+    ``joint_energy_tol`` also permits a non-increasing cycle-score plateau without a force guarantee;
+    zero disables plateau stopping. ``max_iters`` caps completed native steps across both endpoints in each
+    joint pass, and each endpoint cleanup attempt.
+    ``joint_results`` describes final polishing; ``optimizer_attempts`` also retains earlier stage records.
+    Validation coordinate corrections mark the final result ``validation_adjusted`` and invalidate convergence.
+
+    Preserve each endpoint's declared point, E/Z, axial and selected coordination identity through normal
+    validation and bounded recovery. Undefined ligand stereo in a selected Isomer requires selecting a
+    defined identity or explicitly permitting unspecified hands with ``stereo='free'``. Both endpoints
+    must pass publication; whole-pair replacements keep their ids. Fewer conformers may survive or required
+    identity failures may raise. Frozen geometries and stereo expansion require separate embedding.
+    """
+    _validate_relax(max_iters)
+    if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n <= 0):
+        raise ValueError("n must be a positive integer or None")
+    for name, value in (
+        ("alignment_weight", alignment_weight),
+        ("ts_weight", ts_weight),
+        ("joint_gtol", joint_gtol),
+        ("joint_energy_tol", joint_energy_tol),
+    ):
+        nonnegative = name == "joint_energy_tol"
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float, np.integer, np.floating))
+            or not np.isfinite(value)
+            or value < 0
+            or (not nonnegative and value == 0)
+        ):
+            raise ValueError(f"{name} must be finite and {'nonnegative' if nonnegative else 'positive'}")
+    reactant, product = _coembed_inputs(reactant, product)
+    reseed = seed is None and params is None
+    params = resolve_params(params, seed, threads)
+    originals = [
+        _coembed_endpoint(source, stereo, params, metal=metal, charge=charge) for source in (reactant, product)
+    ]
+    public = [owner.restored_mol() for owner in originals]
+    pairs, reactive, correspondence = _coembed_correspondence(
+        public, spectator_atoms, ts_atoms, frames=_is_xyz(reactant) and _is_xyz(product)
+    )
+    specs = [owner.iso if owner.iso is not None else mol for owner, mol in zip(originals, public, strict=True)]
+    if all(isinstance(spec, Isomer) for spec in specs):
+        specs = least_motion_pair(specs[0], specs[1], correspondence)
+    onto = dict(correspondence)
+
+    product_constrain = _coembed_geometry_terms(constrain, onto)
+    results, failed = [], []
+    for label, contact in _contact_modes(public[0], contacts, params):
+        try:
+            terms = _contact_terms(contact)
+            product_terms = _coembed_geometry_terms(terms, onto)
+            for key in terms or {}:
+                if any(
+                    bool(public[0].GetBondBetweenAtoms(int(i), int(j)))
+                    != bool(public[1].GetBondBetweenAtoms(onto[int(i)], onto[int(j)]))
+                    for i, j in itertools.combinations(key, 2)
+                ):
+                    del product_terms[tuple(onto[int(atom)] for atom in key)]
+            owners = [
+                _coembed_endpoint(spec, stereo, params, constrain=constraints, contacts=soft)
+                for spec, constraints, soft in zip(
+                    specs, (constrain, product_constrain), (terms, product_terms), strict=True
+                )
+            ]
+            result = _coembed_pair(
+                owners,
+                pairs,
+                reactive,
+                correspondence,
+                params=params,
+                n=n,
+                alignment_weight=alignment_weight,
+                ts_weight=ts_weight,
+                joint_gtol=joint_gtol,
+                joint_energy_tol=joint_energy_tol,
+                max_iters=max_iters,
+                reseed=reseed,
+            )
+        except (ValueError, RuntimeError) as error:
+            if label is None:
+                raise
+            failed.append(EmbeddingError(f"contacts={contacts!r} mode {label!r}: {error}"))
+            logger.warning("%s", failed[-1])
+            continue
+        if label is not None:
+            for owner in (result.reactant, result.product):
+                owner.tag["nci"] = label
+        results.append(result)
+    if not results:
+        raise EmbeddingError(f"no contact mode co-embedded; first failure: {failed[0]}")
+    results = [replace(result, errors=tuple(failed)) for result in results]
+    return results[0] if len(results) == 1 else results
+
+
+def _coembed_pair(
+    owners,
+    pairs,
+    reactive,
+    correspondence,
+    *,
+    params,
+    n,
+    alignment_weight,
+    ts_weight,
+    joint_gtol,
+    joint_energy_tol,
+    max_iters,
+    reseed,
+):
+    """Seed, optimize and publish one endpoint pair through the shared bounded recovery engine."""
+    allowances = correspondence_budgets(
+        [owner._mol for owner in owners], [owner.cons for owner in owners], correspondence, params
+    )
+    coupled = (*pairs, *reactive)
+    effective = {pair: allowances[pair] for pair in coupled}
+    endpoint_graphs = [materialise_phantoms(owner._mol, owner.cons.haptic) for owner in owners]
+    joint = Chem.CombineMols(*endpoint_graphs)
+    Chem.GetSymmSSSR(joint)
+    split = endpoint_graphs[0].GetNumAtoms()
+    cons = Constraints(
+        distances={(i, split + j): (0.0, effective[i, j]) for i, j in coupled},
+        coupling_weights={
+            **{(i, split + j): alignment_weight / len(pairs) for i, j in pairs},
+            **{(i, split + j): ts_weight / len(reactive) for i, j in reactive},
+        },
+        alignment_pairs=tuple((i, split + j) for i, j in pairs),
+        seed_correspondence=tuple(correspondence),
+    )
+    if n is None:
+        n = max(seed_count(owner._mol, constrained=owner.cons.is_constrained) for owner in owners)
+    for owner in owners:
+        owner._reseed = reseed
+    joint, ids = seed_paired_conformers(joint, cons, owners, n, params, max_iters=max_iters, reseed=reseed)
+    if not ids:
+        raise EmbeddingError("coembed: no shared seeds; inspect endpoint bounds/stereo or try another seed=")
+    engine = PairedConformers(
+        joint,
+        list(ids),
+        cons,
+        params=params,
+        _reseed=reseed,
+        endpoints=tuple(owners),
+        _seed_max_iters=max_iters,
+        validators=tuple(owner._workflow_failure for owner in owners),
+        alignment_weight=alignment_weight,
+        joint_gtol=joint_gtol,
+        joint_energy_tol=joint_energy_tol,
+    )
+    engine._sync_endpoints()
+    for owner in owners:
+        if owner.iso is not None:
+            hands = owner._seed_donor_hands(owner.ids[:1])
+            owner.donor_hand = {donor: hand for donor, (hand, _) in hands.get(owner.ids[0], {}).items()}
+    typed = engine._relax_once(BASE_STIFFNESS, max_iters, operation="coembed")
+    engine._accept_relaxed(BASE_STIFFNESS, max_iters, operation="coembed", typed=typed, raise_if_empty=True)
+    engine._sync_endpoints()
+    engine._refresh_scores(BASE_STIFFNESS)
+    for owner in owners:
+        owner._finalize_minimize(list(ids))
+    common = set(owners[0].ids) & set(owners[1].ids)
+    for owner in owners:
+        owner._remove(set(owner.ids) - common)
+    if not common:
+        raise EmbeddingError("coembed: no pair survived native endpoint filtering; try another seed or alignment")
+    return Coembedded(
+        owners[0],
+        owners[1],
+        cons,
+        alignment_weight,
+        {cid: engine.joint_results[cid] for cid in owners[0].ids},
+        tuple(record for batch in (engine, *engine.recovery_batches) for record in batch.optimizer_attempts),
+        ts_weight=ts_weight,
+    )
+
+
 def embed(
     source,
     *,
@@ -643,90 +1155,3 @@ def minimize(
     # with a `Conformers` result); this only wraps it as an `Ensemble` so the pipeline verbs chain off it.
     mol, ids, cons, iso = prepare_relax(spec, fix=fix, constrain=constrain)
     return Ensemble(mol, ids, cons, iso).minimize(stiffness=stiffness, max_iters=max_iters)
-
-
-def coembed(
-    reaction, *, metal=None, constrain=None, contacts=None, charge=0, n=None, seed=None, threads=None, params=None
-):
-    """Embed a reaction's two endpoints as paired, aligned conformers; return ``(reactant, product)``.
-
-    `reaction` is a ``'reactant>>product'`` SMILES, or a ``(reactant, product)`` pair of anything `embed` reads:
-    SMILES or CXSMILES strings, ``.xyz`` paths, Mols or selected Isomers. The product takes the reactant's atom
-    order from their maximal graph overlay (`utils.map_reaction`); two Isomers share one unless both carry atom maps.
-    Each side's metal identity comes from its CXSMILES notes, its geometry or ``metal=`` (one geometry for both),
-    and must resolve to one Isomer; otherwise select one per side with `rx.metal` and pass the pair. `constrain`
-    and `contacts` take atom indices in the reactant's order and hold both copies (`rxembed.core.coembed`).
-    `contacts` reads as in `embed`: ``'auto'`` co-embeds one pair per binding mode `rx.nci_modes` finds on the
-    reactant, and ``'input'`` holds the contacts its geometry makes.
-
-    Conformer ids pair the two Ensembles, which share one frame (`rxembed.core.coembed`). A
-    pair is kept only when both copies pass `embed`'s per-conformer workflow gate (`published_pair`).
-    `minimize()` on either Ensemble relaxes that endpoint alone, which releases the tie to its partner. When
-    several contact modes return, or one fails, each side is an `EnsembleSet` tagged by ``nci`` mode, and
-    candidate k of one set pairs with candidate k of the other.
-
-        reactant, product = rx.coembed("CBr.[Cl-]>>CCl.[Br-]", n=4)
-    """
-    params = resolve_params(params, seed, threads)
-    if isinstance(reaction, str):  # a dative arrow '->' is not a reaction arrow, so split on '>>' alone
-        reaction = tuple(reaction.split(">>"))
-        if len(reaction) != 2 or any("|" in side for side in reaction):  # noqa: PLR2004 - two sides
-            raise ValueError("coembed() takes 'reactant>>product' without agents or CX extensions, or a pair")
-    if len(reaction) != 2:  # noqa: PLR2004 - two endpoints
-        raise ValueError(f"coembed() takes one reactant and one product; got {len(reaction)} sources")
-    # A mapped Isomer travels as its CX, whose atom notes carry its state through the overlay's reorder.
-    reaction = [cxsmiles(side) if isinstance(side, Isomer) and _has_maps(side.mol) else side for side in reaction]
-    sides = [side if isinstance(side, Isomer) else _normalize(side, charge)[0] for side in reaction]
-    if not any(isinstance(side, Isomer) for side in sides):
-        frames = all(_is_xyz(side) for side in reaction)
-        sides = map_reaction(*sides, frames=frames)
-    left, right = (_one_identity(side, metal, name) for side, name in zip(sides, ("reactant", "product"), strict=True))
-    pairs, failed = [], []
-    for label, contact in _contact_modes(sides[0], contacts, params):
-        try:
-            pair = _coembed_pair(left, right, constrain=constrain, contacts=_contact_terms(contact), n=n, params=params)
-        except ValueError as err:
-            if label is None:
-                raise
-            failed.append(EmbeddingError(f"contacts={contacts!r} mode {label!r}: {err}"))
-            logger.warning("%s", failed[-1])
-            continue
-        if label is not None:
-            for ens in pair:
-                ens.tag = {"nci": label}
-        pairs.append(pair)
-    if not pairs:
-        raise EmbeddingError(f"none of {len(failed)} contact modes could be co-embedded; first: {failed[0]}")
-    if len(pairs) == 1 and not failed:
-        return pairs[0]
-    sets = tuple(EnsembleSet(pair[side] for pair in pairs) for side in (0, 1))
-    for group in sets:
-        group.errors = tuple(failed)
-    return sets
-
-
-def _coembed_pair(left, right, **kwargs):
-    """Return one co-embedded pair as Ensembles (`published_pair`), a bounds contradiction as `ValueError`."""
-    try:
-        copies = core_coembed(left, right, **kwargs)
-    except RuntimeError as err:  # as `_embed_mode`: a contradiction in the pair's bounds is a bad request
-        raise ValueError(f"could not co-embed this pair: {err}") from err
-    return published_pair(*copies)
-
-
-def _has_maps(mol):
-    """Return whether any atom of `mol` carries an atom-map number."""
-    return any(atom.GetAtomMapNum() for atom in mol.GetAtoms())
-
-
-def _one_identity(side, metal, name):
-    """Return the one Isomer or Mol that `embed` would build for `side`, or raise naming how to select one."""
-    _discovery, candidates, _expanded = _source_candidates(
-        side, metal=metal, fix=None, coordinate=None, stereo=_default_stereo(side, None)
-    )
-    if len(candidates) != 1:
-        raise ValueError(
-            f"the {name} has {len(candidates)} coordination identities; select one per side with rx.metal(...) "
-            "and pass the two Isomers, atom-mapped unless they share one atom order"
-        )
-    return candidates[0].spec
