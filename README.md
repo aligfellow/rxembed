@@ -23,8 +23,8 @@ pip install '.[workflow]'         # recommended: adds XYZ perception, pruning, r
 pip install '.[search,workflow]'  # full: adds OpenConf Monte Carlo search
 ```
 
-xTB scoring and optimization need the [xTB executable](https://github.com/grimme-lab/g-xtb) at `~/bin/xtb`, or
-at the path in `$XTB_EXE`.
+xTB scoring and optimization need the [xTB executable](https://github.com/grimme-lab/g-xtb) on `PATH`.
+Set `$XTB_EXE` to use a specific executable.
 
 ## Quick Start
 
@@ -166,24 +166,6 @@ order or the charge; `fallback=False` raises instead.
 `bond_orders=None` skips only the bond-order step (single bonds, dative metal bonds, no formal charges), for
 checking which bonds a geometry has, a radical or zwitterion included.
 
-## Reaction Endpoints
-
-`rx.coembed` embeds a reactant and a product as paired conformers in one frame, as start points for NEB or a TS
-search.
-
-```python
-reactant, product = rx.coembed("CC(=O)C>>C=C(O)C", n=4)
-reactant.dump("r.xyz", align=False)
-product.dump("p.xyz", align=False)  # frame k pairs with frame k of r.xyz
-```
-
-The reaction is a `"reactant>>product"` SMILES, atom-mapped or not, or a pair of `rx.embed` sources such as two
-`.xyz` frames. The product takes the reactant's atom order from the graph overlay that keeps the most bonds; atom
-maps pin atoms where that overlay allows two reactions and stay on the returned molecules. Two `Isomer`s
-either share one order or carry atom maps.
-`constrain=` and `contacts=` take reactant indices and hold both copies. See
-[reaction endpoints](examples/15_coembed.ipynb).
-
 ## Save Results
 
 ```python
@@ -227,6 +209,32 @@ again = rx.embed("C1CCCCC1O", n=3, params=ens.params)  # the same conformers
 Set `seed`, `threads` and `prune_rms` on `EmbedParams`, not the native object, and geometry through `fix` and
 `constrain`. The switches `coplanar_14`, `metal_floor_relief`, `donor_orientation` and `conjugation` each remove
 one of rxembed's additions, for study ([07_metal](examples/07_metal.ipynb)). `max_iters` caps the UFF relax.
+
+## Coembedding reaction endpoints
+
+`rx.coembed` generates paired reactant and product conformers in a shared coordinate frame, as starting
+points for reaction-path or transition-state searches. It aligns unchanged atoms while allowing the reaction
+center to move, retaining each endpoint's geometry and stereochemistry.
+
+```python
+reactant = "[CH3:1][CH2:2][CH2:3][NH2:4].[OH:5][H:99]"
+product = "[CH3:1][CH2:2][CH2:3][NH2+:4]([H:99]).[OH-:5]"
+pairs = rx.coembed(reactant, product, n=4, seed=42)
+reactant_mol, product_mol = pairs[0]
+print(pairs.alignment_scores)  # spectator-atom RMSD, Angstrom
+pairs.reactant.dump("reactant.xyz", align=False)
+pairs.product.dump("product.xyz", align=False)  # matching frames form a pair
+```
+
+Inputs can be SMILES, XYZ paths, RDKit molecules or selected metal isomers. A single `"reactant>>product"`
+SMILES is also accepted. Both endpoints must contain the same atom inventory; atom maps resolve ambiguous
+correspondence. `charge=` supplies the charge for XYZ inputs.
+
+`constrain=` and `contacts=` use reactant atom indices and apply to both endpoints where applicable.
+Start with `n=1` for large flexible molecules; fewer pairs than requested may survive validation. Preserve
+the shared frame with `align=False` when exporting and `auto_align=False` when visualizing with `xyzrender`.
+
+See [15_coembedding](examples/15_coembedding.ipynb) for worked examples and the algorithm.
 
 ## Errors and How It Works
 

@@ -360,6 +360,29 @@ _MAX_SPARE = 2  # bond pairs broken and re-formed beyond the element-pair balanc
 _MAX_REMAINDERS = 20_000  # remainders canonicalised in one overlay search; unmeasured
 
 
+def reaction_correspondence(reactant, product):
+    """Match all explicit atoms by the graph overlay that keeps the most bonds, honoring atom maps.
+
+    Return endpoint-local index pairs without reordering either input. Reject overlays that describe different
+    reactions equally well, requiring maps for the reacting atoms instead of choosing their identities.
+    """
+    elements = [[(atom.GetAtomicNum(), atom.GetIsotope()) for atom in mol.GetAtoms()] for mol in (reactant, product)]
+    if sorted(elements[0]) != sorted(elements[1]):
+        raise ValueError("the endpoints have different atom inventories; supply matching atom inventories")
+    maps = [
+        Counter(atom.GetAtomMapNum() for atom in mol.GetAtoms() if atom.GetAtomMapNum()) for mol in (reactant, product)
+    ]
+    if maps[0].keys() != maps[1].keys() or any(uses > 1 for numbers in maps for uses in numbers.values()):
+        raise ValueError("give each atom-map number to one atom on each side, and the same numbers on both sides")
+    # Identical chemical identities need no reaction overlay. RDKit's isomeric canonical order retains
+    # stereo, bond orders and charge, avoiding apparent changes under symmetry-related atom permutations.
+    copies = [Chem.Mol(mol) for mol in (reactant, product)]
+    if Chem.MolToSmiles(copies[0]) == Chem.MolToSmiles(copies[1]):
+        orders = [mol.GetPropsAsDict(True, True)["_smilesAtomOutputOrder"] for mol in copies]
+        return tuple(sorted(zip(*orders, strict=True)))
+    return tuple(enumerate(_overlay_order(reactant, product)))
+
+
 def map_reaction(reactant, product, frames=False):
     """Return both sides on the reactant's atom order; any atom maps stay on both.
 

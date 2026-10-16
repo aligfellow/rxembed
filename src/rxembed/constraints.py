@@ -67,17 +67,15 @@ class Constraints:
     #   seed-side half-space, a positive value the minimum magnitude (soft walls; validate final stereo);
     #   (anchor, weight) is a template planar well with its fraction of the complete shell's force coefficient
     conjugation: bool = True  # retain rxembed's organic sp2/conjugation UFF cleanup terms
-    ties: dict = field(default_factory=dict)  # (i, j) -> Å budget: j is i's co-embedded copy (`coembed`), i < j
+    coupling_weights: dict = field(default_factory=dict)  # cross-copy pair -> squared-excess energy coefficient
+    seed_correspondence: tuple = ()  # complete endpoint-local correspondence for shared coordinate seeds
+    alignment_pairs: tuple | None = None  # spectator cross-copy pairs for rigid registration and diagnostics;
+    # None retains the original all-distance behavior for low-level paired callers
 
     @property
     def is_constrained(self) -> bool:
         """True when any geometric or coordinate constraint is set."""
-        return bool(self.distances or self.angles or self.dihedrals or self.planes or self.frozen or self.ties)
-
-    @property
-    def tied_copies(self) -> tuple[frozenset, frozenset]:
-        """Return the left and right real-atom sets of a co-embedded pair, both empty without ties."""
-        return frozenset(i for i, _j in self.ties), frozenset(j for _i, j in self.ties)
+        return bool(self.distances or self.angles or self.dihedrals or self.planes or self.frozen)
 
     def copy(self, **overrides) -> "Constraints":
         """Return a field-complete deep copy, with any keyword replacing that field outright."""
@@ -230,6 +228,13 @@ def merge_pulls(a, b):
     return out
 
 
+def _merge_correspondence(name, left, right):
+    """Keep one correspondence, rejecting competing coordinate frames."""
+    if left is not None and right is not None and left != right:
+        raise ValueError(f"compose: conflicting {name}; give one correspondence")
+    return right if right is not None else left
+
+
 _MERGE = {  # field -> how two sources combine. See `compose`.
     "distances": lambda a, b: {**a, **b},  # a spec landing ON a structural hold is a user override (dispatch)
     "angles": lambda a, b: {**a, **b},
@@ -249,7 +254,9 @@ _MERGE = {  # field -> how two sources combine. See `compose`.
     "haptic": partial(_merge_exclusive, "haptic"),  # a shared key = two faces claiming one reserved index = corruption
     "umbrellas": partial(_merge_exclusive, "umbrellas"),
     "conjugation": lambda a, b: a and b,
-    "ties": partial(_merge_exclusive, "ties"),
+    "coupling_weights": partial(_merge_exclusive, "coupling_weights"),
+    "alignment_pairs": partial(_merge_correspondence, "alignment_pairs"),
+    "seed_correspondence": lambda a, b: _merge_correspondence("seed_correspondence", a or None, b or None) or (),
 }
 
 _names = {f.name for f in fields(Constraints)}  # a new field must be given a merge policy, not defaulted

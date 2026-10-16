@@ -10,6 +10,8 @@ from rxembed import metal_isomer as isomer
 from rxembed import metal_polyhedron as poly
 from rxembed import stereo
 from rxembed.metal_core import MetalState
+from rxembed.metal_isomer import Isomer, least_motion_pair
+from rxembed.utils import reaction_correspondence, without_atom_maps
 
 _MA2B2 = "CCCN[Pd](Cl)(Cl)NCCC"
 
@@ -136,3 +138,24 @@ def test_distorted_source_and_stated_isomer_share_polyhedron_angles(geometry):
         distance = np.linalg.norm(positions[donor] - positions[retained.metal])
         window = measured.cons.distances[tuple(sorted((retained.metal, donor)))]
         assert 0.5 * sum(window) == pytest.approx(distance)
+
+
+def _stereoisomer(iso):
+    """Return `iso` as canonical CXSMILES without its atom maps: the stereoisomer, whatever the labelling."""
+    plain = Isomer.from_state(without_atom_maps(iso.graph), iso.centres, iso.donor_bonds, stereo_label=iso.stereo_label)
+    return rx.cxsmiles(plain)
+
+
+def test_relabelling_keeps_each_copy_with_two_side_on_propenes_its_stereoisomer():
+    """Two equivalent eta2-propene faces of opposite winding are not interchangeable: a swap is a diastereomer."""
+    faces = "(<-[CH2:7]=[CH:8]([CH3:9])->1)<-[CH2:10]=[CH:11]([CH3:12])->2"
+    ammine = rx.metal(f"[Cl-:1]->[W:2]12(<-[C-:3]#[O+:4])(<-[PH3:5])(<-[NH3:6]){faces}.[OH2:13]", "OCT")
+    aqua = rx.metal(f"[Cl-:1]->[W:2]12(<-[C-:3]#[O+:4])(<-[PH3:5])(<-[OH2:13]){faces}.[NH3:6]", "OCT")
+
+    def opposite(isomers):  # the two faces carry opposite windings
+        return [iso for iso in isomers if {getattr(s, "winding", "") for s in iso.centres[0].vertices} >= {"+", "-"}]
+
+    left = opposite(ammine)[0]
+    for right in opposite(aqua)[:10]:
+        relabelled = least_motion_pair(left, right, reaction_correspondence(left.graph, right.graph))
+        assert [_stereoisomer(iso) for iso in relabelled] == [_stereoisomer(left), _stereoisomer(right)]

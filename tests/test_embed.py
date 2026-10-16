@@ -664,6 +664,52 @@ def test_replacements_rank_valid_settled_scores_without_touching_survivors(monke
 # ---------------------------------------------------------------------------------------------------------
 
 
+def test_paired_replacements_use_shared_recovery(monkeypatch):
+    mol = Chem.MolFromSmiles("[He].[He]")
+    for cid in (5, 9):
+        conf = Chem.Conformer(2)
+        conf.SetId(cid)
+        conf.SetPositions(np.full((2, 3), float(cid)))
+        mol.AddConformer(conf, assignId=False)
+    calls = []
+
+    class PairedConformers(Conformers):
+        def _replacement_batch(self, count, params):
+            calls.append((count, params.seed))
+            batch_mol = Chem.Mol(mol)
+            batch_mol.RemoveAllConformers()
+            for energy in (5.0, 1.0):
+                conf = Chem.Conformer(2)
+                conf.SetPositions(np.array([[energy, 0, 0], [energy + 10, 0, 0]]))
+                batch_mol.AddConformer(conf, assignId=True)
+            return PairedConformers(batch_mol, [0, 1], params=params)
+
+        def _relax_once(self, *_args, **_kwargs):
+            self.energies = {0: 5.0, 1: 1.0}
+            return True
+
+        def _acceptance_failures(self, *_args, **_kwargs):
+            return {}
+
+        def _adopt_replacement(self, cid, batch, src):
+            super()._adopt_replacement(cid, batch, src)
+            self.adopted = (cid, src)
+
+    def independent_seeds(*_args, **_kwargs):
+        pytest.fail("paired recovery must use the paired batch factory")
+
+    monkeypatch.setattr(emb, "seed_conformers", independent_seeds)
+    owner = PairedConformers(mol, [5, 9], params=bnd.EmbedParams(seed=42))
+    survivor = mol.GetConformer(9).GetPositions().copy()
+
+    assert owner._replace_failed([5], BASE_STIFFNESS, 1) == []
+    assert calls == [(4, 43)]
+    assert owner.adopted == (5, 1)
+    assert owner.ids == [5, 9]
+    np.testing.assert_array_equal(owner._mol.GetConformer(5).GetPositions(), [[1, 0, 0], [11, 0, 0]])
+    np.testing.assert_array_equal(owner._mol.GetConformer(9).GetPositions(), survivor)
+
+
 _REPLACEMENT_VICTIM = 5  # an arbitrary id distinct from the fresh batch's own conformer id (0)
 
 

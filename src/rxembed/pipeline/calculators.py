@@ -22,7 +22,7 @@ import tempfile
 import numpy as np
 from rdkit import Chem
 
-XTB_EXE = os.environ.get("XTB_EXE", os.path.expanduser("~/bin/xtb"))
+XTB_EXE = os.environ.get("XTB_EXE", "xtb")
 XTB_TIMEOUT = int(os.environ.get("XTB_TIMEOUT", "600"))  # s; a hung/non-converging xtb must not freeze the caller
 
 

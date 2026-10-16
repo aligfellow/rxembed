@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from copy import deepcopy
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, replace
 from functools import cache
 from pathlib import Path
 
@@ -14,12 +14,20 @@ from rdkit import Chem
 from rdkit.Chem import rdMolAlign
 
 from rxembed.bounds import bounds_matrix, fragment_contacts
-from rxembed.constraints import constraint_value, graft_owns, match, resolve_atom, within_window
-from rxembed.embed import BASE_STIFFNESS, Conformers, EmbeddingError, Failure, stereo_donor_bonds
-from rxembed.metal_core import connect_metal, donor_chirality_sign, frag_map, metal_index, metal_indices
+from rxembed.coembedding import TS_WEIGHT
+from rxembed.constraints import Constraints, constraint_value, graft_owns, match, resolve_atom, within_window
+from rxembed.embed import BASE_STIFFNESS, Conformers, Failure, stereo_donor_bonds
+from rxembed.metal_core import (
+    connect_metal,
+    donor_chirality_sign,
+    frag_map,
+    materialise_phantoms,
+    metal_index,
+    metal_indices,
+)
 from rxembed.metal_perceive import SHAPE_PROP, shape_clause, shape_gap
 from rxembed.metal_polyhedron import resolve_geometry
-from rxembed.relax import MAX_ITERS, UFFRecord, ff_energies, restrained_uff
+from rxembed.relax import MAX_ITERS, UFFRecord, _alignment_terms, ff_energies, restrained_uff
 from rxembed.stereo import matches_stereo
 from rxembed.utils import atom_label
 
@@ -471,7 +479,6 @@ class Ensemble(Conformers):
         if not self.ids:  # nothing embedded (e.g. ETKDG could not place this graph)
             self._stage = _MINIMIZED
             return self
-        iso = self.iso  # capture before restore: the coordination-planarity gate needs metal + donors
         before = list(self.ids)
         if self.cons.is_constrained and self._stage == _RELAXED:
             typed = True  # already relaxed at embed time; _rescore_restrained below scores it at this stiffness
@@ -489,6 +496,11 @@ class Ensemble(Conformers):
             # relax pass never scores it. The final public energies must share one objective, computed here
             # once acceptance has settled `self.ids`, before the energy window or prune/lowest compares them.
             self._rescore_restrained(stiffness)
+        return self._finalize_minimize(before)
+
+    def _finalize_minimize(self, before):
+        """Apply native energy filtering and publish the relaxed endpoint graph and metadata."""
+        iso = self.iso
         scored = {cid: self.energies[cid] for cid in self.ids if cid not in self.unrelaxed and cid in self.energies}
         if scored:
             emin = min(scored.values())
@@ -1101,35 +1113,6 @@ class Ensemble(Conformers):
         return f"<Ensemble: {n} conformer{'s' if n != 1 else ''}, {state}{de}{tag}>"
 
 
-def published_pair(left, right):
-    """Return co-embedded core copies as Ensembles, keeping each pair whose copies pass `embed`'s per-conformer gate.
-
-    A pair is one conformer id on both sides; a pair failing on either side leaves both, and no fresh seed replaces
-    it. Raise `EmbeddingError` when none survives. The copies stay seeded: each holds geometry, not an endpoint
-    minimum, so a later `minimize()` relaxes it alone.
-    """
-    sides = tuple(Ensemble(**{f.name: getattr(copy, f.name) for f in fields(Conformers)}) for copy in (left, right))
-    for ens in sides:
-        ens.record_metal_context()
-    failed = {}
-    for cid in sides[0].ids:
-        for ens in sides:
-            if reason := ens._workflow_failure(ens, cid):
-                failed[cid] = reason
-                break
-    if failed:
-        logger.warning(
-            "coembed: dropped %d/%d pair(s); first: %s", len(failed), len(sides[0].ids), next(iter(failed.values()))
-        )
-    for ens in sides:
-        ens.discarded += list(failed)
-        ens._remove(failed)
-    if not sides[0].ids:
-        detail = f"; first workflow failure: {next(iter(failed.values()))}" if failed else ""
-        raise EmbeddingError(f"coembed: no pair passed acceptance{detail}")
-    return sides
-
-
 def wrap(mol, ids=None, *, energies=None, minimized=False):
     """Wrap an existing RDKit Mol (with conformers) as an Ensemble to give it rxembed's methods.
 
@@ -1155,3 +1138,131 @@ def wrap(mol, ids=None, *, energies=None, minimized=False):
             ens.energy_kind = "ff"
         ens._stage = _MINIMIZED
     return ens
+
+
+@dataclass(frozen=True)
+class Coembedded:
+    """Return matching endpoint ensembles and diagnostics from coupled polishing and validation.
+
+    Alignment and combined scores are measured on current endpoint coordinates. Independently removing
+    conformers invalidates pair identity and raises when accessing this result. Joint diagnostics describe
+    the last coupled stage after endpoint cleanup. Validation corrections invalidate its convergence and
+    force diagnostics; optimizer attempts retain the earlier stage records. Structural validity is separate.
+    """
+
+    reactant: Ensemble
+    product: Ensemble
+    constraints: Constraints
+    alignment_weight: float
+    joint_results: dict
+    optimizer_attempts: tuple
+    ts_weight: float = TS_WEIGHT
+    errors: tuple = ()
+
+    @property
+    def ids(self):
+        """Return pair ids, requiring endpoint selections to retain the same order."""
+        if self.reactant.ids != self.product.ids:
+            raise ValueError("coembedded endpoint ids differ; select both endpoints together or regenerate the pair")
+        return list(self.reactant.ids)
+
+    @property
+    def correspondence(self):
+        """Return the complete endpoint-local atom matching used for shared seeding."""
+        return self.constraints.seed_correspondence
+
+    @property
+    def alignment_pairs(self):
+        """Return aligned atoms as endpoint-local index pairs."""
+        split = self.reactant._mol.GetNumAtoms() + len(self.reactant.cons.phantoms)
+        pairs = self.constraints.alignment_pairs
+        return tuple((i, j - split) for i, j in (self.constraints.distances if pairs is None else pairs))
+
+    @property
+    def budgets(self):
+        """Return effective displacement budgets by endpoint-local correspondence."""
+        split = self.reactant._mol.GetNumAtoms() + len(self.reactant.cons.phantoms)
+        return {(i, j - split): window[1] for (i, j), window in self.constraints.distances.items()}
+
+    @property
+    def budget_excesses(self):
+        """Measure current displacement beyond each coupling budget, after final coupled polishing."""
+        out = {}
+        for cid in self.ids:
+            left = self.reactant._mol.GetConformer(cid).GetPositions()
+            right = self.product._mol.GetConformer(cid).GetPositions()
+            if not np.all(np.isfinite(left)) or not np.all(np.isfinite(right)):
+                raise ValueError("budget excesses need finite endpoint coordinates; regenerate the pair")
+            out[cid] = {
+                pair: max(0.0, float(np.linalg.norm(left[pair[0]] - right[pair[1]])) - budget)
+                for pair, budget in self.budgets.items()
+            }
+        return out
+
+    @property
+    def alignment_scores(self):
+        """Measure only aligned-atom RMSDs in the current shared frame."""
+        return self._rmsds(self.alignment_pairs)
+
+    @property
+    def ts_pairs(self):
+        """Return reacting-atom pairs from the coupling constraints, excluding spectators."""
+        spectators = set(self.alignment_pairs)
+        return tuple(pair for pair in self.budgets if pair not in spectators)
+
+    @property
+    def ts_rmsds(self):
+        """Measure reacting-atom RMSDs without a fit; return zero for an empty TS selection."""
+        return self._rmsds(self.ts_pairs)
+
+    def _rmsds(self, pairs):
+        """Measure atom-pair displacements without a second rigid fit or mass weighting."""
+        ids = self.ids
+        if not pairs:
+            return dict.fromkeys(ids, 0.0)
+        left, right = np.asarray(pairs, dtype=int).T
+        out = {}
+        for cid in ids:
+            delta = (
+                self.reactant._mol.GetConformer(cid).GetPositions()[left]
+                - self.product._mol.GetConformer(cid).GetPositions()[right]
+            )
+            if not np.all(np.isfinite(delta)):
+                raise ValueError(
+                    "RMSD needs finite endpoint coordinates; regenerate the pair after editing coordinates"
+                )
+            out[cid] = float(np.sqrt(np.mean(np.sum(delta**2, axis=1))))
+        return out
+
+    @property
+    def scores(self):
+        """Combine settled endpoint energies with the current spectator and TS coupling penalties."""
+        if any(owner.energy_kind not in ("", "ff", "uff-surrogate") for owner in (self.reactant, self.product)):
+            raise ValueError("paired scores require restrained-UFF energies; keep real endpoint singlepoints separate")
+        out = {}
+        for cid in self.ids:
+            if cid in self.reactant.energies and cid in self.product.energies:
+                blocks = [
+                    materialise_phantoms(owner._mol, owner.cons.haptic) for owner in (self.reactant, self.product)
+                ]
+                positions = np.concatenate([block.GetConformer(cid).GetPositions() for block in blocks])
+                out[cid] = (
+                    self.reactant.energies[cid]
+                    + self.product.energies[cid]
+                    + _alignment_terms(positions, self.constraints, self.alignment_weight)[0]
+                )
+        return out
+
+    @property
+    def source_seeds(self):
+        """Return original or replacement seeds for the retained pair ids."""
+        return {cid: self.joint_results[cid]["seed"] for cid in self.ids}
+
+    def __len__(self):
+        """Return the number of paired conformers."""
+        return len(self.ids)
+
+    def __getitem__(self, index):
+        """Return one reactant/product Mol pair by position in the retained id list."""
+        cid = self.ids[index]
+        return self.reactant.restored_mol(cid), self.product.restored_mol(cid)
