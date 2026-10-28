@@ -51,8 +51,9 @@ def test_puckered_aromatic_ring_remains_a_geometry_diagnostic():
     ens = rx.embed("c1ccccc1", n=1, seed=1)
     cid = ens.ids[0]
     conf = ens._mol.GetConformer(cid)
-    point = conf.GetAtomPosition(0)
-    conf.SetAtomPosition(0, (point.x, point.y, point.z + 0.5))
+    positions = conf.GetPositions()
+    normal = np.cross(positions[1] - positions[0], positions[5] - positions[0])
+    conf.SetAtomPosition(0, positions[0] + 0.5 * normal / np.linalg.norm(normal))
 
     violations = ens.check()[cid].violations
 
@@ -311,3 +312,43 @@ def test_wrap_labels_its_computed_force_field_single_point():
 
 
 # --- fragment contacts: mc's explore pass must re-bound every free ion pair, not one chosen contact ---
+
+
+@pytest.mark.parametrize(
+    ("energies", "expected"),
+    [
+        ({7: 2.0, 2: 1.0, 9: 1.0}, [2, 9, 7]),
+        ({7: 3.0, 9: 1.0}, [9, 7, 2]),
+        ({7: float("nan"), 2: 1.0, 9: float("inf")}, [2, 7, 9]),
+        ({}, [7, 2, 9]),
+    ],
+    ids=["stable-ties", "missing-score", "nonfinite-scores", "all-unscored"],
+)
+def test_ethane_pair_sorting_preserves_ids_coordinates_and_conformer_properties(energies, expected):
+    from rdkit.Chem import rdDistGeom
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("CC"))
+    rdDistGeom.EmbedMultipleConfs(mol, numConfs=4, randomSeed=42)
+    for cid, conf in zip((7, 2, 9, 11), mol.GetConformers(), strict=True):
+        conf.SetId(cid)
+        conf.SetIntProp("original_id", cid)
+    positions = {conf.GetId(): conf.GetPositions().copy() for conf in mol.GetConformers()}
+    pair = ensemble_module.Coembedded(
+        rx.wrap(mol, ids=[7, 2, 9], energies=energies),
+        rx.wrap(mol, ids=[7, 2, 9], energies=dict.fromkeys((7, 2, 9), 0.0)),
+        Constraints(),
+        25.0,
+        {},
+        (),
+    )
+
+    assert pair.ids == expected
+    assert pair.reactant.ids == pair.product.ids == expected
+    for endpoint in (pair.reactant, pair.product):
+        np.testing.assert_array_equal(endpoint._mol.GetConformer(11).GetPositions(), positions[11])
+        public = endpoint.mol
+        assert [conf.GetId() for conf in public.GetConformers()] == expected
+        for cid in expected:
+            conf = public.GetConformer(cid)
+            assert conf.GetIntProp("original_id") == cid
+            np.testing.assert_array_equal(conf.GetPositions(), positions[cid])

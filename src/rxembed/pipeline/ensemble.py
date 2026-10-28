@@ -14,7 +14,7 @@ from rdkit import Chem
 from rdkit.Chem import rdMolAlign
 
 from rxembed.bounds import bounds_matrix, fragment_contacts
-from rxembed.coembedding import TS_WEIGHT
+from rxembed.coembedding import REACT_WEIGHT
 from rxembed.constraints import Constraints, constraint_value, graft_owns, match, resolve_atom, within_window
 from rxembed.embed import BASE_STIFFNESS, Conformers, Failure, stereo_donor_bonds
 from rxembed.metal_core import (
@@ -328,7 +328,7 @@ class Ensemble(Conformers):
         """Run one openconf search under `cons`; warn and return ``None`` when openconf cannot handle the system."""
         try:
             return search.search(self._mol, cons, cfg)
-        except Exception as e:  # openconf can't handle every system (e.g. a TS hypervalent core)
+        except Exception as e:  # openconf can't handle every system (e.g. a reacting hypervalent core)
             logger.warning(
                 "mc%s: openconf could not search this system (%s: %s); keeping the %d conformer(s)",
                 label,
@@ -673,7 +673,7 @@ class Ensemble(Conformers):
             raise ValueError(
                 "optimize needs a real calculator (refine='gxtb' or 'gfn2'); the force-field relaxation is minimize()"
             )
-        fix = sorted(self.cons.frozen)  # the frozen TS core (reacting atoms)
+        fix = sorted(self.cons.frozen)  # the frozen reacting core (reacting atoms)
         new_mol = Chem.Mol(self._mol)  # opt moves atoms, so work on a copy and never clobber self
         energies, kept = {}, []
         for i in self.ids:
@@ -763,7 +763,7 @@ class Ensemble(Conformers):
         q = self._calc_charge(charge)
         # Coordination windows describe the metal shell, which the covalent perceiver cannot represent; an
         # ordinary restrained ligand distance is still a graph edge and must round-trip. A numeric `fix` is
-        # different: explicit TS authority that may intentionally hold a forming or breaking pair.
+        # different: explicit reacting authority that may intentionally hold a forming or breaking pair.
         intended = {
             frozenset(pair)
             for pair in self.cons.distances
@@ -1142,11 +1142,12 @@ def wrap(mol, ids=None, *, energies=None, minimized=False):
 
 @dataclass(frozen=True)
 class Coembedded:
-    """Return matching endpoint ensembles and diagnostics from coupled polishing and validation.
+    """Return matching endpoints sorted once by combined score; retain input order for ties.
 
-    Alignment and combined scores are measured on current endpoint coordinates. Independently removing
+    Missing or non-finite scores sort last. Alignment and combined scores are measured on current
+    endpoint coordinates. Independently removing
     conformers invalidates pair identity and raises when accessing this result. Joint diagnostics describe
-    the last coupled stage after endpoint cleanup. Validation corrections invalidate its convergence and
+    the last coupled stage. Validation corrections invalidate its convergence and
     force diagnostics; optimizer attempts retain the earlier stage records. Structural validity is separate.
     """
 
@@ -1156,8 +1157,21 @@ class Coembedded:
     alignment_weight: float
     joint_results: dict
     optimizer_attempts: tuple
-    ts_weight: float = TS_WEIGHT
+    react_weight: float = REACT_WEIGHT
     errors: tuple = ()
+
+    def __post_init__(self):
+        """Rank matching pairs and their RDKit conformers without changing ids or coordinates."""
+        scores = {cid: value for cid, value in self.scores.items() if np.isfinite(value)}
+        ranked = sorted(self.ids, key=lambda cid: scores.get(cid, float("inf")))
+        tracked = set(ranked)
+        for owner in (self.reactant, self.product):
+            remaining = [conf.GetId() for conf in owner._mol.GetConformers() if conf.GetId() not in tracked]
+            conformers = [Chem.Conformer(owner._mol.GetConformer(cid)) for cid in (*ranked, *remaining)]
+            owner._mol.RemoveAllConformers()
+            for conf in conformers:
+                owner._mol.AddConformer(conf, assignId=False)
+            owner.ids = list(ranked)
 
     @property
     def ids(self):
@@ -1179,24 +1193,15 @@ class Coembedded:
         return tuple((i, j - split) for i, j in (self.constraints.distances if pairs is None else pairs))
 
     @property
-    def budgets(self):
-        """Return effective displacement budgets by endpoint-local correspondence."""
+    def displacements(self):
+        """Measure corresponding atom separations in the returned shared frame."""
         split = self.reactant._mol.GetNumAtoms() + len(self.reactant.cons.phantoms)
-        return {(i, j - split): window[1] for (i, j), window in self.constraints.distances.items()}
-
-    @property
-    def budget_excesses(self):
-        """Measure current displacement beyond each coupling budget, after final coupled polishing."""
+        pairs = [(i, j - split) for i, j in self.constraints.distances]
         out = {}
         for cid in self.ids:
             left = self.reactant._mol.GetConformer(cid).GetPositions()
             right = self.product._mol.GetConformer(cid).GetPositions()
-            if not np.all(np.isfinite(left)) or not np.all(np.isfinite(right)):
-                raise ValueError("budget excesses need finite endpoint coordinates; regenerate the pair")
-            out[cid] = {
-                pair: max(0.0, float(np.linalg.norm(left[pair[0]] - right[pair[1]])) - budget)
-                for pair, budget in self.budgets.items()
-            }
+            out[cid] = {(i, j): float(np.linalg.norm(left[i] - right[j])) for i, j in pairs}
         return out
 
     @property
@@ -1205,15 +1210,16 @@ class Coembedded:
         return self._rmsds(self.alignment_pairs)
 
     @property
-    def ts_pairs(self):
+    def react_pairs(self):
         """Return reacting-atom pairs from the coupling constraints, excluding spectators."""
         spectators = set(self.alignment_pairs)
-        return tuple(pair for pair in self.budgets if pair not in spectators)
+        split = self.reactant._mol.GetNumAtoms() + len(self.reactant.cons.phantoms)
+        return tuple((i, j - split) for i, j in self.constraints.distances if (i, j - split) not in spectators)
 
     @property
-    def ts_rmsds(self):
-        """Measure reacting-atom RMSDs without a fit; return zero for an empty TS selection."""
-        return self._rmsds(self.ts_pairs)
+    def react_rmsds(self):
+        """Measure reacting-atom RMSDs without a fit; return zero for an empty reacting selection."""
+        return self._rmsds(self.react_pairs)
 
     def _rmsds(self, pairs):
         """Measure atom-pair displacements without a second rigid fit or mass weighting."""
@@ -1236,7 +1242,7 @@ class Coembedded:
 
     @property
     def scores(self):
-        """Combine settled endpoint energies with the current spectator and TS coupling penalties."""
+        """Combine settled endpoint energies with the current positional coupling penalties."""
         if any(owner.energy_kind not in ("", "ff", "uff-surrogate") for owner in (self.reactant, self.product)):
             raise ValueError("paired scores require restrained-UFF energies; keep real endpoint singlepoints separate")
         out = {}

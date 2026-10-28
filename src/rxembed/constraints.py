@@ -68,6 +68,7 @@ class Constraints:
     #   (anchor, weight) is a template planar well with its fraction of the complete shell's force coefficient
     conjugation: bool = True  # retain rxembed's organic sp2/conjugation UFF cleanup terms
     coupling_weights: dict = field(default_factory=dict)  # cross-copy pair -> squared-excess energy coefficient
+    seed_cpci: dict = field(default_factory=dict)  # numerical pair preferences used only by native DG refinement
     seed_correspondence: tuple = ()  # complete endpoint-local correspondence for shared coordinate seeds
     alignment_pairs: tuple | None = None  # spectator cross-copy pairs for rigid registration and diagnostics;
     # None retains the original all-distance behavior for low-level paired callers
@@ -255,6 +256,7 @@ _MERGE = {  # field -> how two sources combine. See `compose`.
     "umbrellas": partial(_merge_exclusive, "umbrellas"),
     "conjugation": lambda a, b: a and b,
     "coupling_weights": partial(_merge_exclusive, "coupling_weights"),
+    "seed_cpci": partial(_merge_exclusive, "seed_cpci"),
     "alignment_pairs": partial(_merge_correspondence, "alignment_pairs"),
     "seed_correspondence": lambda a, b: _merge_correspondence("seed_correspondence", a or None, b or None) or (),
 }

@@ -454,6 +454,9 @@ def seed_coordinates(mol, cons, n, params, *, enforce_chirality=True, max_attemp
     embed_params = params.native
     seed, threads = params.seed, params.threads
     p, prune_rms = _native_params(params)
+    # Preserve caller-owned native CPCI; RDKit cannot inspect or merge its preferences.
+    if cons.seed_cpci and embed_params is None:
+        p.SetCPCI(cons.seed_cpci)
     if embed_params is None:
         p.enforceChirality = enforce_chirality
         p.maxIterations = int(max_attempts)

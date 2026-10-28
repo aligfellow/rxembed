@@ -668,76 +668,127 @@ def _apply_atrop_stereo(mol, axes):
             raise ValueError(f"could not apply {target} atropisomer stereo on bond {pair}")
 
 
-def invert_copied_stereo(mol, label, stationary, seed, twins):
-    """Apply a copied conformer's stated configuration changes, keeping its stationary scaffold in place.
-
-    Only elements whose atoms keep their bonds to their `twins` in `seed` change; the reaction sets the others.
-    """
-    unchanged = {
-        atom
-        for atom, twin in twins.items()
-        if {twins.get(n.GetIdx()) for n in mol.GetAtomWithIdx(atom).GetNeighbors()}
-        == {n.GetIdx() for n in seed.GetAtomWithIdx(twin).GetNeighbors()}
-    }
-    realised = stereo_from_3d(mol, exclude=metal_indices(mol))
+def rotate_axial_stereo(mol, label, stationary):
+    """Rotate a copied conformer's mismatched axial hands while retaining its stationary scaffold."""
+    wanted = axis_stereo(label)
+    if not wanted:
+        return
     conf = mol.GetConformer()
-    for reader, turn in ((axis_stereo, lambda phi: -phi), (bond_stereo, lambda phi: phi + 180.0)):
-        for pair, code in reader(label).items():
-            if reader(realised).get(pair) in (None, code) or not set(pair) <= unchanged:
-                continue
-            moving = turning_side(mol, pair, stationary)
-            if moving is None:
-                continue  # a ring bond cannot turn
-            left, right = sorted(pair, key=lambda atom: atom in moving)  # SetDihedralDeg moves the last atom's side
-            first = next(n.GetIdx() for n in mol.GetAtomWithIdx(left).GetNeighbors() if n.GetIdx() != right)
-            last = next(n.GetIdx() for n in mol.GetAtomWithIdx(right).GetNeighbors() if n.GetIdx() != left)
-            quartet = first, left, right, last
-            rdMolTransforms.SetDihedralDeg(conf, *quartet, turn(rdMolTransforms.GetDihedralDeg(conf, *quartet)))
-    for centre, code in point_stereo(label).items():
-        if centre not in unchanged or point_stereo(realised).get(centre) in (None, code):
+    for axis, target in wanted.items():
+        realised = axis_stereo(stereo_from_3d(mol)).get(axis)
+        if realised is None or realised == target:
             continue
-        moving, plane = centre_inversion(mol, centre, stationary)
-        if plane is None:
-            continue  # no acyclic branch to carry
-        pos = conf.GetPositions()
-        normal = np.cross(pos[plane[1]] - pos[plane[0]], pos[plane[2]] - pos[plane[0]])
-        normal /= np.linalg.norm(normal)
-        for atom in moving:
-            conf.SetAtomPosition(atom, Point3D(*(pos[atom] - 2.0 * np.dot(pos[atom] - pos[plane[0]], normal) * normal)))
+        left, right = sorted(axis)
+        cut = Chem.RWMol(mol)
+        cut.RemoveBond(left, right)
+        fragments = Chem.GetMolFrags(cut)
+        sides = [set(next(part for part in fragments if atom in part)) for atom in (left, right)]
+        if left in sides[1]:
+            continue  # A cyclic axis has no independently rotatable side; leave it to native recovery.
+        if len(sides[1] & stationary) > len(sides[0] & stationary):
+            left, right = right, left
+        first = next(atom.GetIdx() for atom in mol.GetAtomWithIdx(left).GetNeighbors() if atom.GetIdx() != right)
+        last = next(atom.GetIdx() for atom in mol.GetAtomWithIdx(right).GetNeighbors() if atom.GetIdx() != left)
+        quartet = first, left, right, last
+        # Reflect the torsion, not the molecule: rotate one connected group without changing its local stereo.
+        phi = rdMolTransforms.GetDihedralDeg(conf, *quartet)
+        rdMolTransforms.SetDihedralDeg(conf, *quartet, -phi)
 
 
-def turning_side(mol, pair, stationary):
-    """Return the atoms on the side of bond `pair` that turn about it, or None when the bond is in a ring."""
-    first, second = pair
-    cut = Chem.RWMol(mol)
-    cut.RemoveBond(first, second)
-    fragments = Chem.GetMolFrags(cut)
-    sides = [set(next(part for part in fragments if atom in part)) for atom in (first, second)]
-    if first in sides[1]:
-        return None
-    return min(sides, key=lambda side: _moving_cost(mol, side, stationary))
+def reflect_point_stereo(mol, label, stationary):
+    """Invert mismatched point centres across a neighbor plane while preserving other stated hands.
+
+    Reflect the centre and one separable branch through its other three neighbors. This preserves every
+    bond length without minimizing either endpoint. A three-coordinate pyramid needs only its centre moved.
+    Leave inseparable rings, degenerate planes or branches with protected stereo to the ordinary identity
+    gate and bounded recovery. Never reflect a metal-containing branch.
+    """
+    conf = mol.GetConformer()
+    excluded = metal_indices(mol)
+    for centre, target in point_stereo(label).items():
+        before = stereo_from_3d(mol, exclude=excluded)
+        if point_stereo(before).get(centre) == target:
+            continue
+        neighbors = [atom.GetIdx() for atom in mol.GetAtomWithIdx(centre).GetNeighbors()]
+        branches = []
+        if len(neighbors) == 3:  # noqa: PLR2004  a pyramid's three neighbors define its inversion plane
+            branches.append(({centre}, neighbors))
+        elif len(neighbors) == 4:  # noqa: PLR2004  an explicit tetrahedron has four substituents
+            for neighbor in neighbors:
+                cut = Chem.RWMol(mol)
+                cut.RemoveBond(centre, neighbor)
+                branch = set(next(part for part in Chem.GetMolFrags(cut) if neighbor in part))
+                if centre not in branch:
+                    branches.append(({centre, *branch}, [atom for atom in neighbors if atom != neighbor]))
+        positions = conf.GetPositions()
+        for moving, anchors in sorted(branches, key=lambda item: (len(item[0] & stationary), len(item[0]))):
+            if moving & set(excluded):
+                continue
+            a, b, c = positions[anchors]
+            normal = np.cross(b - a, c - a)
+            length = np.linalg.norm(normal)
+            if length <= np.finfo(float).eps:
+                continue
+            normal /= length
+            indices = sorted(moving)
+            trial = positions.copy()
+            trial[indices] -= 2 * ((trial[indices] - a) @ normal)[:, None] * normal
+            conf.SetPositions(trial)
+            realised = stereo_from_3d(mol, exclude=excluded)
+            expected = {**point_stereo(before), centre: target}
+            if (
+                point_stereo(realised) == expected
+                and bond_stereo(realised) == bond_stereo(before)
+                and axis_stereo(realised) == axis_stereo(before)
+            ):
+                break
+            conf.SetPositions(positions)
 
 
-def centre_inversion(mol, centre, stationary):
-    """Return the atoms that invert `centre` and the three neighbours whose plane they reflect through, or None."""
-    neighbours = [atom.GetIdx() for atom in mol.GetAtomWithIdx(centre).GetNeighbors()]
-    if len(neighbours) == 3:  # noqa: PLR2004 - a lone pair is the fourth, massless substituent
-        return {centre}, neighbours
-    cut = Chem.RWMol(mol)
-    cut.RemoveAtom(centre)  # later indices shift down by one
-    fragments = [{i + (i >= centre) for i in part} for part in Chem.GetMolFrags(cut)]
-    branches = {n: next(part for part in fragments if n in part) for n in neighbours}
-    acyclic = [n for n in neighbours if not (set(neighbours) - {n}) & branches[n]]
-    if not acyclic:
-        return {centre}, None
-    carried = min(acyclic, key=lambda n: _moving_cost(mol, branches[n], stationary))
-    return {centre} | branches[carried], [n for n in neighbours if n != carried]
-
-
-def _moving_cost(mol, atoms, stationary):
-    """Rank a group that could move: fewest stationary atoms, then fewest heavy atoms, then fewest atoms."""
-    heavy = sum(mol.GetAtomWithIdx(atom).GetAtomicNum() != 1 for atom in atoms)
-    return len(atoms & stationary), heavy, len(atoms), min(atoms)
+def stereo_restraints(mol, label, cons):
+    """Translate stated endpoint stereo into native torsion half-spaces without approach-angle targets."""
+    terms = dict(cons.dihedrals)
+    for centre in point_stereo(label):
+        atom = mol.GetAtomWithIdx(centre)
+        neighbors = [neighbor.GetIdx() for neighbor in atom.GetNeighbors()]
+        if atom.GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED:
+            apply_point_stereo(mol, label, {centre})
+        tag = atom.GetChiralTag()
+        if tag not in {Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW}:
+            raise ValueError(f"could not assign a native point-stereo force at atom {centre}; inspect endpoint stereo")
+        if len(neighbors) == 4:  # noqa: PLR2004 - tetrahedral carriers
+            quartet = tuple(neighbors)
+        elif len(neighbors) == 3:  # noqa: PLR2004 - pyramid with an implicit carrier
+            quartet = neighbors[0], centre, neighbors[1], neighbors[2]
+        else:
+            raise ValueError(
+                f"stereo restraints need three or four neighbors at atom {centre}; inspect endpoint stereo"
+            )
+        # RDKit's clockwise tag has positive torsion in bond-neighbor order, also with an implicit carrier.
+        positive = tag == Chem.ChiralType.CHI_TETRAHEDRAL_CW
+        terms.setdefault(quartet, (0.0, 180.0) if positive else (-180.0, 0.0))
+    for bond in mol.GetBonds():
+        atoms = list(bond.GetStereoAtoms())
+        if len(atoms) != 2:  # noqa: PLR2004 - one reference on each side of a double bond
+            continue
+        if bond.GetStereo() in {Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOTRANS}:
+            window = (90.0, 270.0)
+        elif bond.GetStereo() in {Chem.BondStereo.STEREOZ, Chem.BondStereo.STEREOCIS}:
+            window = (-90.0, 90.0)
+        else:
+            continue
+        terms.setdefault((atoms[0], bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), atoms[1]), window)
+    realised_axes = axis_stereo(stereo_from_3d(mol, exclude=metal_indices(mol))) if axis_stereo(label) else {}
+    for axis, wanted in axis_stereo(label).items():
+        if realised_axes.get(axis) != wanted:
+            raise ValueError(f"could not prepare requested axial stereo {wanted} on {sorted(axis)}; try another seed=")
+        first, last = sorted(axis)
+        left = next(a.GetIdx() for a in mol.GetAtomWithIdx(first).GetNeighbors() if a.GetIdx() != last)
+        right = next(a.GetIdx() for a in mol.GetAtomWithIdx(last).GetNeighbors() if a.GetIdx() != first)
+        quartet = left, first, last, right
+        phi = rdMolTransforms.GetDihedralDeg(mol.GetConformer(), *quartet)
+        terms.setdefault(quartet, (0.0, 180.0) if phi >= 0 else (-180.0, 0.0))
+    return cons.copy(dihedrals=terms)
 
 
 def clear_ez(mol, pairs=None):

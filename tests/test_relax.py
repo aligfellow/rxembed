@@ -265,12 +265,21 @@ def test_native_joint_optimizer_descends_one_fixed_endpoint_objective(monkeypatc
     assert record["score"] < record["score_history"][0]
     assert np.all(np.diff(record["score_history"]) <= 1e-6)
     assert 0 < record["iterations"] == sum(steps) == record["iteration_budget_used"]
-    assert record["iteration_budget_used"] <= 1000
     assert np.linalg.norm(positions[0] - positions[split]) < 0.4
 
 
-@pytest.mark.parametrize("max_iters", [100, 101])
-def test_native_joint_limit_counts_completed_methanol_steps(max_iters):
+@pytest.mark.parametrize("max_iters", [1, 100, 101, 250])
+@pytest.mark.parametrize("max_cycles", [1, 3])
+def test_native_joint_each_methanol_endpoint_gets_full_step_allowance(monkeypatch, max_iters, max_cycles):
+    native = rdForceField.ForceField.MinimizeTrajectory
+    calls = []
+
+    def capture(field, *args, **kwargs):
+        status, snapshots = native(field, *args, **kwargs)
+        calls.append((kwargs["maxIts"], len(snapshots)))
+        return status, snapshots
+
+    monkeypatch.setattr(rdForceField.ForceField, "MinimizeTrajectory", capture)
     left, right = _mol("CO"), _mol("CO")
     right.GetConformer().SetPositions(right.GetConformer().GetPositions() + np.array([2.0, 0.2, 0.1]))
     _positions, record = relax_module._coupled_uff(
@@ -283,12 +292,65 @@ def test_native_joint_limit_counts_completed_methanol_steps(max_iters):
         gtol=0.1,
         energy_tol=0.0,
         max_iters=max_iters,
+        max_cycles=max_cycles,
     )
 
-    assert record["iterations"] <= max_iters
+    assert len(calls) == 2 * record["cycles"]
+    assert all(allowance == max_iters for allowance, _steps in calls)
+    assert record["iterations"] == sum(steps for _allowance, steps in calls)
     assert record["iteration_budget_used"] == record["iterations"]
-    if record["stopping_reason"] == "iteration_limit":
-        assert record["iterations"] == max_iters
+    assert 1 <= record["cycles"] <= max_cycles
+    if max_iters == 1:
+        assert record["cycles"] == max_cycles
+    if record["stopping_reason"] == "cycle_limit":
+        assert record["cycles"] == max_cycles
+
+
+def test_joint_iteration_budget_relaxes_both_dodecane_endpoints():
+    graphs = [_mol("CCCCCCCCCCCC") for _ in range(2)]
+    for graph in graphs:
+        conf = graph.GetConformer()
+        positions = conf.GetPositions()
+        positions[0] = positions[1] + 3.0 * (positions[0] - positions[1])
+        conf.SetPositions(positions)
+    split = graphs[0].GetNumAtoms()
+    positions, record = relax_module._coupled_uff(
+        graphs,
+        (Constraints(), Constraints()),
+        Constraints(),
+        0,
+        weight=5.0,
+        stiffness=1.0,
+        gtol=1e-8,
+        energy_tol=0.0,
+        max_iters=100,
+    )
+
+    assert record["iterations"] <= 2 * 100 * record["cycles"]
+    assert np.linalg.norm(positions[0] - positions[1]) < 1.7
+    assert np.linalg.norm(positions[split] - positions[split + 1]) < 1.7
+
+
+def test_native_joint_fixed_methanol_has_zero_projected_force_and_does_not_move():
+    left, right = _mol("CO"), _mol("CO")
+    right.GetConformer().SetPositions(right.GetConformer().GetPositions() + np.array([2, 0, 0]))
+    before = np.concatenate([mol.GetConformer().GetPositions() for mol in (left, right)])
+    positions, record = relax_module._coupled_uff(
+        (left, right),
+        tuple(Constraints(frozen=set(range(mol.GetNumAtoms()))) for mol in (left, right)),
+        Constraints(distances={(0, left.GetNumAtoms()): (0.0, 0.3)}),
+        0,
+        weight=5.0,
+        stiffness=1.0,
+        gtol=0.1,
+        energy_tol=1e-3,
+        max_iters=1000,
+    )
+    np.testing.assert_array_equal(positions, before)
+    assert record["converged"]
+    assert record["max_force"] == 0
+    assert record["stopping_reason"] == "force"
+    assert record["iterations"] == 0
 
 
 def test_native_joint_zero_step_cycle_stalls_without_claiming_energy_convergence(monkeypatch):

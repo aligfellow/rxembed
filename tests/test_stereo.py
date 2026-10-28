@@ -10,8 +10,10 @@ from rdkit import Chem
 from rdkit.Chem import rdDepictor, rdDistGeom
 
 from rxembed import stereo
+from rxembed.constraints import Constraints
 from rxembed.metal_core import metal_indices
 from rxembed.metal_smiles import parse_smiles
+from rxembed.relax import restrained_uff
 
 # an alpha-diimine-style chelate: both imine C=N sit in the 5-membered ring the metal closes
 _NATIVE_ATROP = "CC1=CC=CC(I)=C1N1C(C)=CC=C1Br |wU:7.7|"
@@ -27,6 +29,39 @@ def _with_metals(smiles):
     """Return ``(mol, metal indices)``: what a coordination caller passes as ``exclude``."""
     mol = _mol(smiles)
     return mol, set(metal_indices(mol))
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize(
+    "smiles", ["C[C@H](F)Cl", "C[P@](CC)c1ccccc1"], ids=["tetrahedral-carbon", "pyramidal-phosphine"]
+)
+def test_point_stereo_native_force_prefers_the_declared_hand(reverse, smiles):
+    mol = Chem.AddHs(_mol(smiles))
+    if reverse:
+        mol = Chem.RenumberAtoms(mol, list(reversed(range(mol.GetNumAtoms()))))
+    rdDistGeom.EmbedMolecule(mol, randomSeed=7)
+    label = stereo.defined_stereo_label(mol)
+    cons = stereo.stereo_restraints(mol, label, Constraints())
+    before = restrained_uff(mol, cons, max_iters=0)[0]
+    xyz = mol.GetConformer().GetPositions()
+    xyz[:, 0] *= -1
+    mol.GetConformer().SetPositions(xyz)
+
+    assert stereo.stereo_from_3d(mol) != label
+    assert restrained_uff(mol, cons, max_iters=0)[0] > before + 1
+
+
+def test_alkene_stereo_native_force_penalizes_the_opposite_difluoroethene_geometry():
+    from rdkit.Chem import rdMolTransforms
+
+    mol = Chem.AddHs(_mol("F/C=C/F"))
+    rdDistGeom.EmbedMolecule(mol, randomSeed=7)
+    cons = stereo.stereo_restraints(mol, stereo.defined_stereo_label(mol), Constraints())
+    assert restrained_uff(mol, cons, max_iters=0)[0] == pytest.approx(
+        restrained_uff(mol, Constraints(), max_iters=0)[0]
+    )
+    rdMolTransforms.SetDihedralDeg(mol.GetConformer(), 0, 1, 2, 3, 0)
+    assert restrained_uff(mol, cons, max_iters=0)[0] > restrained_uff(mol, Constraints(), max_iters=0)[0] + 1
 
 
 def _labels(mol, **kw):
@@ -80,6 +115,23 @@ def test_skipped_stereo_is_not_expanded_behind_the_filter():
     assert all(variant.GetAtomWithIdx(point).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED for variant, _ in bonds)
 
 
+def test_point_inversion_preserves_bonds_and_the_other_fluoroalcohol_hand():
+    mol = Chem.AddHs(_mol("C[C@H](O)[C@@H](F)C"))
+    assert rdDistGeom.EmbedMolecule(mol, randomSeed=7) == 0
+    target = Chem.Mol(mol)
+    target.GetAtomWithIdx(1).InvertChirality()
+    wanted = stereo.defined_stereo_label(target)
+    positions = mol.GetConformer().GetPositions()
+    pairs = [(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()) for bond in mol.GetBonds()]
+    before = [np.linalg.norm(positions[i] - positions[j]) for i, j in pairs]
+
+    stereo.reflect_point_stereo(mol, wanted, stationary={3, 4, 5})
+
+    assert stereo.stereo_from_3d(mol) == wanted
+    positions = mol.GetConformer().GetPositions()
+    assert [np.linalg.norm(positions[i] - positions[j]) for i, j in pairs] == pytest.approx(before)
+
+
 # ---------------------------------------------------------------------------------------------------------
 # axial chirality
 # ---------------------------------------------------------------------------------------------------------
@@ -103,6 +155,22 @@ def test_stated_native_atrop_axis_is_racemized_and_measured_from_3d():
     assert len(before) == 1
     pair, code = next(iter(before.items()))
     assert after[pair] == {"M": "P", "P": "M"}[code]
+
+
+def test_atrop_native_force_rejects_a_wrong_reference_and_penalizes_the_opposite_hand():
+    mol = Chem.AddHs(_mol(_NATIVE_ATROP))
+    assert rdDistGeom.EmbedMolecule(mol, randomSeed=7) == 0
+    label = stereo.defined_stereo_label(mol)
+    stereo.rotate_axial_stereo(mol, label, set())
+    cons = stereo.stereo_restraints(mol, label, Constraints())
+    before = restrained_uff(mol, cons, max_iters=0)[0]
+    positions = mol.GetConformer().GetPositions()
+    positions[:, 0] *= -1
+    mol.GetConformer().SetPositions(positions)
+
+    with pytest.raises(ValueError, match="requested axial stereo"):
+        stereo.stereo_restraints(mol, label, Constraints())
+    assert restrained_uff(mol, cons, max_iters=0)[0] > before + 1
 
 
 @pytest.mark.parametrize(

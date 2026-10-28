@@ -498,7 +498,7 @@ def test_geometry_source_is_normalized_once_for_stereo(tmp_path):
     The check only runs while relaxing into a window, so the re-embed needs one trivial fix= to engage it.
     """
     helicene = Chem.AddHs(Chem.MolFromSmiles("c1ccc2c(c1)ccc1ccc3ccc4ccccc4c3c12"))
-    assert rdDistGeom.EmbedMolecule(helicene, randomSeed=1, useRandomCoords=True) == 0
+    assert rdDistGeom.EmbedMolecule(helicene, randomSeed=1) == 0
     rdForceFieldHelpers.MMFFOptimizeMolecule(helicene, maxIters=5000)
     hand = signature(helicene, charge=0)["helical"]
 
@@ -553,40 +553,35 @@ def test_coembed_defaults_match_the_selected_proton_transfer_weights():
     product = "[CH3:1][CH2:2][CH2:3][NH2+:4]([H:99]).[OH-:5]"
 
     default = rx.coembed(reactant, product, n=1, seed=42, threads=1)
-    explicit = rx.coembed(reactant, product, n=1, seed=42, threads=1, alignment_weight=25, ts_weight=1.25)
+    explicit = rx.coembed(reactant, product, n=1, seed=42, threads=1, alignment_weight=25, react_weight=1.25)
 
     assert default.alignment_weight == 25
-    assert default.ts_weight == 1.25
+    assert default.react_weight == 1.25
     assert default.scores == pytest.approx(explicit.scores)
     for left, right in zip((default.reactant, default.product), (explicit.reactant, explicit.product), strict=True):
         np.testing.assert_allclose(left.mol.GetConformer().GetPositions(), right.mol.GetConformer().GetPositions())
 
 
-@pytest.mark.parametrize("failure", ["empty", "relax"])
+@pytest.mark.parametrize("failure", ["empty", "invalid", "bounds"])
 @pytest.mark.parametrize("sampling", ["automatic", "seed", "params"])
-def test_coembed_retries_a_failed_ethanol_seed_from_the_given_seed(monkeypatch, failure, sampling):
+def test_coembed_retries_failed_ethanol_seeds_with_a_reproducible_sequence(monkeypatch, failure, sampling):
     paired = importlib.import_module("rxembed.coembedding")
-    native_seed = paired.seed_conformers
-    native_minimize = paired.Conformers.minimize
+    core = importlib.import_module("rxembed.embed")
+    native = paired.seed_coordinates
     seen = []
-    rejected = False
 
-    def seed(mol, cons, iso, n, params, **kwargs):
+    def seed(mol, cons, n, params, **kwargs):
         seen.append(params.seed)
         if failure == "empty" and len(seen) == 1:
-            mol.RemoveAllConformers()
-            return mol, [], n
-        return native_seed(mol, cons, iso, n, params, **kwargs)
-
-    def minimize(owner, *args, **kwargs):
-        nonlocal rejected
-        if failure == "relax" and not rejected:
-            rejected = True
+            return []
+        if failure == "invalid" and len(seen) == 1:
             raise rx.EmbeddingError("ethanol seed failed geometry validation")
-        return native_minimize(owner, *args, **kwargs)
+        if failure == "bounds" and len(seen) == 1:
+            raise RuntimeError("triangle smoothing failed")
+        return native(mol, cons, n, params, **kwargs)
 
-    monkeypatch.setattr(paired, "seed_conformers", seed)
-    monkeypatch.setattr(paired.Conformers, "minimize", minimize)
+    monkeypatch.setattr(paired, "seed_coordinates", seed)
+    monkeypatch.setattr(core, "seed_coordinates", seed)
     settings = {"threads": 1}
     if sampling == "seed":
         settings["seed"] = 42
@@ -594,82 +589,110 @@ def test_coembed_retries_a_failed_ethanol_seed_from_the_given_seed(monkeypatch, 
         settings = {"params": rx.EmbedParams(seed=42, threads=1)}
 
     result = rx.coembed("CCO", "CCO", n=1, **settings)
-
-    assert seen == [seen[0], seen[0] + 1]
-    assert sampling == "automatic" or seen[0] == 42
     assert len(result) == 1
+    assert seen == [seen[0], seen[0] + 1]
     assert set(result.source_seeds.values()) == {seen[-1]}
+    assert result.joint_results[result.ids[0]]["seed_method"] == "endpoint"
+    assert result.joint_results[result.ids[0]]["seed_bounds"] == "endpoint"
+    assert not result.joint_results[result.ids[0]]["seed_cpci"]
 
 
 def test_coembed_retains_ethanol_pairs_when_only_missing_seeds_are_retried(monkeypatch):
     paired = importlib.import_module("rxembed.coembedding")
-    native = paired.seed_conformers
+    core = importlib.import_module("rxembed.embed")
+    native = paired.seed_coordinates
     requests = []
 
-    def seed(mol, cons, iso, n, params, **kwargs):
+    def seed(mol, cons, n, params, **kwargs):
         requests.append((params.seed, n))
-        return native(mol, cons, iso, 1, params, **kwargs)
+        return native(mol, cons, 1, params, **kwargs)
 
-    monkeypatch.setattr(paired, "seed_conformers", seed)
-
+    monkeypatch.setattr(paired, "seed_coordinates", seed)
+    monkeypatch.setattr(core, "seed_coordinates", seed)
     result = rx.coembed("CCO", "CCO", n=2, threads=1)
 
     initial = requests[0][0]
     assert requests == [(initial, 2), (initial + 1, 1)]
     assert len(result) == 2
-    assert list(result.source_seeds.values()) == [initial, initial + 1]
+    assert result.source_seeds == {0: initial, 1: initial + 1}
 
 
-def test_coembed_reports_the_last_ethanol_failure_after_automatic_seed_retries(monkeypatch):
+def test_coembed_returns_surviving_ethanol_pairs_when_replacement_seeding_fails(monkeypatch):
+    core = importlib.import_module("rxembed.embed")
+    paired = importlib.import_module("rxembed.coembedding")
+    native = paired.PairedConformers._acceptance_failures
+    seeds = []
+    native_seed = paired.seed_union_conformers
+
+    def reject_second(self, operation="coembed", validator=None, ids=None):
+        failures = native(self, operation, validator, ids)
+        selected = self.ids if ids is None else ids
+        if 1 in selected:
+            failures[core.Failure("bonding", "ethanol bond validation failed", atoms=(0, 1))] = [1]
+        return failures
+
+    def reject_seed(owners, correspondence, n, params, **kwargs):
+        if params.seed == 42:
+            return native_seed(owners, correspondence, n, params, **kwargs)
+        seeds.append(params.seed)
+        raise rx.EmbeddingError("ethanol replacement seed failed; try another seed=")
+
+    monkeypatch.setattr(paired.PairedConformers, "_acceptance_failures", reject_second)
+    monkeypatch.setattr(paired, "seed_union_conformers", reject_seed)
+    monkeypatch.setattr(paired, "seed_endpoint_conformers", reject_seed)
+
+    result = rx.coembed("CCO", "CCO", n=2, params=rx.EmbedParams(seed=42, threads=1, prune_rms=-1))
+
+    assert result.ids == [0]
+    assert result.reactant.ids == result.product.ids == result.ids
+    assert result.source_seeds == {0: 42}
+    assert seeds
+    assert all(seed > 42 for seed in seeds)
+
+
+def test_coembed_reports_the_last_ethanol_failure_after_seed_retries(monkeypatch):
     paired = importlib.import_module("rxembed.coembedding")
     failures = []
 
-    def minimize(owner, *args, **kwargs):
-        error = rx.EmbeddingError(f"ethanol seed {owner.params.seed} failed geometry validation")
+    def seed(owners, correspondence, n, params, **kwargs):
+        error = rx.EmbeddingError(f"ethanol seed {params.seed} failed geometry validation")
         failures.append(error)
         raise error
 
-    monkeypatch.setattr(paired.Conformers, "minimize", minimize)
-
+    monkeypatch.setattr(paired, "seed_union_conformers", seed)
+    monkeypatch.setattr(paired, "seed_endpoint_conformers", seed)
     with pytest.raises(rx.EmbeddingError) as caught:
-        rx.coembed("CCO", "CCO", n=1, threads=1)
+        rx.coembed("CCO", "CCO", n=1, seed=42, threads=1)
 
-    assert 1 < len(failures) <= 4
+    assert len(failures) == 4
     assert caught.value is failures[-1]
 
 
-@pytest.mark.parametrize("stereo_selection", [False, True])
-def test_coembed_derives_every_nested_retry_from_the_explicit_seed(monkeypatch, stereo_selection):
+def test_coembed_reproduces_fresh_seed_recovery_without_repeating_joint_passes(monkeypatch):
     core = importlib.import_module("rxembed.embed")
-    native = core.seed_coordinates
+    paired = importlib.import_module("rxembed.coembedding")
+    native = paired._seed_conformers
     seeds = []
 
-    def coordinates(mol, cons, n, params, **kwargs):
-        seeds.append(params.seed)
-        return native(mol, cons, n, params, **kwargs)
+    def coordinates(owners, correspondence, n, params, **kwargs):
+        seeds.append((params.seed, kwargs["seed_union"], kwargs["seed_cpci"]))
+        return native(owners, correspondence, n, params, **kwargs)
 
-    monkeypatch.setattr(core, "seed_coordinates", coordinates)
-    if stereo_selection:
-        source = rx.metal("C[C@H](F)C[NH2]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]", "SPL")[0]
-        monkeypatch.setattr(core, "_seed_stereo_matches", lambda *args, **kwargs: False)
-    else:
-        source = "CCO"
-        monkeypatch.setattr(
-            core.Conformers,
-            "_geometry_failure",
-            lambda *args, **kwargs: core.Failure("bonding", "ethanol seed failed bond validation"),
-        )
+    def fail(self, *args, **kwargs):
+        return {core.Failure("bonding", "ethanol bond validation failed", atoms=(0, 1)): list(self.ids)}
 
-    runs = []
-    for _ in range(2):
-        seeds.clear()
-        with pytest.raises(rx.EmbeddingError):
-            rx.coembed(source, source, n=1, seed=42, threads=1)
-        runs.append(list(seeds))
+    monkeypatch.setattr(paired, "_seed_conformers", coordinates)
+    monkeypatch.setattr(paired.PairedConformers, "_acceptance_failures", fail)
+    with pytest.raises(rx.EmbeddingError):
+        rx.coembed("CCO", "CCO", n=1, seed=42, threads=1)
+    first = list(seeds)
+    seeds.clear()
+    with pytest.raises(rx.EmbeddingError):
+        rx.coembed("CCO", "CCO", n=1, seed=42, threads=1)
 
-    assert runs[0] == runs[1]  # the explicit seed reproduces the whole search
-    assert runs[0][0] == 42
-    assert len(set(runs[0])) > 1  # its retries draw seeds of their own
+    assert seeds == first
+    assert first[0] == (42, True, True)
+    assert all(seed > 42 and not union and not cpci for seed, union, cpci in first[1:])
 
 
 @pytest.mark.parametrize("reverse_product", [False, True])
@@ -683,10 +706,10 @@ def test_coembed_rotates_the_substituted_aryl_ring_between_declared_atropisomers
         product = Chem.RenumberAtoms(product, list(reversed(range(product.GetNumAtoms()))))
     expected = [defined_stereo_label(mol) for mol in (reactant, product)]
 
-    result = rx.coembed(reactant, product, n=1, seed=42, threads=1, stereo="free")
+    result = rx.coembed(reactant, product, n=1, seed=42, threads=1, stereo="free", joint_max_iters=5000)
 
     assert len(result) == 1
-    moving = {i for i, _j in result.ts_pairs}
+    moving = {i for i, _j in result.react_pairs}
     aryl = reactant.GetSubstructMatch(Chem.MolFromSmarts("c1c(C(C)C)cccc1"))
     assert set(aryl) <= moving
     assert 0 not in moving  # the sulfonyl methyl belongs to the stationary scaffold
@@ -711,7 +734,7 @@ def test_coembed_keeps_an_unchanged_atropisomeric_ring_in_the_spectators():
     result = rx.coembed(atropisomer, atropisomer, n=1, seed=42, threads=1)
 
     assert len(result) == 1
-    assert not result.ts_pairs
+    assert not result.react_pairs
 
 
 def test_coembed_overlays_an_unmapped_palladium_c_h_activation_onto_the_reactant_order():
@@ -722,7 +745,7 @@ def test_coembed_overlays_an_unmapped_palladium_c_h_activation_onto_the_reactant
     reactant, product = result.reactant, result.product
 
     r_mol, p_mol = reactant.mol, product.mol
-    moved = [(i, j) for i, j in result.ts_pairs if r_mol.GetAtomWithIdx(i).GetAtomicNum() == 1]
+    moved = [(i, j) for i, j in result.react_pairs if r_mol.GetAtomWithIdx(i).GetAtomicNum() == 1]
     assert len(moved) == 1
     rh, ph = moved[0]
     r_parent = r_mol.GetAtomWithIdx(rh).GetNeighbors()[0].GetIdx()
@@ -763,23 +786,19 @@ def test_coembed_refuses_a_geometry_for_selected_isomers():
         rx.coembed((cisplatin, cisplatin), metal="TET")
 
 
-def test_coembed_xyz_frames_honor_explicit_hydrogen_correspondence_and_only_budget_ts_pairs(tmp_path, monkeypatch):
+def test_coembed_xyz_frames_honor_explicit_hydrogen_correspondence_and_couples_reacting_atoms_without_allowances(
+    tmp_path, monkeypatch
+):
     water = rx.embed("O", n=1, seed=1).mol
     paths = [tmp_path / name for name in ("reactant.xyz", "product.xyz")]
     Chem.MolToXYZFile(water, str(paths[0]))
     Chem.MolToXYZFile(Chem.RenumberAtoms(water, [0, 2, 1]), str(paths[1]))
-    monkeypatch.setattr(
-        dispatch,
-        "correspondence_budgets",
-        lambda _molecules, _terms, correspondence, _params: dict.fromkeys(correspondence, 0.8),
-    )
-
-    result = rx.coembed(paths, spectator_atoms={0: 0, 1: 2}, ts_atoms={2: 1}, n=1, seed=1)
+    result = rx.coembed(paths, spectator_atoms={0: 0, 1: 2}, react_atoms={2: 1}, n=1, seed=1)
 
     assert dict(result.correspondence) == {0: 0, 1: 2, 2: 1}
-    assert result.ts_pairs == ((2, 1),)
-    assert set(result.budgets) == {(0, 0), (1, 2), (2, 1)}
-    assert result.budgets == {(0, 0): 0.0, (1, 2): 0.0, (2, 1): 0.8}
+    assert result.react_pairs == ((2, 1),)
+    assert all(window == (0.0, 0.0) for window in result.constraints.distances.values())
+    assert set(result.displacements[result.ids[0]]) == {(0, 0), (1, 2), (2, 1)}
 
 
 @pytest.mark.parametrize("atom", [True, 0.5, "0", 100])
@@ -875,7 +894,6 @@ def test_coembed_keeps_every_atom_map_of_two_mapped_isomers(reactant, product, g
     mols[1] = Chem.RenumberAtoms(mols[1], list(range(mols[1].GetNumAtoms()))[::-1])  # the product in its own order
     isomers = [rx.metal(mol, geometry).select() for mol in mols]
 
-    # Seed 1 needs a fresh-seed retry for beta-hydride; explicit seeds now remain fixed.
     result = rx.coembed(tuple(isomers), n=1, seed=2)
     pair = result.reactant, result.product
 

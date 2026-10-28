@@ -401,36 +401,41 @@ def _coupling_coefficients(cons, weight):
 
 
 def _alignment_terms(positions, cons, weight):
-    """Evaluate weighted flat-bottomed correspondence energy and its Cartesian gradient."""
-    left, right = np.asarray(tuple(cons.distances), dtype=int).T
-    ceilings = np.asarray([window[1] for window in cons.distances.values()])
-    delta = positions[left] - positions[right]
-    distances = np.linalg.norm(delta, axis=1)
-    excess = np.maximum(distances - ceilings, 0.0)
-    coefficients = _coupling_coefficients(cons, weight)
-    energy = float(np.sum(coefficients * excess**2))
+    """Evaluate positional correspondence penalties and their Cartesian gradients."""
     gradient = np.zeros_like(positions)
-    force = (2 * coefficients * excess / np.maximum(distances, 1e-12))[:, None] * delta
-    np.add.at(gradient, left, force)
-    np.add.at(gradient, right, -force)
+    energy = 0.0
+    if cons.distances:
+        left, right = np.asarray(tuple(cons.distances), dtype=int).T
+        ceilings = np.asarray([window[1] for window in cons.distances.values()])
+        delta = positions[left] - positions[right]
+        distances = np.linalg.norm(delta, axis=1)
+        excess = np.maximum(distances - ceilings, 0.0)
+        coefficients = _coupling_coefficients(cons, weight)
+        energy = float(np.sum(coefficients * excess**2))
+        force = (2 * coefficients * excess / np.maximum(distances, 1e-12))[:, None] * delta
+        np.add.at(gradient, left, force)
+        np.add.at(gradient, right, -force)
     return energy, gradient
 
 
-def _coupled_uff(graphs, terms, alignment, conf_id, *, weight, stiffness, gtol, energy_tol, max_iters):
+def _coupled_uff(graphs, terms, alignment, conf_id, *, weight, stiffness, gtol, energy_tol, max_iters, max_cycles=100):
     """Alternate native UFF minimizations of two blocks on one fixed combined objective.
 
     The other endpoint supplies fixed position-restraint targets. Each field uses the original seed's
     restraint reference and nonbonded list. Base fields evaluate E_left + E_right + alignment exactly once.
-    Count completed native steps across both endpoints toward the iteration limit.
+    Give each endpoint up to max_iters native steps per cycle, for at most max_cycles complete cycles.
+    Count completed native steps across both endpoints for diagnostics. Measure the gradient only on free
+    coordinates when an endpoint has fixed atoms.
     A small cycle energy change is a plateau criterion, not a guarantee on the reported maximum gradient.
     """
     started = perf_counter()
     fields = [_restrained_field(graph, cons, conf_id, stiffness) for graph, cons in zip(graphs, terms, strict=True)]
     split = graphs[0].GetNumAtoms()
     positions = np.concatenate([graph.GetConformer(conf_id).GetPositions() for graph in graphs])
-    left, right = np.asarray(tuple(alignment.distances), dtype=int).T
+    left, right = np.asarray(tuple(alignment.distances), dtype=int).reshape(-1, 2).T
     ceilings = [window[1] for window in alignment.distances.values()]
     coefficients = _coupling_coefficients(alignment, weight)
+    frozen = sorted(terms[0].frozen | {split + index for index in terms[1].frozen})
 
     def evaluate():
         chunks = tuple(positions[:split].ravel()), tuple(positions[split:].ravel())
@@ -439,6 +444,7 @@ def _coupled_uff(graphs, terms, alignment, conf_id, *, weight, stiffness, gtol, 
         gradient += np.concatenate([ff.CalcGrad(chunk) for ff, chunk in zip(fields, chunks, strict=True)]).reshape(
             -1, 3
         )
+        gradient[frozen] = 0.0
         if not np.isfinite(energy) or not np.all(np.isfinite(gradient)):
             raise FloatingPointError("non-finite joint energy or gradient")
         return energy, float(np.max(np.abs(gradient)))
@@ -446,16 +452,13 @@ def _coupled_uff(graphs, terms, alignment, conf_id, *, weight, stiffness, gtol, 
     score, force = evaluate()
     cycles, iterations = 0, 0
     change = math.inf
-    reason = "force" if force <= gtol else "iteration_limit"
+    reason = "force" if force <= gtol else "cycle_limit"
     history = [score]
-    while force > gtol and iterations < max_iters:
+    while force > gtol and cycles < max_cycles:
         previous = score
         previous_iterations = iterations
         completed = True
         for endpoint in (0, 1):
-            if iterations == max_iters:
-                completed = False
-                break
             graph = Chem.Mol(graphs[endpoint])
             ff = _restrained_field(graph, terms[endpoint], conf_id, stiffness)
             conf = graph.GetConformer(conf_id)
@@ -468,10 +471,9 @@ def _coupled_uff(graphs, terms, alignment, conf_id, *, weight, stiffness, gtol, 
             current = positions[:split] if endpoint == 0 else positions[split:]
             conf.SetPositions(current)
             ff.Initialize()
-            allowance = min(100, max_iters - iterations)
             # RDKit records one snapshot per completed step, excluding the starting coordinates.
             # Keep native tolerances: its scaled force test is not the raw joint-gradient criterion.
-            _status, snapshots = ff.MinimizeTrajectory(1, maxIts=allowance)
+            _status, snapshots = ff.MinimizeTrajectory(1, maxIts=max_iters)
             iterations += len(snapshots)
             old = current.copy()
             current[:] = conf.GetPositions()
@@ -504,7 +506,7 @@ def _coupled_uff(graphs, terms, alignment, conf_id, *, weight, stiffness, gtol, 
         "message": {
             "force": "joint force tolerance reached",
             "energy": "joint score plateau reached",
-            "iteration_limit": "joint native iteration budget exhausted",
+            "cycle_limit": "joint cycle limit reached",
             "stalled": "native minimizations could not advance the joint objective",
         }[reason],
         "cycles": cycles,

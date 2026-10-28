@@ -1292,7 +1292,13 @@ class Conformers:
                 break
             count = _REPLACEMENT_FACTOR * len(left)
             trial_params = replace(self.params, seed=self.params.seed + 1 + batch_index)
-            batch = self._replacement_batch(count, trial_params)
+            try:
+                batch = self._replacement_batch(count, trial_params)
+            except EmbeddingError as error:
+                logger.info("%s: replacement seed %d rejected: %s", operation, trial_params.seed, error)
+                previous_signature = None
+                _log_replacement_round(operation, batch_index, 0, count)
+                continue
             if not batch.ids:
                 previous_signature = None
                 _log_replacement_round(operation, batch_index, 0, count)
@@ -1420,6 +1426,7 @@ class Conformers:
         validator=None,
         typed=True,
         raise_if_empty=False,
+        allow_underfilled=False,
     ):
         """Search bounded replacements for publication failures, then reject unresolved ids.
 
@@ -1428,8 +1435,8 @@ class Conformers:
         states share the same fresh-seed replacement loop. Internal replacement batches call
         `_acceptance_failures` directly and cannot recurse. A requested identity left underfilled raises
         `EmbeddingError`, as does rejecting every conformer under `raise_if_empty`; fewer conformers otherwise warn.
-        `typed` is False when UFF could not type the system: fresh seeds could not relax either, and the caller
-        has already warned that nothing relaxed.
+        `allow_underfilled` returns surviving candidates even when others missed a requested identity.
+        `typed` is False when UFF could not type the system: fresh seeds cannot relax either.
         """
         target = len(self.ids)
         failures = self._acceptance_failures(operation, validator)
@@ -1461,7 +1468,7 @@ class Conformers:
                     ),
                 ]
             )
-            if len(self.ids) < target and (required or (raise_if_empty and not self.ids)):
+            if len(self.ids) < target and ((required and not allow_underfilled) or (raise_if_empty and not self.ids)):
                 raise EmbeddingError(
                     f"{who}: {_headline(groups, self.iso, self.cons)}", failures=groups, isomer=self.iso
                 )
