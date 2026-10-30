@@ -695,6 +695,22 @@ def rotate_axial_stereo(mol, label, stationary):
         rdMolTransforms.SetDihedralDeg(conf, *quartet, -phi)
 
 
+def point_inversion_branches(mol, centre):
+    """Return separable point-inversion groups and their three stationary neighbors."""
+    neighbors = [atom.GetIdx() for atom in mol.GetAtomWithIdx(centre).GetNeighbors()]
+    branches = []
+    if len(neighbors) == 3:  # noqa: PLR2004  a pyramid's neighbors define its inversion plane
+        branches.append(({centre}, neighbors))
+    elif len(neighbors) == 4:  # noqa: PLR2004  an explicit tetrahedron has four substituents
+        for neighbor in neighbors:
+            cut = Chem.RWMol(mol)
+            cut.RemoveBond(centre, neighbor)
+            branch = set(next(part for part in Chem.GetMolFrags(cut) if neighbor in part))
+            if centre not in branch and not branch & set(metal_indices(mol)):
+                branches.append(({centre, *branch}, [atom for atom in neighbors if atom != neighbor]))
+    return branches
+
+
 def reflect_point_stereo(mol, label, stationary):
     """Invert mismatched point centres across a neighbor plane while preserving other stated hands.
 
@@ -709,17 +725,7 @@ def reflect_point_stereo(mol, label, stationary):
         before = stereo_from_3d(mol, exclude=excluded)
         if point_stereo(before).get(centre) == target:
             continue
-        neighbors = [atom.GetIdx() for atom in mol.GetAtomWithIdx(centre).GetNeighbors()]
-        branches = []
-        if len(neighbors) == 3:  # noqa: PLR2004  a pyramid's three neighbors define its inversion plane
-            branches.append(({centre}, neighbors))
-        elif len(neighbors) == 4:  # noqa: PLR2004  an explicit tetrahedron has four substituents
-            for neighbor in neighbors:
-                cut = Chem.RWMol(mol)
-                cut.RemoveBond(centre, neighbor)
-                branch = set(next(part for part in Chem.GetMolFrags(cut) if neighbor in part))
-                if centre not in branch:
-                    branches.append(({centre, *branch}, [atom for atom in neighbors if atom != neighbor]))
+        branches = point_inversion_branches(mol, centre)
         positions = conf.GetPositions()
         for moving, anchors in sorted(branches, key=lambda item: (len(item[0] & stationary), len(item[0]))):
             if moving & set(excluded):

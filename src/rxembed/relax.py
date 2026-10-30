@@ -418,7 +418,9 @@ def _alignment_terms(positions, cons, weight):
     return energy, gradient
 
 
-def _coupled_uff(graphs, terms, alignment, conf_id, *, weight, stiffness, gtol, energy_tol, max_iters, max_cycles=100):
+def _coupled_uff(
+    graphs, terms, alignment, conf_id, *, weight, stiffness, gtol, energy_tol, max_iters, max_cycles=100, fields=None
+):
     """Alternate native UFF minimizations of two blocks on one fixed combined objective.
 
     The other endpoint supplies fixed position-restraint targets. Each field uses the original seed's
@@ -427,9 +429,11 @@ def _coupled_uff(graphs, terms, alignment, conf_id, *, weight, stiffness, gtol, 
     Count completed native steps across both endpoints for diagnostics. Measure the gradient only on free
     coordinates when an endpoint has fixed atoms.
     A small cycle energy change is a plateau criterion, not a guarantee on the reported maximum gradient.
+    Accept prebuilt base fields so the paired owner can retain this objective for publication scoring.
     """
     started = perf_counter()
-    fields = [_restrained_field(graph, cons, conf_id, stiffness) for graph, cons in zip(graphs, terms, strict=True)]
+    if fields is None:
+        fields = [_restrained_field(graph, cons, conf_id, stiffness) for graph, cons in zip(graphs, terms, strict=True)]
     split = graphs[0].GetNumAtoms()
     positions = np.concatenate([graph.GetConformer(conf_id).GetPositions() for graph in graphs])
     left, right = np.asarray(tuple(alignment.distances), dtype=int).reshape(-1, 2).T

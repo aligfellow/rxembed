@@ -142,41 +142,9 @@ payload.
 the selected coordinates. Public graphs keep real atoms and bonds; surrogate metals and haptic centroid helpers
 stay private.
 
-Coembedding resolves complete graph correspondence in `utils`, preserving input atom orders. `coembedding`
-compares restored endpoint graphs to derive a temporary numerical union with one atom inventory. It retains
-unchanged connectivity, including coordination edges, and uses ZERO for changing edges, including bond-order
-and dative-direction changes. Surrogate metal identities remain the DG boundary. Affected aromatic components
-are numerically Kekulized and changing hybridization is unspecified; original endpoint graphs and
-hybridization remain authoritative. The shared DG matrix averages overlapping endpoint windows and uses their
-interval hull when disjoint. `Constraints.seed_cpci` carries numerical DG preferences: attraction on changing
-edges and repulsion between unbonded outer atoms of one forming and one breaking edge. `bounds` applies them
-to rxembed's KDG model; caller-supplied RDKit parameters own CPCI without mutation or merging.
-
-`coembedding` copies the shared coordinates to the original graphs, applies declared point and axial changes,
-and rebuilds exact haptic centroids. `stereo` translates declared point, bond and verified axial stereo into
-native torsion half-spaces. Shared seeds are selected for compatible metal hands and ranked by endpoint stereo
-and coordination geometry. Each endpoint uses the core guarded UFF preparation, capped by `seed_relax_iters`
-per attempt (100 by default). Rejected preparation returns to the shared seed without independent endpoint
-reseeding. Stereo walls are soft; publication remains the identity gate.
-
-`coembed` can seed from the ZERO-bond union or from the endpoint graph with more bonds; graph-derived CPCI
-preferences can be disabled independently. The non-union path uses the core seed selection, including carried
-terminal SP donor bonds, then copies the full mapped atom inventory onto the other endpoint. Underfilled union
-seeding and rejected pairs use fresh endpoint seeds without generated CPCI. Recovery retains successful pairs
-and replaces only missing slots. Explicit seeds reproduce the full retry sequence.
-
-`relax` constructs separate endpoint force fields and alternates native RDKit minimizations on endpoint energy
-plus positional correspondence penalties. Reacting atoms and spectators use separately weighted
-squared-distance penalties, with no free movement allowance. `coembedding.PairedConformers` reuses
-`Conformers` acceptance and bounded whole-pair recovery. Each candidate receives one joint optimization pass,
-with up to `joint_max_iters` native steps for each endpoint per cycle and at most `max_cycles` cycles. All
-atoms remain free. A failed result restores a valid prepared pair when available and marks its optimizer
-diagnostics as adjusted. No final polish or cleanup pass is run. No extra reaction-angle objective is applied.
-
-`embed` has no coembedding branches or dependency. `pipeline.dispatch` adapts inputs and selected identities;
-`pipeline.ensemble` owns publication and paired result access, ordering both endpoints by combined score when
-constructing `Coembedded`. Alignment and reacting-atom RMSDs measure the returned shared frame without an
-additional fit. Metal, ligand, and workflow identity gates remain active.
+For coembedding, `pipeline.dispatch` adapts inputs and classifies reacting groups; `coembedding` manages
+paired seeds and uses the coupled optimizer in `relax` with `Conformers` acceptance/recovery.
+`pipeline.ensemble.Coembedded` publishes both endpoints in their shared frame.
 
 ### Acceptance and recovery
 

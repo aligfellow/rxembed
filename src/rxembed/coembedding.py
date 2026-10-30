@@ -24,7 +24,7 @@ from .embed import (
     seed_conformers,
 )
 from .metal_core import materialise_phantoms
-from .relax import MAX_ITERS, UFFRecord, _alignment_terms, _coupled_uff, _prepare_uff, error_summary
+from .relax import MAX_ITERS, UFFRecord, _alignment_terms, _coupled_uff, _prepare_uff, _restrained_field, error_summary
 from .stereo import reflect_point_stereo, rotate_axial_stereo, stereo_restraints
 
 logger = logging.getLogger("rxembed")
@@ -54,8 +54,8 @@ def _bond_graphs(endpoints, correspondence):
     return back, left, right, changed
 
 
-def _seed_cpci(left, right, changed, *, back=None):
-    """Build reaction-graph CPCI preferences, optionally reindexed onto the product graph."""
+def _seed_cpci(left, right, changed):
+    """Build reaction-graph CPCI preferences."""
     cpci = dict.fromkeys(changed, -1.0)
     repelled = {
         tuple(sorted(set(first) ^ set(second)))
@@ -64,18 +64,15 @@ def _seed_cpci(left, right, changed, *, back=None):
         if len(set(first) & set(second)) == 1
     }
     cpci.update(dict.fromkeys(repelled - left.keys() - right.keys(), 1.0))
-    if back is not None:
-        forward = {left_idx: right_idx for right_idx, left_idx in back.items()}
-        cpci = {tuple(sorted((forward[i], forward[j]))): value for (i, j), value in cpci.items()}
     return cpci
 
 
-def seed_union_conformers(endpoints, correspondence, n, params, *, use_cpci=True):
+def seed_union_conformers(endpoints, correspondence, n, params):
     """Embed one numerical union using averaged overlapping windows and hulls for disjoint windows.
 
     Keep all original endpoint graphs authoritative. A changing bond includes a bond-order or dative-direction
     change. Changed atoms have no hybridization in this numerical graph; endpoint hybridization remains intact.
-    Optional CPCI preferences attract changing edges and repel unbonded outer atoms of one forming and one
+    CPCI preferences attract changing edges and repel unbonded outer atoms of one forming and one
     breaking edge. Their unit coefficients are numerical seed preferences, not physical charges. A supplied
     native parameter object owns its CPCI settings, which RDKit cannot expose for merging.
     """
@@ -131,7 +128,7 @@ def seed_union_conformers(endpoints, correspondence, n, params, *, use_cpci=True
     compatible = np.maximum(*lowers) <= np.minimum(*uppers)
     lower = np.where(compatible, 0.5 * (lowers[0] + lowers[1]), lower)
     upper = np.where(compatible, 0.5 * (uppers[0] + uppers[1]), upper)
-    cpci = _seed_cpci(left, right, changed) if use_cpci else {}
+    cpci = _seed_cpci(left, right, changed)
     cons = Constraints(
         distances={
             (i, j): (float(lower[i, j]), float(upper[i, j]))
@@ -146,9 +143,8 @@ def seed_union_conformers(endpoints, correspondence, n, params, *, use_cpci=True
     return union, ids
 
 
-def seed_endpoint_conformers(endpoints, correspondence, n, params, *, use_cpci=True):
+def seed_endpoint_conformers(endpoints, correspondence, n, params):
     """Seed from the endpoint with more bonds, preferring fewer haptic sites on ties."""
-    back, left, right, changed = _bond_graphs(endpoints, correspondence)
     source_side = max(
         range(2),
         key=lambda side: (
@@ -160,20 +156,9 @@ def seed_endpoint_conformers(endpoints, correspondence, n, params, *, use_cpci=T
     owner = endpoints[source_side]
     mol = Chem.Mol(owner._mol)
     mol.RemoveAllConformers()
-    preferences = {}
-    if use_cpci:
-        preferences = _seed_cpci(left, right, changed, back=back if source_side else None)
-    cons = owner.cons.copy(conjugation=False, seed_cpci=preferences)
+    cons = owner.cons.copy(conjugation=False, seed_cpci={})
     mol, ids, _target = seed_conformers(mol, cons, owner.iso, n, params)
     return mol, ids, source_side
-
-
-def _seed_conformers(endpoints, correspondence, n, params, *, seed_union, seed_cpci):
-    """Run the selected shared or endpoint-topology seed strategy."""
-    if seed_union:
-        mol, ids = seed_union_conformers(endpoints, correspondence, n, params, use_cpci=seed_cpci)
-        return mol, ids, None
-    return seed_endpoint_conformers(endpoints, correspondence, n, params, use_cpci=seed_cpci)
 
 
 def _prepare_seed_endpoints(endpoints, cons, shared, seeded_ids, source_side, params, need, max_iters):
@@ -194,7 +179,7 @@ def _prepare_seed_endpoints(endpoints, cons, shared, seeded_ids, source_side, pa
             conf.SetId(cid)
             conf.SetPositions(copied)
             graph.AddConformer(conf, assignId=False)
-        endpoint = Conformers(graph, list(seeded_ids), owner.cons.copy(conjugation=False), owner.iso, params=params)
+        endpoint = Conformers(graph, list(seeded_ids), owner.cons, owner.iso, params=params)
         stationary = {pair[side] - (split if side else 0) for pair in cons.alignment_pairs or ()}
         for cid in endpoint.ids:
             public = endpoint.restored_mol(cid)
@@ -210,7 +195,7 @@ def _prepare_seed_endpoints(endpoints, cons, shared, seeded_ids, source_side, pa
                 last_stereo_error = error
         else:
             raise EmbeddingError(str(last_stereo_error)) from last_stereo_error
-        endpoint.cons = owner.cons.copy(conjugation=False)
+        endpoint.cons = owner.cons
         prepared.append(endpoint)
     common = set(seeded_ids)
     for endpoint in prepared:
@@ -243,20 +228,24 @@ def seed_paired_conformers(
     *,
     seed_relax_iters=100,
     seed_union=True,
-    seed_cpci=True,
     oversample=True,
 ):
-    """Select shared stereo-compatible seeds and prepare both endpoint copies without losing intact seeds."""
+    """Select shared stereo-compatible seeds and prepare both endpoint copies without losing intact seeds.
+
+    Start with the union, then use fresh endpoint seeds without generated CPCI for missing slots.
+    The endpoint with more bonds supplies the recovery topology, with fewer haptic sites breaking ties.
+    Preserve accepted pairs rather than rerunning them. Derive retry seeds from the original parameters
+    so a stated seed reproduces the sequence. Joint recovery skips the union because it already failed.
+    """
     mol.RemoveAllConformers()
     ids = []
     last_failure = None
     for attempt in range(_REPLACEMENT_ROUNDS + 1):
         trial = replace(params, seed=params.seed + attempt)
         active_union = seed_union and attempt == 0
-        active_cpci = seed_cpci if active_union or not seed_union else False
         mol.SetIntProp("_rxembed_last_seed", trial.seed)
         if attempt:
-            logger.info(
+            logger.debug(
                 "coembed: retry seed %d with %s",
                 trial.seed,
                 "endpoint seeding",
@@ -264,17 +253,16 @@ def seed_paired_conformers(
         need = n - len(ids)
         count = _REPLACEMENT_FACTOR * need if oversample and any(owner.iso for owner in endpoints) else need
         try:
-            shared, seeded_ids, source_side = _seed_conformers(
-                endpoints,
-                cons.seed_correspondence,
-                count,
-                trial,
-                seed_union=active_union,
-                seed_cpci=active_cpci,
-            )
+            if active_union:
+                shared, seeded_ids = seed_union_conformers(endpoints, cons.seed_correspondence, count, trial)
+                source_side = None
+            else:
+                shared, seeded_ids, source_side = seed_endpoint_conformers(
+                    endpoints, cons.seed_correspondence, count, trial
+                )
         except (EmbeddingError, RuntimeError) as error:
             last_failure = error if isinstance(error, EmbeddingError) else EmbeddingError(error_summary(error))
-            logger.info("coembed: seed %d rejected: %s", trial.seed, error)
+            logger.debug("coembed: seed %d rejected: %s", trial.seed, error)
             continue
         if not seeded_ids:
             continue
@@ -284,7 +272,7 @@ def seed_paired_conformers(
             )
         except EmbeddingError as error:
             last_failure = error
-            logger.info("coembed: seed %d rejected: %s", trial.seed, error)
+            logger.debug("coembed: seed %d rejected: %s", trial.seed, error)
             continue
         if not selected:
             continue
@@ -300,7 +288,7 @@ def seed_paired_conformers(
             conf.SetIntProp("_rxembed_source_id", cid)
             conf.SetProp("_rxembed_seed_method", "union" if active_union else "endpoint")
             conf.SetProp("_rxembed_seed_bounds", "average" if active_union else "endpoint")
-            conf.SetBoolProp("_rxembed_seed_cpci", active_cpci and params.native is None)
+            conf.SetBoolProp("_rxembed_seed_cpci", active_union and params.native is None)
             ids.append(mol.AddConformer(conf, assignId=True))
         if len(ids) == n:
             break
@@ -322,11 +310,10 @@ class PairedConformers(Conformers):
     joint_energy_tol: float = field(default=1e-3, kw_only=True)
     max_cycles: int = field(default=100, kw_only=True)
     seed_relax_iters: int = field(default=100, kw_only=True)
-    seed_union: bool = field(default=True, kw_only=True)
-    seed_cpci: bool = field(default=True, kw_only=True)
     joint_results: dict = field(default_factory=dict, kw_only=True)
     optimizer_attempts: list = field(default_factory=list, kw_only=True)
     recovery_batches: list = field(default_factory=list, kw_only=True, repr=False)
+    _joint_fields: dict = field(default_factory=dict, init=False, repr=False)
 
     def _sync_endpoints(self):
         """Copy packed coordinates into endpoint graphs without changing either chemical identity."""
@@ -352,8 +339,16 @@ class PairedConformers(Conformers):
 
     def _refresh_scores(self, stiffness, *, excluded=()):
         """Rank settled pairs by uniformly rescored endpoint energies plus the alignment penalty."""
-        for owner in self.endpoints:
-            owner._rescore_restrained(stiffness, ids=[cid for cid in self.ids if cid not in excluded])
+        for side, owner in enumerate(self.endpoints):
+            selected = [cid for cid in self.ids if cid not in excluded]
+            owner._rescore_restrained(stiffness, ids=[cid for cid in selected if cid not in self._joint_fields])
+            for cid in selected:
+                if cid in self._joint_fields and cid not in owner.unrelaxed:
+                    graphs, fields = self._joint_fields[cid]
+                    split = graphs[0].GetNumAtoms()
+                    positions = self._mol.GetConformer(cid).GetPositions()
+                    block = positions[:split] if side == 0 else positions[split:]
+                    owner.energies[cid] = fields[side].CalcEnergy(tuple(block.ravel()))
         self.energies = {}
         self.unrelaxed = sorted({cid for owner in self.endpoints for cid in owner.unrelaxed if cid in self.ids})
         for cid in self.ids:
@@ -376,7 +371,6 @@ class PairedConformers(Conformers):
             params,
             seed_relax_iters=self.seed_relax_iters,
             seed_union=False,
-            seed_cpci=False,
             oversample=False,  # The core replacement count already includes the selection margin.
         )
         self._mol.SetIntProp("_rxembed_last_seed", mol.GetIntProp("_rxembed_last_seed"))
@@ -408,8 +402,6 @@ class PairedConformers(Conformers):
             joint_energy_tol=self.joint_energy_tol,
             max_cycles=self.max_cycles,
             seed_relax_iters=self.seed_relax_iters,
-            seed_union=False,
-            seed_cpci=False,
             _coord_state_prep=self._coord_state_prep,
         )
         self.recovery_batches.append(batch)
@@ -419,6 +411,10 @@ class PairedConformers(Conformers):
         """Adopt both endpoint coordinates and their stage diagnostics into the original pair id."""
         super()._adopt_replacement(cid, batch, src)
         self.joint_results[cid] = dict(batch.joint_results[src])
+        if src in batch._joint_fields:
+            self._joint_fields[cid] = batch._joint_fields[src]
+        else:
+            self._joint_fields.pop(cid, None)
         for owner, source in zip(self.endpoints, batch.endpoints, strict=True):
             if src in source.uff.statuses:
                 owner.uff.statuses[cid] = source.uff.statuses[src]
@@ -443,10 +439,9 @@ class PairedConformers(Conformers):
             graphs, field_terms = [], []
             packed_offset = 0
             for owner in self.endpoints:
-                # Copied coordinates can have the other endpoint's hybridisation. Let native UFF repair
-                # them without preserving seed-centred conjugation torsions from that geometry.
-                cons = owner.cons.copy(conjugation=False)
-                target, terms, retyped, replacements = _prepare_uff(owner._mol, cons, owner.uff)
+                # Native fields keep coordinate pointers; endpoint synchronization replaces conformers.
+                graph = Chem.Mol(owner._mol, confId=cid)
+                target, terms, retyped, replacements = _prepare_uff(graph, owner.cons, owner.uff)
                 for dummy in owner.cons.phantoms:
                     target.GetConformer(cid).SetAtomPosition(
                         int(dummy), self._mol.GetConformer(cid).GetPositions()[packed_offset + int(dummy)]
@@ -472,6 +467,13 @@ class PairedConformers(Conformers):
             else:
                 graphs[1].GetConformer(cid).SetPositions(seed[split:])
             try:
+                # Retain native fields, including their seed-derived windows and nonbonded lists.
+                # Rebuilding from final coordinates would change the objective used for ranking.
+                fields = [
+                    _restrained_field(graph, terms, cid, stiffness)
+                    for graph, terms in zip(graphs, field_terms, strict=True)
+                ]
+                self._joint_fields[cid] = (graphs, fields)
                 positions, record = _coupled_uff(
                     graphs,
                     field_terms,
@@ -483,6 +485,7 @@ class PairedConformers(Conformers):
                     energy_tol=self.joint_energy_tol,
                     max_iters=max_iters,
                     max_cycles=self.max_cycles,
+                    fields=fields,
                 )
                 if not np.all(np.isfinite(positions)):
                     raise FloatingPointError("non-finite joint coordinates")
@@ -533,6 +536,7 @@ class PairedConformers(Conformers):
             raise ValueError("paired relaxation needs EmbedParams; construct the pair with coembed(...)")
         self._sync_endpoints()
         self.joint_results, self.optimizer_attempts, self.recovery_batches = {}, [], []
+        self._joint_fields = {}
         self.relax_failures = {}
         failed = {cid for cids in self._acceptance_failures(operation).values() for cid in cids}
         checkpoint = {cid: self._mol.GetConformer(cid).GetPositions().copy() for cid in self.ids if cid not in failed}

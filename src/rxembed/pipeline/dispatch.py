@@ -57,6 +57,7 @@ from rxembed.stereo import (
     bond_stereo,
     defined_stereo_label,
     enumerate_unassigned,
+    point_inversion_branches,
     point_stereo,
     unassigned_centres,
 )
@@ -248,6 +249,17 @@ def _contact_modes(source, contacts, params):
     return list(modes.items())
 
 
+def _reference_stereo(source, stereo, *, charge=None, native=True):
+    """Read optional geometry stereo unless reference comparison is disabled."""
+    if stereo == "free" or not source.GetNumConformers():
+        return None
+    try:
+        return signature(source, charge=charge, native=native)
+    except Exception as err:
+        logger.warning("stereo preservation unavailable for the input geometry: %s", err)
+        return None
+
+
 def _stereo_filter(source, charge, stereo):
     """Return the chirality filter ``(spec, reference signature)`` each embedded ensemble keeps, or ``None``.
 
@@ -265,11 +277,7 @@ def _stereo_filter(source, charge, stereo):
         if not isinstance(stereo, dict) and stereo != "invert":  # an enumeration default means keep the input
             stereo = "preserve"
     if ref is None and not isinstance(source, Isomer) and source.GetNumConformers():
-        try:
-            ref = signature(source, charge=charge)
-        except Exception as err:
-            logger.warning("stereo preservation unavailable for the input geometry: %s", err)
-            ref = None
+        ref = _reference_stereo(source, stereo, charge=charge)
     if not ref:
         return None
     # An enumerating mode keeps only planar chirality, which the embed cannot re-enumerate: axial reads
@@ -381,12 +389,7 @@ def enumerate_isomers(
     metal_enumeration.validate_stereo(stereo)
     mol = _normalize(mol, charge)[0]
     reject_metal_bonds(mol)
-    ref_sig = None  # chirality fingerprint of the input geometry (real metals), letting stereo='preserve'
-    if mol.GetNumConformers() > 0:  # hold a spectator's planar/axial/helical handedness
-        try:
-            ref_sig = signature(mol, native=False)  # _stereo_filter only reads planar/helical
-        except ImportError as err:
-            logger.warning("stereo preservation unavailable for the input geometry: %s", err)
+    ref_sig = _reference_stereo(mol, stereo, native=False)  # _stereo_filter only reads planar/helical
     return metal_enumeration.enumerate_isomers(
         mol,
         geometry,
@@ -587,48 +590,72 @@ def _coembed_pairs(molecules, selection, name):
     return pairs
 
 
-def _atrop_rotating_atoms(molecules, *, alignment):
-    """Return mapped moving groups for changes between declared axial hands."""
-    axes = [
-        {
-            tuple(sorted(mol.GetAtomWithIdx(index).GetAtomMapNum() for index in axis)): code
-            for axis, code in axis_stereo(defined_stereo_label(mol)).items()
-        }
-        for mol in molecules
-    ]
-    heavy_labels = {atom.GetAtomMapNum() for atom in molecules[0].GetAtoms() if atom.GetAtomicNum() != 1}
+def _configuration_moving_atoms(molecules, *, alignment):
+    """Release graph-derived groups for declared point, E/Z and axial configuration changes."""
+    labels = [defined_stereo_label(mol) for mol in molecules]
+    indices = [{atom.GetAtomMapNum(): atom.GetIdx() for atom in mol.GetAtoms()} for mol in molecules]
+    heavy = {atom.GetAtomMapNum() for atom in molecules[0].GetAtoms() if atom.GetAtomicNum() != 1}
     moving = set()
-    for axis in axes[0].keys() & axes[1].keys():
-        if axes[0][axis] == axes[1][axis]:
-            continue
-        sides = [set(), set()]
-        for mol in molecules:
-            indices = {atom.GetAtomMapNum(): atom.GetIdx() for atom in mol.GetAtoms()}
-            cut = Chem.RWMol(mol)
-            cut.RemoveBond(*(indices[label] for label in axis))
-            fragments = Chem.GetMolFrags(cut)
-            for side, label in enumerate(axis):
-                fragment = next(part for part in fragments if indices[label] in part)
-                sides[side].update(mol.GetAtomWithIdx(index).GetAtomMapNum() for index in fragment)
-        if set(axis) <= sides[0] or set(axis) <= sides[1]:
-            if alignment is None:
-                raise ValueError(
-                    "an atropisomeric axis lies in a cycle; select stationary atoms with spectator_atoms= "
-                    "and moving atoms with react_atoms="
+    for reader in (point_stereo, bond_stereo, axis_stereo):
+        codes = [
+            {
+                tuple(
+                    sorted(mol.GetAtomWithIdx(i).GetAtomMapNum() for i in ((site,) if isinstance(site, int) else site))
+                ): code
+                for site, code in reader(label).items()
+            }
+            for mol, label in zip(molecules, labels, strict=True)
+        ]
+        for site in codes[0].keys() & codes[1].keys():
+            reset = any(
+                _mapped_neighborhood(molecules[0].GetAtomWithIdx(indices[0][number]))
+                != _mapped_neighborhood(molecules[1].GetAtomWithIdx(indices[1][number]))
+                for number in site
+            )
+            if codes[0][site] == codes[1][site] or reset:
+                # A local bond change can swap sequence priorities without requiring an inversion.
+                continue
+            groups = {}
+            for mol, lookup in zip(molecules, indices, strict=True):
+                atoms = [lookup[number] for number in site]
+                if len(atoms) == 1:
+                    neighbors = {atom.GetIdx() for atom in mol.GetAtomWithIdx(atoms[0]).GetNeighbors()}
+                    branches = {
+                        tuple(sorted(mol.GetAtomWithIdx(i).GetAtomMapNum() for i in neighbors - set(anchors))): group
+                        for group, anchors in point_inversion_branches(mol, atoms[0])
+                    }
+                else:
+                    cut = Chem.RWMol(mol)
+                    cut.RemoveBond(*atoms)
+                    fragments = Chem.GetMolFrags(cut)
+                    branches = {
+                        (number,): set(next(part for part in fragments if atom in part))
+                        for number, atom in zip(site, atoms, strict=True)
+                    }
+                    if set(atoms) <= branches[(site[0],)]:
+                        if reader is axis_stereo and alignment is None:
+                            raise ValueError(
+                                "an atropisomeric axis lies in a cycle; select stationary atoms with spectator_atoms= "
+                                "and moving atoms with react_atoms="
+                            )
+                        continue  # A ring has no separable rotating side.
+                for key, branch in branches.items():
+                    groups.setdefault(key, set()).update(mol.GetAtomWithIdx(index).GetAtomMapNum() for index in branch)
+            if not groups:
+                continue
+            # Identify a point branch by its severed neighbor, or an axis side by its carrier atom.
+            # Union each branch across endpoints so its attached atoms cannot remain spectators.
+            moving.update(
+                min(
+                    groups.values(),
+                    key=lambda group: (
+                        len(group & (alignment or set())),
+                        len(group & heavy),
+                        len(group),
+                        tuple(sorted(group)),
+                    ),
                 )
-            continue
-        # Rotating an axis moves its whole attached group. Keep the larger scaffold as the reference frame;
-        # use both endpoints' fragments so a substituent cannot remain a strongly coupled spectator.
-        rotating = min(
-            sides,
-            key=lambda labels: (
-                len(labels & (alignment or set())),
-                len(labels & heavy_labels),
-                len(labels),
-                tuple(sorted(labels)),
-            ),
-        )
-        moving.update(rotating)
+            )
     return moving
 
 
@@ -691,19 +718,10 @@ def _coembed_correspondence(molecules, spectator_atoms, react_atoms, *, frames=F
         or stereo[0].get(label) != stereo[1].get(label)
     }
     alignment = None if selected is None else {graphs[0].GetAtomWithIdx(i).GetAtomMapNum() for i, _j in selected}
-    rotating = _atrop_rotating_atoms(graphs, alignment=alignment)
+    rotating = _configuration_moving_atoms(graphs, alignment=alignment)
     changed.update(pair for label, pair in enumerate(correspondence, 1) if label in rotating)
-    if selected is None:
-        unchanged = tuple(pair for pair in correspondence if pair not in changed)
-        heavy = tuple(pair for pair in unchanged if graphs[0].GetAtomWithIdx(pair[0]).GetAtomicNum() != 1)
-        mapped_hydrogens = tuple(
-            (left.GetIdx(), mapped[1][number].GetIdx())
-            for number, left in mapped[0].items()
-            if left.GetAtomicNum() == 1 and (left.GetIdx(), mapped[1][number].GetIdx()) in unchanged
-        )
-        pairs = tuple(dict.fromkeys((*heavy, *mapped_hydrogens))) or unchanged
-    else:
-        pairs = selected
+    changed.update(requested or ())
+    pairs = selected if selected is not None else tuple(pair for pair in correspondence if pair not in changed)
     if not pairs:
         raise ValueError("coembed cannot align the endpoints: the mapped correspondence has no unchanged atoms")
     if requested and (
@@ -726,11 +744,8 @@ def _coembed_endpoint(source, stereo, params, *, metal=None, charge=0, constrain
     metal_enumeration.validate_stereo(selected_stereo)
     source = source if isinstance(source, Isomer) else _normalize(source, charge, remove_hs=False)[0]
     geometry_stereo = None
-    if not isinstance(source, Isomer) and source.GetNumConformers() and metal_indices(source):
-        try:
-            geometry_stereo = signature(source, charge=charge)
-        except ImportError as err:
-            logger.warning("stereo preservation unavailable for the input geometry: %s", err)
+    if not isinstance(source, Isomer) and metal_indices(source):
+        geometry_stereo = _reference_stereo(source, selected_stereo, charge=charge)
     if metal is not None or (not isinstance(source, Isomer) and metal_indices(source)):
         metals = metal_indices(source) if not isinstance(source, Isomer) else ()
         if metal is None and metals and not source.GetNumConformers():
@@ -752,6 +767,9 @@ def _coembed_endpoint(source, stereo, params, *, metal=None, charge=0, constrain
         raise ValueError("coembed needs one stereo identity per endpoint; specify stereo or pass stereo='free'")
     source = variants[0][0]
     work, terms, iso, _ref = prepare(source, constrain=constrain, contacts=contacts, params=params)
+    # Copied seeds can carry the other endpoint's hybridisation. Native UFF repairs it without
+    # seed-centred conjugation holds; retain this effective objective through publication and rescoring.
+    terms = terms.copy(conjugation=False)
     if terms.frozen:
         raise ValueError("coembed needs free endpoint geometries; select unfrozen Isomers or embed separately")
     owner = Ensemble(work, [conf.GetId() for conf in work.GetConformers()], terms, iso, params=params)
@@ -816,80 +834,40 @@ def coembed(  # noqa: C901 -- Keep public validation and its sampling warning to
     max_cycles=100,
     joint_max_iters=100,
     seed_relax_iters=100,
-    seed_union=True,
-    seed_cpci=True,
     seed=None,
     threads=None,
     params=None,
     stereo=None,
-    verbose=False,
 ):
-    """Coembed endpoints from a shared mapped geometry using native UFF and whole-pair recovery.
+    """Coembed two endpoint identities in one frame and rank them by the coupled UFF objective.
 
-    Accept two SMILES, XYZ paths, RDKit molecules or selected Isomers, a pair, or a 'reactant>>product'
-    SMILES. ``metal`` selects a coordination geometry; when it leaves several identities, select one per
-    endpoint with ``rx.metal(mol, geometry)[index]``. Unspecified metal identities warn and raise. ``charge``
-    supplies XYZ charge. ``constrain`` and
-    ``contacts`` use reactant atom-index keys mapped to the product, with the normal ``embed`` discovery.
-    Contacts that become bonds hold only the reactant. Multiple surviving contact modes return a list of
-    paired results with NCI tags; failures remain in their ``errors``.
+    Accept two SMILES, XYZ paths, RDKit molecules or selected Isomers, a pair, or a reaction SMILES.
+    Require matching explicit-H inventories; use atom maps to resolve ambiguous correspondence.
+    ``constrain`` and ``contacts`` use reactant atom indices and map onto the product where applicable.
+    Multiple contact modes return a list of paired results carrying NCI tags and mode errors.
 
-    Match complete explicit-H inventories by the graph overlay that keeps the most bonds, honoring maps
-    and explicit selections. Ambiguous overlays require reacting-atom maps. Preserve input atom orders and
-    connectivity. Different inventories require separate embedding. ``spectator_atoms`` selects spectator index pairs;
-    otherwise use unchanged heavy atoms and unchanged explicitly mapped hydrogens. Changed neighborhoods,
-    charges and declared stereo identify reacting atoms, including transferring hydrogens. ``react_atoms`` adds
-    one-to-one pairs outside the alignment; inferred reacting pairs are always included.
+    Select one stereo identity per endpoint. Native point, E/Z, axial and coordination checks gate
+    publication, but sampling can underfill or raise. ``stereo='free'`` skips optional reference
+    comparison. See ``examples/15_coembedding.ipynb`` for stereo scope and worked examples.
 
-    Seed one numerical union graph using averaged overlapping windows and interval hulls for disjoint windows.
-    Keep unchanged
-    connectivity and make changing bonds ZERO, including bond-order and dative-direction changes.
-    Native CPCI attracts changing edges and repels unbonded outer atoms connected by one forming
-    and one breaking edge. A supplied ``EmbedParams.native`` owns its CPCI settings instead.
-    Set ``seed_union=False`` to seed from the endpoint with more bonds (fewer haptic sites break ties), or
-    ``seed_cpci=False`` to disable rxembed-generated seed CPCI. These switches vary independently.
-    Copy the shared coordinates to the original endpoint graphs, apply declared stereo and its native
-    torsion restraints, and rebuild each endpoint's own haptic helpers. Prepare each endpoint through guarded
-    independent UFF capped at ``seed_relax_iters`` per native attempt (100 by default). Rejected
-    preparation returns to the shared seed. With
-    ``n=None``, use the larger endpoint's normal sampling target, counting each endpoint once.
-    Retries derive new seeds from ``seed`` or ``EmbedParams.seed`` so the complete search is reproducible.
-    Missing or rejected union candidates fall back to endpoint seeding without generated CPCI. Recovery
-    retains successful pairs and refills only the missing slots. Return pairs in ascending combined-score
-    order, with unscored pairs last; ``result[0]`` selects the lowest-score pair.
-    Set ``verbose=True`` to print preparation limits and actual joint iteration/cycle diagnostics.
-    Requesting ``n<=3`` warns that an unfortunate starting geometry may survive; prefer more conformers.
+    ``spectator_atoms`` selects one-to-one index pairs; otherwise infer unchanged atoms, including hydrogens,
+    excluding groups that must move. ``react_atoms`` adds reacting pairs and excludes them from automatic
+    spectator selection. ``alignment_weight`` and ``react_weight`` scale separately normalized squared
+    separations, without a free allowance.
+    The core coembedding module owns shared seeding, endpoint preparation and whole-pair recovery.
+    ``n=None`` uses the larger endpoint's sampling target. Explicit seeds reproduce retries.
 
-    Alternate native RDKit minimizations on the sum of endpoint energies and separately normalized
-    spectator and reacting-atom squared-distance penalties. ``alignment_weight=25`` and
-    ``react_weight=1.25`` control the groups independently. Every separation incurs a penalty;
-    there is no free movement allowance. Before the single joint pass, rigidly register spectators
-    when this decreases the complete coupling penalty. ``displacements``, ``alignment_scores`` and
-    ``react_rmsds`` measure returned coordinates without an additional fit.
-
-    ``seed_relax_iters`` caps each endpoint's independent pre-joint UFF minimization at 100 by default;
-    zero skips that preparation. ``joint_gtol`` controls the maximum gradient over free coordinates; native
-    minimizations keep RDKit tolerances. ``joint_energy_tol`` also permits a non-increasing cycle-score
-    plateau without a force guarantee; zero disables plateau stopping.
-    ``joint_max_iters`` defaults to 100 and caps native steps for each endpoint separately in every joint cycle.
-    ``max_cycles`` caps complete reactant/product cycles at 100 by default.
-    ``joint_results`` describes that pass; ``optimizer_attempts`` includes rejected replacement candidates.
-    Validation coordinate corrections mark the final result ``validation_adjusted`` and invalidate convergence.
-
-    Preserve each endpoint's declared point, E/Z, axial and selected coordination identity through normal
-    validation and bounded recovery. Undefined ligand stereo in a selected Isomer requires selecting a
-    defined identity or explicitly permitting unspecified hands with ``stereo='free'``. Both endpoints
-    must pass publication; whole-pair replacements keep their ids. Return fewer pairs if recovery underfills;
-    raise when no pair survives. Frozen geometries and stereo expansion require separate embedding.
+    ``seed_relax_iters`` caps each native endpoint preparation attempt; zero skips preparation.
+    ``joint_max_iters`` caps steps per endpoint per cycle, and ``max_cycles`` caps complete cycles.
+    ``joint_gtol`` tests the maximum joint gradient; ``joint_energy_tol`` permits a non-increasing
+    cycle-score plateau without a force guarantee (zero disables it). Validation coordinate changes
+    invalidate convergence in ``joint_results``; ``optimizer_attempts`` retains attempt diagnostics.
+    Use ``rx.set_verbose('INFO')`` for summaries or ``'DEBUG'`` for attempts.
     """
-    if not isinstance(verbose, bool):
-        raise TypeError("verbose must be a bool")
     _validate_relax(joint_max_iters, name="joint_max_iters")
     _validate_relax(max_cycles, name="max_cycles")
     if isinstance(seed_relax_iters, bool) or not isinstance(seed_relax_iters, int) or seed_relax_iters < 0:
         raise ValueError("seed_relax_iters must be a nonnegative integer")
-    if not isinstance(seed_union, bool) or not isinstance(seed_cpci, bool):
-        raise TypeError("seed_union and seed_cpci must be bools")
     if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n <= 0):
         raise ValueError("n must be a positive integer or None")
     for name, value in (
@@ -909,10 +887,13 @@ def coembed(  # noqa: C901 -- Keep public validation and its sampling warning to
             raise ValueError(f"{name} must be finite and {'nonnegative' if nonnegative else 'positive'}")
     if n is not None and n <= _SMALL_COEMBED_ENSEMBLE:
         logger.warning("coembed: n<=3 may give unfortunate starting geometries; we recommend more conformers (n>3).")
-    if verbose:
-        print(f"coembed: requested={n}; preparation cap={seed_relax_iters} iterations per endpoint/attempt")
-        print("coembed: preparation uses native UFF; actual preparation step counts are not exposed")
-        print(f"coembed: joint cap={joint_max_iters} steps per endpoint/cycle, {max_cycles} cycles")
+    logger.info(
+        "coembed: requested=%s; preparation cap=%d; joint cap=%d steps/endpoint/cycle, %d cycles",
+        n,
+        seed_relax_iters,
+        joint_max_iters,
+        max_cycles,
+    )
     reactant, product = _coembed_inputs(reactant, product)
     params = resolve_params(params, seed, threads)
     originals = [
@@ -960,8 +941,6 @@ def coembed(  # noqa: C901 -- Keep public validation and its sampling warning to
                 max_cycles=max_cycles,
                 joint_max_iters=joint_max_iters,
                 seed_relax_iters=seed_relax_iters,
-                seed_union=seed_union,
-                seed_cpci=seed_cpci,
             )
         except (ValueError, RuntimeError) as error:
             if label is None:
@@ -972,28 +951,23 @@ def coembed(  # noqa: C901 -- Keep public validation and its sampling warning to
         if label is not None:
             for owner in (result.reactant, result.product):
                 owner.tag["nci"] = label
-        if verbose:
-            _print_coembed_progress(result)
+        logger.info("coembed: retained %d pairs, %d joint attempts", len(result), len(result.optimizer_attempts))
+        for index, record in enumerate(result.optimizer_attempts, 1):
+            logger.debug(
+                "coembed: attempt %d: seed=%s, iterations=%s, cycles=%s, stop=%s, max_force=%s, seconds=%s",
+                index,
+                record.get("seed"),
+                record.get("iterations"),
+                record.get("cycles"),
+                record.get("stopping_reason"),
+                record.get("max_force"),
+                record.get("seconds"),
+            )
         results.append(result)
     if not results:
         raise EmbeddingError(f"no contact mode co-embedded; first failure: {failed[0]}")
     results = [replace(result, errors=tuple(failed)) for result in results]
     return results[0] if len(results) == 1 else results
-
-
-def _print_coembed_progress(result):
-    """Print actual joint work and distinguish retained pairs from rejected attempts."""
-    for index, record in enumerate(result.optimizer_attempts, 1):
-        print(
-            f"coembed: attempt {index}: seed={record.get('seed')} "
-            f"bounds={record.get('seed_bounds', record.get('seed_method'))}; "
-            f"iterations={record.get('iterations')}, cycles={record.get('cycles')}; "
-            f"converged={record.get('converged')}, stop={record.get('stopping_reason')}; "
-            f"max_force={record.get('max_force')}, seconds={record.get('seconds')}"
-        )
-    print(f"coembed: retained {len(result)} pairs, {len(result.optimizer_attempts)} joint attempts")
-    for cid, score in result.scores.items():
-        print(f"coembed: pair {cid}: score={score:.6g}, spectator RMSD={result.alignment_scores[cid]:.4f} A")
 
 
 def _coembed_pair(
@@ -1011,8 +985,6 @@ def _coembed_pair(
     max_cycles,
     joint_max_iters,
     seed_relax_iters,
-    seed_union,
-    seed_cpci,
 ):
     """Seed, optimize and publish one endpoint pair through the shared bounded recovery engine."""
     coupled = (*pairs, *reactive)
@@ -1038,8 +1010,6 @@ def _coembed_pair(
         n,
         params,
         seed_relax_iters=seed_relax_iters,
-        seed_union=seed_union,
-        seed_cpci=seed_cpci,
     )
     if not ids:
         raise EmbeddingError("coembed: no shared seeds; inspect endpoint bounds/stereo or try another seed=")
@@ -1055,8 +1025,6 @@ def _coembed_pair(
         joint_energy_tol=joint_energy_tol,
         max_cycles=max_cycles,
         seed_relax_iters=seed_relax_iters,
-        seed_union=seed_union,
-        seed_cpci=seed_cpci,
     )
     engine._sync_endpoints()
     for owner in owners:

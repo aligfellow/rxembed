@@ -212,9 +212,8 @@ one of rxembed's additions, for study ([07_metal](examples/07_metal.ipynb)). `ma
 
 ## Coembedding reaction endpoints
 
-`rx.coembed` generates matched reactant and product conformers in one coordinate frame for reaction-path or
-transition-state searches. Each endpoint keeps its own bonds and specified stereochemical identity. The
-endpoints can have different configurations, including a stated inversion at a reacting stereocenter.
+`rx.coembed` generates matched reactant and product conformers in one coordinate frame, preserving each endpoint's bonds and declared stereo.
+Both endpoints need the same atoms; see the [coembedding notebook](examples/15_coembedding.ipynb) for mapping, controls and limitations.
 
 ```python
 reactant = "[CH3:1][CH2:2][CH2:3][NH2:4].[OH:5][H:99]"
@@ -225,41 +224,6 @@ print(pairs.alignment_scores)  # spectator-atom RMSD, Angstrom
 pairs.reactant.dump("reactant.xyz", align=False)
 pairs.product.dump("product.xyz", align=False)
 ```
-
-Inputs can be SMILES, XYZ paths, RDKit molecules or selected metal `Isomer` objects. A single
-`"reactant>>product"` SMILES is also accepted. Both endpoints need the same atoms, including hydrogens and
-isotopes. Atom maps resolve ambiguous correspondence; keep transferred hydrogens explicit and mapped.
-`charge=` supplies the charge for XYZ inputs.
-
-Coembedding takes one stereochemical identity per endpoint:
-
-| Stereo element | How to specify it | What coembedding supports |
-|---|---|---|
-| Tetrahedral atom or graph-supported pyramidal N/P/As center | `@`/`@@` in each endpoint, or a selected ligand stereoisomer | Retention or a different stated configuration at the same mapped site; returned coordinates are checked against each endpoint's own point stereo. |
-| Independent double-bond E/Z | `/` and `\` in each endpoint | Retention or a stated E/Z change, provided that endpoint has an independently stereogenic double bond. |
-| Atropisomeric single-bond axis | RDKit atropisomer bond tags or their CXSMILES representation, such as `wU`/`wD` | Retention or a stated change of axial hand. A cyclic axis can require explicit `spectator_atoms` and `react_atoms`; arbitrary allene/cumulene axial stereo is not covered by this contract. |
-| Metal coordination stereo | One selected `rx.metal(...)[index]` per endpoint, or its `rx.cxsmiles(...)` | Each selected geometry, donor-site arrangement and represented metal/haptic hand is validated independently. Specify ligand stereo too; a geometry name alone may leave several identities. |
-| Planar or helical chirality from 3D | An input geometry and the `workflow` extra | A limited handedness filter when a reference can be perceived, not an exact guarantee for every site. It does not construct a requested planar/helical inversion. |
-
-For coordinate-free organic inputs, the default tries to resolve undefined stereo and raises if that would
-produce more than one endpoint identity. Specify the missing configurations, or use `stereo="free"` to permit
-unspecified configurations. For organic inputs, `"free"` does not erase explicit point, E/Z or atropisomer tags.
-For metal inputs, `"free"` can also release labile donor hands during identity selection; pass fully selected
-isomers with the default mode when those hands matter. It never makes a selected metal arrangement optional.
-Coembedding does not return the Cartesian product of stereoisomers; select endpoint identities and call it
-separately for each desired pairing.
-
-With coordinates, the default additionally compares stereo with the input geometry. `stereo="free"` disables
-that reference comparison. Planar/helical comparison needs `rxembed[workflow]`, compares observed hand sets
-rather than exact sites, and can miss a stereo element that perception no longer detects. A missing backend
-or a caught reference-perception failure warns and leaves that filter unavailable. Native declared point,
-E/Z and atrop checks still apply. Configurations that cannot be realized are rejected; fewer pairs may survive, or the call
-may raise. A valid endpoint pair does not establish a transition state or a favorable reaction approach.
-
-`constrain=` and `contacts=` use reactant atom indices and apply to both endpoints where applicable. Request
-more than three conformers; `n<=3` warns. Pairs are ordered by combined score, with unscored pairs last.
-Preserve their shared frame with `align=False` when exporting and `auto_align=False` in `xyzrender`.
-See [15_coembedding](examples/15_coembedding.ipynb) for examples, stereo limitations and advanced comparisons.
 
 ## Errors and How It Works
 
