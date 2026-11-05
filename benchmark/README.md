@@ -9,7 +9,7 @@ RMSD, the metal, and kappa/eta denticity; see `run.py`'s `FIELDS` for the exact 
 ```sh
 just bench                   # the 100 shipped fixtures, compared against baseline.csv
 just bench tmqmg --size N    # a MaxMin-diverse sample of a local tmQMg clone (RXEMBED_TMQMG_DIR)
-just bench-plot              # regenerate benchmark/docs/*.png from a results CSV
+just bench-plot              # regenerate benchmark/figures/*.png from a results CSV
 ```
 
 To accept a measured change, copy the new results CSV over `benchmark/baseline.csv`.

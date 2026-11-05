@@ -54,6 +54,4 @@ coverage.xml
 # Ignore temporary local notebooks/output
 output/
 benchmark/results/
-
-# Local reaction-pair collection
-/reaction_pairs.txt
+examples/cleanup.xyz

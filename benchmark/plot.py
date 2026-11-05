@@ -1,6 +1,6 @@
 """Plot a results CSV into PNGs: round-trip performance, and, for a tmQMg run, sample coverage.
 
-just bench-plot                                  # benchmark/baseline.csv -> benchmark/docs/
+just bench-plot                                  # benchmark/baseline.csv -> benchmark/figures/
 uv run python benchmark/plot.py PATH.csv OUT_DIR  # any other results CSV and output directory
 """
 
@@ -291,7 +291,7 @@ FIGURES = [
 
 
 def main(argv=None):
-    """Plot `argv[0]` (default benchmark/baseline.csv) into `argv[1]` (default benchmark/docs/), with
+    """Plot `argv[0]` (default benchmark/baseline.csv) into `argv[1]` (default benchmark/figures/), with
     every filename prefixed by its cohort ("fixtures" or "tmqmg", read from the results path's stem).
 
     A `tmqmg` results CSV has a `<stem>-coverage.json` sidecar (written by `run.py`); when present, it
@@ -299,7 +299,7 @@ def main(argv=None):
     """  # noqa: D205
     argv = sys.argv[1:] if argv is None else argv
     path = Path(argv[0]) if argv else HERE / "baseline.csv"
-    out_dir = Path(argv[1]) if len(argv) > 1 else HERE / "docs"
+    out_dir = Path(argv[1]) if len(argv) > 1 else HERE / "figures"
     out_dir.mkdir(parents=True, exist_ok=True)
     cohort = "tmqmg" if path.stem.startswith("tmqmg") else "fixtures"
     set_label = "tmQMg sample" if cohort == "tmqmg" else "fixtures"

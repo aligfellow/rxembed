@@ -4,21 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rxembed"
-version = "0.1.4"
+version = "0.2.0"
 description = "Constrained conformer embedding for reactive chemistry."
 authors = [{name = "Alister S. Goodfellow"}]
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-dependencies = ["numpy", "rdkit>=2026.3.6", "networkx"]
+dependencies = ["numpy", "rdkit>=2026.9.1", "networkx", "xyzgraph>=1.7.0"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
 
 [project.optional-dependencies]
-search = ["openconf>=0.0.16"]
-workflow = ["xyzgraph>=1.6.16", "prism_pruner", "scikit-learn", "matplotlib"]
+search = ["openconf>=0.0.17"]
+workflow = ["scikit-learn", "scipy", "matplotlib"]
 
 [project.urls]
 homepage = "https://github.com/aligfellow/rxembed"
@@ -34,15 +34,17 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.14.14",
     "ty>=0.0.14",
-    "ipykernel",
-    "xyzrender>=0.3.8",
 ]
+notebooks = ["ipykernel", "xyzrender>=0.3.8"]
+
+[tool.uv]
+default-groups = ["dev", "notebooks"]
 
 # ===== Ruff =====
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-src = ["src", "tests"]
+src = ["src", "tests", "benchmark"]
 
 [tool.ruff.lint]
 exclude = ["examples/*.ipynb"]
@@ -56,6 +58,8 @@ select = [
     "W",      # pycodestyle warnings
     "C4",     # comprehensions
     "C901",   # mccabe cyclomatic complexity ceiling (see [tool.ruff.lint.mccabe])
+    "ERA",    # commented-out code
+    "FIX",    # TODO/FIXME markers
     "PL",     # pylint
     "PT",     # flake8-pytest-style
     "PIE",    # misc lints
@@ -65,37 +69,43 @@ select = [
     "RUF",    # Ruff-specific rules
     "RSE",    # flake8-raise
     "ICN001", # unconventional-import-alias
+    "T20",    # print: the library returns text; only the scripts outside src print
 ]
 ignore = [
-    "PLR0911", # Too many returns
-    "PLR0912", # Too many branches
-    "PLR0913", # Too many arguments to function call
-    "PLR0914", # Too many locals
-    "PLR0915", # Too many statements
-    "PLR1702", # Too many nested-blocks
+    "PLR0913", # More than six arguments prompts a review of the signature (AGENTS.md), not a hard limit.
+    "PLR0915", # Length is not a clarity measure: one real step may be long; complexity guards tangled logic.
     "PLC0415", # Local imports which may be performance related
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["F401", "F403"]
+"!src/**" = ["T20"]
 "tests/**" = ["D", "PLR2004"]
-"src/rxembed/pipeline/xyz2mol_local.py" = ["ALL"]
-"src/rxembed/pipeline/xyz2mol_tmc.py" = [
+"src/rxembed/perception/xyz2mol_local.py" = ["ALL"]
+"src/rxembed/perception/xyz2mol_tmc.py" = [
     "N802", "N806", "PLR2004", "RUF046", "RUF059", "RUF015",
-    "D205", "D401", "D406", "D407", "C401", "C901", "B905", "PLW0603", "PLW0604",
+    "D205", "D401", "D406", "D407", "C401", "C901", "B905", "PLW0603", "PLW0604", "PLR0911", "PLR0912",
+    "PLR0915",
 ]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
 
 [tool.ruff.lint.mccabe]
 max-complexity = 15
 
+[tool.ruff.lint.pylint]
+max-args = 6
+max-branches = 15
+max-returns = 6
+
 [tool.ruff.lint.pydocstyle]
-convention = "numpy"
+convention = "numpy"  # for its summary-line rules and its __init__ exemption; AGENTS.md rules out the sections
 
 [tool.ruff.format]
 docstring-code-format = true
 exclude = [
-    "src/rxembed/pipeline/xyz2mol_local.py",
-    "src/rxembed/pipeline/xyz2mol_tmc.py"
+    "src/rxembed/perception/xyz2mol_local.py",
+    "src/rxembed/perception/xyz2mol_tmc.py"
 ]
 
 # ===== ty =====
@@ -109,6 +119,8 @@ exclude = ["examples", ".venv"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 doctest_optionflags = "NORMALIZE_WHITESPACE"
+addopts = "-m 'not slow'"  # `-m slow` runs only the slow tests, `-m ""` runs every test
+markers = ["slow: a long test the default run skips"]
 
 # ===== Coverage =====
 [tool.coverage.run]

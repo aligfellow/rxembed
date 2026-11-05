@@ -25,6 +25,6 @@ bench *args='':
     export PYTHONHASHSEED=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 UV_NO_SYNC=1
     uv run python benchmark/run.py {{args}}
 
-# Regenerate benchmark/docs/*.png from benchmark/baseline.csv.
+# Regenerate benchmark/figures/*.png from benchmark/baseline.csv.
 bench-plot:
     uv run python benchmark/plot.py

@@ -1,184 +1,85 @@
 # Architecture
 
-`README.md` owns usage, `AGENTS.md` owns development rules, and each module owns its own rationale. This file
-owns package boundaries and data flow.
+rxembed reads a chemical species, compiles its geometric requirements, builds coordinates with RDKit and checks
+them. The species stays authoritative while coordinates are searched and relaxed.
 
-## Packages
+## One call
 
-`rxembed` is the workflow facade. It accepts strings, paths, RDKit molecules and selected metal isomers, and
-returns a chainable `Ensemble` or `EnsembleSet`, or a `list[EnsembleSet]` for `stereo="separate"`.
-`coembed` returns a `Coembedded` result holding two finalized endpoint ensembles with matching conformer ids.
+`rx.embed("N->[Pd+2](<-[Cl-])(<-[Cl-])<-N")` runs:
 
-`rxembed.core` is the low-level API for a caller that already has an explicit-H RDKit `Mol` or an `Isomer`. It
-returns `Conformers` and has no pipeline operations.
+1. Read the input: parse, add hydrogens and draw each metal bond as a dative (`api`, `identity/smiles_io`,
+   `metal/centres`); an `.xyz` is perceived first (`perception/readers`).
+2. Read the species: ligand stereo and each metal's polyhedron, donor seating and hand (`identity/reading`,
+   `identity/species`, `stereo`). A Mol that is several species raises, naming `rx.isomers`, which enumerates them
+   (`identity/arrangements`).
+3. Compile one `Constraints` from the species and any `fix=`, `constrain=` or `contacts=` (`engine/seeding.prepare`,
+   `metal/sphere`, `metal/distances`, `perception/contacts`, `geometry/constraints`).
+4. Write it into RDKit's bounds matrix on the surrogate graph, where each metal is a bondless carbon
+   (`geometry/bounds`, `geometry/mechanisms`).
+5. Draw ETKDG seeds, keeping those with the requested hands and stereo (`engine/seeding`).
+6. Relax each seed into its windows with restrained UFF (`geometry/relax`, `engine/conformers`).
+7. Check the gates (`engine/acceptance.CORE_GATES`), replacing failures from fresh seeds.
+8. Return an `Ensemble`, with real metals and notes restored (`ensemble`).
 
-The core modules sit flat in `src/rxembed/`. They use NumPy and RDKit with relative imports and never import
-`pipeline`. `src/rxembed/pipeline/` owns input adaptation, candidate expansion, search, selection, scoring, QA
-and optional integrations. It imports core through `rxembed`, loads optional dependencies only in the operation
-that needs them, and is the only user of NetworkX.
+`rx.isomers` stops after step 2, `rx.minimize` skips step 5, and `rx.coembed` runs steps 3 to 7 on both endpoints of
+a reaction (`engine/coembed`). Each species or contact mode is built on its own, and a collection keeps the failures
+in `.errors`.
 
-## Layers
+The surrogate graph and the other derived views (stripped ligands, stereo caps) feed the numerical models and never
+become a second identity. Construction holds what the species specifies; reading a result describes its coordinates
+and refuses a contradiction with the Mol. Results own their coordinates: construction and selection copy, a public Mol
+is a copy, and changing coordinates drops what was derived from them. Force-field energies rank conformers within one
+species; scoring and minimization share one restrained-UFF objective, and calculators get the chemical graph.
 
-A module imports only modules in rows above it, or listed before it in its own row. Imports sit at module top,
-except optional dependencies at their point of use.
+## Loops
 
-| layer | module | owns |
-|---|---|---|
-| base | `utils` | the reaction graph correspondence, coordinate math, small RDKit facts and the QA `Violation`; nothing about metals or constraints |
-| | `constraints` | the `Constraints` payload, the `fix`/`constrain`/`template` resolver, `match` and measurement |
-| shapes | `metal_polyhedron` | the `POLYHEDRA` registry, proper rotations, slot notes and hand frames |
-| metal graph | `metal_core` | metal state records, surrogate swap and restore, haptic sites, the ligand graph |
-| graph chemistry | `stereo` | ligand stereo, including coordination-locked centres: read from 3D, written, enumerated |
-| | `metal_distance` | the fitted M-L length model, the alkali ion contact and the floors for non-donor atoms near the metal |
-| DG and FF engine | `mechanisms` | each `Constraints` field as DG bounds and restrained-UFF terms (`Mechanism`) |
-| | `relax` | restrained UFF fields and native minimization, including a coupled endpoint objective |
-| | `bounds` | `EmbedParams`, native bounds and their edits, ligand reach, fragment contacts, DG seeding |
-| metal models | `metal_donor_orient` | donor hybridisation and the soft holds that point each donor at the metal |
-| | `metal_perceive` | read-only judgement of a sphere: shape readings and the shape gate, overbonding, donor fold |
-| | `metal_stereo` | coordination-site identity, metal hand, haptic winding and face descriptors |
-| | `metal_slots` | distinct donor-to-slot assignments under rotations, and chelate bite windows |
-| compile | `metal_constraints` | one metal state to `Constraints`: M-L windows, L-M-L angles and chelate bites |
-| identity | `metal_isomer` | `Isomer` and `IsomerSet`, and the isomer read from coordinates and least-motion relabelling of equivalent sites |
-| enumeration | `metal_enumeration` | ligand, haptic and coordination states as screened `Isomer` candidates |
-| strings | `metal_smiles` | reading and writing dative SMILES and CXSMILES |
-| orchestration | `embed` | `prepare`, seeding, acceptance and recovery: `Conformers`, `Failure`, `EmbeddingError` |
-| | `coembedding` | shared endpoint seeding, reacting-atom coupling and `PairedConformers` on native `Conformers` workflows |
-| facade | `core` | the low-level API, logging setup and the version lookup |
-| pipeline | `calculators` | the xtb executable and the `Calculator` and `ASE` scoring surface |
-| | `search` | Monte Carlo search through openconf |
-| | `xyz2mol_local`, `xyz2mol_tmc` | vendored xyz2mol and its transition-metal bond-order and charge search |
-| | `perceive` | `read_xyz`: connectivity and bond-order backends, fallbacks and the charge warning |
-| | `nci` | the `KINDS` registry of contact kinds, contacts as constraints, binding-mode signatures |
-| | `select` | descriptors, clustering and pruning |
-| | `viz` | the ensemble landscape plot |
-| | `metrics` | bond sanity and connectivity diffs |
-| | `stereo_check` | stereo fingerprints for chirality-aware selection |
-| | `geom_check` | the physical geometry gate (`check`, `GeometryReport`) |
-| | `ensemble` | `Ensemble`, `EnsembleSet`, `Coembedded` and `wrap`: publication and workflow operations |
-| | `dispatch` | the `embed`, `coembed`, `metal` and `minimize` verbs and input adaptation |
-| facades | `pipeline/__init__`, `rxembed/__init__` | public names only |
+An unconstrained `embed` returns ETKDG seeds as they are; the loop runs when relaxation is required or requested.
 
-The engine sits below the metal compile on purpose: `mechanisms`, `relax` and `bounds` read `Constraints` as
-data and know nothing about metal identity, while the compile and the screen use them as tools. Data still flows
-compile, then engine, then embed.
-
-## Flow
-
-```text
-source
-  -> pipeline normalization and identity expansion
-  -> Candidate(Isomer or Mol, fix, tags)
-  -> prepare -> Constraints
-  -> edited RDKit bounds -> seed and graft -> Conformers
-  -> restrained UFF -> core and workflow checks -> replacement
-  -> Ensemble or EnsembleSet, or list[EnsembleSet] for stereo="separate"
-  -> optional search, selection, scoring and QA
+```mermaid
+flowchart TD
+    Seed["Seeds or supplied geometry"] --> Relax["Relax coordinates"]
+    Relax --> Check["Check identity + geometry"]
+    Check -- accepted --> Keep["Keep conformer<br/>record convergence separately"]
+    Check -- "bounded same-seed repair" --> Repair["Repair / increase stiffness"]
+    Repair --> Relax
+    Check -- "fresh-seed replacement allowed<br/>and budget remains" --> Seed
+    Check -- "cannot recover" --> Failure["Report omission or raise<br/>according to the contract"]
 ```
 
-`pipeline.dispatch` expands organic stereo, metal identities, open-site coordination and automatic contacts
-into candidates. `_execute` is the only place a candidate enters core. When a call expands into two or more
-candidates, one that raises `EmbeddingError` is skipped with one warning line and kept in
-`EnsembleSet.errors`, and the result stays an `EnsembleSet`; the call raises only when none embeds. A lone
-candidate, such as one selected `Isomer`, raises its own error. An expanded stereoisomer or contact mode also
-records any other `ValueError` or `RuntimeError` there, as an `EmbeddingError` naming it.
+- Enumeration gives species, not conformers, after symmetry and feasibility screens.
+- Preparation compiles twice, because the soft contacts it keeps change which donors are independent.
+- Recovery never changes the `Constraints` or the gates; a required failure raises and a permitted one keeps its
+  reason.
+- Conformer search (`mc`) re-enters relaxation, acceptance and selection under the same species.
 
-`embed.prepare` turns a `Mol` or selected `Isomer` plus `fix`, `constrain` and soft `contacts` into one `Constraints` value.
-`seed_conformers` edits RDKit's bounds matrix, embeds, grafts fixed coordinates and picks seeds with the
-requested metal hand and haptic winding. `embed.prepare_relax` and `pipeline.dispatch.minimize` share the same
-preparation and graft to relax existing coordinates without a search.
+## Coembedding
 
-## Rules
+Both endpoints share one mapped atom order and grow from one seed of a union graph whose changing bonds have zero
+order, falling back to an endpoint's own seeds when no union seed passes. Each endpoint relaxes on its own chemical
+graph, coupled atom by atom to its partner, and a pair is kept only when both pass their gates. `fixed=` holds one
+supplied endpoint in its frame and builds the other there. rxts owns reaction mapping and TS scanning and takes a
+`Coembedded`.
 
-- Select chemical identity before numerical geometry. `coordinate=` fills open vertices on a copied `Isomer`;
-  it is not a late constraint patch.
-- `Constraints` is the only geometry payload. Mechanisms translate it into matching distance-geometry bounds
-  and force-field terms.
-- `fix` is rigid, `constrain` is releasable, and `template` supplies coordinates to `fix`. Rigid terms win over
-  inferred soft contacts; competing soft terms are errors. A torsion is owned by its central bond, and a
-  coordinate graft removes a generated term only when it owns every real atom that defines it.
-- Keep the selected `Isomer` attached through embedding, search, minimization and validation. It records metal
-  connectivity, occupied slots, hand and haptic winding.
-- Never put a real-metal graph into ETKDG or a force field. Core uses a surrogate graph, then restores and
-  validates the selected metal state, including its formal charge.
-- Keep structural validity separate from optimizer convergence. Replace or raise on wrong identity. Report an
-  unconverged conformer only when it still satisfies the structural rules.
-- Reject non-finite coordinates before distance, shape, connectivity or frozen-core checks.
-- Use `constraints.constraint_value` for distances, angles, periodic dihedrals and haptic centroids.
+## Owners
 
-### Identity and enumeration
-
-`Isomer.cons` compiles `Constraints` afresh through `metal_constraints` on every access, so retained and
-enumerated states share one compiler. Model M-L distances (`lengths="model"`) are the default; `lengths="input"`
-measures them from the supplied conformer. Angle preferences come from the polyhedron and the ligand graph in
-both modes.
-
-`metal_slots` reduces donor-slot assignments by proper rotations and ligand equivalence. `metal_enumeration`
-combines metal, ligand and haptic stereo and screens the candidates of a tethered sphere. Only the first of three
-screens is a proof, and it is a proof against the compiled model, not against chemistry:
-
-- The reach certificate rejects a single-centre candidate whose compiled constraints contradict the ligands'
-  native reach (row, triangle-smoothing and Euclidean certificates).
-- The `metal_slots` edge rule holds each short chelate pair to a polyhedron hull edge, a measured claim.
-- The haptic span test, and for a multi-metal candidate in place of the certificate the trans span test, are
-  model priors.
-
-Passing the screen proves nothing. `screen=False` and any `fix=` turn all three off, but not symmetry reduction
-or embedding validation, and the input conformer's own arrangement is exempt when its donor spans fit the native
-reach. `observed_only=True` returns only the measured assignment. More than `MAX_EXHAUSTIVE_ORBITS` assignments
-raise.
-
-### Bounds and relaxation
-
-`bounds` starts from native RDKit bounds and has one ordering: generate windows, relieve obsolete floors, commit
-stated windows, project dependent terms, then triangle-smooth. Passing the smoothing does not establish that a
-3D structure exists. An empty search is not retried.
-
-`EmbedParams` is the one object that reproduces a seed batch. `Conformers.params` carries it, and
-`bounds.resolve_params` folds a facade's plain `seed` and `threads` into one. `coplanar_14` and
-`metal_floor_relief` filter a constraint copy only while the matrix is built; UFF and acceptance keep the full
-payload.
-
-`relax` owns one restrained UFF attempt, including private typing and optimizer status; an exception restores
-the selected coordinates. Public graphs keep real atoms and bonds; surrogate metals and haptic centroid helpers
-stay private.
-
-For coembedding, `pipeline.dispatch` adapts inputs and classifies reacting groups; `coembedding` manages
-paired seeds and uses the coupled optimizer in `relax` with `Conformers` acceptance/recovery.
-`pipeline.ensemble.Coembedded` publishes both endpoints in their shared frame.
-
-### Acceptance and recovery
-
-`Conformers` owns core validation and both bounded recovery loops: same-seed stiffness retries and up to three
-fresh-seed replacement batches. Replacement batches reuse the same relaxation and acceptance code without
-recursing, and accepted replacements keep their conformer ids.
-
-Core checks cover finite coordinates, numeric fixes, ligand bonds, rigid shapes, the selected metal state and
-coordination terms. The shape gate lives in `metal_perceive`: the requested polyhedron must read within
-`_FIT_MARGIN` of the best reading, and each accepted conformer carries the `shape` record. Each `Failure` is
-built by the check that finds it, in chemistry words, and grouped by `Failure.key` (kind and site). Retries log
-at DEBUG; an `EmbeddingError` is one sentence naming the isomer, the most common failure and one remedy, with the
-counts on `EmbeddingError.failures`.
-
-`pipeline.Ensemble` adds workflow checks: requested stereo, donor hands, `geom_check` for metal workflows and,
-with the `workflow` extra, connectivity. `.check()` reports QA diagnostics and `.filter()` enforces them.
-
-### Input and optional capabilities
-
-`pipeline/perceive.py` owns the connectivity and bond-order backends. A fallback warns, records the backend used,
-and may not drop or reorder atoms or change the requested charge; `fallback=False` makes the chosen backends
-strict. Optional search, calculator and QA backends are imported at point of use, and core behaviour does not
-depend on installed extras.
-
-## Where changes go
-
-| adding | existing owner |
+| Responsibility | Owners |
 |---|---|
-| constraint kind | `Constraints` field plus a root `Mechanism` |
-| coordination shape | `metal_polyhedron.POLYHEDRA` row |
-| NCI contact kind | `pipeline.nci.KINDS` row |
-| search or calculator backend | `pipeline/search.py` or `pipeline/calculators.py` |
-| QA or input format | the owning `pipeline/` module |
-| package-managed optional dependency | `pyproject.toml` extra plus guarded point-of-use import |
+| Input and composition | [`api`](src/rxembed/api.py), [`perception/readers`](src/rxembed/perception/readers.py), [`engine/atom_mapping`](src/rxembed/engine/atom_mapping.py) |
+| Identity, stereo and enumeration | [`identity`](src/rxembed/identity/), [`stereo`](src/rxembed/stereo.py) |
+| Requirements and preparation | [`geometry/constraints`](src/rxembed/geometry/constraints.py), [`metal`](src/rxembed/metal/), [`engine/seeding`](src/rxembed/engine/seeding.py) |
+| Numerical construction | [`geometry`](src/rxembed/geometry/), [`engine/conformers`](src/rxembed/engine/conformers.py), [`engine/coembed`](src/rxembed/engine/coembed.py) |
+| Acceptance | [`engine/acceptance`](src/rxembed/engine/acceptance.py) |
+| Non-covalent contacts | xyzgraph detects them; [`perception/contacts`](src/rxembed/perception/contacts.py) proposes modes and holds them |
+| Results and workflow | [`ensemble`](src/rxembed/ensemble.py), [`workflow`](src/rxembed/workflow/) |
+| Binding patterns along a reaction path | rxflow |
 
-Keep chemistry rationale beside its owning code and measured results in `benchmark/baseline.csv`. Do not add
-another package directory merely to mark a tier.
+The foundations `graph`, `stereo` and `utils` sit flat at the top. Each folder imports only them and the folders
+before it: `geometry`, `metal`, `identity` and `engine` form the core (NumPy and RDKit), `perception` adds xyzgraph and
+NetworkX, `workflow` the optional extras, and `api` and `ensemble` compose them.
+
+## Open gaps
+
+- A metal's sites have three views: the atoms that form one site (`graph.haptic_sites`), the identity record
+  (`metal/centres.Site`) and the engine's centroid atoms (`Constraints.haptic`). The index map between them
+  (`Sites`, `Collapsed`) numbers centroid dummies per centre in one form and per species in the other; no per-centre
+  number leaves the call that made it.
