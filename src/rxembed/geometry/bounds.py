@@ -504,8 +504,8 @@ def seed_coordinates(mol, cons, n, sampling, *, enforce_chirality=True):
 
 
 # (useLegacyImplementation, useRandomCoords) per phase: rxembed's AIO search, then legacy refinement from random
-# starts, fast where AIO's starts fail (Mn-H2), then AIO from random starts, which holds where legacy refinement
-# cannot (tmQMg NAKXIG, an eta2 alkyne on Os)
+# starts, fast where AIO's starts fail (a Mn H2 complex), then AIO from random starts, which holds where legacy
+# refinement cannot (an eta2 alkyne on Os)
 _SEED_PHASES = ((False, False), (True, True), (False, True))
 
 
