@@ -2,7 +2,7 @@
 
 ## xyz2mol_tm
 
-`src/rxembed/pipeline/xyz2mol_tmc.py` and `src/rxembed/pipeline/xyz2mol_local.py`  contains modified code from
+`src/rxembed/perception/xyz2mol_tmc.py` and `src/rxembed/perception/xyz2mol_local.py`  contains modified code from
 [jensengroup/xyz2mol_tm](https://github.com/jensengroup/xyz2mol_tm).
 
 MIT License

@@ -1,205 +1,83 @@
-"""Test shared coordinate, RDKit and QA helpers."""
-
-from __future__ import annotations
+"""`utils.py`: the RDKit facts every layer shares, a ranking and a bond edit that keep what a graph means."""
 
 import numpy as np
-import pytest
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom
 
-from rxembed.metal_smiles import parse_smiles
-from rxembed.utils import (
-    assign_stereo_from_3d,
-    bond_removal_mirrors,
-    flat_ranks,
-    map_reaction,
-    repair_bond_stereo,
-)
+import rxembed as rx
+from rxembed.identity.smiles_io import parse_smiles
+from rxembed.utils import bond_removal_mirrors, conjugated_quartets, flat_ranks, remove_bond
 
 
-def _mol(smiles, seed=None):
-    """A Mol with explicit Hs, carrying a conformer only when a seed is given."""
-    mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
-    if seed is not None:
-        assert rdDistGeom.EmbedMolecule(mol, randomSeed=seed) == 0
-    return mol
+def test_flat_ranks_ignore_where_charge_or_bond_order_is_drawn():
+    """Acac's -1 written on one oxygen ranks neither apart; a map ranks atoms only when asked, ties break when asked."""
+    for name, smiles, options, atoms, alike in (
+        ("acac oxygens", r"CC(=O)/C=C(\C)[O-]", {}, (2, 6), True),
+        ("mapped ethane", "[CH3:1][CH3:2]", {}, (0, 1), True),
+        ("ranked by map", "[CH3:1][CH3:2]", {"maps": True}, (0, 1), False),
+        ("ties broken", "CC", {"break_ties": True}, (0, 1), False),
+    ):
+        ranks = flat_ranks(Chem.AddHs(Chem.MolFromSmiles(smiles)), **options)
+        assert (ranks[atoms[0]] == ranks[atoms[1]]) is alike, name
 
 
-def _without(mol, atom):
-    """Delete `atom`, keeping any conformer: the bond surgery `repair_bond_stereo` cleans up after."""
-    rw = Chem.RWMol(mol)
-    rw.RemoveAtom(atom)
-    out = rw.GetMol()
-    out.UpdatePropertyCache(strict=False)
-    return out
+def test_bond_removal_mirrors_by_slot_parity_at_given_degrees():
+    """Removing slot p of n bonds costs n - 1 - p swaps; a degree-five P has no tetrahedral parity to keep."""
+    for smiles, partner, degrees, mirrors in (
+        ("F[C@](Cl)(Br)I", 0, (4,), True),
+        ("F[C@](Cl)(Br)I", 2, (4,), False),
+        ("F[P@](Cl)Br", 2, (4,), False),
+        ("F[P@](Cl)Br", 2, (3, 4), True),
+        ("F[P@](Cl)(Br)(I)F", 2, (4,), False),
+    ):
+        mol = Chem.MolFromSmiles(smiles, sanitize=False)
+        assert bond_removal_mirrors(mol.GetAtomWithIdx(1), partner, degrees) is mirrors, (smiles, partner, degrees)
 
 
-# ---------------------------------------------------------------------------------------------------------
-# coordinate math
-# ---------------------------------------------------------------------------------------------------------
+def test_remove_bond_keeps_what_a_tetrahedral_or_ez_tag_means():
+    """The ligand left is the free one with a lone pair where Pt was, in any bond order; an E/Z drawn against Pt moves
+    to the other substituent of its end, or is dropped where there is none."""
+    for name, smiles, bond, free in (
+        ("P drawn second", "C[P@@](->[Pt])(CC)c1ccccc1", (1, 2), "C[P@@](CC)c1ccccc1.[Pt]"),
+        ("P drawn third", "C[P@](CC)(->[Pt])c1ccccc1", (1, 4), "C[P@@](CC)c1ccccc1.[Pt]"),
+        ("imine against Pt", r"C/C=N(/[Pt])C", (2, 3), r"C/C=N\C.[Pt]"),
+        ("imine N bare", r"C/C=N/[Pt]", (2, 3), "CC=N.[Pt]"),
+    ):
+        rw = Chem.RWMol(Chem.MolFromSmiles(smiles))
+
+        remove_bond(rw, *bond)
+
+        rw.UpdatePropertyCache(strict=False)
+        assert Chem.MolToSmiles(rw) == Chem.MolToSmiles(Chem.MolFromSmiles(free)), name
 
 
-# ---------------------------------------------------------------------------------------------------------
-# conjugated_quartets: the one perception the QA gate and the FF cap must agree on
-# ---------------------------------------------------------------------------------------------------------
+def test_without_zero_bonds_drops_only_zero_order_contacts():
+    """An O...N contact goes; the stereocentre, the silver dative, the maps and the conformer stay, the input too."""
+    molecule = Chem.AddHs(Chem.MolFromSmiles("F[C@H](O)C=O.[NH3]->[Ag+]"))
+    for atom in molecule.GetAtoms():
+        atom.SetAtomMapNum(atom.GetIdx() + 1)
+    conformer = Chem.Conformer(molecule.GetNumAtoms())
+    conformer.SetPositions(np.arange(molecule.GetNumAtoms() * 3, dtype=float).reshape(-1, 3))
+    molecule.AddConformer(conformer)
+    contacted = Chem.RWMol(molecule)
+    contacted.AddBond(2, 5, Chem.BondType.ZERO)
+    before = Chem.MolsToJSON([contacted])
+
+    chemical = rx.without_zero_bonds(contacted)
+
+    assert Chem.MolToSmiles(chemical, canonical=False) == Chem.MolToSmiles(molecule, canonical=False)
+    np.testing.assert_array_equal(chemical.GetConformer().GetPositions(), molecule.GetConformer().GetPositions())
+    assert Chem.MolsToJSON([contacted]) == before
+    assert rx.without_zero_bonds(molecule) is molecule
 
 
-# ---------------------------------------------------------------------------------------------------------
-# flat_ranks: charge and bond order removed before canonical ranking, so a delocalised -1 written on one
-# arbitrary donor cannot rank it apart from its chemically equivalent partner
-# ---------------------------------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "smiles",
-    [
-        "CC(=O)/C=C(\\C)[O-]",  # acac: same delocalised-oxygen artefact over a longer conjugated backbone
-    ],
-)
-def test_delocalised_oxygens_rank_equal_despite_the_written_charge(smiles):
-    mol = _mol(smiles)
-    oxygens = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetSymbol() == "O"]
-    assert len(oxygens) == 2
-
-    charged_ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
-    assert charged_ranks[oxygens[0]] != charged_ranks[oxygens[1]], (
-        "fixture no longer carries the artefact: the two oxygens already rank equal with charge intact"
-    )
-
-    ranks = flat_ranks(mol)
-    assert ranks[oxygens[0]] == ranks[oxygens[1]]
-
-
-# ---------------------------------------------------------------------------------------------------------
-# repair_bond_stereo: the cleanup bond surgery needs
-# ---------------------------------------------------------------------------------------------------------
-
-
-def test_bond_removal_drops_orphaned_stereo_flag():
-    work = _without(Chem.MolFromSmiles(r"C/C=C/Cl"), 3)  # no conformer: nothing to re-perceive from
-    assert repair_bond_stereo(work) == 1
-    for b in work.GetBonds():
-        assert b.GetStereo() == Chem.BondStereo.STEREONONE, "a flagged bond kept fewer than two reference atoms"
-
-    clean = _mol(r"C/C=C/C", seed=1)
-    Chem.AssignStereochemistryFrom3D(clean)
-    before = [(b.GetIdx(), b.GetStereo()) for b in clean.GetBonds()]
-    assert repair_bond_stereo(clean) == 0, "nothing was orphaned, so nothing may be re-perceived"
-    assert [(b.GetIdx(), b.GetStereo()) for b in clean.GetBonds()] == before
-
-
-def test_geometry_rebases_orphaned_ez_flag():
-    work = _without(_mol(r"C/C=C/Cl", seed=1), 3)  # the Cl was one of the two reference atoms
-    assert repair_bond_stereo(work) == 1
-    bond = work.GetBondBetweenAtoms(1, 2)
-    assert bond.GetStereo() != Chem.BondStereo.STEREONONE, "the E/Z was discarded, not re-referenced"
-    assert len(bond.GetStereoAtoms()) == 2
-    assert 3 not in list(bond.GetStereoAtoms())
-
-
-# ---------------------------------------------------------------------------------------------------------
-# the chiral tag is a parity over the atom's own bond order (`bond_removal_mirrors` / `remove_bond`)
-# ---------------------------------------------------------------------------------------------------------
-
-
-def _names_the_hand(mol, centre):
-    """Whether the tag at `centre` names its conformer's hand, in whatever bond order it has now.
-
-    RDKit's own definition: the signed volume of the FIRST THREE bonds about the centre, negative for CW. It
-    holds at degree 3 as at degree 4, the fourth reference (implicit H, lone pair, the centre itself) sitting
-    last either way. Calibrated against `AssignStereochemistryFrom3D` by the first test below, not assumed.
-    """
-    atom = mol.GetAtomWithIdx(centre)
-    nbrs = [b.GetOtherAtomIdx(centre) for b in atom.GetBonds()][:3]
-    p = mol.GetConformer().GetPositions()
-    vol = float(np.dot(np.cross(p[nbrs[0]] - p[centre], p[nbrs[1]] - p[centre]), p[nbrs[2]] - p[centre]))
-    cw = Chem.ChiralType.CHI_TETRAHEDRAL_CW
-    return atom.GetChiralTag() == (cw if vol < 0 else Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
-
-
-@pytest.mark.parametrize(
-    ("smiles", "slot", "mirrors"),
-    [
-        ("F[P@](Cl)(Br)(I)F", 1, False),  # degree 5: the arithmetic would say odd, and is refuted there
-    ],
-    ids=["hypervalent"],
-)
-def test_parity_rule_is_bounded_to_degree_four(smiles, slot, mirrors):
-    mol = Chem.MolFromSmiles(smiles, sanitize=False)
-    mol.UpdatePropertyCache(strict=False)
-    centre = mol.GetAtomWithIdx(1)
-    partner = [b.GetOtherAtomIdx(1) for b in centre.GetBonds()][slot]
-    assert bond_removal_mirrors(centre, partner) is mirrors
-
-
-# ---------------------------------------------------------------------------------------------------------
-# assign_stereo_from_3d: the writer half of the same rule
-# ---------------------------------------------------------------------------------------------------------
-
-# A sulfoxide S donating through a dative arrow: the one shape where RDKit's 3D writer both assigns a tag and
-# reads a different bond order from every one of its readers. `->` puts the same bond LAST, the even control.
-_DATIVE_S = "Cl[Pd](Cl)(Cl)<-[S@](=O)(C)CC"
-
-
-def _sulfur(mol):
-    return next(a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "S")
-
-
-def test_rdkit_3d_writer_emits_unreadable_bond_order():
-    mol = _mol(_DATIVE_S, seed=0xF00D)
-    centre = _sulfur(mol)
-    Chem.AssignStereochemistryFrom3D(mol)  # deliberately the RAW call: this test is about what it does
-    assert mol.GetAtomWithIdx(centre).GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED, "nothing was written"
-    assert not _names_the_hand(mol, centre), "the writer already agrees with its readers; the premise is gone"
-
-
-@pytest.mark.parametrize("smiles", [_DATIVE_S], ids=["dative-first"])
-def test_3d_stereo_matches_reader_bond_order(smiles):
-    mol = _mol(smiles, seed=0xF00D)
-    centre = _sulfur(mol)
-    assign_stereo_from_3d(mol)
-    assert mol.GetAtomWithIdx(centre).GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED, "nothing was written"
-    assert _names_the_hand(mol, centre), "the tag names the mirror of the geometry it was written from"
-
-
-def _changes(reaction):
-    """Return the bonds `map_reaction` breaks and forms for a ``'reactant>>product'`` SMILES."""
-    sides = map_reaction(*(Chem.AddHs(parse_smiles(side)) for side in reaction.split(">>")))
-    bonds = [{tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))) for b in mol.GetBonds()} for mol in sides]
-    return bonds[0] - bonds[1], bonds[1] - bonds[0]
-
-
-@pytest.mark.parametrize(
-    ("reaction", "broken", "formed"),
-    [
-        ("CC(=O)O.[O-]c1ccccc1>>CC(=O)[O-].Oc1ccccc1", {(3, 14)}, {(4, 14)}),  # O-H count balances: a spare pair
-        ("CC(C)O>>CC(C)=O.[H][H]", {(1, 7), (3, 11)}, {(7, 11)}),  # the two leaving H differ, yet form one H2
-        ("[CH2:1]=C[CH2:2]OC=C>>[CH2:2]=C[CH2:1]CC=O", {(2, 3)}, {(0, 5)}),  # mapped allyl ends pin a [3,3] shift
-    ],
-    ids=("acetic-acid-protonates-phenoxide", "isopropanol-dehydrogenates-to-acetone", "mapped-claisen"),
-)
-def test_map_reaction_keeps_the_most_bonds(reaction, broken, formed):
-    assert _changes(reaction) == (broken, formed)
-
-
-@pytest.mark.parametrize(
-    "reaction",
-    ["C=CCOC=C>>C=CCCC=O", "CC(=O)C.CC(=O)C>>C=C(O)C.C=C(O)C"],
-    ids=("claisen-as-3-3-or-1-3-shift", "acetone-pair-with-either-proton-on-either-oxygen"),
-)
-def test_map_reaction_asks_for_a_map_where_the_graphs_allow_two_reactions(reaction):
-    with pytest.raises(ValueError, match="map the reacting atoms"):
-        _changes(reaction)
-
-
-def test_map_reaction_follows_a_fully_mapped_proton_relay_through_three_waters():
-    pyridone = (
-        "[O:1]=[c:2]1[c:3]([H:11])[c:4]([H:12])[c:5]([H:13])[c:6]([H:14])[n:7]1[H:15]"
-        ".[O:8]([H:16])[H:17].[O:9]([H:18])[H:19].[O:10]([H:20])[H:21]"
-    )
-    hydroxypyridine = (
-        "[O:1]([H:20])[c:2]1[c:3]([H:11])[c:4]([H:12])[c:5]([H:13])[c:6]([H:14])[n:7]1"
-        ".[O:8]([H:15])[H:17].[O:9]([H:16])[H:19].[O:10]([H:18])[H:21]"
-    )
-    broken, formed = _changes(f"{pyridone}>>{hydroxypyridine}")
-    assert len(broken) == len(formed) == 4  # the map's relay, not the direct N-H to O transfer
+def test_conjugated_quartets_are_open_amide_or_ester_planes():
+    """A lactam's ring bond, a thioester's S, a dative N-Pd substituent and an excluded atom give none."""
+    quartets = {  # (SMILES, excluded atoms) -> its quartets
+        ("CC(=O)NC", ()): [(2, 1, 3, 4)],
+        ("CC(=O)OC", ()): [(2, 1, 3, 4)],
+        ("CC(=O)NC", (3,)): [],
+        ("O=C1NCCC1", ()): [],
+        ("CC(=O)SC", ()): [],
+        ("CC(=O)[NH]->[Pd+2]", ()): [],
+    }
+    assert {key: list(conjugated_quartets(parse_smiles(key[0]), key[1])) for key in quartets} == quartets

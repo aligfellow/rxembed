@@ -22,7 +22,7 @@ from rdkit.Chem import rdMolAlign
 from rdkit.SimDivFilters import rdSimDivPickers
 
 import rxembed as rx
-from rxembed.metal_core import COORDINATION_METALS
+from rxembed.graph import COORDINATION_METALS
 
 HERE = Path(__file__).resolve().parent
 _PT = Chem.GetPeriodicTable()
@@ -302,21 +302,21 @@ def _kappa_eta(mol):
 
 
 def _stereo_kinds(ref):
-    """Read the input's own stereo kinds through the public, non-enumerating `rx.metal(ref, lengths=
-    "model", observed_only=True)[0]`: it reads the one arrangement `ref` already has, nothing more.
+    """Read the input's own stereo kinds from `rx.identity(ref)`, which reads the one arrangement `ref` has.
 
     Descriptor only, never a gate: if perception raises (an unsupported polyhedron, say), stereo comes
     back empty and pass/fail is untouched. A kind is a point (R/S/r/s -> 'point', CW/CCW -> 'donor
     hand', locked with no CIP), a bond ('E/Z'), or an axis ('diene' when both its atoms sit in one
     haptic face, else 'atrop'), plus 'winding' / 'planar' for the metal centre itself.
-    """  # noqa: D205
+    """
     try:
-        iso = rx.metal(ref, lengths="model", observed_only=True)[0]
+        ident = rx.identity(ref)
+        centre = ident.centres[0]
     except Exception:
         return ""
-    kinds = {k for k, v in (("winding", iso.chirality), ("planar", iso.haptic_configuration)) if v}
-    faces = [set(atoms) for atoms in iso.haptic.values()]
-    for part in filter(None, iso.stereo_label.split(",")):
+    kinds = {k for k, v in (("winding", centre.hand), ("planar", any(ident.haptic))) if v}
+    faces = [set(v.atoms) for v in centre.vertices if v and len(v.atoms) > 1]
+    for part in filter(None, ident.stereo.split(",")):
         if "=" in part:
             kinds.add("E/Z")
         elif "-" in part:
