@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
-from rdkit.Chem.rdMolTransforms import GetBondLength
+from rdkit.Chem.rdMolTransforms import GetAngleDeg, GetBondLength
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
@@ -106,6 +106,24 @@ def test_restrained_uff_scores_each_conformer_on_its_own_field():
     native = [rdForceFieldHelpers.UFFGetMoleculeForceField(borane, confId=cid).CalcEnergy() for cid in (4, 9)]
     assert restrained_uff(borane, Constraints(), max_iters=0) == pytest.approx(native)
     assert restrained_uff(borane, Constraints(), max_iters=0, conf_ids=[9]) == pytest.approx(native[1:])
+
+
+def test_restrained_uff_keeps_three_centre_hydrogen_bridges_bent():
+    """UFF gives a two-legged hydrogen its linear angle term, which flattens a B2H2 ring and loses both boron hands."""
+    for smiles, widest in (("C[B@H-]1[H+][B@H-](C)[H+]1", 95.0), ("[BH3-][H+][BH3-]", 150.0)):
+        species = rx.isomers(smiles)[0]
+
+        mol = rx.embed(species, n=2, seed=17, threads=1).minimize().mol
+
+        angles = [
+            GetAngleDeg(conf, a.GetIdx(), h.GetIdx(), b.GetIdx())
+            for conf in mol.GetConformers()
+            for h in mol.GetAtoms()
+            if h.GetAtomicNum() == 1 and h.GetDegree() == 2
+            for a, b in [h.GetNeighbors()]
+        ]
+        assert max(angles) < widest, (smiles, angles)
+        assert rx.identity(mol).stereo == rx.identity(species).stereo, smiles
 
 
 def test_unbuildable_uff_objective_is_refused_and_restored():

@@ -17,6 +17,7 @@ from rdkit.Geometry import Point3D
 from rxembed.geometry.mechanisms import MECHANISM_ORDER
 from rxembed.graph import (
     COORDINATION_METALS,
+    hydrogen_bond,
     materialise_phantoms,
     metal_indices,
     strip_phantoms,
@@ -209,6 +210,34 @@ def _ff_surrogate(mol, metals, phantoms=()):
     return out
 
 
+def _bent_bridges(graph, mol):
+    """Return `graph`, or a copy with each three-centre hydrogen bridge of `mol` (B-H-B) typed SP2 so UFF bends it.
+
+    RDKit types every hydrogen H_ (theta0 180) and never its bent bridge type H_b, and sanitisation tags a two-legged
+    hydrogen SP, so the bridge gets the linear angle term. The builder takes the angle form from hybridisation: SP2
+    gives RDKit's 90 degree term in a four-membered ring and 120 degrees elsewhere, where `TrigonalAngle`'s 90 degree
+    floor then applies too. A proton shared between lone pairs is a hydrogen bond (`hydrogen_bond`) and stays linear.
+    """
+    metals = set(metal_indices(mol))
+    bridges = [
+        atom.GetIdx()
+        for atom in mol.GetAtoms()
+        if atom.GetAtomicNum() == 1
+        and atom.GetDegree() == 2  # noqa: PLR2004  two-legged
+        and all(
+            bond.GetBondType() == Chem.BondType.SINGLE and not hydrogen_bond(atom, bond.GetOtherAtom(atom), metals)
+            for bond in atom.GetBonds()
+        )
+    ]
+    if not bridges:
+        return graph
+    out = Chem.Mol(graph)
+    for idx in bridges:
+        out.GetAtomWithIdx(idx).SetHybridization(Chem.HybridizationType.SP2)
+    logger.debug("UFF: private SP2 typing for bridging H %s", ", ".join(atom_label(mol, h) for h in bridges))
+    return out
+
+
 def _uff_typeable(mol, phantoms):
     """Return whether RDKit has a UFF atom type for every real atom."""
     with rdBase.BlockLogs():
@@ -386,6 +415,7 @@ def _uff_target(mol, cons, record):
     """
     work = _ff_surrogate(materialise_phantoms(mol, cons.haptic), cons.metals, cons.phantoms)
     target = UFFTarget(*_select_uff_graph(work, cons, set(cons.frozen)))
+    target = target._replace(mol=_bent_bridges(target.mol, mol))
     _report_uff_typing(mol, target.retyped, target.replacements, record)
     return target
 
