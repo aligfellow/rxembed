@@ -27,6 +27,7 @@ from rxembed.geometry.mechanisms import law_of_cosines, opposite_angle, triangle
 from rxembed.graph import ETA2, frag_map, haptic_sites, ligand_graph
 from rxembed.metal.centres import Centre, donor_bonds, engine_graph, logger, vertex_atom
 from rxembed.metal.distances import (
+    BRIDGE_ANGLE,
     BRIDGE_H,
     INPUT_HALF_WIDTH,
     bridge_floors,
@@ -336,7 +337,9 @@ def compile_constraints(species, request=None, contacts=None, *, params=None, fa
             facts=facts,
         )
         built.append(coordination(sphere))
-    bridges = bridge_floors(facts.donor_bonds, {c.atom: c.atomic_num for c in species.centres}, base.frozen)
+    legs = {key: window for cons in built for key, window in cons.distances.items()}
+    real_z = {centre.atom: centre.atomic_num for centre in species.centres}
+    bridges = bridge_floors(mol, legs, facts.donor_bonds, real_z, base.frozen)
     out = compose(*built, bridges, base) if built or bridges.floors else base  # nothing held composes to the base
     out = _add_donor_angle_floors(out, mol, facts)
     stereo = species.held_stereo
@@ -573,9 +576,11 @@ def bite_window_and_reach(facts, left, right, donors, lengths, row):
 
 
 def seated_bites(sphere, distances):
-    """Return each same-ligand donor pair's (window, reach) angle windows, keyed by its seated site pair.
+    """Return each ring-closing donor pair's (window, reach) angle windows, keyed by its seated site pair.
 
-    Each is drawn about the polyhedron's own pair angle; a trans pair (`Polyhedron.trans_pairs`) gets none.
+    A ring closes through one ligand's backbone, or through a second metal both donors bind (`_ring_bite`). Each
+    same-ligand window is drawn about the polyhedron's own pair angle; a trans pair (`Polyhedron.trans_pairs`) gets
+    none.
     """
     metal, od, haptic, facts = sphere.metal, sphere.vertices, sphere.haptic, sphere.facts
     wide, real = sphere.poly.trans_pairs, frozenset(sphere.real)  # a bite's calibrated window reads the co-donors
@@ -583,7 +588,11 @@ def seated_bites(sphere, distances):
     for i, j in itertools.combinations(range(len(od)), 2):
         left, right = od[i], od[j]
         pair = frozenset((i, j))
-        if VACANT in (left, right) or sphere.frag_of(left) != sphere.frag_of(right) or (i, j) in wide:
+        if VACANT in (left, right) or (i, j) in wide:
+            continue
+        if sphere.frag_of(left) != sphere.frag_of(right):
+            if (bite := _ring_bite(sphere, left, right, distances)) is not None:
+                bites[pair] = bite
             continue
         keys = (canonical_key((metal, left)), canonical_key((metal, right)))
         lengths = (0.5 * sum(distances[keys[0]]), 0.5 * sum(distances[keys[1]]))
@@ -596,6 +605,24 @@ def seated_bites(sphere, distances):
         if (bite := facts.memo[bite_key]) is not None:
             bites[pair] = bite
     return bites
+
+
+def _ring_bite(sphere, left, right, distances):
+    """Return the (window, reach) of two donors that close a ring through a second metal both bind, else None.
+
+    The second metal is the ring's backbone, as a chelate's is: the angle runs from the donors' contact floor to the
+    ring lying flat with `BRIDGE_ANGLE` at both bridges. The polyhedron's ideal angle may not close it: a
+    trigonal-planar Zn2(mu-H)2 ring closes near 90 degrees on each Zn, against a 112-128 degree row.
+    """
+    if left in sphere.haptic or right in sphere.haptic:
+        return None
+    metal, facts = sphere.metal, sphere.facts
+    if not {m for d, m in facts.donor_bonds if d == left} & {m for d, m in facts.donor_bonds if d == right} - {metal}:
+        return None
+    # ponytail: the two metals split the flat ring's other 180 degrees evenly, as equal legs do; a mixed-metal ring
+    # (Pt-H 1.73, Ir-H 1.88) tilts it a few degrees toward the shorter legs
+    window = (_contact_angle(sphere.mol, metal, left, right, distances), STRAIGHT - BRIDGE_ANGLE)
+    return (window, window) if window[0] < window[1] else None
 
 
 def _bite_corners(bites):
@@ -753,7 +780,8 @@ def _chelate_bite_images(sphere, bites):
     gives weak pulls, else the usable corner nearest it, else none.
     """
     od = sphere.vertices
-    blocked = set(sphere.frozen) | set(sphere.coupled)
+    ring_donors = {od[i] for pair in bites if len({sphere.frag_of(od[k]) for k in pair}) > 1 for i in pair}
+    blocked = set(sphere.frozen) | (set(sphere.coupled) - ring_donors)  # a ring donor's other metal is its backbone
     bite_fragments = {sphere.frag_of(od[i]) for pair in bites for i in pair}
     corner_images, mid_angles = [], None
     windows = {pair: window for pair, (window, _reach) in bites.items()}
@@ -870,7 +898,8 @@ def _donor_length(sphere, donor, charges, hyb, eta):
     """
     if sphere.pos is not None:
         return float(np.linalg.norm(sphere.pos[sphere.metal] - sphere.pos[donor]))
-    return ml_distance(sphere.mol, donor, sphere.real_z, charges=charges, hyb=hyb, eta=eta)
+    metals = sphere.facts.bound[donor]
+    return ml_distance(sphere.mol, donor, sphere.real_z, charges=charges, hyb=hyb, eta=eta, metals=metals)
 
 
 def _donor_window(sphere, target):

@@ -72,9 +72,18 @@ def _titanium_alkyl(chain):
     return placed(mol, [(0, 0, 0), (-2.2, 0, 0), (0, -2.2, 0), (0, 0, 2.2), *chain])
 
 
+def _manganese_pair(gap):
+    """Return Cl0->Mn1-Mn2<-Cl3 bridged by Cl4, its stated Mn-Mn bond `gap` A long, every Mn-Cl at 2.3-2.35 A."""
+    rise = np.sqrt(2.35**2 - (gap / 2) ** 2)
+    points = [(-gap / 2 - 2.3, 0, 0), (-gap / 2, 0, 0), (gap / 2, 0, 0), (gap / 2 + 2.3, 0, 0), (0, rise, 0)]
+    return placed(rx.parse_smiles("[Cl-]->[Mn+]1[Mn+](<-[Cl-])<-[Cl-]->1"), points)
+
+
 def test_bond_changes_name_each_bond_formed_or_broken():
-    """A metal keeps a site it binds through any atom and the atoms bonded to a donor; an ion its ionic contact."""
+    """A metal keeps a site it binds through any atom and the atoms bonded to a donor, another metal included; an ion
+    its ionic contact."""
     axis = np.subtract(*ZEISE.GetConformer().GetPositions()[[5, 4]])
+    folded = [(-3.0, 1.6), (-1.4, 0), (-3.0, -1.6), (0, 1.75), (1.4, 0), (3.0, 1.6), (3.0, -1.6), (0, -1.75)]
     cases = {
         "proton onto carboxylate": (_glycine_proton_on_oxygen(), Changes(formed=((4, 5),), broken=((0, 5),))),
         "Pt slipped over one C": (_moved(ZEISE, [1], -axis / np.linalg.norm(axis)), Changes()),
@@ -85,6 +94,8 @@ def test_bond_changes_name_each_bond_formed_or_broken():
             Changes(formed=((0, 6),)),
         ),
         "KCl contact unread": (placed("[Cl-]->[K+]", [(0, 0, 0), (3.1, 0, 0)]), Changes()),
+        "Pd pair 2.8 A apart across its bridges": (placed(PD2CL6, [(x, y, 0) for x, y in folded]), Changes()),
+        "stated Mn-Mn pulled to 4.3 A": (_manganese_pair(4.3), Changes(broken=((1, 2),))),
     }
     for name, (mol, expected) in cases.items():
         assert bond_changes(mol) == expected, name

@@ -16,10 +16,12 @@ import numpy as np
 from rdkit import Chem
 
 from rxembed.geometry.constraints import graft_owns
+from rxembed.geometry.mechanisms import law_of_cosines
 from rxembed.graph import COORDINATION_METALS, ligand_graph
 from rxembed.metal.centres import EPS_LEN
 from rxembed.metal.distances import (
     APEX,
+    BRIDGE_REPORT_ANGLE,
     DONOR_COLLAPSE_RATIO,
     NEAR,
     NEAR_REPORT_RATIO,
@@ -43,8 +45,9 @@ def metal_overbond(mol, pos, donors) -> list[Violation]:
     """Return atoms that have collapsed onto a metal, which every other check misses by excluding metals.
 
     A donor is floored only at `DONOR_COLLAPSE_RATIO`, the one ruler that works for a lone hydride or halide; a
-    non-donor at `overbond_tier`'s tiers, below the FF's floor so a floored relax never trips it. An undeclared H is
-    skipped.
+    non-donor at `overbond_tier`'s tiers, below the FF's floor so a floored relax never trips it; a metal sharing a
+    donor where that bridge folds past `BRIDGE_REPORT_ANGLE`, or at collapse when the legs themselves are crushed. An
+    undeclared H is skipped.
 
     The caller must pass the intended `donors`: perceiving them would read a collapsed atom as a donor and ask it the
     donor's looser question. ``{metal: donors}`` declares only some metals.
@@ -54,13 +57,20 @@ def metal_overbond(mol, pos, donors) -> list[Violation]:
         rm = _PT.GetRcovalent(mol.GetAtomWithIdx(m).GetAtomicNum())
         for a in mol.GetAtoms():
             i = a.GetIdx()
-            if i == m or a.GetAtomicNum() in COORDINATION_METALS:
+            if i == m:
                 continue
             r_sum = rm + _PT.GetRcovalent(a.GetAtomicNum())
             if i in sphere:
                 floor, what = DONOR_COLLAPSE_RATIO * r_sum, "donor"
             elif a.GetAtomicNum() == 1:
                 continue  # an undeclared H: a beta-agostic contact reaches this distance and is not an over-bond
+            elif a.GetAtomicNum() in COORDINATION_METALS:
+                bridges = [x for x in sphere if mol.GetBondBetweenAtoms(i, x) is not None]
+                if not bridges:
+                    continue  # an unbridged metal is a bond question, which `bond_changes` asks
+                legs = [(np.linalg.norm(pos[m] - pos[x]), np.linalg.norm(pos[i] - pos[x])) for x in bridges]
+                folded = max(law_of_cosines(*pair, BRIDGE_REPORT_ANGLE) for pair in legs)
+                floor, what = max(folded, DONOR_COLLAPSE_RATIO * r_sum), "bridged metal"
             else:
                 tier = overbond_tier(mol, sphere, i)
                 if tier == APEX:  # a bite apex or haptic backbone is fixed by its donors' own windows
