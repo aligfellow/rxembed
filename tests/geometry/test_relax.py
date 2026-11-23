@@ -225,6 +225,24 @@ def test_coupled_uff_relaxes_both_ends_on_one_budgeted_objective():
         assert joint.energies([mol.GetConformer().GetPositions() for mol in moved]) == pytest.approx(fresh)
 
 
+def test_coupled_uff_relaxes_on_a_stiffer_rung_and_keeps_the_base_objective():
+    """Methanol's C-O held at 1.2 A: a 10x rung pulls it nearer, and the score stays on the 1x restrained UFF."""
+    coupling = Coupling(atoms=np.array([0, 1]), weights=np.array([5.0, 5.0]), spectators=1)
+    short = Constraints(distances={(0, 1): (1.2, 1.2)})
+    spans = []
+    for rung in (1.0, 10.0):
+        left, right = _methanols((2.0, 0.2, 0.1))
+        endpoints = [Endpoint(mol=mol, cons=short, record=UFFRecord()) for mol in (left, right)]
+        joint = coupled_uff(endpoints, coupling, [0], 1.0, CoEmbedParams(), rung=rung)[0]
+        positions = [mol.GetConformer().GetPositions() for mol in (left, right)]
+        base = [restrained_uff(Chem.Mol(mol), short, max_iters=0)[0] for mol in (left, right)]
+        spans.append(np.linalg.norm(positions[0][0] - positions[0][1]))
+        assert joint.energies(positions) == pytest.approx(base)
+        assert joint.record["score"] == pytest.approx(sum(base) + coupling.penalty(*positions).value)
+        assert joint.record["stiffness"] == rung
+    assert spans[1] < spans[0]
+
+
 def test_unbuildable_coupling_registers_its_start_if_it_helps(caplog):
     """Registered on its spectator C0, a translated methanol moves onto the other; one with only C0 displaced stays."""
     broken = Constraints(distances={(0, 99): (1.0, 1.0)})

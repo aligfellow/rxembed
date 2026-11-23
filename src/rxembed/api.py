@@ -312,9 +312,11 @@ def coembed(
     per binding mode, each failed mode in its ``.errors``. `stereo` applies to each endpoint as in `rx.embed`; the
     stereo each endpoint specifies is held and checked, and stereo a graph leaves open takes the shared seed's hand.
 
-    A shared ZERO-bond union seeds both endpoints, which get a short guarded preparation and one coupled relaxation of
-    their restrained UFF plus spectator and reacting penalties. ``coembed_params`` takes `rx.CoEmbedParams`: the coupled
-    relaxation's weights, stopping tolerances and step budgets, which few runs need to change.
+    A shared ZERO-bond union seeds both endpoints, which get a short guarded preparation and a coupled relaxation of
+    their restrained UFF plus spectator and reacting penalties. A pair the relaxation leaves outside a window climbs the
+    restraint stiffness ladder as `rx.embed` does, and every pair is scored at base stiffness. ``coembed_params`` takes
+    `rx.CoEmbedParams`: the coupled relaxation's weights, stopping tolerances and step budgets, which few runs need to
+    change.
 
     ``fixed="reactant"`` or ``fixed="product"`` keeps that source's single conformer exactly, every atom, and builds one
     partner around it in the same frame (``n`` None or 1). It may be any geometry of its species, a calculator's minimum

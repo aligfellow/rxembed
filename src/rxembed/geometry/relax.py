@@ -601,11 +601,13 @@ class Joint(NamedTuple):
         return values
 
 
-def coupled_uff(endpoints, coupling, ids, stiffness, params, *, fixed=None):
+def coupled_uff(endpoints, coupling, ids, stiffness, params, *, fixed=None, rung=1.0):
     """Relax paired ids on one endpoint-UFF plus correspondence objective, kept for scoring.
 
-    Spectators are registered only when that lowers the coupling, and `fixed` is kept exactly. A pair whose objective
-    cannot be built or run keeps its start geometry with an infinite score; endpoint acceptance is the caller's.
+    Spectators are registered only when that lowers the coupling, and `fixed` is kept exactly. `rung` multiplies the
+    restraint stiffness of the relax, not of the kept objective: the record describes the run on the rung, and only its
+    ``score`` is the kept objective's, so a stiffer rung never reaches a score. A pair whose objective cannot be built
+    or run keeps its start geometry with an infinite score; endpoint acceptance is the caller's.
     """
     targets = [_uff_target(endpoint.mol, endpoint.cons, endpoint.record) for endpoint in endpoints]
     results = {}
@@ -616,9 +618,12 @@ def coupled_uff(endpoints, coupling, ids, stiffness, params, *, fixed=None):
         fields = None
         try:
             fields = [_restrained_field(target, cid, stiffness) for target in local]
-            relaxed, record = _coupled(Joint(local, fields, {}), coupling, cid, stiffness, params, fixed)
+            run = fields if rung == 1.0 else [_restrained_field(target, cid, stiffness * rung) for target in local]
+            relaxed, record = _coupled(Joint(local, run, {}), coupling, cid, stiffness * rung, params, fixed)
             if not all(np.isfinite(positions).all() for positions in relaxed):
                 raise FloatingPointError("non-finite joint coordinates")
+            if run is not fields:
+                record["score"] = _joint(fields, coupling, relaxed).value
         except (RuntimeError, FloatingPointError) as error:
             relaxed = pos
             record = {
@@ -642,7 +647,7 @@ def coupled_uff(endpoints, coupling, ids, stiffness, params, *, fixed=None):
         for endpoint, target, positions in zip(endpoints, local, relaxed, strict=True):
             endpoint.mol.GetConformer(cid).SetPositions(positions[: endpoint.mol.GetNumAtoms()])
             target.mol.GetConformer(cid).SetPositions(positions)
-        results[cid] = Joint(local, fields, {**record, "stiffness": stiffness})
+        results[cid] = Joint(local, fields, {**record, "stiffness": stiffness * rung})
     for endpoint, target in zip(endpoints, targets, strict=True):
         endpoint.record.surrogates.update(target.replacements)
         endpoint.record.retyped.update(target.retyped)

@@ -18,7 +18,7 @@ from rdkit.Chem import rdMolTransforms
 
 from rxembed.engine.acceptance import EmbeddingError, Failure, conformer_misses, describe_groups, group_failures
 from rxembed.engine.atom_mapping import bond_sides, point_inversion_branches, site_motions
-from rxembed.engine.conformers import BASE_STIFFNESS, Conformers, repeated_rejection
+from rxembed.engine.conformers import BASE_STIFFNESS, RUNGS, Conformers, repeated_rejection
 from rxembed.engine.seeding import REPLACEMENT_FACTOR, prepare, seed_conformers, seed_takes_shape
 from rxembed.geometry.bounds import seed_bounds, seed_coordinates, seed_count
 from rxembed.geometry.constraints import Constraints, resolve_core
@@ -375,15 +375,32 @@ def _prepare_pairs(batch, params, need, *, fixed=None):
 
 
 def _relaxed_pairs(batch, coupling, params, unspecified, *, fixed=None):
-    """Run one joint pass, restore valid prepared pairs if rejected, and score the retained native objective."""
-    failed = _pair_failures(batch, unspecified, fixed)
-    checkpoint = {
-        cid: [endpoint._mol.GetConformer(cid).GetPositions().copy() for endpoint in batch]
-        for cid in batch[0].ids
-        if cid not in failed
+    """Climb the joint stiffness ladder, restore valid prepared pairs if rejected, and score the retained objective.
+
+    A pair whose endpoint fails a gate the ladder repairs reruns from its prepared coordinates at the next rung, as one
+    endpoint does in `Conformers._relax`; every pair is scored at base stiffness.
+    """
+    prepared = {
+        cid: [endpoint._mol.GetConformer(cid).GetPositions().copy() for endpoint in batch] for cid in batch[0].ids
     }
+    failed = _pair_failures(batch, unspecified, fixed)
+    checkpoint = {cid: positions for cid, positions in prepared.items() if cid not in failed}
     targets = [Endpoint(mol=endpoint._mol, cons=endpoint.cons, record=endpoint._uff) for endpoint in batch]
-    objectives = coupled_uff(targets, coupling, batch[0].ids, BASE_STIFFNESS, params, fixed=fixed)
+    objectives, climbing = {}, list(batch[0].ids)
+    for rung in RUNGS:
+        run = coupled_uff(targets, coupling, climbing, BASE_STIFFNESS, params, fixed=fixed, rung=rung)
+        # a failed run left its pair on the prepared coordinates and stops it climbing; a lower rung's objective stays
+        ran = [cid for cid in climbing if run[cid].record["stopping_reason"] != "failure"]
+        objectives |= {cid: run[cid] for cid in climbing if cid in ran or cid not in objectives}
+        climbing = [cid for cid in ran if _climbs(batch, cid, rung, fixed)]
+        if not climbing:
+            break
+        for cid in climbing:
+            for endpoint, positions in zip(batch, prepared[cid], strict=True):
+                endpoint._mol.GetConformer(cid).SetPositions(positions)
+    stiffest = max((objective.record["stiffness"] for objective in objectives.values()), default=BASE_STIFFNESS)
+    if stiffest != BASE_STIFFNESS:
+        logger.debug("coembed: pairs climbed to joint restraint stiffness %gx", stiffest / BASE_STIFFNESS)
     optimized = {
         cid: [endpoint._mol.GetConformer(cid).GetPositions().copy() for endpoint in batch] for cid in batch[0].ids
     }
@@ -425,6 +442,18 @@ def _relaxed_pairs(batch, coupling, params, unspecified, *, fixed=None):
         for cid, objective in objectives.items()
     }
     return records, failures, raw
+
+
+def _climbs(batch, cid, rung, fixed):
+    """Return whether pair `cid` climbs past `rung`: an endpoint fails, and each failing one climbs alone."""
+    failing = [
+        endpoint
+        for side, endpoint in enumerate(batch)
+        if side != fixed and endpoint._first_failure(cid, endpoint.gates)
+    ]
+    return bool(failing) and all(
+        (reason := endpoint._ladder_failure(cid)) is not None and endpoint._climbs(reason, rung) for endpoint in failing
+    )
 
 
 def _pair_failures(batch, unspecified, fixed=None):

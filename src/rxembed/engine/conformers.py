@@ -73,6 +73,7 @@ def _log_replacement_round(operation, index, kept, asked):
 BASE_STIFFNESS = 1.0
 FC_ESCALATION = (1.0, 3.0, 10.0, 30.0, 100.0)
 _HIGH_FC_ESCALATION = (300.0, 1000.0)
+RUNGS = (*FC_ESCALATION, *_HIGH_FC_ESCALATION)  # the ladder's stiffness multipliers; `Conformers._climbs` stops it
 # Three deterministic batches cover DG basin variability.
 _REPLACEMENT_ROUNDS = 3
 # another shape or seating waits for a fresh seed, not a stiffer rung: angular walls stop strengthening at 1x
@@ -252,7 +253,7 @@ class Conformers:
 
         # The ladder's view of `self._uff`: a shallow copy shares its statuses and typing, and keeps frames apart.
         record = replace(self._uff, snapshots={} if frames is not None else None)
-        for mult in (*FC_ESCALATION, *_HIGH_FC_ESCALATION):
+        for mult in RUNGS:
             if not pending:
                 break
             current = pending  # on their seeds: the first rung starts there, and a failed endpoint returns there
@@ -279,20 +280,9 @@ class Conformers:
             self.unrelaxed = [cid for cid in self.unrelaxed if cid not in current]
             self.energies = {}
             self._correct_metal_hand(operation, ids=current, snapshots=record.snapshots, mirror=mirror)
-            failed = {}  # each conformer's first failure, where the gate that caught it is one the ladder repairs
-            for cid in current:
-                reason = self._first_failure(cid, self.gates)
-                if reason and next(gate for gate in self.gates if self._verdicts[cid].rows[gate]).ladder:
-                    failed[cid] = reason
+            failed = {cid: reason for cid in current if (reason := self._ladder_failure(cid))}
             accepted = set(current).difference(failed)
-            pending = [  # climb to the next rung, unless a fresh seed is the only repair
-                cid
-                for cid, reason in failed.items()
-                if reason.kind not in STABLE_SHAPE_KINDS
-                and mult != _HIGH_FC_ESCALATION[-1]
-                and (mult < FC_ESCALATION[-1] or reason.kind == "ml_distance")
-                and not (reason.kind == "bonding" and self.species.centres)
-            ]
+            pending = [cid for cid, reason in failed.items() if self._climbs(reason, mult)]
             restored.update({cid: reason for cid, reason in failed.items() if cid not in pending})
             for cid in failed:
                 self._mol.GetConformer(cid).SetPositions(seed_pos[cid])
@@ -332,6 +322,26 @@ class Conformers:
             )
         self._correct_metal_hand(operation, ids=list(restored), mirror=mirror)  # a restored seed was not corrected
         return typed
+
+    def _ladder_failure(self, cid):
+        """Return conformer `cid`'s first failure when the gate that caught it is one the stiffness ladder repairs."""
+        reason = self._first_failure(cid, self.gates)
+        if reason and next(gate for gate in self.gates if self._verdicts[cid].rows[gate]).ladder:
+            return reason
+        return None
+
+    def _climbs(self, reason, rung):
+        """Return whether a ladder failure at stiffness multiplier `rung` climbs to the next rung.
+
+        A fresh seed is the only repair of another shape or seating, or of a torn bond at a metal centre, and only an
+        M-L distance climbs past the standard rungs.
+        """
+        return (
+            reason.kind not in STABLE_SHAPE_KINDS
+            and rung != RUNGS[-1]
+            and (rung < FC_ESCALATION[-1] or reason.kind == "ml_distance")
+            and not (reason.kind == "bonding" and self.species.centres)
+        )
 
     def _rescore_restrained(self, stiffness, *, ids=None):
         """Score settled conformers, or explicit `ids`, on the requested restrained-UFF objective.
