@@ -376,7 +376,7 @@ def _prepare_pairs(batch, params, need, *, fixed=None):
 
 def _relaxed_pairs(batch, coupling, params, unspecified, *, fixed=None):
     """Run one joint pass, restore valid prepared pairs if rejected, and score the retained native objective."""
-    failed = _pair_failures(batch, unspecified)
+    failed = _pair_failures(batch, unspecified, fixed)
     checkpoint = {
         cid: [endpoint._mol.GetConformer(cid).GetPositions().copy() for endpoint in batch]
         for cid in batch[0].ids
@@ -387,13 +387,13 @@ def _relaxed_pairs(batch, coupling, params, unspecified, *, fixed=None):
     optimized = {
         cid: [endpoint._mol.GetConformer(cid).GetPositions().copy() for endpoint in batch] for cid in batch[0].ids
     }
-    failures = _pair_failures(batch, unspecified)
+    failures = _pair_failures(batch, unspecified, fixed)
     restored = failures.keys() & checkpoint.keys()
     for cid in restored:
         for endpoint, pos in zip(batch, checkpoint[cid], strict=True):
             endpoint._mol.GetConformer(cid).SetPositions(pos)
     if restored:
-        failures = _pair_failures(batch, unspecified)
+        failures = _pair_failures(batch, unspecified, fixed)
     records = {}
     for cid, objective in objectives.items():
         positions = [endpoint._mol.GetConformer(cid).GetPositions() for endpoint in batch]
@@ -427,14 +427,17 @@ def _relaxed_pairs(batch, coupling, params, unspecified, *, fixed=None):
     return records, failures, raw
 
 
-def _pair_failures(batch, unspecified):
+def _pair_failures(batch, unspecified, fixed=None):
     """Return each pair id's first failure, named by endpoint: either endpoint's gates, the reactant's first.
 
+    A `fixed` endpoint is not judged again: it does not move, and `rx.coembed` judged it once as supplied geometry.
     A pair both endpoints accept fails as ``'unspecified_stereo'`` when an `Unspecified` element reads one configuration
     in its reactant and the other in its product, since its two frames are then two stereoisomers.
     """
     failures = {}
-    for name, endpoint in zip(_ENDPOINTS, batch, strict=True):
+    for side, (name, endpoint) in enumerate(zip(_ENDPOINTS, batch, strict=True)):
+        if side == fixed:
+            continue
         for reason, cids in endpoint._acceptance_failures().items():
             named = replace(reason, detail=f"{name}: {reason.detail}")
             for cid in cids:

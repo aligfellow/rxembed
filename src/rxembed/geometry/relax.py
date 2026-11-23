@@ -463,11 +463,14 @@ def restrained_uff(
     energies = []
     try:
         target = _uff_target(mol, cons, out)
+        held = set(cons.frozen) >= set(range(target.mol.GetNumAtoms()))  # nothing is free, where RDKit's BFGS aborts
         for conf in confs:
             cid = conf.GetId()
             ff = _restrained_field(target, cid, stiffness)
             try:
-                if out.snapshots is None:
+                if held:
+                    status = 0  # the held geometry is final, so it counts as converged
+                elif out.snapshots is None:
                     status = ff.Minimize(maxIts=max_iters)
                 else:
                     status, frames = ff.MinimizeTrajectory(1, maxIts=max_iters)

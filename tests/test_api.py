@@ -89,6 +89,18 @@ def test_minimize_refuses_a_relax_cap_not_a_positive_integer():
         rx.minimize(embedded("CCO"), max_iters=0)
 
 
+def test_minimize_with_every_atom_held_returns_the_geometry_unchanged():
+    """With nothing free there is nothing to optimise: the held conformer comes back as given, with its energy."""
+    trans = rx.isomers(DIAMMINE_PD, geometry="SPL").select(label="trans")
+    for mol in (embedded("CC(=O)C"), rx.embed(trans, n=1, seed=1, threads=1).mol):
+        held = mol.GetConformer().GetPositions()
+
+        out = rx.minimize(mol, fix=list(range(mol.GetNumAtoms())))
+
+        np.testing.assert_array_equal(out.mol.GetConformer(out.ids[0]).GetPositions(), held)
+        assert np.isfinite(list(out.energies.values())).all()
+
+
 def test_coembed_refuses_a_reaction_count_or_selection():
     forms = r"a \(reactant, product\) pair or 'reactant>>product'"
     for sources, kwargs, error, refusal in (
@@ -635,6 +647,25 @@ def test_coembed_keeps_a_fixed_endpoint_and_its_source_unmoved(beta_hydride):
         np.testing.assert_array_equal(kept.mol.GetConformer(rebuilt.ids[0]).GetPositions(), supplied, err_msg=name)
         np.testing.assert_array_equal(sides[side].GetConformer().GetPositions(), supplied, err_msg=name)
         assert built.check()[rebuilt.ids[0]].ok, name
+
+
+def test_coembed_keeps_a_fixed_endpoint_outside_construction_windows():
+    """A supplied geometry is judged as a calculator's result, so a bond or M-L distance past its window is kept."""
+    found = rx.isomers(DIAMMINE_PD, geometry="SPL")
+    trans = rx.embed(found.select(label="trans"), n=1, seed=1).mol  # N0 Pd1 Cl2 Cl3 N4
+    for name, mol, partner, fixed, (a, b), length in (
+        ("acetone C=O, judged on entry", embedded("CC(=O)C"), "C=C(O)C", "reactant", (1, 2), 1.47),
+        ("Pd-Cl, judged after the joint pass", trans, found.select(label="cis"), "product", (1, 2), 2.54),
+    ):
+        pos = mol.GetConformer().GetPositions()
+        pos[b] = pos[a] + length * (pos[b] - pos[a]) / np.linalg.norm(pos[b] - pos[a])
+        mol.GetConformer().SetPositions(pos)
+        sides = (mol, partner) if fixed == "reactant" else (partner, mol)
+
+        pair = rx.coembed(*sides, fixed=fixed, n=1, seed=42, threads=1)
+
+        kept = pair.reactant if fixed == "reactant" else pair.product
+        np.testing.assert_array_equal(kept.mol.GetConformer(pair.ids[0]).GetPositions(), pos, err_msg=name)
 
 
 def test_coembed_refuses_a_failing_fixed_endpoint_unmoved():

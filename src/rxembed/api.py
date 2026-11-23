@@ -316,9 +316,10 @@ def coembed(
     their restrained UFF plus spectator and reacting penalties. ``coembed_params`` takes `rx.CoEmbedParams`: the coupled
     relaxation's weights, stopping tolerances and step budgets, which few runs need to change.
 
-    ``fixed="reactant"`` or ``fixed="product"`` keeps that source's single conformer exactly and builds one partner
-    around it in the same frame (``n`` None or 1). The fixed geometry must pass its gates first, and a failure raises
-    without moving it. Both sources are left unchanged.
+    ``fixed="reactant"`` or ``fixed="product"`` keeps that source's single conformer exactly, every atom, and builds one
+    partner around it in the same frame (``n`` None or 1). It may be any geometry of its species, a calculator's minimum
+    included: it is judged once, as `Ensemble.optimize` judges a calculator's result, and construction windows are not
+    its limits. A geometry of another species raises without moving it. Both sources are left unchanged.
 
         pairs = rx.coembed("CBr.[Cl-]>>CCl.[Br-]", n=4)
         best = pairs.lowest(1)
@@ -363,10 +364,10 @@ def coembed(
                         prepared.mol, [], prepared.cons, species=species, sampling=sampling, _stereo_filter=chirality
                     )
                 )
-            if fixed_side is not None:  # the supplied conformer must pass its gates before it is frozen
+            if fixed_side is not None:  # judged once, before it is frozen
                 given = endpoints[fixed_side]
                 given.ids = [given._mol.GetConformer().GetId()]
-                if reason := given._first_failure(given.ids[0], given.gates):
+                if reason := given._first_failure(given.ids[0], given._supplied_gates("flag", "drop")):
                     raise EmbeddingError(
                         f"coembed: fixed {fixed} fails ({reason}); supply a valid conformer",
                         failures=Counter({reason: 1}),

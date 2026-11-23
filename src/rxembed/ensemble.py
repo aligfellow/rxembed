@@ -591,18 +591,26 @@ class Ensemble(Conformers):
         out._record(FINAL, {cid: energies[cid] for cid in out.ids if cid not in failed}, calc.name, lost)
         return out
 
+    def _supplied_gates(self, *policies):
+        """Return the gates of `policies` that judge a geometry rxembed did not build, each by its `calculator_check`.
+
+        A supplied geometry keeps its bonds, specified stereo, hand, face and coordination state; construction windows
+        are not its limits.
+        """
+        return [
+            row._replace(check=row.calculator_check or row.check)
+            for policy in policies  # in the order given, so a "flag" row can be read first
+            for row in self.gates
+            if row.calculator == policy
+        ]
+
     def _calculator_failures(self, label):
         """Return ``{id: Failure}`` for the conformers a ``calculator="drop"`` gate fails on.
 
         A ``"flag"`` gate is read first: a conformer it fails is another molecule, warned and kept for `filter` to drop,
         and not judged against the species it left.
         """
-        rows = {
-            policy: [
-                row._replace(check=row.calculator_check or row.check) for row in self.gates if row.calculator == policy
-            ]
-            for policy in ("drop", "flag")
-        }
+        rows = {policy: self._supplied_gates(policy) for policy in ("drop", "flag")}
         flagged = {cid: reason for cid in self.ids if (reason := self._first_failure(cid, rows["flag"]))}
         failed = {
             cid: reason for cid in self.ids if cid not in flagged and (reason := self._first_failure(cid, rows["drop"]))
