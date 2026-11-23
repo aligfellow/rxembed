@@ -36,7 +36,7 @@ from rxembed.identity.reading import (
     requested_geometry,
     vacancy_seatings,
 )
-from rxembed.identity.smiles_io import mol_from_species, parse_smiles, read_native_tags
+from rxembed.identity.smiles_io import mol_from_species, parse_smiles, read_native_tags, specified_arrangement
 from rxembed.identity.species import graph_with_stereo, retold_centres
 from rxembed.identity.stereoisomers import StereoRequest
 from rxembed.metal.centres import canonical_metal_graph
@@ -304,13 +304,15 @@ def coembed(
     """Co-embed a reaction's reactant and product as paired conformers in one frame; return a `Coembedded`.
 
     The endpoints are two sources (Mols or SMILES), a ``(reactant, product)`` pair or a ``'reactant>>product'`` SMILES,
-    each one species up to the stereo its graph leaves unspecified. The product is put on the reactant's atom order
-    (atom maps first, else the graph overlay that keeps most bonds), so atom i is one atom in both. The reacting atoms
-    are told from the spectators the endpoints align by; ``spectator_atoms`` and ``react_atoms`` select either, as
-    reactant atoms. `constrain` and `contacts` take reactant atom indices and hold both endpoints, a contact only where
-    both bond its atoms alike. ``contacts='auto'``, or `rx.contacts`' modes, give a `CoembeddedSet`, one `Coembedded`
-    per binding mode, each failed mode in its ``.errors``. `stereo` applies to each endpoint as in `rx.embed`; the
-    stereo each endpoint specifies is held and checked, and stereo a graph leaves open takes the shared seed's hand.
+    each one species up to the stereo its graph leaves unspecified; one that leaves a metal arrangement open takes the
+    species that follows the other, the first `rx.isomers` ranks with it as ``reference=``. The product is put on the
+    reactant's atom order (atom maps first, else the graph overlay that keeps most bonds), so atom i is one atom in
+    both. The reacting atoms are told from the spectators the endpoints align by; ``spectator_atoms`` and
+    ``react_atoms`` select either, as reactant atoms. `constrain` and `contacts` take reactant atom indices and hold
+    both endpoints, a contact only where both bond its atoms alike. ``contacts='auto'``, or `rx.contacts`' modes, give a
+    `CoembeddedSet`, one `Coembedded` per binding mode, each failed mode in its ``.errors``. `stereo` applies to each
+    endpoint as in `rx.embed`; the stereo each endpoint specifies is held and checked, and stereo a graph leaves open
+    takes the shared seed's hand.
 
     A shared ZERO-bond union seeds both endpoints, which get a short guarded preparation and a coupled relaxation of
     their restrained UFF plus spectator and reacting penalties. A pair the relaxation leaves outside a window climbs the
@@ -335,6 +337,7 @@ def coembed(
     mols = [_mol_from_source(side, "rx.coembed") for side in _endpoints(reactant, product)]
     fixed_side = _fixed_side(mols, fixed, n)
     mols[1] = in_reactant_order(mols[0], mols[1])
+    mols = _followed(mols, stereo)
     reading = request if request.given is not None else StereoRequest.parse("free")
     sides = least_motion(*(read_species(mol, reading.on(mol)) for mol in mols))
     atoms = reaction_atoms(sides[0], sides[1], spectator_atoms, react_atoms)
@@ -423,6 +426,34 @@ def _endpoints(reactant, product):
             f"{type(reactant).__name__} {reactant!r:.60}"
         )
     return tuple(reactant)
+
+
+def _followed(mols, stereo):
+    """Return the endpoints, one that leaves a metal arrangement open replaced by the species following its partner.
+
+    It is the first species `rx.isomers` ranks with the partner as `reference=`: stereo the reaction leaves alone keeps
+    the partner's, and other open ligand stereo is left to the seed unless `stereo` asks. Endpoints that both leave an
+    arrangement open are read as given.
+    """
+    open_sides = [
+        side
+        for side, mol in enumerate(mols)
+        if not mol.GetNumConformers() and any(specified_arrangement(mol, m) is None for m in metal_indices(mol))
+    ]
+    if len(open_sides) != 1:
+        return mols
+    (side,) = open_sides
+    name, partner = ("reactant", "product")[side], ("reactant", "product")[1 - side]
+    try:
+        ranked = isomers(mols[side], reference=mols[1 - side], stereo="free" if stereo is None else stereo)
+    except ValueError as error:
+        raise ValueError(
+            f"the {name} leaves a metal arrangement open and cannot follow the {partner} ({error}); "
+            f"pass the {name} as one species of rx.isomers"
+        ) from error
+    if (ties := sum(score == ranked.scores[0] for score in ranked.scores)) > 1:
+        logger.info("coembed: the %s follows the %s in %d equal species; took the first", name, partner, ties)
+    return [ranked[0] if k == side else mol for k, mol in enumerate(mols)]
 
 
 def _fixed_side(mols, fixed, n):

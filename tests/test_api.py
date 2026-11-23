@@ -629,6 +629,16 @@ def test_coembed_reads_sources_a_pair_or_a_reaction_smiles():
     assert [[rx.smiles(end.mol) for end in (pair.reactant, pair.product)] for pair in pairs] == [written] * 3
 
 
+def test_coembed_takes_the_open_product_arrangement_that_follows_the_reactant():
+    """A bare [PtCl(Br)(NH3)2] product is cis or trans; each reactant pairs with the one that keeps its ammines."""
+    shapes = []
+    for reactant in rx.isomers("[NH3:1]->[Pt+2](<-[NH3:2])(<-[Cl-:3])<-[Cl-:4].[Br-:5]"):
+        pair = rx.coembed(reactant, "[NH3:1]->[Pt+2](<-[NH3:2])(<-[Cl-:3])<-[Br-:5].[Cl-:4]", n=1, seed=1)
+        ends = (pair.reactant, pair.product)
+        shapes.append(tuple("cis" if end.measure((0, 1, 2))["mean"] < 135 else "trans" for end in ends))
+    assert sorted(shapes) == [("cis", "cis"), ("trans", "trans")]
+
+
 def test_coembed_keeps_a_fixed_endpoint_and_its_source_unmoved(beta_hydride):
     """The beta-hydride pair is rebuilt around its reactant, and a cis-diamminedichloropalladium around a trans one."""
     pair = beta_hydride[1][0]

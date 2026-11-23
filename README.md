@@ -163,6 +163,9 @@ branches = [m for m, score in zip(products, products.scores) if score == product
 product_confs = rx.embed(products[0], n=4)  # H2 in the vacancy, trans to the amine
 ```
 
+`rx.coembed` follows the same way when one endpoint leaves a metal arrangement open: it takes the first species, and
+ligand stereo the reaction makes is left to the shared seed.
+
 ### Stereo
 
 `stereo=` on `rx.isomers` controls point R/S, E/Z, atropisomer M/P and bound-donor hands:
