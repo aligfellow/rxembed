@@ -1352,7 +1352,7 @@ requires-dist = [
     { name = "rdkit", specifier = ">=2026.9.1" },
     { name = "scikit-learn", marker = "extra == 'workflow'" },
     { name = "scipy", marker = "extra == 'workflow'" },
-    { name = "xyzgraph", specifier = ">=1.7.0" },
+    { name = "xyzgraph", specifier = ">=1.7.3" },
 ]
 provides-extras = ["search", "workflow"]
 
@@ -1599,16 +1599,16 @@ wheels = [
 
 [[package]]
 name = "xyzgraph"
-version = "1.7.0"
+version = "1.7.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "networkx" },
     { name = "numpy" },
     { name = "rdkit" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9c/d3/cdff0f08919b2cc12394af0345e36a043f37777222c2ab195c337482da51/xyzgraph-1.7.0.tar.gz", hash = "sha256:e2fefd0b26bc1974dc56ee16874e15fe1338127a810f8b623836cec2be2c314b", size = 204386, upload-time = "2026-11-05T13:49:42.763Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/16/62/9f1285ce6ae0ef23f5b07cae03881dd4b2d09289f2ca82d52a70869e6e5b/xyzgraph-1.7.3.tar.gz", hash = "sha256:c175a0ede5bfc99832eaf6b760994e92549b93122841fdde934ce04b1ed54c28", size = 210714, upload-time = "2026-11-25T11:40:09.295Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cf/1c/ec11c00ebf7f0807d85a25f2addc641a057a0c9853aebfb3b6f08b186726/xyzgraph-1.7.0-py3-none-any.whl", hash = "sha256:69850932ddce4b35db95281df05c4a12d9b9874898407711b627256c5f97168d", size = 141507, upload-time = "2026-11-05T13:49:41.26Z" },
+    { url = "https://files.pythonhosted.org/packages/01/f0/461bbd45ab533e81ebcf1089190225e374ea63a3bef3988efc9cd00c84e9/xyzgraph-1.7.3-py3-none-any.whl", hash = "sha256:5d6ef66c46e4cca645aea807ce2cf6b7b4bb0dba236a7380490be892d9c186aa", size = 144058, upload-time = "2026-11-25T11:40:07.76Z" },
 ]
 
 [[package]]

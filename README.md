@@ -196,9 +196,10 @@ By default xyzgraph perceives bonds and bond orders. xyz2mol bond orders optimiz
 xyzgraph's for reactive or multicentre bonds such as a TS or a bridging hydride. The alternatives
 `connectivity="rdkit"` and `"xyz2mol"` need xyz2mol bond orders. An XYZ stores no charge: pass the real charge for a
 radical, a charged complex or another connectivity, and `metal_charges={0: 2, 1: 1}` for a split the total does not
-fix. `read_xyz` warns when a metal looks like an ion read as neutral and on every perception change, which never
-alters the atoms, their order or the charge; `fallback=False` raises instead. `bond_orders=None` skips only the
-bond-order step, for checking which bonds a geometry has.
+fix. Connectivity comes from the backend asked for, which raises where it reads no graph. `read_xyz` warns when a metal
+looks like an ion read as neutral and when xyz2mol cannot rank a graph and another ranking of the same connectivity is
+kept, which never alters the atoms, their order or the charge; `fallback=False` raises instead. `bond_orders=None`
+skips only the bond-order step, for checking which bonds a geometry has.
 
 ```python
 mol = rx.read_graph(graph, charge=0)  # graph: a Mol whose bonds are known, hydrogens as atoms

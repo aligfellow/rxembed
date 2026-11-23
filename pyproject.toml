@@ -10,7 +10,7 @@ authors = [{name = "Alister S. Goodfellow"}]
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-dependencies = ["numpy", "rdkit>=2026.9.1", "networkx", "xyzgraph>=1.7.0"]
+dependencies = ["numpy", "rdkit>=2026.9.1", "networkx", "xyzgraph>=1.7.3"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",

@@ -1,8 +1,8 @@
 """Read an ``.xyz``, in-memory atoms or a bonded graph into an RDKit Mol: the inputs that need perception.
 
-xyzgraph, RDKit and xyz2mol supply connectivity, and xyzgraph or xyz2mol rank bond orders; `read_graph` ranks a caller's
-connectivity the same way. A fallback warns and records the backend used, and no reader drops or reorders atoms or
-changes the requested charge.
+xyzgraph, RDKit or xyz2mol supplies connectivity, the one asked for or none, and xyzgraph or xyz2mol rank bond orders;
+`read_graph` ranks a caller's connectivity the same way. A bond-order fallback ranks the same graph another way, warns
+and records the backend used, and no reader drops or reorders atoms or changes the requested charge.
 """
 
 from __future__ import annotations
@@ -54,12 +54,12 @@ def read_xyz(source, charge=None, connectivity="xyzgraph", bond_orders="xyzgraph
 
     Every XYZ is read as a minimum: a Lewis graph cannot encode a TS, so a TS geometry comes in through ``fix=`` or
     ``constrain=``. An XYZ stores no charge: `charge` is the total, xyzgraph's own reading when None; give it for a
-    radical, a charged complex, another connectivity or a fallback reader. `connectivity` is "xyzgraph", "rdkit"
-    (connect-the-dots) or "xyz2mol". `bond_orders` is xyzgraph's optimiser (needs xyzgraph connectivity) or "xyz2mol"'s
-    ranked charge search for metal complexes; a graph without a metal xyz2mol models keeps xyzgraph's orders, with a
-    warning. `metal_charges` gives every metal's formal charge, for a multi-metal XYZ whose total does not fix the
-    split. ``fallback=False`` raises where a backend fails instead of warning and using another. The backends used are
-    recorded in the Mol's ``_rxembed*`` properties.
+    radical, a charged complex or another connectivity. `connectivity` is "xyzgraph", "rdkit" (connect-the-dots) or
+    "xyz2mol", and raises where it reads no graph. `bond_orders` is xyzgraph's optimiser (needs xyzgraph connectivity)
+    or "xyz2mol"'s ranked charge search for metal complexes; a graph without a metal xyz2mol models keeps xyzgraph's
+    orders, with a warning. `metal_charges` gives every metal's formal charge, for a multi-metal XYZ whose total does
+    not fix the split. ``fallback=False`` raises where xyz2mol cannot rank the graph instead of warning and ranking it
+    another way. The backends used are recorded in the Mol's ``_rxembed*`` properties.
 
     ``bond_orders=None`` skips bond orders, to check which bonds a geometry has: every bond single (metal bonds dative),
     no formal charges and no multi-centre refusals.
@@ -121,15 +121,15 @@ def _read(source, charge, connectivity, bond_orders, metal_charges, fallback):
     if bond_orders is None:
         mol, perceived_by = _from_xyzgraph(source, charge, quick=True), connectivity
     else:
-        mol, perceived_by = _with_fallback(source, charge, connectivity, fallback)
+        perceive = {"rdkit": _from_rdkit_connectivity, "xyzgraph": _from_xyzgraph, "xyz2mol": _from_xyz2mol}
+        mol, perceived_by = perceive[connectivity](source, charge), connectivity
         reject_boron_cages(mol)  # before xyz2mol forces multi-centre B-H/B-B into valence-two orders
         if charge is None:  # xyzgraph read it as its formal charges' sum, the total every later step uses
             charge = Chem.GetFormalCharge(mol)
             logger.info("read_xyz: xyzgraph read a total charge of %+d", charge)
     _apply_metal_charges(mol, metal_charges)  # before bond orders, so xyz2mol ranks on the named split
-    read = _assign_bond_orders(mol, source, charge, perceived_by, bond_orders, fallback)
-    changed = read.connectivity != connectivity or read.ordered_by != bond_orders
-    return _settled(read, charge, metal_charges, fallback=changed)
+    read = _assign_bond_orders(mol, charge, perceived_by, bond_orders, fallback)
+    return _settled(read, charge, metal_charges, fallback=read.ordered_by != bond_orders)
 
 
 def _settled(read, charge, metal_charges, *, fallback):
@@ -171,34 +171,6 @@ def _settled(read, charge, metal_charges, *, fallback):
     return mol
 
 
-def _with_fallback(path, charge, backend, allow_fallback=True):
-    """Return the Mol `backend` perceives and the backend's name, or with `allow_fallback` another's.
-
-    A fallback warns; without `charge` it raises instead, since no fallback reads a total.
-    """
-    primary = {"rdkit": _from_rdkit_connectivity, "xyzgraph": _from_xyzgraph, "xyz2mol": _from_xyz2mol}[backend]
-    try:
-        return primary(path, charge), backend
-    except (OSError, RuntimeError, ValueError) as first:
-        if not allow_fallback:
-            raise
-        if backend != "xyzgraph":  # xyz2mol or RDKit connectivity falls back to the metal-aware xyzgraph path
-            fallback, name = _from_xyzgraph, "xyzgraph"
-        elif any(atom.GetAtomicNum() in TRANSITION_METALS_NUM for atom in _coordinates(path).GetAtoms()):
-            fallback, name = _from_xyz2mol, "xyz2mol"
-        else:
-            fallback, name = _from_rdkit, "rdkit"
-        state = f"failed ({first})"
-        display = "RDKit" if name == "rdkit" else name
-        if charge is None:  # only xyzgraph reads a total from a geometry
-            raise ValueError(f"{backend} failed ({first}); pass charge= to read with {display}") from first
-        logger.warning("read_xyz: %s %s; using %s", backend, state, display)
-        try:
-            return fallback(path, charge), name
-        except (OSError, RuntimeError, ValueError) as second:
-            raise ValueError(f"{backend} {state}; {display} fallback also failed ({second})") from second
-
-
 def xyz_atoms(mol, conf_id=-1):
     """Return conformer `conf_id` of `mol` as the ``(symbol, (x, y, z))`` atoms xyzgraph reads in place of a file."""
     pos = mol.GetConformer(conf_id).GetPositions()
@@ -226,8 +198,8 @@ def _from_xyzgraph(path, charge, quick=False):
         # with kekule=True every other edge is order 1, 2 or 3; anything else is a changed xyzgraph
         if (order := data.get("bond_order")) not in _KEKULE_ORDERS:
             raise ValueError(
-                f"xyzgraph {xyzgraph.__version__} gave edge {u}-{v} bond_order={order!r}; install the version "
-                "rxembed requires"
+                f"xyzgraph {xyzgraph.__version__} gave edge {u}-{v} bond_order={order!r} under kekule=True; report "
+                "the geometry to xyzgraph"
             )
         u_metal = rw.GetAtomWithIdx(idx[u]).GetAtomicNum() in COORDINATION_METALS
         v_metal = rw.GetAtomWithIdx(idx[v]).GetAtomicNum() in COORDINATION_METALS
@@ -240,9 +212,10 @@ def _from_xyzgraph(path, charge, quick=False):
     mol = rw.GetMol()
     total = graph.graph["total_charge"]
     if not quick and Chem.GetFormalCharge(mol) != total:  # the reader takes the total as these charges' sum
+        found = graph.graph.get("validation_errors") or [f"atom charges sum to {Chem.GetFormalCharge(mol):+d}"]
         raise ValueError(
-            f"xyzgraph {xyzgraph.__version__} gave total charge {total} but atom charges summing to "
-            f"{Chem.GetFormalCharge(mol)}; install the version rxembed requires"
+            f"xyzgraph found no Lewis structure at total charge {total:+d} ({'; '.join(found)}); check charge= and "
+            "the geometry"
         )
     conf = Chem.Conformer(mol.GetNumAtoms())
     for node, data in graph.nodes(data=True):
@@ -281,19 +254,6 @@ def _from_rdkit_connectivity(path, charge):
     rdDetermineBonds.DetermineConnectivity(mol, charge=charge, useVdw=False)
     mol.UpdatePropertyCache(strict=False)
     Chem.FastFindRings(mol)
-    return mol
-
-
-def _from_rdkit(path, charge):
-    """Read an organic molecule with RDKit's bond perceiver."""
-    mol = _coordinates(path)
-    try:
-        rdDetermineBonds.DetermineBonds(mol, charge=charge)
-    except ValueError as exc:
-        raise ValueError(
-            f"RDKit could not perceive bonds in {path if isinstance(path, str) else 'the atoms'} ({exc}); use "
-            "connectivity='xyzgraph'"
-        ) from exc
     return mol
 
 
@@ -359,7 +319,7 @@ class _BondOrders(NamedTuple):
     ordered_by: str | None
 
 
-def _assign_bond_orders(mol, path, charge, connectivity, requested, allow_fallback):
+def _assign_bond_orders(mol, charge, connectivity, requested, allow_fallback):
     """Apply the requested bond-order backend, falling back only where allowed; return `_BondOrders`."""
     if requested is None:
         return _BondOrders(mol, connectivity, None)
@@ -382,7 +342,7 @@ def _assign_bond_orders(mol, path, charge, connectivity, requested, allow_fallba
     except ValueError as first:
         if not allow_fallback:
             raise
-        return _fallback_reading(path, mol, backend, charge, connectivity, first)
+        return _fallback_reading(mol, backend, charge, connectivity, first)
     return _BondOrders(ranked, connectivity, ranker)
 
 
@@ -407,43 +367,32 @@ def _without_hydrogen_bonds(mol):
     return out
 
 
-def _fallback_reading(path, mol, backend, charge, connectivity, first):
-    """Return the `_BondOrders` read when xyz2mol finds no bond orders on the selected graph.
+def _fallback_reading(mol, backend, charge, connectivity, first):
+    """Return the `_BondOrders` read when xyz2mol finds no closed-shell bond orders on the selected graph.
 
-    xyz2mol's own connectivity comes next. When that fails too, the selected graph is kept with the reading that has
-    fewer radical electrons: xyz2mol's with a metal's excess charge moved onto donors as radicals, or xyzgraph's own
-    charges when they reach the total within each metal's valence electrons. A tie takes xyz2mol's.
+    The graph is kept with the reading that has fewer radical electrons: xyz2mol's with a metal's excess charge moved
+    onto donors as radicals, or xyzgraph's own charges when they reach the total within each metal's valence electrons.
+    A tie takes xyz2mol's.
     """
-    try:
-        joint = _from_xyz2mol(path, charge)
-    except (ImportError, OSError, RuntimeError, ValueError) as second:
-        readings = []
-        with contextlib.suppress(ValueError):
-            readings.append(_rank_orders(mol, charge, radicals=True))
-        metals = [backend.GetAtomWithIdx(index) for index in metal_indices(backend)]
-        if (
-            connectivity == "xyzgraph"
-            and Chem.GetFormalCharge(backend) == charge
-            and all(metal.GetFormalCharge() <= _PT.GetNOuterElecs(metal.GetAtomicNum()) for metal in metals)
-        ):
-            own = Chem.Mol(backend)
-            kept = ", ".join(f"{metal.GetSymbol()}{metal.GetFormalCharge():+d}" for metal in metals)
-            own.SetProp(
-                "_rxembedChargeRescue",
-                f"xyz2mol found no closed-shell reading at charge={charge}; kept xyzgraph's {kept}",
-            )
-            readings.append((own, "xyzgraph"))
-        if not readings:
-            raise ValueError(
-                f"xyz2mol found no bond orders on the {connectivity} graph ({first}); "
-                f"xyz2mol connectivity also failed ({second})"
-            ) from second
-        reading, order_by = min(readings, key=lambda item: sum(a.GetNumRadicalElectrons() for a in item[0].GetAtoms()))
-        return _BondOrders(reading, connectivity, order_by)
-    logger.warning(
-        "read_xyz: xyz2mol found no bond orders on the %s graph (%s); using xyz2mol connectivity", connectivity, first
-    )
-    return _BondOrders(joint, "xyz2mol", "xyz2mol")
+    readings = []
+    with contextlib.suppress(ValueError):
+        readings.append(_rank_orders(mol, charge, radicals=True))
+    metals = [backend.GetAtomWithIdx(index) for index in metal_indices(backend)]
+    if (
+        connectivity == "xyzgraph"
+        and Chem.GetFormalCharge(backend) == charge
+        and all(metal.GetFormalCharge() <= _PT.GetNOuterElecs(metal.GetAtomicNum()) for metal in metals)
+    ):
+        own = Chem.Mol(backend)
+        kept = ", ".join(f"{metal.GetSymbol()}{metal.GetFormalCharge():+d}" for metal in metals)
+        own.SetProp(
+            "_rxembedChargeRescue", f"xyz2mol found no closed-shell reading at charge={charge}; kept xyzgraph's {kept}"
+        )
+        readings.append((own, "xyzgraph"))
+    if not readings:
+        raise ValueError(f"xyz2mol found no bond orders on the {connectivity} graph ({first})") from first
+    reading, order_by = min(readings, key=lambda item: sum(a.GetNumRadicalElectrons() for a in item[0].GetAtoms()))
+    return _BondOrders(reading, connectivity, order_by)
 
 
 def _hydrogen_bond_legs(mol):
