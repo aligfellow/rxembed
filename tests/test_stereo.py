@@ -424,6 +424,26 @@ def test_without_stale_point_tags_keeps_stereocentre_tags():
         assert _props(mol) == before, name
 
 
+def test_stereo_from_3d_reads_an_unreadable_stated_axis_as_none():
+    """An axis end whose two ring bonds project to one side has no hand: the stated axis misses, as a centre would."""
+    mol = rx.embed(PHENYLPYRROLE_AXIS, n=1, seed=3, threads=1).mol
+    pos = mol.GetConformer().GetPositions()
+    axis = (pos[8] - pos[7]) / np.linalg.norm(pos[8] - pos[7])
+    first, second = (n.GetIdx() for n in mol.GetAtomWithIdx(7).GetNeighbors() if n.GetIdx() != 8)
+    lateral = pos[first] - pos[7] - (pos[first] - pos[7]) @ axis * axis
+    pos[second] = pos[7] + (pos[second] - pos[7]) @ axis * axis + 0.9 * lateral
+    mol.GetConformer().SetPositions(pos)
+    assert rx.changes(mol).stereo == "specified C7-N8 M but the conformer has none"
+
+
+def test_assign_atrop_from_3d_refuses_a_2d_conformer():
+    """A depiction has no axis hand to read, so its placeholder tag must not be taken for one."""
+    mol = Chem.Mol(rx.isomers(PHENYLPYRROLE_AXIS)[0])
+    rdDepictor.Compute2DCoords(mol)
+    with pytest.raises(ValueError, match="this conformer is 2D"):
+        stereo.assign_atrop_from_3d(mol, [(7, 8)])
+
+
 def test_renumber_atoms_keeps_each_atropisomer_axis_hand():
     """Swapping C1 and C5 changes the lowest neighbour at one end of the C7-N8 axis; also C9 and C13, at both."""
     mol = Chem.MolFromSmiles(PHENYLPYRROLE_AXIS)

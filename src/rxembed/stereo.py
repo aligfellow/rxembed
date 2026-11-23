@@ -759,17 +759,14 @@ def assign_atrop_from_3d(mol, atrop_centers, *, required=True):
     if not atrop_centers:
         return []
     probe = Chem.Mol(mol)
-    for bond in probe.GetBonds():
-        bond.SetBondDir(Chem.BondDir.NONE)  # RDKit will not wedge an axis beside an E/Z slash bond
-    for pair in atrop_centers:
+    if not probe.GetConformer().Is3D():  # RDKit leaves a 2D conformer's placeholder tag in place, unread
+        raise ValueError("atropisomer hands are read from 3D coordinates and this conformer is 2D; embed it first")
+    for pair in atrop_centers:  # RDKit reads an axis from 3D only once it carries an atrop tag
         probe.GetBondBetweenAtoms(*pair).SetStereo(Chem.BondStereo.STEREOATROPCW)
-    block = Chem.MolToMolBlock(probe, confId=probe.GetConformer().GetId(), includeStereo=True)
-    perceived = Chem.MolFromMolBlock(block, sanitize=False, removeHs=False)
-    if perceived is None or not perceived.GetConformer().Is3D():
-        raise ValueError("RDKit could not perceive atropisomer stereo from the 3D MolBlock")
+    Chem.AssignStereochemistryFrom3D(probe, confId=probe.GetConformer().GetId())
     assigned = []
     for pair in atrop_centers:
-        tag = perceived.GetBondBetweenAtoms(*pair).GetStereo()
+        tag = probe.GetBondBetweenAtoms(*pair).GetStereo()
         if tag not in ATROP_STEREO:
             if required:
                 raise ValueError(f"RDKit could not perceive atropisomer axis {pair} from 3D coordinates")
@@ -1444,7 +1441,6 @@ def stereo_from_3d(mol, exclude=(), *, apply=False):
             atom = view.GetAtomWithIdx(idx)
             atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
             atom.ClearProp("_CIPCode")
-    assign_atrop_from_3d(work, stated_axes)
     atrop_centers = sorted(set(stated_axes) | set(assign_atrop_from_3d(work, inferred, required=False)))
     atom_centers, bond_centers, _ = graph.centres(work)
     atom_centers = [idx for idx in atom_centers if idx in supported_points]
