@@ -527,9 +527,12 @@ def without_stale_point_tags(mol):
     tagged = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetChiralTag() in TETRAHEDRAL_TAGS]
     if not tagged:
         return mol
-    graph = StereoGraph(mol, metal_indices(mol))
-    work = graph.work
     has_conformer = bool(mol.GetNumConformers())
+    # judged with every hydrogen explicit: RDKit counts an implicit H and two [H+] bridge legs as three equal hydrogens
+    explicit = Chem.Mol(mol)
+    explicit.UpdatePropertyCache(strict=False)  # an RWMol edit or unsanitised read has no implicit counts yet
+    graph = StereoGraph(Chem.AddHs(explicit, addCoords=has_conformer), metal_indices(mol))
+    work = graph.work
     unreadable = _non_tetrahedral_points(_cap_lone_pairs(work, graph.points), graph.points) if has_conformer else set()
     Chem.FindPotentialStereo(work, cleanIt=True, flagPossible=False)
     held = {index for index in tagged if work.GetAtomWithIdx(index).GetChiralTag() in TETRAHEDRAL_TAGS}

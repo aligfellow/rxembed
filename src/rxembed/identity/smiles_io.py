@@ -694,8 +694,11 @@ def _atrop_bond_stereo(core, stereo, at):
 def write_organic(mol, *, cx):
     """Write a metal-free Mol with RDKit's own writer, or return None when only the dative writer can.
 
-    `mol` carries the stereo to write as tags. Hydrogens drop as RDKit's `RemoveHs` drops them; mapped ones stay. A
-    metal, an atropisomer axis or a zero-order or dative bond needs the dative writer.
+    `mol` carries the stereo to write as tags. Hydrogens drop as RDKit's `RemoveHs` drops them; mapped ones stay, as
+    does the hydrogen of a tagged centre that also bonds an unlabelled hydrogen atom: with its own hydrogen implicit,
+    RDKit 2026.09 writes such a centre's hand dropped or inverted (``C[B@H-]1[H+][B@H-](C)[H+]1`` as
+    ``C[B@H-]1[H+][B@@H-](C)[H+]1``); a deuterium neighbour writes correctly. A metal, an atropisomer axis or a
+    zero-order or dative bond needs the dative writer.
     """
     if metal_indices(mol) or any(
         bond.GetStereo() in ATROP_STEREO or bond.GetBondType() in _NOTED_BONDS for bond in mol.GetBonds()
@@ -704,6 +707,14 @@ def write_organic(mol, *, cx):
     keep = Chem.RemoveHsParameters()
     keep.removeMapped = False
     mol = Chem.RemoveHs(mol, keep, sanitize=False)
+    if inverted := [
+        atom.GetIdx()
+        for atom in mol.GetAtoms()
+        if atom.GetChiralTag() in TETRAHEDRAL_TAGS
+        and atom.GetTotalNumHs()
+        and any(neighbor.GetAtomicNum() == 1 and not neighbor.GetIsotope() for neighbor in atom.GetNeighbors())
+    ]:
+        mol = Chem.AddHs(mol, onlyOnAtoms=inverted)
     return (
         Chem.MolToCXSmiles(mol, Chem.SmilesWriteParams(), Chem.CXSmilesFields.CX_ALL_BUT_COORDS)
         if cx

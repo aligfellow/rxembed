@@ -180,6 +180,7 @@ def test_smiles_writes_one_dative_string_for_every_drawing():
         (_reversed(rx.parse_smiles("C[C@@H](CO)CO~N |Z:5|")), "CC(CO)CO~N |Z:5|"),
         (_enolate_both_ways(), "CC=C[O-]"),
         (["[NH3:1]->[Cu+:2]<-[NH2:3][H:4]"], "[NH3:1]->[Cu+:2]<-[NH2:3][H:4]"),
+        (["C[C@H]([2H])O"], "[2H][C@@H](C)O"),  # RDKit writes a deuterium neighbour's hand right
         ([imine], r"[H]/[N](=C\C)->[Pt+2](<-[Cl-])(<-[Cl-])<-[Br-]"),
         ([side_on], "C[CH]1=[CH](F)->[Pt+2]<-1(<-[NH3])(<-[Cl-])<-[Br-]"),  # E/Z through the metal is CX's
         ([carbanion, forged_beside_a_hand], rx.smiles(carbanion)),
@@ -223,6 +224,8 @@ def test_each_species_cx_name_reads_back_as_itself():
             [_planar("N(->[Pd+]<-[Cl-])->[Pt+]<-[Br-]", [(0, 0), (-2, 0), (-4, 0), (2, 0), (4, 0)])],
         ),
         ("pyrazine-bridged-cobalts", [rx.parse_smiles(NOTED_PYRAZINE_CO2)]),
+        ("cis and trans B2H2 rings", rx.isomers("C[BH-]1[H+][BH-](C)[H+]1")),
+        ("boron hands beside one bridge", rx.isomers("C[BH-]1[H+][BH2-]CC1")),
     ):
         names = [rx.cxsmiles(one) for one in species]
         assert len(set(names)) == len(names), name
