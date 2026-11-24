@@ -180,7 +180,9 @@ POLYHEDRA: dict[str, Polyhedron] = {
             name="tetrahedral",
             code="TET",
             default_rank=1,
-            vertex_dirs=((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)),
+            vertex_dirs=tuple(
+                tuple(c / math.sqrt(3) for c in ray) for ray in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1))
+            ),
         ),
         # trans pair 0,1 as octahedral; idealised 180/120 deg, since no crystal-structure fit pins a d-block sawhorse
         Polyhedron(

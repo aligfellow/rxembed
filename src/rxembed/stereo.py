@@ -514,6 +514,74 @@ def potential_stereo(mol):
     return list(Chem.FindPotentialStereo(Chem.Mol(mol), cleanIt=True))
 
 
+def kept_stereo(reference, mol):
+    """Return `mol` with each open point centre and double bond that keeps its `reference` neighbours set as there.
+
+    Both Mols share one atom order. An element whose atoms change neighbours or hydrogens reacts and stays open: whether
+    it inverts or keeps its configuration is the mechanism's, not the graph's. A pyramidal point that trades its lone
+    pair for one neighbour or hydrogen, or one for a lone pair, keeps its hand, the bond forming or leaving where the
+    lone pair stands. A point with no hand that only gains neighbours takes, when `reference` has a conformer, the hand
+    the newcomer shows there from its side of the others. A conformer's own hands count as tags. A point's CW/CCW is
+    relative to neighbour order and a bond's is copied as cis/trans of its stereo atoms, so neither rests on CIP
+    priorities.
+    """
+    out, metals = Chem.RWMol(mol), metal_indices(mol)
+    if reference.GetNumConformers():
+        reference = Chem.Mol(reference)
+        stereo_from_3d(reference, metal_indices(reference), apply=True)
+
+    def bonded(side, idx):
+        return {n.GetIdx() for n in side.GetAtomWithIdx(idx).GetNeighbors()}
+
+    def same_hs(idx):
+        return out.GetAtomWithIdx(idx).GetTotalNumHs() == reference.GetAtomWithIdx(idx).GetTotalNumHs()
+
+    def kept(idx):
+        return same_hs(idx) and bonded(out, idx) == bonded(reference, idx)
+
+    for atom in out.GetAtoms():
+        idx, given = atom.GetIdx(), reference.GetAtomWithIdx(atom.GetIdx())
+        if atom.GetChiralTag() in TETRAHEDRAL_TAGS or given.GetChiralTag() not in TETRAHEDRAL_TAGS:
+            continue
+        order, mine = [n.GetIdx() for n in given.GetNeighbors()], [n.GetIdx() for n in atom.GetNeighbors()]
+        gained, lost = sorted(set(mine) - set(order)), sorted(set(order) - set(mine))
+        hs = given.GetTotalNumHs(), atom.GetTotalNumHs()
+        if not kept(idx):  # RDKit counts implicit hydrogens and a lone pair last, so the one ligand traded sits there
+            traded = len(gained) + len(lost) + abs(hs[0] - hs[1]) == 1
+            if idx in metals or not traded or {len(order) + hs[0], len(mine) + hs[1]} != {3, 4}:
+                continue
+            order, mine = [*order, *gained], [*mine, *lost]
+        perm = [order.index(n) for n in mine]
+        swaps = sum(a > b for i, a in enumerate(perm) for b in perm[i + 1 :])
+        atom.SetChiralTag(given.GetChiralTag() if swaps % 2 == 0 else mirror_tag(given.GetChiralTag()))
+    for bond in reference.GetBonds():
+        ends = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        other = out.GetBondBetweenAtoms(*ends)
+        if bond.GetStereo() not in EZ_RELATION or other is None or other.GetStereo() != Chem.BondStereo.STEREONONE:
+            continue
+        if other.GetBondType() == bond.GetBondType() and all(map(kept, ends)):
+            refs = list(bond.GetStereoAtoms())
+            other.SetStereoAtoms(*(refs if other.GetBeginAtomIdx() == ends[0] else refs[::-1]))
+            cis = EZ_RELATION[bond.GetStereo()] == "cis"
+            other.SetStereo(Chem.BondStereo.STEREOCIS if cis else Chem.BondStereo.STEREOTRANS)
+    Chem.SetDoubleBondNeighborDirections(out)  # RDKit's writer re-reads E/Z from directions
+    for atom in out.GetAtoms() if reference.GetNumConformers() else ():
+        idx, neighbours = atom.GetIdx(), bonded(out, atom.GetIdx())
+        gains = same_hs(idx) and bonded(reference, idx) < neighbours and len(neighbours) >= 3  # noqa: PLR2004 - a point's
+        if idx in metals or atom.GetChiralTag() in TETRAHEDRAL_TAGS or not gains:
+            continue
+        # read alone, the point at its neighbours' centroid: inside them as `stereo_from_3d` reads, not turning them
+        work = Chem.Mol(out)
+        work.RemoveAllConformers()
+        conf = Chem.Conformer(reference.GetConformer())
+        conf.SetAtomPosition(idx, Point3D(*conf.GetPositions()[sorted(neighbours)].mean(axis=0)))
+        work.AddConformer(conf, assignId=True)
+        stereo_from_3d(work, metals, apply=True)
+        if (tag := work.GetAtomWithIdx(idx).GetChiralTag()) in TETRAHEDRAL_TAGS:
+            atom.SetChiralTag(tag)
+    return without_stale_point_tags(out.GetMol())
+
+
 def without_stale_point_tags(mol):
     """Return `mol` without point tags that mark no stereocentre: `mol` itself or a copy.
 

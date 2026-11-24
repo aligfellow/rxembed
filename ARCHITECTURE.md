@@ -22,8 +22,10 @@ them. The species stays authoritative while coordinates are searched and relaxed
 8. Return an `Ensemble`, with real metals and notes restored (`ensemble`).
 
 `rx.isomers` stops after step 2, `rx.minimize` skips step 5, and `rx.coembed` runs steps 3 to 7 on both endpoints of
-a reaction (`engine/coembed`). Each species or contact mode is built on its own, and a collection keeps the failures
-in `.errors`.
+a reaction (`engine/coembed`). With `reference=`, `rx.isomers` ranks its species against a reaction partner by the
+co-embed's least motion (`engine/coembed.follow`), holding each metal whose bonds stay and carrying hands and faces
+over on the shared atom order (`stereo.kept_stereo`, `identity/species.retold_centres`). Each species or contact mode
+is built on its own, and a collection keeps the failures in `.errors`.
 
 The surrogate graph and the other derived views (stripped ligands, stereo caps) feed the numerical models and never
 become a second identity. Construction holds what the species specifies; reading a result describes its coordinates

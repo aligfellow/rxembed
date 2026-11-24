@@ -55,7 +55,9 @@ from rxembed.metal.stereo import (
     chirality_of,
     donor_classes,
     face_descriptors,
+    face_orientations,
     face_winding,
+    retold_winding,
     site_classes,
 )
 from rxembed.stereo import (
@@ -331,6 +333,56 @@ def observed_haptic_windings(mol, metal, donors, haptic):
         for dummy, face in haptic.items()
         if (sign := face_winding(mol, pos, metal, face, ranks, eta2_ranks))
     }
+
+
+def retold_centres(source, target, centres):
+    """Return `centres`, named on chemical graph `source`, with faces wound and hands named as `target` names them.
+
+    Both graphs share one atom order; centres from two graphs compare only once named on one. A conformer of `source`
+    shows each face's side, so `target` reads it there, a face it alone makes planar-chiral included; without one, a
+    side `source` names is retold (`retold_winding`). A hand names a seating by its donors' classes, which an edit to
+    a donor's own bonds can reorder (a proton leaving a bound amine), so `target` names each handed seating again.
+    """
+    pos = source.GetConformer().GetPositions() if source.GetNumConformers() else None
+    faces = [
+        (centre, site) for centre in centres for site in centre.vertices if site is not VACANT and len(site.atoms) > 1
+    ]
+    told = {}
+    if any(pos is not None or site.winding in ("+", "-") for _centre, site in faces):
+        graphs = engine_graph(source), engine_graph(target)
+        for centre, site in faces:
+            donors = {atom for s in centre.vertices if s is not VACANT for atom in s.atoms}
+            ranks = [
+                donor_classes(graph, donors | {n.GetIdx() for n in mol.GetAtomWithIdx(centre.atom).GetNeighbors()})
+                for graph, mol in zip(graphs, (source, target), strict=True)
+            ]
+            if pos is None:
+                told[centre.atom, site] = retold_winding(*graphs, centre.atom, site.atoms, site.winding, ranks)
+            else:
+                read = face_winding(graphs[1], pos, centre.atom, site.atoms, ranks[1])
+                told[centre.atom, site] = read if read in face_orientations(graphs[1], site.atoms, ranks[1]) else ""
+    wound = tuple(
+        centre._replace(
+            vertices=tuple(
+                replace(site, winding=told[centre.atom, site]) if (centre.atom, site) in told else site
+                for site in centre.vertices
+            )
+        )
+        for centre in centres
+    )
+    if not any(centre.hand for centre in wound):
+        return wound
+    facts, sites = LigandFacts(target), materialized_states(target, wound)
+    return tuple(
+        centre._replace(
+            hand=chirality_of(
+                facts.mol, centre.geometry, sites[centre.atom].vertices, sites[centre.atom].haptic, facts.roles
+            )
+        )
+        if centre.hand
+        else centre
+        for centre in wound
+    )
 
 
 def canonical_metals(mol, metals, state=None):

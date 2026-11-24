@@ -67,12 +67,14 @@ from rxembed.metal.stereo import MIRROR, chelate_links, chirality_of, donor_clas
 _SCREEN_SITES = 8  # Keep the finite raw pool bounded before applying whole-network reach screening.
 
 
-def _select_geometries(base, m, donors, haptic, geometry):
-    """Return the polyhedra to enumerate: the requested names, else the default for the donor count."""
+def _select_geometries(base, m, donors, haptic, geometry, *, every):
+    """Return the polyhedra to enumerate: the requested names, else `every` one or the default for the donor count."""
     n = len(donors)
     if geometry is not None:
         logger.debug("geometry: requested %s", ", ".join(map(describe, geometry)))
         return list(geometry)
+    if every:
+        return [p.name for p in geometries_for_cn(n)]
     selected = retained_geometry(base, m, donors, haptic)
     if selected is None:
         raise ValueError(
@@ -359,14 +361,14 @@ def _certified_conflict(n, payload, refine):
     return None
 
 
-def _told_apart(facts, context, metal, classes, haptic):
-    """Return the site `classes` of `metal`, each site split off whose ligand binds another open centre.
+def _told_apart(facts, context, metal, classes, haptic, held):
+    """Return the site `classes` of `metal`, each site split off whose ligand binds another open or `held` centre.
 
     Donors equivalent at this centre stop being so once the other is seated: a bridge trans to the chloride at both
-    metals (syn) and at one (anti) are two species.
+    metals (syn) and at one (anti) are two species, and a held centre is seated already.
     """
     frag = facts.fragments
-    others = {centre.atom for centre in context if not centre.geometry} - {metal}
+    others = {centre.atom for centre in context if not centre.geometry or centre in held} - {metal}
     joined = {frag[donor] for donor, other in facts.donor_bonds if other in others}
     return {
         site: (*key, site) if any(frag[atom] in joined for atom in haptic.get(site, (site,))) else key
@@ -404,7 +406,13 @@ def _centres_for_geometry(request, facts, context, centre, geom, collapsed):
         )
     classes = site_classes(base, padded, haptic, facts.roles)
     problem = SeatingProblem(
-        base, tuple(padded), geom, haptic, _told_apart(facts, context, m, classes, haptic), distances, linked
+        base,
+        tuple(padded),
+        geom,
+        haptic,
+        _told_apart(facts, context, m, classes, haptic, request.held),
+        distances,
+        linked,
     )
     retained = _retained_seating(problem, m, screen)
     out, unreachable = [], 0
@@ -469,7 +477,8 @@ def _haptic_choices(facts, centres, modes):
     """Return `centres` with their face windings expanded under `modes`.
 
     A diene face takes the diene mode, any other the side mode. 'racemic' drops the observed winding and 'invert'
-    mirrors it; both then take every symmetry-distinct winding.
+    mirrors it; both then take every symmetry-distinct winding. Other modes wind only the faces left unwound, such as
+    one a bond change elsewhere makes planar-chiral at a held centre.
     """
     if set(modes) <= {"free", "preserve"}:
         return centres
@@ -493,10 +502,12 @@ def _reject_unenumerable(mol, request, selected):
     Under ``center='all'``, `geometry=` cannot name one polyhedron for every metal, and three or more metals joined by
     bridges refuse, since notes cannot record how bridges join them. One `center` among three or more equivalent metals
     refuses, since its other arrangements have no canonical name; any other single `center` needs a conformer for the
-    remaining metals. Notes on any metal, or ``observed=True``, skip these checks.
+    remaining metals. A held metal is seated already and counts in none of these. Notes on any metal, or
+    ``observed=True``, skip these checks.
     """
-    metals, center = metal_indices(mol), request.center
-    if center == "all" and request.geometry is not None:
+    held = {centre.atom for centre in request.held}
+    metals, center = [m for m in metal_indices(mol) if m not in held], request.center
+    if center == "all" and request.geometry is not None and len(metals) > 1:
         raise ValueError("geometry= names one polyhedron, but every metal is enumerated here, each in its own; omit it")
     if (
         len(metals) <= 1
@@ -608,7 +619,8 @@ def _open_choices(mol, facts, order, notes, request):
     """Return the centres each metal in `order` can take when `mol` has no notes.
 
     The requested metal takes every arrangement found, the others the one their conformer shows; ``center='all'``
-    enumerates every metal in canonical order. Under `mirror`, centres read from the conformer are mirrored.
+    enumerates every metal in canonical order. A metal the request holds takes its held centre. Under `mirror`, centres
+    read from the conformer are mirrored.
     """
     if request.center == "all":
         order = canonical_metals(mol, order)
@@ -616,9 +628,15 @@ def _open_choices(mol, facts, order, notes, request):
         enumerated = ()
     else:
         enumerated = order if request.center == "all" else order[:1]
+    held = {centre.atom: centre for centre in request.held}
+    enumerated = [m for m in enumerated if m not in held]
     # notes survive here only under observed=True, which reads each noted metal in its noted polyhedron
     noted = {m: (notes[m].geometry,) for m in order if notes[m]}  # as `IsomerRequest.geometry` names polyhedra
-    fixed = {m: observed_centre(facts, m, notes[m] and notes[m].geometry) for m in order if m not in enumerated}
+    fixed = {
+        m: held[m] if m in held else observed_centre(facts, m, notes[m] and notes[m].geometry)
+        for m in order
+        if m not in enumerated
+    }
     context = tuple(fixed.get(metal, facts.centre(metal)) for metal in metal_indices(mol))
     choices = [
         [fixed[m]] if m in fixed else _enumerated(request, facts, m, context, request.geometry or noted.get(m))
@@ -739,7 +757,7 @@ def _enumerated(request, facts, metal, context, geometry):
             f"{centre_name(centre)} has no donor bonds, so there is no coordination isomer to enumerate; "
             + (remedy if len(context) == 1 else "enumerate the other metals without it")
         )
-    geoms = _select_geometries(base, metal, donors, haptic, geometry)
+    geoms = _select_geometries(base, metal, donors, haptic, geometry, every=request.every_polyhedron)
     if request.observed:
         return [observed_centre(facts, metal, geom) for geom in geoms]
     return [

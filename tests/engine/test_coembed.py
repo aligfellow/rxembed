@@ -161,6 +161,20 @@ def test_pair_scores_and_records_read_one_coupled_objective():
     assert observed == ("joint", score, score, pytest.approx([3.4, 3.4], abs=0.05))
 
 
+def test_coembed_holds_a_pi_stack_in_both_endpoints():
+    """1,3-Diphenylpropane's rings lie 7 A apart unheld; a constrain= stack holds them 3.6 A apart at both ends."""
+    rings = (5, 0, 1, 2, 3, 4), (9, 10, 11, 12, 13, 14)
+    pair = rx.coembed("c1ccccc1CCCc1ccccc1", "c1ccccc1CCCc1ccccc1", constrain={rings: 3.6}, n=1, seed=1)
+
+    (cid,) = pair.ids
+    ends = (pair.reactant, pair.product)
+    spans = [
+        np.linalg.norm(np.subtract(*(end.mol.GetConformer(cid).GetPositions()[list(ring)].mean(0) for ring in rings)))
+        for end in ends
+    ]
+    assert spans == pytest.approx([3.6, 3.6], abs=0.1)
+
+
 def test_nazarov_frames_coembed_in_their_input_order():
     """Two xyz frames of one path, mapped atom for atom, return in their input order."""
     paths = [str(EXAMPLES_DIR / f"nazarov_{side}.xyz") for side in ("start", "end")]

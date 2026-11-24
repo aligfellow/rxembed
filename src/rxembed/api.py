@@ -18,7 +18,7 @@ from rdkit import Chem
 
 from rxembed.engine.acceptance import EmbeddingError
 from rxembed.engine.atom_mapping import in_reactant_order, reaction_atoms
-from rxembed.engine.coembed import coembed_pair, coupling, least_motion
+from rxembed.engine.coembed import coembed_pair, coupling, follow, least_motion
 from rxembed.engine.seeding import prepare, relaxed, seeded
 from rxembed.ensemble import FINAL, Coembedded, CoembeddedSet, Ensemble, EnsembleSet, SpeciesSet, species_name
 from rxembed.geometry.bounds import resolve_sampling
@@ -37,12 +37,12 @@ from rxembed.identity.reading import (
     vacancy_seatings,
 )
 from rxembed.identity.smiles_io import mol_from_species, parse_smiles, read_native_tags
-from rxembed.identity.species import graph_with_stereo
+from rxembed.identity.species import graph_with_stereo, retold_centres
 from rxembed.identity.stereoisomers import StereoRequest
 from rxembed.metal.centres import canonical_metal_graph
 from rxembed.perception.changes import stereo_filter
 from rxembed.perception.contacts import contact_modes, parse_contacts
-from rxembed.stereo import without_stale_point_tags
+from rxembed.stereo import kept_stereo, without_stale_point_tags
 from rxembed.utils import require_mol
 
 logger = logging.getLogger("rxembed")
@@ -74,7 +74,18 @@ def _mol_from_source(source, verb, *, geometry=False):
     return read_native_tags(canonical_metal_graph(mol))
 
 
-def isomers(source, *, geometry=None, stereo=None, center=None, coordinate=None, observed=None, screen=True, fix=None):
+def isomers(
+    source,
+    *,
+    geometry=None,
+    stereo=None,
+    center=None,
+    coordinate=None,
+    observed=None,
+    screen=True,
+    fix=None,
+    reference=None,
+):
     """Return every species `source` can be: its stereoisomers and, for a metal, its coordination arrangements.
 
     `source` is a SMILES or a Mol (read a charged .xyz with `read_xyz`). A Mol with a conformer is one species carrying
@@ -89,8 +100,36 @@ def isomers(source, *, geometry=None, stereo=None, center=None, coordinate=None,
     arrangements beyond the model's reach screens, which may not embed. `fix` takes what `rx.embed` takes and keeps only
     the species its pinned atoms agree with, so `rx.embed` accepts each under that fix; it raises when none is left, and
     pinning a sphere atom lifts the screens.
+
+    `reference` ranks the species against a reaction partner of the same atoms, a SMILES or Mol with its metal
+    arrangement specified, paired as `rx.coembed` pairs endpoints. A metal whose neighbours stay keeps the reference's
+    arrangement (`species.retold_centres`); one whose bonds change takes the polyhedra its kept sites fit best, unless
+    `geometry` names one. Hands and double bonds carry over as `stereo.kept_stereo` reads them. The species come least
+    motion first (`coembed.follow`), each `scores` entry the changing bonds' bound conflict in Å, the sites that move
+    and the RMS shift of the shared ones; equal scores are branches the reference leaves open. `center` and
+    ``stereo='invert'`` are refused, and so is a reference no species follows.
     """
     mol = _mol_from_source(source, "rx.isomers")
+    held = ()
+    if reference is not None:
+        if coordinate is not None:
+            raise ValueError("reference= ranks the species a source can be; seat its vacancies first, then rank them")
+        if center is not None:
+            raise ValueError("reference= enumerates each metal whose bonds change and holds the others; omit center=")
+        if "invert" in (stereo.values() if isinstance(stereo, dict) else (stereo,)):
+            raise ValueError(
+                "reference= follows the reference's hands; to follow its mirror image, pass the reference inverted "
+                "by rx.isomers(reference, stereo='invert')"
+            )
+        given = in_reactant_order(mol, _mol_from_source(reference, "rx.isomers"))  # on the source's atom order
+        mol = kept_stereo(given, mol)
+        reference = read_species(given, StereoRequest.parse("free").on(given))
+        bonded = [
+            {m: {n.GetIdx() for n in side.GetAtomWithIdx(m).GetNeighbors()} for m in metal_indices(mol)}
+            for side in (given, mol)
+        ]
+        told = retold_centres(reference.mol, mol, reference.centres)
+        held = tuple(centre for centre in told if bonded[0][centre.atom] == bonded[1][centre.atom])
     if observed and not mol.GetNumConformers():
         raise ValueError("observed=True reads a conformer, and this Mol has none")
     if not metal_indices(mol) and any(choice is not None for choice in (geometry, center, coordinate, fix)):
@@ -105,8 +144,17 @@ def isomers(source, *, geometry=None, stereo=None, center=None, coordinate=None,
         geometry=requested_geometry(geometry),
         observed=observed,
         screen=screen,
+        every_polyhedron=reference is not None,
+        held=held,
     )
     found = possible_species(mol, request)
+    if reference is not None:
+        if not (ranked := follow(reference, found, resolve_sampling(None, None, None))):
+            raise ValueError(
+                "no species of this source follows the reference; check the atom mapping, "
+                "or pass geometry= or screen=False"
+            )
+        return SpeciesSet.of_isomers([species for _score, species in ranked], [score for score, _species in ranked])
     if request.coordinate is None:
         return SpeciesSet.of_isomers(found)
     # Each donor choice seats each species once; CX order, not slot or atom order, picks the first.
@@ -288,7 +336,7 @@ def coembed(
     sides = least_motion(*(read_species(mol, reading.on(mol)) for mol in mols))
     atoms = reaction_atoms(sides[0], sides[1], spectator_atoms, react_atoms)
     modes = contact_modes(mols[0], contacts)
-    for terms in (constrain, *modes.values()):  # both endpoints share the reactant's atom order
+    for terms in modes.values():  # both endpoints share the reactant's atom order; resolve_core checks constrain
         if terms and not all(is_index(atom) and 0 <= atom < mols[0].GetNumAtoms() for key in terms for atom in key):
             raise ValueError("coembed geometry terms need atom-index keys of the reactant's atoms")
     pins = resolve_core(mols[0], constrain=constrain)

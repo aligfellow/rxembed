@@ -147,6 +147,22 @@ templated = rx.embed(trans, fix=rx.Template(trans_confs[0], {0: 0, 1: 1, 2: 2}),
 bound = rx.embed(rx.isomers("N->[Pt](Cl)Cl.CC(C)=O", geometry="SPL", coordinate="[OX1]").select(index=0), n=10)
 ```
 
+`reference=` gives a product the arrangement and stereo its reactant leads to, without embedding, for a graph edit
+such as a ligand binding or leaving or a proton moving. The reactant specifies its metal arrangement and pairs with
+the product as `rx.coembed` pairs endpoints, by atom maps or else the overlay keeping most bonds. A metal whose bonds
+stay keeps its arrangement and faces; one whose bonds change takes the polyhedra its kept ligands fit best, so H2
+adding to a square plane gives an octahedron. Stereo the reaction leaves untouched keeps the reactant's, a pyramidal
+centre such as P keeps its hand when it trades its lone pair for a bond or a bond for one, and a centre with no hand
+that only gains bonds takes the hand the reactant's conformer shows, when it has one. The species come least motion
+first; equal `.scores` are branches the reactant leaves open:
+
+```python
+reactant = rx.isomers("[NH2]1CC[NH-]->[Mn+]<-1(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+].[H][H]", geometry="SPY")[0]
+products = rx.isomers("[H][H]->[Mn+]1(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[NH-]CC[NH2]->1", reference=reactant)
+branches = [m for m, score in zip(products, products.scores) if score == products.scores[0]]
+product_confs = rx.embed(products[0], n=4)  # H2 in the vacancy, trans to the amine
+```
+
 ### Stereo
 
 `stereo=` on `rx.isomers` controls point R/S, E/Z, atropisomer M/P and bound-donor hands:
