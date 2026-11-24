@@ -232,10 +232,12 @@ pairs.product.dump("product.xyz", align=False)  # matching frames form a pair
 Supply the endpoints as SMILES, CX SMILES or Mols, including an `.xyz` read with `rx.read_xyz`, as two arguments, a
 pair or one `"reactant>>product"` SMILES. Each endpoint must specify one species, selected with `rx.isomers` when
 needed. Stereo neither endpoint states takes the hand the shared seed gives in both; to choose it, state it in the
-SMILES or pick a species. Atom maps resolve ambiguous overlays and stay on both endpoints. Atoms whose bonding or
-specified stereo differs between the endpoints react and the rest are spectators; a change of a metal's arrangement
-reacts at the metal and the fewest donors that move. `spectator_atoms=` and `react_atoms=` select the aligned and
-reacting atoms, and `constrain=` and `contacts=` hold both endpoints where they apply, all by reactant index.
+SMILES or pick a species. Atom maps resolve ambiguous overlays and stay on both endpoints. Atoms whose bonded
+partners, hybridization or specified stereo differ between the endpoints react, and a group a configuration change
+turns is neither reacting nor aligned; the rest are spectators, including atoms whose bond order or charge alone
+changes, as between resonance forms. A change of a metal's arrangement reacts at the metal and the fewest donors
+that move. `spectator_atoms=` and `react_atoms=` select the aligned and reacting atoms, and `constrain=` and
+`contacts=` hold both endpoints where they apply, all by reactant index.
 `contacts="auto"` gives a `CoembeddedSet`, one `Coembedded` per binding mode, with the failed modes in `.errors`. For
 reaction-path sampling, request more than three pairs and inspect their approach geometries. Keep the shared frame
 with `align=False` when writing and `auto_align=False` when drawing with `xyzrender`.

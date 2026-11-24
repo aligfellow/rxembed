@@ -79,9 +79,11 @@ def test_in_reactant_order_pairs_one_identity_with_its_stereo():
 
 
 def test_reaction_atoms_are_the_fewest_sites_that_change():
-    """Atoms react where a bond or specified arrangement changes. Equivalent sites of one species keep their places in
-    any atom order. A metal moves the fewest sites within its polyhedron, and across a change of polyhedron all of them
-    only when it keeps them all. A configuration change turns its smallest separable group.
+    """Atoms react where a bonded partner, a hybridization or a specified arrangement changes. Equivalent sites of one
+    species keep their places in any atom order. A metal moves the fewest sites within its polyhedron, and across a
+    change of polyhedron all of them only when it keeps them all. A configuration change reacts at its own atoms, and
+    the group it turns does not react. A bond order that changes alone, between resonance forms, in a ring joining an
+    aromatic system or in the diene's middle, leaves its atoms in place.
     """
     propenes = rx.isomers(f"[Cl-]->[Pt+2]12(<-[Cl-])(<-{PROPENE_PT}", geometry="SPL")
     meso = next(mol for mol in propenes if rx.identity(mol).haptic == ("meso",))
@@ -109,8 +111,12 @@ def test_reaction_atoms_are_the_fewest_sites_that_change():
             _reversed(rx.isomers(f"N->[Pt+2]12(<-[Cl-])(<-{PROPENE_PT}.[Cl-]", geometry="SPL")[1]),
             (0, 1, 9),
         ),
-        "CFClBrI inverted": ("[F:1][C@:2]([Cl:3])([Br:4])[I:5]", "[F:1][C@@:2]([Cl:3])([Br:4])[I:5]", (0, 1)),
-        "E to Z butene": ("C/C=C/C", "C/C=C\\C", (0, 1, 2, 4, 5, 6, 7)),
+        "CFClBrI inverted": ("[F:1][C@:2]([Cl:3])([Br:4])[I:5]", "[F:1][C@@:2]([Cl:3])([Br:4])[I:5]", (1,)),
+        "E to Z butene": ("C/C=C/C", "C/C=C\\C", (1, 2)),
+        "acetate resonance forms": ("[CH3:1][C:2](=[O:3])[O-:4]", "[CH3:1][C:2]([O-:3])=[O:4]", ()),
+        "carbanion to carbocation": ("C[CH-]C", "C[CH+]C", (1,)),
+        "indene deprotonated": ("C1C=Cc2ccccc21.[OH-]", "[cH-]1ccc2ccccc12.O", (0, 9, 10)),
+        "Diels-Alder": ("C=CC=C.C=C", "C1=CCCCC1", (0, 3, 4, 5)),
     }
     reacting = {name: _reaction_atoms(reactant, product).reacting for name, (reactant, product, _atoms) in rows.items()}
     assert reacting == {name: atoms for name, (_reactant, _product, atoms) in rows.items()}
@@ -125,6 +131,11 @@ def test_reaction_atoms_align_the_selected_spectators():
         ReactionAtoms(spectators=(0,), reacting=(1, 2, 3)),
         ReactionAtoms(spectators=(4, 5, 6, 7, 8), reacting=(0, 1, 2, 3)),
     ]
+
+
+def test_reaction_atoms_leave_a_turned_group_out_of_both():
+    """E- to Z-butene turns C0 with its hydrogens 4-7 about the double bond, which neither aligns nor reacts."""
+    assert _reaction_atoms("C/C=C/C", "C/C=C\\C") == ReactionAtoms(spectators=(3, 8, 9, 10, 11), reacting=(1, 2))
 
 
 def test_reaction_atoms_refuse_what_they_cannot_align():

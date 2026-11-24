@@ -58,7 +58,7 @@ def _element(atom):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ReactionAtoms:
-    """Hold which atoms a reaction's endpoints align by and which it moves, as indices of their one atom order."""
+    """Hold which atoms a reaction's endpoints align by and which react, as indices of their one atom order."""
 
     spectators: tuple
     reacting: tuple
@@ -68,11 +68,14 @@ def reaction_atoms(reactant, product, spectators=None, reacting=None):
     """Return the `ReactionAtoms` of the reactant and product `Species`, which share one atom order.
 
     Their equivalent sites are labelled as the co-embed seats them (`coembed.least_motion`). `spectators` and
-    `reacting` select atoms by index or SMARTS on the reactant. An atom reacts when its charge, bonds (partner, order,
-    dative direction) or specified stereo change, a metal's arrangement included (the metal and the donors of its
-    `site_motions`, unless the sides are one species), when a specified configuration change turns it
-    (`turned_atoms`), or when `reacting` selects it. The spectators are the selected ones, else every unchanged atom,
-    hydrogens included. Identical endpoints have no reacting atoms and align their common scaffold.
+    `reacting` select atoms by index or SMARTS on the reactant. An atom reacts when its bonded partners, a dative bond's
+    direction or its hybridization change, when its specified stereo changes, a metal's arrangement included (the metal
+    and the donors of its `site_motions`, unless the sides are one species), or when `reacting` selects it. A bond order
+    or charge that changes alone, as between resonance forms, keeps the partners and hybridization UFF builds the
+    atom's geometry from, so the atom stays a spectator. The group a specified configuration change turns
+    (`turned_atoms`) is neither: the turn is the reaction itself, so a pull between the endpoints only strains them or
+    flips the hand. The spectators are the selected ones, else every atom that neither reacts nor turns, hydrogens
+    included. Identical endpoints have no reacting atoms and align their common scaffold.
     """
     graphs = [graph_with_stereo(species) for species in (reactant, product)]
     aligned, moved = (_picked(graphs[0], *row) for row in ((spectators, "spectator_atoms"), (reacting, "react_atoms")))
@@ -83,16 +86,17 @@ def reaction_atoms(reactant, product, spectators=None, reacting=None):
             "react_atoms must be outside spectator_atoms; remove reacting atoms from the spectator selection"
         )
     every = range(graphs[0].GetNumAtoms())
-    bonds = {atom for atom in every if _bonds(graphs[0], atom) != _bonds(graphs[1], atom)}
+    bonds = {atom for atom in every if _bonding(graphs[0], atom) != _bonding(graphs[1], atom)}
     elements = [_stereo_at(species.stereo) for species in (reactant, product)]
     changed = bonds | {atom for atom in every if elements[0].get(atom) != elements[1].get(atom)}
     if changed or len(distinct([reactant, product])) > 1:  # one species twice moves no site, however it is labelled
         for metal, sites in site_motions(reactant.centres, product.centres).items():
             changed |= {metal}.union(*sites)
+    changed |= set(moved or ())
     stereo = (reactant.stereo, product.stereo)
-    changed |= set(moved or ()) | turned_atoms(graphs, stereo, set(aligned or ()), bonds, chosen=aligned is not None)
+    turned = turned_atoms(graphs, stereo, set(aligned or ()), bonds, chosen=aligned is not None)
     if aligned is None:
-        aligned = tuple(atom for atom in every if atom not in changed)
+        aligned = tuple(atom for atom in every if atom not in changed | turned)
     if not aligned:
         raise ValueError("coembed cannot align the endpoints: the reaction changes every atom; pass spectator_atoms=")
     reacting = tuple(a for a in every if a in changed and a not in aligned)
@@ -112,18 +116,13 @@ def _picked(graph, picked, name):
     return tuple(dict.fromkeys(resolve_atom(graph, atom) for atom in picked))
 
 
-def _bonds(mol, atom):
-    """Return an atom's charge and its bonds as (partner, order, whether the atom donates it)."""
-    found = mol.GetAtomWithIdx(atom)
+def _bonding(mol, atom):
+    """Return an atom's hybridization and its bonds as (partner, whether the atom donates it)."""
     bonds = sorted(
-        (
-            b.GetOtherAtomIdx(atom),
-            b.GetBondTypeAsDouble(),
-            b.GetBondType() == Chem.BondType.DATIVE and b.GetBeginAtomIdx() == atom,
-        )
-        for b in found.GetBonds()
+        (b.GetOtherAtomIdx(atom), b.GetBondType() == Chem.BondType.DATIVE and b.GetBeginAtomIdx() == atom)
+        for b in mol.GetAtomWithIdx(atom).GetBonds()
     )
-    return found.GetFormalCharge(), bonds
+    return mol.GetAtomWithIdx(atom).GetHybridization(), bonds
 
 
 def _stereo_at(stereo):
