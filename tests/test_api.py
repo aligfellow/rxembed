@@ -639,6 +639,19 @@ def test_coembed_takes_the_open_product_arrangement_that_follows_the_reactant():
     assert sorted(shapes) == [("cis", "cis"), ("trans", "trans")]
 
 
+def test_coembed_pulls_h2_toward_trans_hydride_sites_without_bonding_it():
+    """H2 adding trans to Vaska's complex is drawn toward both hydride sites short of bonding it to the Ir, so every
+    pair keeps its jointly relaxed geometry."""
+    reactant = rx.isomers(VASKA, geometry="square_planar")[1]
+    trans = next(
+        mol
+        for mol in rx.isomers(VASKA_H2, reference=reactant)
+        if frozenset((7, 8)) in _slot_pairs(mol, OCTAHEDRAL_TRANS)
+    )
+    pair = rx.coembed(reactant, trans, n=4, seed=1, threads=1)
+    assert {record["stage"] for record in pair.joint_results.values()} == {"joint"}
+
+
 def test_coembed_keeps_a_fixed_endpoint_and_its_source_unmoved(beta_hydride):
     """The beta-hydride pair is rebuilt around its reactant, and a cis-diamminedichloropalladium around a trans one."""
     pair = beta_hydride[1][0]

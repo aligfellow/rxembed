@@ -512,14 +512,16 @@ class Energy(NamedTuple):
 class CoEmbedParams:
     """Hold the coupled relaxation's weights, stopping tolerances and step budgets for `rx.coembed`, validated.
 
-    `alignment_weight` and `react_weight` pull spectator and reacting atoms together, each normalized over its group.
+    `alignment_weight` and `react_weight` pull each spectator and each reacting atom toward its place in the other
+    endpoint, in kcal/mol/Å² per atom, so a pull does not depend on the size of its group or molecule; a stronger
+    spectator weight trades endpoint strain for alignment.
     `joint_gtol` and `joint_energy_tol` stop the joint relaxation; a score plateau gives no force guarantee.
     `seed_relax_iters` caps each endpoint's preparation, zero skipping it, and each endpoint takes at most
     `joint_max_iters` native steps per cycle for `max_cycles` cycles.
     """
 
-    alignment_weight: float = 25.0
-    react_weight: float = 1.25
+    alignment_weight: float = 0.5
+    react_weight: float = 2.5
     joint_gtol: float = 0.1
     joint_energy_tol: float = 1e-3
     seed_relax_iters: int = 100

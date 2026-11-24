@@ -18,7 +18,7 @@ from rdkit.Chem import GetPeriodicTable
 
 from rxembed.geometry.constraints import Constraints, add_distance, canonical_key, graft_owns
 from rxembed.geometry.mechanisms import law_of_cosines
-from rxembed.graph import COORDINATION_METALS, frag_map, ligand_degree, ligand_graph
+from rxembed.graph import COORDINATION_METALS, frag_map, ligand_degree, ligand_graph, metal_indices
 from rxembed.metal.centres import ligand_valence
 from rxembed.utils import flat_ranks
 
@@ -286,6 +286,27 @@ def bridge_floors(mol, distances, donor_bonds, real_z, frozen=frozenset()):
             ]
             floors[pair] = max(floors.get(pair, 0.0), law_of_cosines(legs[0], legs[1], BRIDGE_ANGLE))
     return Constraints(floors=floors, dg_floors=floors)
+
+
+def bond_floors(mol, pairs):
+    """Return `Constraints` holding each metal pair of `mol` in `pairs` outside a bond when its partner is `OUTER`.
+
+    The floor is the covalent sum plus `_OVERBOND_MARGIN`, hydrogen included and without `_tier_floor`'s vdW clearance,
+    so the partner approaches as far as re-perception allows. A partner bonded to a donor is the metal's own geometry
+    (`overbond_tier`), and a pair without a metal is not floored, since the margin models metal re-perception.
+    """
+    metals = set(metal_indices(mol))
+    floors = {}
+    for pair in map(canonical_key, pairs):
+        metal = next((atom for atom in pair if atom in metals), None)
+        if metal is None:
+            continue
+        partner = pair[1] if pair[0] == metal else pair[0]
+        donors = [atom.GetIdx() for atom in mol.GetAtomWithIdx(metal).GetNeighbors() if atom.GetIdx() not in metals]
+        if overbond_tier(mol, donors, partner) == OUTER:
+            radii = sum(_PT.GetRcovalent(mol.GetAtomWithIdx(atom).GetAtomicNum()) for atom in pair)
+            floors[pair] = radii + _OVERBOND_MARGIN
+    return Constraints(floors=floors)
 
 
 _ALKALI = frozenset({3, 11, 19, 37, 55, 87})  # Li, Na, K, Rb, Cs, Fr

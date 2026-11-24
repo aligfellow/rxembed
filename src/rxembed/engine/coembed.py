@@ -21,13 +21,14 @@ from rxembed.engine.atom_mapping import bond_sides, point_inversion_branches, si
 from rxembed.engine.conformers import BASE_STIFFNESS, RUNGS, Conformers, repeated_rejection
 from rxembed.engine.seeding import REPLACEMENT_FACTOR, prepare, seed_conformers, seed_takes_shape
 from rxembed.geometry.bounds import seed_bounds, seed_coordinates, seed_count
-from rxembed.geometry.constraints import Constraints, resolve_core
+from rxembed.geometry.constraints import Constraints, compose, resolve_core
 from rxembed.geometry.relax import Coupling, Endpoint, coupled_uff
 from rxembed.graph import frag_map, metal_indices
 from rxembed.identity.smiles_io import distinct
 from rxembed.identity.species import retold_centres
 from rxembed.identity.stereoisomers import unassigned_centres
 from rxembed.metal.centres import donor_bonds
+from rxembed.metal.distances import bond_floors
 from rxembed.metal.polyhedra import VACANT, vertex_dirs
 from rxembed.metal.sphere import LigandFacts
 from rxembed.metal.stereo import chelate_links, equivalent_site_assignments, site_classes
@@ -378,14 +379,25 @@ def _relaxed_pairs(batch, coupling, params, unspecified, *, fixed=None):
     """Climb the joint stiffness ladder, restore valid prepared pairs if rejected, and score the retained objective.
 
     A pair whose endpoint fails a gate the ladder repairs reruns from its prepared coordinates at the next rung, as one
-    endpoint does in `Conformers._relax`; every pair is scored at base stiffness.
+    endpoint does in `Conformers._relax`; every pair is scored at base stiffness. Each endpoint is floored outside the
+    metal bonds only its partner has (`bond_floors`), since the coupling pulls toward them and a bond made would change
+    the species, which no rung repairs.
     """
     prepared = {
         cid: [endpoint._mol.GetConformer(cid).GetPositions().copy() for endpoint in batch] for cid in batch[0].ids
     }
     failed = _pair_failures(batch, unspecified, fixed)
     checkpoint = {cid: positions for cid, positions in prepared.items() if cid not in failed}
-    targets = [Endpoint(mol=endpoint._mol, cons=endpoint.cons, record=endpoint._uff) for endpoint in batch]
+    left, right, _changed = _bond_graphs([endpoint.specification.mol for endpoint in batch])
+    lacking = (right.keys() - left.keys(), left.keys() - right.keys())
+    targets = [
+        Endpoint(
+            mol=endpoint._mol,
+            cons=compose(endpoint.cons, bond_floors(endpoint.specification.mol, pairs)),
+            record=endpoint._uff,
+        )
+        for endpoint, pairs in zip(batch, lacking, strict=True)
+    ]
     objectives, climbing = {}, list(batch[0].ids)
     for rung in RUNGS:
         run = coupled_uff(targets, coupling, climbing, BASE_STIFFNESS, params, fixed=fixed, rung=rung)
@@ -684,10 +696,9 @@ def _slot_dirs(state):
 
 
 def coupling(spectators, reacting, params):
-    """Couple corresponding atoms at zero displacement with separately normalized spectator and reacting weights."""
+    """Couple corresponding atoms at zero displacement, each by its group's per-atom weight."""
     held = len(spectators)
-    weights = [params.alignment_weight / held for _atom in spectators]
-    weights += [params.react_weight / len(reacting) for _atom in reacting]
+    weights = [params.alignment_weight] * held + [params.react_weight] * len(reacting)
     return Coupling(
         atoms=np.asarray([*spectators, *reacting], dtype=int),
         weights=np.array(weights),

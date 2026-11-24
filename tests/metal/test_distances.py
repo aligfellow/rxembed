@@ -108,6 +108,15 @@ def test_metals_sharing_a_donor_are_floored_apart():
         assert angles == [pytest.approx(92.0, abs=6.0)] * 2, fix
 
 
+def test_bond_floors_hold_only_an_outer_metal_partner_outside_a_bond():
+    """Only Pd2...H5 of a free H2 is floored, past its covalent sum: C0, bonded to donor C1, is the metal's own
+    geometry, and the organic C0...H6 has no metal."""
+    mol = Chem.MolFromSmiles("C[CH2-]->[Pd+2](<-[Cl-])<-N.[H][H]")
+    floors = distances.bond_floors(mol, [(5, 2), (0, 2), (0, 6)]).floors
+    assert floors.keys() == {(2, 5)}
+    assert floors[(2, 5)] > _PT.GetRcovalent(46) + _PT.GetRcovalent(1)
+
+
 def test_alkali_ion_embeds_at_ionic_contact_with_each_partner():
     """A chelating acetate, and waters and a chloride drawn as arrows from the sodium, all rest at contact; each lone
     partner is pulled to its window's middle and the chelate's linked arms are not."""
