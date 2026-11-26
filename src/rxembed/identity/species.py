@@ -221,6 +221,25 @@ def misplaced_pins(species, core, *, angles_only=False):
     return []
 
 
+def seated_as_pinned(species, core):
+    """Return `species` with each centre whose every site `core` pins seated as the pins show, if its state stays.
+
+    Pins that swap equivalent donors show the same arrangement, so the centre takes their seating. Pins leaving a site
+    free, or showing another arrangement, stay for `misplaced_pins` to name.
+    """
+    centres = list(species.centres)
+    for i, centre in enumerate(species.centres):
+        sites = species.sites[centre.atom].vertices
+        pinned = pinned_vertices(species.mol, core, centre.atom, sites, centre.geometry) if centre.geometry else {}
+        if not pinned or len(pinned) < sum(site is not VACANT for site in sites):
+            continue
+        facts = LigandFacts(species.mol)
+        moved = centre_from_slots(facts, centre.atom, centre.geometry, {v: sites[k] for v, k in pinned.items()})
+        if centre_state(facts, moved) == centre_state(facts, centre):
+            centres[i] = moved
+    return species if tuple(centres) == species.centres else replace(species, centres=tuple(centres))
+
+
 def centre_name(centre):
     """Return the element and atom index naming `centre`, e.g. ``'Pd0'``."""
     return f"{_PT.GetElementSymbol(centre.atomic_num)}{centre.atom}"

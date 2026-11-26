@@ -502,6 +502,19 @@ def test_pins_seat_traded_equivalent_ammines_as_they_fit_best():
     assert len(rx.isomers(swapped, fix=as_noted)) == 1
 
 
+def test_pins_seat_a_drawing_whose_equivalent_ammines_they_trade():
+    """A drawing has no conformer to reframe, so pins trading its equivalent ammines show it and seat them there."""
+    cis = _pd("cis")
+    swapped, drawn = _ammines_swapped(cis), _without_conformers(cis)
+    pins = rx.Template(swapped, {i: i for i in range(5)})
+
+    (found,) = rx.isomers(drawn, fix=pins)
+    out = rx.embed(drawn, fix=pins, n=1, seed=1)
+
+    assert rx.cxsmiles(found) == rx.cxsmiles(drawn)
+    assert _trans_chloride(out.mol, out.ids[0]) == _trans_chloride(swapped) != _trans_chloride(cis)
+
+
 def test_isomers_and_embed_take_one_stereo_request_alike():
     """'invert' mirrors every hand, a metal's included, and keeps E/Z, which {'ez': 'invert'} flips."""
     alcohol = embedded("C[C@H](N)O")
@@ -695,8 +708,6 @@ def test_reading_refuses_a_request_naming_no_one_species():
     cis_in_a_trans_frame = Chem.Mol(rx.isomers(PD_AMMINE, geometry="SPL").select(label="cis"))
     cis_in_a_trans_frame.AddConformer(Chem.Conformer(_pd("trans").GetConformer()), assignId=True)
     core = rx.Template(_pd("trans").GetConformer().GetPositions(), {i: i for i in range(5)})
-    swapped = _ammines_swapped(_pd("cis"))
-    as_swapped = {i: tuple(swapped.GetConformer().GetPositions()[i]) for i in range(5)}
     specified = rx.cxsmiles(rx.isomers(PD_AMMINE, geometry="SPL")[0])
     for call, message in (
         (lambda: rx.identity(rx.parse_smiles(PD_AMMINE)), r"2 species .*rx\.isomers"),
@@ -710,7 +721,7 @@ def test_reading_refuses_a_request_naming_no_one_species():
         (lambda: rx.isomers(PD_AMMINE, center="Pt"), "needs center= to name one of"),
         (lambda: rx.isomers(PT2CL4_AMMINES, center="Pt"), "name one by its atom index"),
         (
-            lambda: rx.isomers(_without_conformers(_pd("cis")), fix=as_swapped),
+            lambda: rx.isomers(_without_conformers(_pd("cis")), fix=core),
             r"pins coordination-sphere atoms \[0, 2, 3, 4\] off the arrangement this source specifies; use observed",
         ),
         (lambda: rx.embed(cis_in_a_trans_frame, fix=core, n=1, seed=1), "observed=True"),
