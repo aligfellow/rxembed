@@ -14,7 +14,7 @@ from rdkit import Chem, DistanceGeometry
 
 from rxembed.geometry.bounds import coordination_reach
 from rxembed.geometry.mechanisms import law_of_cosines
-from rxembed.graph import frag_map, ligand_graph, metal_indices, reject_metal_bonds, torsion_path
+from rxembed.graph import frag_map, haptic_sites, ligand_graph, metal_indices, reject_metal_bonds, torsion_path
 from rxembed.identity.smiles_io import (
     SpecifiedArrangement,
     distinct,
@@ -500,10 +500,11 @@ def _reject_unenumerable(mol, request, selected):
     """Refuse a request on several metals that no enumeration answers, before any variant is drawn.
 
     Under ``center='all'``, `geometry=` cannot name one polyhedron for every metal, and three or more metals joined by
-    bridges refuse, since notes cannot record how bridges join them. One `center` among three or more equivalent metals
-    refuses, since its other arrangements have no canonical name; any other single `center` needs a conformer for the
-    remaining metals. A held metal is seated already and counts in none of these. Notes on any metal, or
-    ``observed=True``, skip these checks.
+    bridges refuse, since notes cannot record how bridges join them, unless at most one has three or more sites: a
+    metal on one or two sites has a single arrangement, so naming each centre alone loses nothing. One `center` among
+    three or more equivalent metals refuses, since its other arrangements have no canonical name; any other single
+    `center` needs a conformer for the remaining metals. A held metal is seated already and counts in none of these.
+    Notes on any metal, or ``observed=True``, skip these checks.
     """
     held = {centre.atom for centre in request.held}
     metals, center = [m for m in metal_indices(mol) if m not in held], request.center
@@ -529,7 +530,9 @@ def _reject_unenumerable(mol, request, selected):
             )
         return
     for fragment in Chem.GetMolFrags(mol):
-        if len(joined := sorted(set(fragment) & set(metals))) > 2:  # noqa: PLR2004  a pair is seated jointly
+        joined = sorted(set(fragment) & set(metals))
+        counts = [len(haptic_sites(mol, [n.GetIdx() for n in mol.GetAtomWithIdx(m).GetNeighbors()])) for m in joined]
+        if len(joined) > 2 and sum(count > 2 for count in counts) > 1:  # noqa: PLR2004  a pair is seated jointly
             raise ValueError(
                 f"metals {joined} are joined by bridges, which no name records for three or more; specify each "
                 "centre's arrangement"

@@ -90,6 +90,7 @@ def test_enumerate_isomers_lists_each_arrangement_once():
             {},
             1,
         ),
+        ("propenyl on a chain of three Cu", "CC=C[Cu]<-[Cl-]->[Cu]<-[Cl-]->[Cu]", {}, 2),
         ("lone Cp Cu", "[Cu+]1234<-[CH-]5[CH]->1=[CH]->2[CH]->3=[CH]5->4", {}, 1),
         ("Zeise anion default", "[Cl-]->[Pt+2]1(<-[Cl-])(<-[Cl-])<-[CH2]=[CH2]->1", {}, 1),
         ("one Pd of placed Pd2Cl6", pd2cl6(), {"center": 1, "observed": False}, 2),
@@ -157,6 +158,7 @@ def test_enumerate_isomers_refuses_an_unanswerable_request():
     )
     for source, choices, message in (
         (MO6CL14, {}, "joined by bridges, which no name records for three or more"),
+        ("Cl[Pd]1(<-[Cl-]->[Cu]Cl)<-[Cl-]->[Pd](Cl)(Cl)<-[Cl-]->1", {}, "joined by bridges"),  # a Cu leaves Pd2 unnamed
         (cluster, {"center": 1, "observed": False}, "one of three or more symmetry-equivalent metals"),
         (
             "N->[Nb+5](<-O)(<-[F-])(<-[Cl-])(<-[Br-])(<-[I-])<-n1ccn(cc1)->[Nb+5](<-O)(<-[F-])(<-[Cl-])(<-[Br-])(<-[I-])<-N",
