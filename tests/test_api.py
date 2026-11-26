@@ -191,6 +191,7 @@ def test_isomers_follow_a_reference_by_least_motion():
         ("C[C@@H](O)CCCl.[Br-]", "BrCCC(O)C.[Cl-]", {"C[C@@H](O)CCBr.[Cl-]"}),  # an untouched centre keeps its hand
         (r"F/C=C\CCCl.[Br-]", "BrCCC=CF.[Cl-]", {r"F/C=C\CCBr.[Cl-]"}),  # and an untouched double bond its E/Z
         ("C[C@H](O)Cl.[Br-]", "CC(O)Br.[Cl-]", {"C[C@H](O)Br.[Cl-]", "C[C@@H](O)Br.[Cl-]"}),  # a reacting one is open
+        ("C[C@@H]([O-])CC", "CC(=O)CC.[H-]", {"CCC(C)=O.[H-]"}),  # and a carbon losing its hydride keeps no hand
     ):
         found = rx.isomers(product, reference=reference)
 

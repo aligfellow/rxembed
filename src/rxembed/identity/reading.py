@@ -49,6 +49,7 @@ from rxembed.identity.species import (
     misplaced_pins,
     observe_stereo,
     observed_centre,
+    seated_as_pinned,
     selected_centres,
     shape_readings,
     takes_shape,
@@ -186,11 +187,12 @@ def read_species(mol, stereo=DEFAULT_STEREO, *, pins=None):
     they specify, with unassigned ligand stereo read from the conformer; without a full set of notes it is what the
     conformer shows. The notes are rewritten in the conformer's frame unless `pins` fit the noted seating better.
     Without a conformer the Mol must be exactly one species under `stereo`, else it raises naming `rx.isomers`. Every
-    later conformer must read as the first.
+    later conformer must read as the first. Without a conformer, `pins` reseat a centre (`seated_as_pinned`).
     """
     metals = metal_indices(mol)
     if not mol.GetNumConformers():
-        return _enumerated(mol, stereo)
+        species = _enumerated(mol, stereo)
+        return species if pins is None else seated_as_pinned(species, pins.graft)
     if not metals:
         mol = fill_unspecified_from_3d(mol)  # its tags now agree with the conformer, so its frame stands
         species = _specified(mol, metals)
@@ -343,7 +345,9 @@ def possible_species(mol, request):
         request.observed is not False and mol.GetNumConformers() and request.geometry is None and stereo.given is None
     )
     one = from_conformer and (request.observed is None or not metals or read(mol).problem is None)
-    found = [read_species(mol, pins=pins)] if one else _candidates(mol, request)
+    found = (
+        [read_species(mol, pins=pins)] if one else [seated_as_pinned(s, pins.graft) for s in _candidates(mol, request)]
+    )
     kept = [species for species in found if not misplaced_pins(species, pins.graft)]
     if found and not kept:
         raise ValueError(
