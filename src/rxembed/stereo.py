@@ -548,7 +548,8 @@ def kept_stereo(reference, mol):
         hs = given.GetTotalNumHs(), atom.GetTotalNumHs()
         if not kept(idx):  # RDKit counts implicit hydrogens and a lone pair last, so the one ligand traded sits there
             traded = len(gained) + len(lost) + abs(hs[0] - hs[1]) == 1
-            if idx in metals or not traded or {len(order) + hs[0], len(mine) + hs[1]} != {3, 4}:
+            lone_pair = Chem.GetPeriodicTable().GetNOuterElecs(atom.GetAtomicNum()) in _LONE_PAIR_GROUPS
+            if idx in metals or not lone_pair or not traded or {len(order) + hs[0], len(mine) + hs[1]} != {3, 4}:
                 continue
             order, mine = [*order, *gained], [*mine, *lost]
         perm = [order.index(n) for n in mine]
