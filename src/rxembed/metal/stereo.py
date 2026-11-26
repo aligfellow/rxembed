@@ -382,6 +382,46 @@ def face_winding(mol, pos, metal, face, ranks, eta2_ranks=None):
     return "+" if side > 0 else "-" if side < 0 else ""
 
 
+def retold_winding(source, target, metal, face, token, ranks):
+    """Return side `token` of `face` at `metal`, named on surrogate graph `source`, as graph `target` names it, or ''.
+
+    Both graphs share one atom order and `ranks` holds each one's donor classes. A side is named against priorities
+    that a bond change elsewhere can reorder, so the face is laid out alone with `metal` on the side `token` names on
+    `source`, then read on `target`. Helicity and the s-cis token need no priorities and pass as given.
+    """
+    if token not in ("+", "-"):
+        return token
+    pos = np.zeros((max(source.GetNumAtoms(), target.GetNumAtoms()), 3))
+    if len(face) == ETA2:  # planar, the stated or ring cis neighbours on one side, as `eta2_signatures` lays it out
+        a, b = face
+        bonds = (mol.GetBondBetweenAtoms(a, b) for mol in (target, source))
+        stated = [bond for bond in bonds if bond is not None and bond.GetStereo() in EZ_RELATION]
+        refs, cis = [], True
+        if stated:
+            refs = list(stated[0].GetStereoAtoms())[:: 1 if stated[0].GetBeginAtomIdx() == a else -1]
+            cis = EZ_RELATION[stated[0].GetStereo()] == "cis"
+        elif source.GetBondBetweenAtoms(a, b).IsInRing():
+            ring = min((r for r in source.GetRingInfo().AtomRings() if {a, b} <= set(r)), key=len)
+            refs = [next(n for n in ring if n not in face and source.GetBondBetweenAtoms(atom, n)) for atom in face]
+        for atom, x, angles in ((a, -0.7, (120, 240)), (b, 0.7, (60, -60) if cis else (-60, 60))):
+            pos[atom] = (x, 0.0, 0.0)
+            others = [
+                n.GetIdx() for n in source.GetAtomWithIdx(atom).GetNeighbors() if n.GetIdx() not in (*face, metal)
+            ]
+            for n, angle in zip(sorted(others, key=lambda n: (n not in refs, n)), angles, strict=False):
+                pos[n] = pos[atom] + (np.cos(np.radians(angle)), np.sin(np.radians(angle)), 0.0)
+    else:
+        walk = _face_walk(source, face)[0]
+        for k, atom in enumerate(walk):
+            pos[atom] = (np.cos(2 * np.pi * k / len(walk)), np.sin(2 * np.pi * k / len(walk)), 0.0)
+    for height in (1.0, -1.0):
+        pos[metal] = (0.0, 0.0, height)
+        if face_winding(source, pos, metal, face, ranks[0]) == token:
+            told = face_winding(target, pos, metal, face, ranks[1])
+            return told if told in face_orientations(target, face, ranks[1]) else ""
+    return ""
+
+
 def _face_reference(ranks, sequence):
     """Return a face's unique top-ranked atom and its higher-ranked ring neighbour, or None on a tie."""
     highest = max(ranks[atom] for atom in sequence)

@@ -228,13 +228,23 @@ class EnsembleSet(list):
 class SpeciesSet(tuple):
     """Hold the species Mols a source can be, in enumeration order; index it, select one, or filter several.
 
-    Select by the names `species.matches` reads (an organic has only ``stereo``), or by ``index``.
+    Select by the names `species.matches` reads (an organic has only ``stereo``), or by ``index``. `scores` holds each
+    member's motion from the reference ``rx.isomers(reference=)`` ranked it against, kept through slicing and
+    filtering, else None.
     """
 
+    scores: tuple[tuple[float, int, float], ...] | None
+
+    def __new__(cls, members=(), scores=None):
+        """Return the set of `members`, with their `scores` when ranked."""
+        out = super().__new__(cls, members)
+        out.scores = None if scores is None else tuple(scores)
+        return out
+
     @classmethod
-    def of_isomers(cls, isomers):
+    def of_isomers(cls, isomers, scores=None):
         """Return the species Mols of internal `Species` candidates."""
-        return cls(map(mol_from_species, isomers))
+        return cls(map(mol_from_species, isomers), scores)
 
     @property
     def records(self):
@@ -244,7 +254,7 @@ class SpeciesSet(tuple):
     def __getitem__(self, key):
         """Return one species, or a `SpeciesSet` for a slice."""
         got = super().__getitem__(key)
-        return SpeciesSet(got) if isinstance(key, slice) else got
+        return SpeciesSet(got, self.scores and self.scores[key]) if isinstance(key, slice) else got
 
     def __add__(self, other):
         """Return this set's species, then those of `other`, a `SpeciesSet`, as one `SpeciesSet`; else a TypeError."""
@@ -255,7 +265,8 @@ class SpeciesSet(tuple):
     def filter(self, *, index=None, **keys):
         """Return the species at `index` matching every name in `keys` (`_picked`), as a `SpeciesSet`."""
         records = cache(lambda: self.records)
-        return SpeciesSet(_picked(self, lambda k: records()[k], index, keys))
+        picked = _picked(range(len(self)), lambda k: records()[k], index, keys)
+        return SpeciesSet([self[k] for k in picked], self.scores and [self.scores[k] for k in picked])
 
     def select(self, **keys):
         """Return the one species matching every key; raise naming the choices when none or several match."""
@@ -580,18 +591,26 @@ class Ensemble(Conformers):
         out._record(FINAL, {cid: energies[cid] for cid in out.ids if cid not in failed}, calc.name, lost)
         return out
 
+    def _supplied_gates(self, *policies):
+        """Return the gates of `policies` that judge a geometry rxembed did not build, each by its `calculator_check`.
+
+        A supplied geometry keeps its bonds, specified stereo, hand, face and coordination state; construction windows
+        are not its limits.
+        """
+        return [
+            row._replace(check=row.calculator_check or row.check)
+            for policy in policies  # in the order given, so a "flag" row can be read first
+            for row in self.gates
+            if row.calculator == policy
+        ]
+
     def _calculator_failures(self, label):
         """Return ``{id: Failure}`` for the conformers a ``calculator="drop"`` gate fails on.
 
         A ``"flag"`` gate is read first: a conformer it fails is another molecule, warned and kept for `filter` to drop,
         and not judged against the species it left.
         """
-        rows = {
-            policy: [
-                row._replace(check=row.calculator_check or row.check) for row in self.gates if row.calculator == policy
-            ]
-            for policy in ("drop", "flag")
-        }
+        rows = {policy: self._supplied_gates(policy) for policy in ("drop", "flag")}
         flagged = {cid: reason for cid in self.ids if (reason := self._first_failure(cid, rows["flag"]))}
         failed = {
             cid: reason for cid in self.ids if cid not in flagged and (reason := self._first_failure(cid, rows["drop"]))

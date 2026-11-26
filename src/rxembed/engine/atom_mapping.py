@@ -18,7 +18,7 @@ from rdkit import Chem
 from rxembed.geometry.constraints import resolve_atom
 from rxembed.graph import metal_indices
 from rxembed.identity.smiles_io import distinct
-from rxembed.identity.species import graph_with_stereo
+from rxembed.identity.species import graph_with_stereo, retold_centres
 from rxembed.metal.polyhedra import VACANT, seating_frames, vertex_dirs
 from rxembed.stereo import renumber_atoms
 from rxembed.utils import atom_label, skeleton
@@ -58,7 +58,7 @@ def _element(atom):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ReactionAtoms:
-    """Hold which atoms a reaction's endpoints align by and which it moves, as indices of their one atom order."""
+    """Hold which atoms a reaction's endpoints align by and which react, as indices of their one atom order."""
 
     spectators: tuple
     reacting: tuple
@@ -68,11 +68,14 @@ def reaction_atoms(reactant, product, spectators=None, reacting=None):
     """Return the `ReactionAtoms` of the reactant and product `Species`, which share one atom order.
 
     Their equivalent sites are labelled as the co-embed seats them (`coembed.least_motion`). `spectators` and
-    `reacting` select atoms by index or SMARTS on the reactant. An atom reacts when its charge, bonds (partner, order,
-    dative direction) or specified stereo change, a metal's arrangement included (the metal and the donors of its
-    `site_motions`, unless the sides are one species), when a specified configuration change turns it
-    (`turned_atoms`), or when `reacting` selects it. The spectators are the selected ones, else every unchanged atom,
-    hydrogens included. Identical endpoints have no reacting atoms and align their common scaffold.
+    `reacting` select atoms by index or SMARTS on the reactant. An atom reacts when its bonded partners, a dative bond's
+    direction or its hybridization change, when its specified stereo changes, a metal's arrangement included (the metal
+    and the donors of its `site_motions`, unless the sides are one species), or when `reacting` selects it. A bond order
+    or charge that changes alone, as between resonance forms, keeps the partners and hybridization UFF builds the
+    atom's geometry from, so the atom stays a spectator. The group a specified configuration change turns
+    (`turned_atoms`) is neither: the turn is the reaction itself, so a pull between the endpoints only strains them or
+    flips the hand. The spectators are the selected ones, else every atom that neither reacts nor turns, hydrogens
+    included. Identical endpoints have no reacting atoms and align their common scaffold.
     """
     graphs = [graph_with_stereo(species) for species in (reactant, product)]
     aligned, moved = (_picked(graphs[0], *row) for row in ((spectators, "spectator_atoms"), (reacting, "react_atoms")))
@@ -83,16 +86,19 @@ def reaction_atoms(reactant, product, spectators=None, reacting=None):
             "react_atoms must be outside spectator_atoms; remove reacting atoms from the spectator selection"
         )
     every = range(graphs[0].GetNumAtoms())
-    bonds = {atom for atom in every if _bonds(graphs[0], atom) != _bonds(graphs[1], atom)}
+    bonds = {atom for atom in every if _bonding(graphs[0], atom) != _bonding(graphs[1], atom)}
     elements = [_stereo_at(species.stereo) for species in (reactant, product)]
     changed = bonds | {atom for atom in every if elements[0].get(atom) != elements[1].get(atom)}
     if changed or len(distinct([reactant, product])) > 1:  # one species twice moves no site, however it is labelled
-        for metal, sites in site_motions(reactant.centres, product.centres).items():
+        for metal, sites in site_motions(
+            retold_centres(reactant.mol, product.mol, reactant.centres), product.centres
+        ).items():
             changed |= {metal}.union(*sites)
+    changed |= set(moved or ())
     stereo = (reactant.stereo, product.stereo)
-    changed |= set(moved or ()) | turned_atoms(graphs, stereo, set(aligned or ()), bonds, chosen=aligned is not None)
+    turned = turned_atoms(graphs, stereo, set(aligned or ()), bonds, chosen=aligned is not None)
     if aligned is None:
-        aligned = tuple(atom for atom in every if atom not in changed)
+        aligned = tuple(atom for atom in every if atom not in changed | turned)
     if not aligned:
         raise ValueError("coembed cannot align the endpoints: the reaction changes every atom; pass spectator_atoms=")
     reacting = tuple(a for a in every if a in changed and a not in aligned)
@@ -112,18 +118,13 @@ def _picked(graph, picked, name):
     return tuple(dict.fromkeys(resolve_atom(graph, atom) for atom in picked))
 
 
-def _bonds(mol, atom):
-    """Return an atom's charge and its bonds as (partner, order, whether the atom donates it)."""
-    found = mol.GetAtomWithIdx(atom)
+def _bonding(mol, atom):
+    """Return an atom's hybridization and its bonds as (partner, whether the atom donates it)."""
     bonds = sorted(
-        (
-            b.GetOtherAtomIdx(atom),
-            b.GetBondTypeAsDouble(),
-            b.GetBondType() == Chem.BondType.DATIVE and b.GetBeginAtomIdx() == atom,
-        )
-        for b in found.GetBonds()
+        (b.GetOtherAtomIdx(atom), b.GetBondType() == Chem.BondType.DATIVE and b.GetBeginAtomIdx() == atom)
+        for b in mol.GetAtomWithIdx(atom).GetBonds()
     )
-    return found.GetFormalCharge(), bonds
+    return mol.GetAtomWithIdx(atom).GetHybridization(), bonds
 
 
 def _stereo_at(stereo):
@@ -278,11 +279,11 @@ def _without(skeleton, bonds):
 def site_motions(left, right):
     """Return ``{metal: sites}``, each metal's sites that move between the centres `left` and `right`.
 
-    Both share one atom order. A site both sides bind keeps its place when a relabelling of the polyhedron
-    (`seating_frames`) sends its vertex and winding in `right` to those in `left`; the relabelling taken moves the
-    fewest sites, each a frozenset of atoms, then the shortest summed chord between their two slot directions, the
-    given frame first. A metal that changes polyhedron moves every site when it keeps them all, and none when its sites
-    change, which is a bond change; no coordinate is read.
+    Both share one atom order and name their faces on one graph (`species.retold_centres`). A site both sides bind
+    keeps its place when a relabelling of the polyhedron (`seating_frames`) sends its vertex and winding in `right` to
+    those in `left`; the relabelling taken moves the fewest sites, each a frozenset of atoms, then the shortest summed
+    chord between their two slot directions, the given frame first. A metal that changes polyhedron moves every site
+    when it keeps them all, and none when its sites change, which is a bond change; no coordinate is read.
     """
     seated = {centre.atom: centre for centre in right}
     pairs = [(one, seated[one.atom]) for one in left if one.atom in seated]
@@ -302,9 +303,13 @@ def _motion(one, other):
         return frozenset(shared) if slots[0].keys() == slots[1].keys() else frozenset()
     dirs = vertex_dirs(one.geometry)
     best, rank = frozenset(), None
+
+    def moves(seat, home):  # a face either side leaves unnamed has no side to change
+        return seat[0] != home[0] or bool(seat[1] and home[1] and seat[1] != home[1])
+
     for q in sorted(seating_frames(dirs, tuple(sorted(k for k, _winding in slots[1].values())))):
         seats = {site: (q[slots[1][site][0]], slots[1][site][1]) for site in shared}
-        sites = frozenset(site for site in shared if seats[site] != slots[0][site])
+        sites = frozenset(site for site in shared if moves(seats[site], slots[0][site]))
         chord = sum(math.dist(dirs[slots[0][site][0]], dirs[seats[site][0]]) for site in sites)
         if rank is None or (len(sites), round(chord, 6)) < rank:
             best, rank = sites, (len(sites), round(chord, 6))

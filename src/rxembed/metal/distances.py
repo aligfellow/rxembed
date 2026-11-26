@@ -17,7 +17,8 @@ from rdkit import Chem
 from rdkit.Chem import GetPeriodicTable
 
 from rxembed.geometry.constraints import Constraints, add_distance, canonical_key, graft_owns
-from rxembed.graph import COORDINATION_METALS, frag_map, ligand_degree, ligand_graph
+from rxembed.geometry.mechanisms import law_of_cosines
+from rxembed.graph import COORDINATION_METALS, frag_map, ligand_degree, ligand_graph, metal_indices
 from rxembed.metal.centres import ligand_valence
 from rxembed.utils import flat_ranks
 
@@ -38,6 +39,11 @@ OUTER_REPORT_MARGIN = 0.45  # Å over the covalent sum, for a third-sphere non-d
 DONOR_COLLAPSE_RATIO = 0.70
 APEX_DONORS = 2  # donors of one metal an atom bonds to that make it a bite apex (`overbond_tier`)
 APEX, NEAR, OUTER = "apex", "near", "outer"
+# Two metals sharing a donor: the angle at the bridge. Doubly bridged rings sit at 83-107 deg (neutron and gas-phase
+# diffraction: Rh2(mu-H)2 94, Ga2H6 95, B2H6 83), so `bridge_floors` holds it square. Past equilateral the metals sit
+# closer than their legs, which `metal_overbond` reports as a fold.
+BRIDGE_ANGLE = 90.0
+BRIDGE_REPORT_ANGLE = 60.0
 
 _SOFT_DATIVE_DONORS = frozenset({15, 33, 51})  # P/As/Sb, whose covalent radius over-states the dative M-bond.
 # Relative, so it scales the group without over-contracting As/Sb. Halides/chalcogens keep the covalent sum.
@@ -86,6 +92,9 @@ _LIGAND_FREE_CONTRACTION = {  # Z -> (constant, metal-group slope), in A, fitted
     8: (0.67730, -0.04421),  # oxo: only oxo carries a group slope
 }
 # A donor here has no ligand-side neighbour at all: aqua, ammine and agostic H all keep one and never enter.
+# Shared by k metals, one of these donors splits its bond order k ways; Pauling's D(n) = D(1) - 0.60 log10(n) (J. Am.
+# Chem. Soc. 1947, 69, 542) lengthens each leg 0.18 A at k = 2, 0.29 A at k = 3. Neutron Rh-H: +0.21 and +0.31.
+_BOND_SPLIT = 0.60
 
 
 def delocalised_charges(mol):
@@ -112,7 +121,7 @@ def delocalised_charges(mol):
     return out
 
 
-def ml_distance(mol, d, real_z, charges, *, hyb, eta):
+def ml_distance(mol, d, real_z, charges, *, hyb, eta, metals=1):
     """Return the ideal metal-donor bond length from a periodic model fitted to transition-metal crystal structures.
 
     `c0 + c1*r_M + c2*r_D + c3*group + c4*group^2 + c5*tanh(q x dEN) + c6*eta`; outside the fitted tables it falls back
@@ -120,7 +129,8 @@ def ml_distance(mol, d, real_z, charges, *, hyb, eta):
 
     * charge is delocalised over the metal-cut graph (`delocalised_charges`); * a neutral non-haptic P, As or Sb
     contracts to `_SOFT_DONOR_FRAC`, since the fit has no dative term; * a donor with no ligand-side valence (hydride,
-    nitrido, oxo) takes its own contraction instead of a charge term; * a terminal non-haptic sp donor binds
+    nitrido, oxo) takes its own contraction instead of a charge term and lengthens by `_BOND_SPLIT` when it binds
+    `metals` metals (the surrogate `mol` cannot show them); * a terminal non-haptic sp donor binds
     `_SP_CONTRACTION` shorter (s-character and pi back-donation); * an X-H...M bridging H adds its `BRIDGE_H` offset.
 
     `eta` is 0 for a sigma donor, else the site size. Bond order is not read, so an anionic O donor still runs short.
@@ -151,7 +161,7 @@ def ml_distance(mol, d, real_z, charges, *, hyb, eta):
             base = r_m + _SOFT_DONOR_FRAC * r_d
         elif ligand_free:
             intercept, slope = _LIGAND_FREE_CONTRACTION[z_d]
-            base -= intercept + slope * g
+            base += _BOND_SPLIT * math.log10(metals) - intercept - slope * g
         elif eta == 0 and hyb.get(d) is Chem.HybridizationType.SP and ligand_degree(a) == 1:
             base -= _SP_CONTRACTION
     if partners := bridge_partners(mol, d):  # an X-H...M bridge, not a hydride
@@ -253,22 +263,50 @@ def nondonor_floors(mol, metal, real_z, real, cons, *, topology=None):
     return replace(cons, floors=floors, dg_floors=dg_floors)
 
 
-def bridge_floors(donor_bonds, real_z, frozen=frozenset()):
-    """Return `Constraints` flooring every two metals that share a donor at the `NEAR` tier.
+def bridge_floors(mol, distances, donor_bonds, real_z, frozen=frozenset()):
+    """Return `Constraints` flooring two metals of `mol` that share a donor where its angle closes to `BRIDGE_ANGLE`.
 
-    The stripped graph cannot reach one metal from the other and states no M-M bond, so nothing else holds them apart
-    and UFF would fold the bridge shut.
+    A leg is the middle of its held M-donor window in `distances`, where its pull rests; one no window holds (an unheld
+    metal, a grafted bond) is the covalent radius sum, the metal read from `real_z`. The stripped graph cannot reach one
+    metal from the other and states no M-M bond, so nothing else holds them apart and UFF would fold the bridge shut.
     """
     sharing = defaultdict(set)
     for donor, metal in donor_bonds:
         sharing[donor].add(metal)
-    floors = {
-        (a, b): _tier_floor(real_z[b], NEAR, _PT.GetRcovalent(real_z[a]), real_z[a])
-        for metals in sharing.values()
-        for a, b in itertools.combinations(sorted(metals), 2)
-        if not graft_owns((a, b), frozen)
-    }
+    floors = {}
+    for donor, metals in sharing.items():
+        for pair in itertools.combinations(sorted(metals), 2):
+            if graft_owns(pair, frozen):
+                continue
+            legs = [
+                0.5 * sum(window)
+                if (window := distances.get(canonical_key((metal, donor))))
+                else _PT.GetRcovalent(real_z[metal]) + _PT.GetRcovalent(mol.GetAtomWithIdx(donor).GetAtomicNum())
+                for metal in pair
+            ]
+            floors[pair] = max(floors.get(pair, 0.0), law_of_cosines(legs[0], legs[1], BRIDGE_ANGLE))
     return Constraints(floors=floors, dg_floors=floors)
+
+
+def bond_floors(mol, pairs):
+    """Return `Constraints` holding each metal pair of `mol` in `pairs` outside a bond when its partner is `OUTER`.
+
+    The floor is the covalent sum plus `_OVERBOND_MARGIN`, hydrogen included and without `_tier_floor`'s vdW clearance,
+    so the partner approaches as far as re-perception allows. A partner bonded to a donor is the metal's own geometry
+    (`overbond_tier`), and a pair without a metal is not floored, since the margin models metal re-perception.
+    """
+    metals = set(metal_indices(mol))
+    floors = {}
+    for pair in map(canonical_key, pairs):
+        metal = next((atom for atom in pair if atom in metals), None)
+        if metal is None:
+            continue
+        partner = pair[1] if pair[0] == metal else pair[0]
+        donors = [atom.GetIdx() for atom in mol.GetAtomWithIdx(metal).GetNeighbors() if atom.GetIdx() not in metals]
+        if overbond_tier(mol, donors, partner) == OUTER:
+            radii = sum(_PT.GetRcovalent(mol.GetAtomWithIdx(atom).GetAtomicNum()) for atom in pair)
+            floors[pair] = radii + _OVERBOND_MARGIN
+    return Constraints(floors=floors)
 
 
 _ALKALI = frozenset({3, 11, 19, 37, 55, 87})  # Li, Na, K, Rb, Cs, Fr

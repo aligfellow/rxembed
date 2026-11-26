@@ -388,7 +388,8 @@ def test_stereo_from_3d_with_apply_writes_what_it_reads():
 
 def test_without_stale_point_tags_keeps_stereocentre_tags():
     """A MolFile read tags every sp3 atom; a tag stays where the conformer shows a centre, a pseudoasymmetric carbon
-    judged beside its amine hands, and where 3D cannot measure the atom RDKit's cleanup decides."""
+    judged beside its amine hands, and where 3D cannot measure the atom RDKit's cleanup decides. A tag drops only where
+    two hydrogens are interchangeable: a deuterium or a bridging H keeps it."""
     flat_butanol = embedded("C[C@H](O)CC")
     positions = flat_butanol.GetConformer().GetPositions()
     positions[1] = positions[[0, 2, 3]].mean(axis=0)  # the centre in the plane of its heavy carriers
@@ -403,6 +404,8 @@ def test_without_stale_point_tags_keeps_stereocentre_tags():
     carbanion = Chem.AddHs(Chem.MolFromSmiles("C[C-](CC)c1ccccc1"))
     for mol in (stale, carbanion):
         mol.GetAtomWithIdx(1).SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+    implicit_ch2 = Chem.RemoveHs(embedded("C[C@H](F)CCl"))
+    implicit_ch2.GetAtomWithIdx(3).SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW)
     for name, mol, kept in (
         ("unlike Pd diamine", _v3000(_geometry(PD_METHYLPROPANEDIAMINE)), {6}),
         ("like Pd diamine", _v3000(_geometry(PD_METHYLPROPANEDIAMINE, 1)), set()),
@@ -411,10 +414,34 @@ def test_without_stale_point_tags_keeps_stereocentre_tags():
         ("flat butanol", flat_butanol, {1}),
         ("isopropanol unplaced", stale, set()),
         ("carbanion", carbanion, {1}),
+        ("CH2 beside a centre, implicit H", implicit_ch2, {1}),
+        ("CHD", Chem.MolFromSmiles("F[C@H]([2H])Cl"), {1}),
+        ("B2H2 ring, implicit H", Chem.MolFromSmiles("C[B@H-]1[H+][B@H-](C)[H+]1"), {1, 3}),
+        ("unsanitised read", Chem.MolFromSmiles("C[C@H](O)CC", sanitize=False), {1}),
     ):
         before, out = _props(mol), stereo.without_stale_point_tags(mol)
         assert {atom.GetIdx() for atom in out.GetAtoms() if atom.GetChiralTag() in TETRAHEDRAL_TAGS} == kept, name
         assert _props(mol) == before, name
+
+
+def test_stereo_from_3d_reads_an_unreadable_stated_axis_as_none():
+    """An axis end whose two ring bonds project to one side has no hand: the stated axis misses, as a centre would."""
+    mol = rx.embed(PHENYLPYRROLE_AXIS, n=1, seed=3, threads=1).mol
+    pos = mol.GetConformer().GetPositions()
+    axis = (pos[8] - pos[7]) / np.linalg.norm(pos[8] - pos[7])
+    first, second = (n.GetIdx() for n in mol.GetAtomWithIdx(7).GetNeighbors() if n.GetIdx() != 8)
+    lateral = pos[first] - pos[7] - (pos[first] - pos[7]) @ axis * axis
+    pos[second] = pos[7] + (pos[second] - pos[7]) @ axis * axis + 0.9 * lateral
+    mol.GetConformer().SetPositions(pos)
+    assert rx.changes(mol).stereo == "specified C7-N8 M but the conformer has none"
+
+
+def test_assign_atrop_from_3d_refuses_a_2d_conformer():
+    """A depiction has no axis hand to read, so its placeholder tag must not be taken for one."""
+    mol = Chem.Mol(rx.isomers(PHENYLPYRROLE_AXIS)[0])
+    rdDepictor.Compute2DCoords(mol)
+    with pytest.raises(ValueError, match="this conformer is 2D"):
+        stereo.assign_atrop_from_3d(mol, [(7, 8)])
 
 
 def test_renumber_atoms_keeps_each_atropisomer_axis_hand():

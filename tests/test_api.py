@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
+from rdkit.Geometry import Point3D
 
 import rxembed as rx
 from rxembed.engine.atom_mapping import in_reactant_order
@@ -88,6 +89,18 @@ def test_minimize_refuses_a_relax_cap_not_a_positive_integer():
         rx.minimize(embedded("CCO"), max_iters=0)
 
 
+def test_minimize_with_every_atom_held_returns_the_geometry_unchanged():
+    """With nothing free there is nothing to optimise: the held conformer comes back as given, with its energy."""
+    trans = rx.isomers(DIAMMINE_PD, geometry="SPL").select(label="trans")
+    for mol in (embedded("CC(=O)C"), rx.embed(trans, n=1, seed=1, threads=1).mol):
+        held = mol.GetConformer().GetPositions()
+
+        out = rx.minimize(mol, fix=list(range(mol.GetNumAtoms())))
+
+        np.testing.assert_array_equal(out.mol.GetConformer(out.ids[0]).GetPositions(), held)
+        assert np.isfinite(list(out.energies.values())).all()
+
+
 def test_coembed_refuses_a_reaction_count_or_selection():
     forms = r"a \(reactant, product\) pair or 'reactant>>product'"
     for sources, kwargs, error, refusal in (
@@ -97,7 +110,7 @@ def test_coembed_refuses_a_reaction_count_or_selection():
         (("CO>>CO |a:0|",), {}, ValueError, "without agents or CX extensions"),
         (SN2, {"n": 0}, ValueError, "positive conformer count"),
         (SN2, {"n": 1.5}, ValueError, "positive conformer count"),
-        (SN2, {"constrain": {(0, 100): (2.0, 3.0)}}, ValueError, "geometry terms need atom-index keys"),
+        (SN2, {"constrain": {(0, 100): (2.0, 3.0)}}, ValueError, "outside this molecule.s atoms"),
         (SN2, {"spectator_atoms": []}, ValueError, "spectator_atoms must contain at least one atom"),
         (SN2, {"react_atoms": "[CH3]"}, TypeError, "react_atoms takes reactant atoms"),
     ):
@@ -145,6 +158,312 @@ def test_isomers_seat_water_once_per_vacancy_in_cx_order():
 
     assert names == sorted(set(names))
     assert len(names) == 2
+
+
+MN_DIAMINE = "[NH2]1CC[NH-]->[Mn+]<-1(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+].[H][H]"
+MN_H2 = "[H][H]->[Mn+]1(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[NH-]CC[NH2]->1"
+MN_H2_NOTES = MN_H2 + " |atomProp:1.atomNote.s0:2.atomNote."
+CO_AQUA = "[Cl-]->[Co+3]1(<-[Br-])(<-N)(<-[OH2])<-NCC[NH2]->1.[F-]"
+CO_FLUORO = "[Cl-]->[Co+3]1(<-[Br-])(<-N)(<-[F-])<-NCC[NH2]->1.[OH2]"
+
+
+def test_isomers_follow_a_reference_by_least_motion():
+    """The species moving least from the reference come first; equal scores are branches it leaves open."""
+    for reference, product, first in (
+        *(  # the fluoride takes the water's site, and the metal keeps its hand
+            (aqua, CO_FLUORO, {rx.cxsmiles(aqua).replace("[F-].", "O.").replace("[OH2]", "[F-]")})
+            for aqua in rx.isomers(CO_AQUA, geometry="octahedral")[:2]
+        ),
+        (  # H2 takes the square pyramid's vacancy, trans to the amine
+            rx.isomers(MN_DIAMINE, geometry="square_pyramidal")[0],
+            MN_H2,
+            {MN_H2_NOTES + "OCT:3.atomNote.s2:5.atomNote.s3:7.atomNote.s4:9.atomNote.s5:12.atomNote.s1|"},
+        ),
+        (  # an achiral trigonal bipyramid opens any equatorial edge, so both hands and the achiral adduct tie
+            rx.isomers(MN_DIAMINE, geometry="trigonal_bipyramidal")[0],
+            MN_H2,
+            {
+                MN_H2_NOTES + "OCT-delta:3.atomNote.s1:5.atomNote.s2:7.atomNote.s4:9.atomNote.s3:12.atomNote.s5|",
+                MN_H2_NOTES + "OCT-lambda:3.atomNote.s1:5.atomNote.s2:7.atomNote.s5:9.atomNote.s3:12.atomNote.s4|",
+                MN_H2_NOTES + "OCT:3.atomNote.s2:5.atomNote.s3:7.atomNote.s4:9.atomNote.s1:12.atomNote.s5|",
+            },
+        ),
+        ("C[C@@H](O)CCCl.[Br-]", "BrCCC(O)C.[Cl-]", {"C[C@@H](O)CCBr.[Cl-]"}),  # an untouched centre keeps its hand
+        (r"F/C=C\CCCl.[Br-]", "BrCCC=CF.[Cl-]", {r"F/C=C\CCBr.[Cl-]"}),  # and an untouched double bond its E/Z
+        ("C[C@H](O)Cl.[Br-]", "CC(O)Br.[Cl-]", {"C[C@H](O)Br.[Cl-]", "C[C@@H](O)Br.[Cl-]"}),  # a reacting one is open
+    ):
+        found = rx.isomers(product, reference=reference)
+
+        assert list(found.scores) == sorted(found.scores)
+        assert {rx.cxsmiles(m) for m, s in zip(found, found.scores, strict=True) if s == found.scores[0]} == first
+
+
+FE = "[Fe+2:1](<-[Br-:2])(<-[NH3:3])(<-[PH3:4])<-[C-:5]#[O+:6]"
+FE_CL = "[Cl-:7]->[Fe+2:1](<-[Br-:2])(<-[NH3:3])(<-[PH3:4])<-[C-:5]#[O+:6]"
+ZN = "[Zn+2:1](<-[Br-:2])(<-[NH3:3])<-[PH3:4]"
+ZN_CL = "[Cl-:5]->[Zn+2:1](<-[Br-:2])(<-[NH3:3])<-[PH3:4]"
+PD = "[Pd+2:11](<-[Cl-:12])(<-[Br-:13])(<-[NH3:14])<-[PH3:15]"
+PD2 = "[Cl-:1]->[Pd+2:2]1(<-[NH3:3])<-[Cl-:4]->[Pd+2:5](<-[Br-:6])(<-[PH3:7])<-[Cl-:8]->1"
+PD2_N = "[Cl-:1]->[Pd+2:2]1<-[Cl-:4]->[Pd+2:5](<-[Br-:6])(<-[PH3:7])<-[Cl-:8]->1.[NH3:3]"
+CO_EN2 = "[Co+3:1]12(<-[Cl-:2])(<-[NH3:3])(<-[NH2:4][CH2:5][CH2:6][NH2:7]->1)<-[NH2:8][CH2:9][CH2:10][NH2:11]->2"
+CO_EN = "[Co+3:1]1(<-[Cl-:2])(<-[NH3:3])<-[NH2:4][CH2:5][CH2:6][NH2:7]->1.[NH2:8][CH2:9][CH2:10][NH2:11]"
+
+
+def _notes(mol):
+    """Return each mapped atom's CX note: the metal's arrangement, each donor's slot."""
+    return {atom.GetAtomMapNum(): atom.GetProp("atomNote") for atom in mol.GetAtoms() if atom.HasProp("atomNote")}
+
+
+def _slot_pairs(mol, pairs):
+    """Return the mapped donor pairs that fill each pair of slot numbers in `pairs`."""
+    slots = {note: number for number, note in _notes(mol).items() if note.startswith("s")}
+    return {frozenset(slots[f"s{i}"] for i in pair) for pair in pairs if all(f"s{i}" in slots for i in pair)}
+
+
+def test_isomers_follow_a_reference_into_another_polyhedron():
+    """A new site count takes the polyhedron the kept sites fill unmoved, each in its place by mapped atoms."""
+    axis, octahedral = [(0, 1)], [(0, 1), (2, 3), (4, 5)]
+    for reference, product, shape, held in (
+        *(  # a seesaw is a trigonal bipyramid short of one equatorial site, so its axis stays the axis
+            (seesaw, FE_CL, "TBP", axis) for seesaw in rx.isomers(FE + ".[Cl-:7]", geometry="seesaw")[:2]
+        ),
+        (rx.isomers(ZN + ".[Cl-:5]", geometry="trigonal_pyramidal")[0], ZN_CL, "TET", []),
+        *(  # the en whose atoms are mapped as free leaves, and the trans pair it leaves is the seesaw's axis
+            (cis, CO_EN, "SEE", octahedral) for cis in rx.isomers(CO_EN2, geometry="octahedral")[1:]
+        ),
+    ):
+        top = rx.isomers(product, reference=reference)[0]
+        bound = {number for number, note in _notes(top).items() if note.startswith("s")}
+
+        assert _notes(top)[1].startswith(shape)
+        assert _slot_pairs(top, held and axis) == {pair for pair in _slot_pairs(reference, held) if pair <= bound}
+
+
+def test_isomers_hold_a_metal_whose_bonds_stay():
+    """A metal the reaction leaves alone keeps the reference's arrangement, so it adds no branch."""
+    zinc = rx.isomers(ZN + ".[Cl-:5]", geometry="trigonal_pyramidal")[0]
+    alone = rx.isomers(ZN_CL, reference=zinc)
+    for palladium in rx.isomers(PD, geometry="square_planar"):
+        found = rx.isomers(ZN_CL + "." + PD, reference=Chem.CombineMols(zinc, palladium))
+
+        assert found.scores == alone.scores
+        assert all(_notes(palladium).items() <= _notes(mol).items() for mol in found)
+    shaped = rx.isomers(ZN_CL + "." + PD, reference=Chem.CombineMols(zinc, palladium), geometry="tetrahedral")
+    assert shaped.scores == rx.isomers(ZN_CL, reference=zinc, geometry="tetrahedral").scores  # Pd is seated already
+
+
+def test_isomers_tell_bridges_apart_at_a_held_metal():
+    """The held metal seats each bridge, so the dissociating one keeps its other sites unmoved, and alone first."""
+    for reference in rx.isomers(PD2):
+        found = rx.isomers(PD2_N, reference=reference)
+
+        assert found.scores[0][1:] == (0, 0.0)
+        assert found.scores[1] > found.scores[0]
+
+
+def test_isomers_place_a_gaining_centre_as_the_reference_conformer_shows():
+    """A ketone carbon takes the face its hydride sits on in the reference, as the formed alkoxide shows it."""
+    ketone = rx.parse_smiles("[CH3:1][C:2](=[O:3])[CH2:4][CH3:5].[H-:6]", remove_hs=False)
+    alkoxide = rx.parse_smiles("[CH3:1][C:2]([H:6])([O-:3])[CH2:4][CH3:5]", remove_hs=False)
+    rdDistGeom.EmbedMolecule(ketone, randomSeed=1)
+    conf = ketone.GetConformer()
+    carbon, oxygen, methyl = (np.array(conf.GetAtomPosition(i)) for i in (1, 2, 0))
+    normal = np.cross(oxygen - carbon, methyl - carbon)
+    normal /= np.linalg.norm(normal)
+    hands = []
+    for side in (1.0, -1.0):
+        conf.SetAtomPosition(5, Point3D(*(carbon + side * 1.6 * normal)))
+        found = rx.isomers(alkoxide, reference=Chem.Mol(ketone))
+        formed = Chem.Mol(alkoxide)  # the carbon pyramidalised toward its hydride, read by RDKit
+        shown = Chem.Conformer(formed.GetNumAtoms())
+        for atom, at in zip(range(6), (0, 1, 5, 2, 3, 4), strict=True):
+            shown.SetAtomPosition(atom, conf.GetAtomPosition(at))
+        shown.SetAtomPosition(1, Point3D(*(carbon + side * 0.4 * normal)))
+        formed.AddConformer(shown)
+        Chem.AssignStereochemistryFrom3D(formed)
+
+        assert len(found) == 1
+        assert found[0].GetAtomWithIdx(1).GetChiralTag() == formed.GetAtomWithIdx(1).GetChiralTag()
+        hands.append(formed.GetAtomWithIdx(1).GetChiralTag())
+
+    assert hands[0] != hands[1]
+
+
+def test_isomers_keep_reference_scores_through_selection():
+    found = rx.isomers(MN_H2, reference=rx.isomers(MN_DIAMINE, geometry="square_pyramidal")[0])
+
+    assert found[1:].scores == found.scores[1:]
+    assert found.filter(index=2).scores == found.scores[2:3]
+    assert rx.isomers(MN_H2).scores is None
+
+
+VASKA = "[Ir+:1](<-[PH3:2])(<-[PH3:3])(<-[C-:4]#[O+:5])<-[Cl-:6].[H:7][H:8]"
+VASKA_H2 = "[Ir+3:1](<-[PH3:2])(<-[PH3:3])(<-[C-:4]#[O+:5])(<-[Cl-:6])(<-[H-:7])<-[H-:8]"
+OCTAHEDRAL_TRANS = [(0, 1), (2, 3), (4, 5)]
+
+
+def test_isomers_add_a_breaking_bond_where_it_stays_in_reach():
+    """H2 adds cis to an octahedron, which alone holds the square: the trans dihydride moves no site, but its hydrides
+    start bonded and end out of reach."""
+    trans_phosphines = rx.isomers(VASKA, geometry="square_planar")[1]
+    found = rx.isomers(VASKA_H2, reference=trans_phosphines)
+    first = [mol for mol, score in zip(found, found.scores, strict=True) if score == found.scores[0]]
+
+    assert found.filter(geometry="octahedral") == found
+    assert frozenset((2, 3)) in _slot_pairs(trans_phosphines, [(0, 2)])
+    assert any(frozenset((7, 8)) in _slot_pairs(mol, OCTAHEDRAL_TRANS) for mol in found)
+    assert not any(frozenset((7, 8)) in _slot_pairs(mol, OCTAHEDRAL_TRANS) for mol in first)
+
+
+def test_isomers_offer_no_mirror_image_only_a_reflection_reaches():
+    """A handed seesaw opens to a bipyramid of its own hand; its mirror image would turn the sites through a mirror."""
+    for seesaw in rx.isomers(FE + ".[Cl-:7]", geometry="seesaw")[:2]:
+        found = rx.isomers(FE_CL, reference=seesaw)
+
+        assert rx.cxsmiles(rx.isomers(found[0], stereo="invert")[0]) not in {rx.cxsmiles(mol) for mol in found}
+
+
+FERROCENE = (
+    "[I-:16].[cH:1]12->[Fe+2:15]3456789(<-[cH:2]1[cH:3]->3[cH-:4]->4[cH:5]->52)<-[c:8]1([CH2:7][Cl:6])"
+    "[c-:9]->6([CH2:10][{}:11])[cH:12]->7[cH:13]->8[cH:14]->91"
+)
+PT_ALKENE = "[CH2:1]1=[C:2]([CH2:3][Cl:4])([CH2:5][Br:6])->[Pt+2:7]<-1(<-[Cl-:8])(<-[Cl-:9])<-[NH3:10].[I-:11]"
+
+
+def _substituted(mol, leaving, entering):
+    """Return `mol` with mapped atom `leaving`'s carbon bonded to `entering` instead, coordinates kept, notes not."""
+    rw = Chem.RWMol(mol)
+    for atom in rw.GetAtoms():
+        atom.ClearProp("atomNote")
+    at = {atom.GetAtomMapNum(): atom.GetIdx() for atom in rw.GetAtoms()}
+    carbon = rw.GetAtomWithIdx(at[leaving]).GetNeighbors()[0].GetIdx()
+    rw.RemoveBond(carbon, at[leaving])
+    rw.AddBond(carbon, at[entering], Chem.BondType.SINGLE)
+    rw.GetAtomWithIdx(at[leaving]).SetFormalCharge(-1)
+    rw.GetAtomWithIdx(at[entering]).SetFormalCharge(0)
+    out = rw.GetMol()
+    Chem.SanitizeMol(out)
+    return out
+
+
+def _faces(mol):
+    """Return each mapped face atom's side token, which no relabelling of the slots changes."""
+    return {number: note[-1] for number, note in _notes(mol).items() if note[-1] in "+-"}
+
+
+def test_isomers_keep_a_held_face_through_a_remote_edit():
+    """A substitution beside a bound face reorders its priorities, not its side: it reads as the edit made in place."""
+    for source, leaving, entering, geometry in (
+        (FERROCENE.format("Br"), 6, 16, None),  # a planar-chiral Cp ring
+        (PT_ALKENE, 4, 11, "square_planar"),  # a prochiral alkene face
+    ):
+        for reference in rx.isomers(source, geometry=geometry)[:2]:
+            in_place = rx.isomers(_substituted(rx.embed(reference, n=1, seed=1).mol, leaving, entering))[0]
+            found = rx.isomers(_substituted(rx.parse_smiles(source), leaving, entering), reference=reference)
+
+            assert len(found) == 1
+            assert _faces(found[0]) == _faces(in_place)
+
+
+def test_isomers_open_a_face_an_edit_makes_planar_chiral():
+    """Of two like arms, the one substituted names the face; a conformer shows which side that is, notes do not."""
+    source = FERROCENE.format("Cl")
+    (reference,) = rx.isomers(source)
+    shown = rx.embed(reference, n=1, seed=1).mol
+    product = _substituted(rx.parse_smiles(source), 6, 16)
+
+    tied = rx.isomers(product, reference=reference)
+    assert tied.scores[0] == tied.scores[1]  # neither side moves a site, as the face had no side to keep
+    assert len(tied) == 2
+    assert tied.scores[0][1] == 0
+    found = rx.isomers(product, reference=shown)
+    assert len(found) == 1
+    assert _faces(found[0]) == _faces(rx.isomers(_substituted(shown, 6, 16))[0])
+
+
+def test_coembed_aligns_a_metal_whose_faces_a_remote_edit_leaves():
+    """The substitution renames the ferrocene face and leaves its side and ring charge, so Fe and the ring align."""
+    source = FERROCENE.format("Br")
+    reactant = rx.isomers(source)[0]
+    product = rx.isomers(_substituted(rx.parse_smiles(source), 6, 16), reference=reactant)[0]
+    pair = rx.coembed(reactant, product, n=1, seed=1)
+
+    assert sorted(pair.reactant.mol.GetAtomWithIdx(i).GetAtomMapNum() for i in pair.react_atoms) == [6, 7, 16]
+
+
+PHOSPHINE = "[CH3:1][P@:2]([CH2:3][CH3:4])[c:5]1[cH:6][cH:7][cH:8][cH:9][cH:10]1"
+PROPYL_IODIDE = "[CH3:14][CH2:13][CH2:11][I:12]"
+PHOSPHONIUM = "[CH3:1][P+:2]([CH2:3][CH3:4])([CH2:11][CH2:13][CH3:14])[c:5]1[cH:6][cH:7][cH:8][cH:9][cH:10]1.[I-:12]"
+PROTONATED = "[CH3:1][P@@H+:2]([CH2:3][CH3:4])[c:5]1[cH:6][cH:7][cH:8][cH:9][cH:10]1.[OH-:11]"
+
+
+def _cip(mol, mapped):
+    """Return the CIP label of mapped atom `mapped`, read without the maps that would rank it."""
+    work = Chem.Mol(mol)
+    for atom in work.GetAtoms():
+        atom.SetAtomMapNum(mapped if atom.GetAtomMapNum() == mapped else 0)
+    Chem.AssignStereochemistry(work, cleanIt=True, force=True)
+    return next(atom for atom in work.GetAtoms() if atom.GetAtomMapNum() == mapped).GetProp("_CIPCode")
+
+
+def test_isomers_keep_a_pyramidal_hand_through_a_lone_pair_trade():
+    """P bonds at its lone pair or leaves one there, so its hand stays, in both directions of the edit.
+
+    Each label is the edit read in place: the newcomer set on the lone pair, or the proton's site left to it.
+    """
+    for reference, product, label in (
+        (PHOSPHINE + "." + PROPYL_IODIDE, PHOSPHONIUM, "R"),
+        (PHOSPHINE + ".[Cl-:11][Au+:12]", PHOSPHINE.replace("@", "") + "->[Au+:12]<-[Cl-:11]", "S"),
+        (PROTONATED, PHOSPHINE.replace("@", "") + ".[OH2:11]", "R"),
+    ):
+        (found,) = rx.isomers(product, reference=reference)
+        (back,) = rx.isomers(reference.replace("@", ""), reference=found)
+
+        assert _cip(found, 2) == label
+        assert _cip(back, 2) == _cip(rx.parse_smiles(reference), 2)
+
+
+def test_isomers_keep_the_hand_a_reference_conformer_shows():
+    """An untagged conformer still shows the pyramid at P, which the quaternisation keeps wherever the iodide stands."""
+    reference = Chem.AddHs(rx.parse_smiles(PHOSPHINE + "." + PROPYL_IODIDE))
+    rdDistGeom.EmbedMolecule(reference, randomSeed=7)
+    at = {atom.GetAtomMapNum(): atom.GetIdx() for atom in reference.GetAtoms()}
+    pos = reference.GetConformer().GetPositions()
+    pyramid = pos[at[2]] - pos[[at[1], at[3], at[5]]].mean(axis=0)
+    shift = pos[at[2]] - 3.5 * pyramid / np.linalg.norm(pyramid) - pos[at[11]]  # below P, away from its lone pair
+    for fragment in Chem.GetMolFrags(reference):
+        if at[11] in fragment:
+            for atom in fragment:
+                reference.GetConformer().SetAtomPosition(atom, Point3D(*(pos[atom] + shift)))
+    reference.GetAtomWithIdx(at[2]).SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+
+    assert [_cip(mol, 2) for mol in rx.isomers(PHOSPHONIUM, reference=reference)] == ["R"]
+
+
+CO_AMMINE = "[Cl-:2]->[Co+3:1]1(<-[Cl-:3])(<-[NH3:4])(<-[NH2:5][H:11])<-[NH2:6][CH2:7][CH2:8][NH2:9]->1.[OH-:10]"
+CO_AMIDO = "[Cl-:2]->[Co+3:1]1(<-[Cl-:3])(<-[NH3:4])(<-[NH2-:5])<-[NH2:6][CH2:7][CH2:8][NH2:9]->1.[OH:10][H:11]"
+
+
+def test_isomers_rename_the_hand_of_a_kept_seating_whose_donor_changes():
+    """An ammine's proton leaving keeps every donor in its slot, but reorders the donors that name the hand."""
+    for reference in rx.isomers(CO_AMMINE)[1:3]:  # the two chiral cis arrangements
+        (found,) = rx.isomers(CO_AMIDO, reference=reference)
+        slots = [{mapped: note for mapped, note in _notes(mol).items() if mapped != 1} for mol in (reference, found)]
+
+        assert slots[0] == slots[1]
+        assert _notes(found)[1] == {"OCT-delta": "OCT-lambda", "OCT-lambda": "OCT-delta"}[_notes(reference)[1]]
+        assert rx.cxsmiles(rx.parse_smiles(rx.cxsmiles(found))) == rx.cxsmiles(found)
+
+
+def test_isomers_refuse_a_reference_they_cannot_follow():
+    for reference, kwargs, refusal in (
+        (MN_DIAMINE, {}, "specifies 3 species"),  # the reference's own arrangement is open
+        (rx.isomers(MN_DIAMINE, geometry="square_pyramidal")[0], {"coordinate": 0}, "seat its vacancies first"),
+        (rx.isomers(MN_DIAMINE, geometry="square_pyramidal")[0], {"center": "Mn"}, "omit center="),
+        (rx.isomers(MN_DIAMINE, geometry="square_pyramidal")[0], {"stereo": "invert"}, "pass the reference inverted"),
+    ):
+        with pytest.raises(ValueError, match=refusal):
+            rx.isomers(MN_H2, reference=reference, **kwargs)
 
 
 def test_embed_seeds_from_its_seed_through_native_params():
@@ -310,6 +629,29 @@ def test_coembed_reads_sources_a_pair_or_a_reaction_smiles():
     assert [[rx.smiles(end.mol) for end in (pair.reactant, pair.product)] for pair in pairs] == [written] * 3
 
 
+def test_coembed_takes_the_open_product_arrangement_that_follows_the_reactant():
+    """A bare [PtCl(Br)(NH3)2] product is cis or trans; each reactant pairs with the one that keeps its ammines."""
+    shapes = []
+    for reactant in rx.isomers("[NH3:1]->[Pt+2](<-[NH3:2])(<-[Cl-:3])<-[Cl-:4].[Br-:5]"):
+        pair = rx.coembed(reactant, "[NH3:1]->[Pt+2](<-[NH3:2])(<-[Cl-:3])<-[Br-:5].[Cl-:4]", n=1, seed=1)
+        ends = (pair.reactant, pair.product)
+        shapes.append(tuple("cis" if end.measure((0, 1, 2))["mean"] < 135 else "trans" for end in ends))
+    assert sorted(shapes) == [("cis", "cis"), ("trans", "trans")]
+
+
+def test_coembed_pulls_h2_toward_trans_hydride_sites_without_bonding_it():
+    """H2 adding trans to Vaska's complex is drawn toward both hydride sites short of bonding it to the Ir, so every
+    pair keeps its jointly relaxed geometry."""
+    reactant = rx.isomers(VASKA, geometry="square_planar")[1]
+    trans = next(
+        mol
+        for mol in rx.isomers(VASKA_H2, reference=reactant)
+        if frozenset((7, 8)) in _slot_pairs(mol, OCTAHEDRAL_TRANS)
+    )
+    pair = rx.coembed(reactant, trans, n=4, seed=1, threads=1)
+    assert {record["stage"] for record in pair.joint_results.values()} == {"joint"}
+
+
 def test_coembed_keeps_a_fixed_endpoint_and_its_source_unmoved(beta_hydride):
     """The beta-hydride pair is rebuilt around its reactant, and a cis-diamminedichloropalladium around a trans one."""
     pair = beta_hydride[1][0]
@@ -328,6 +670,25 @@ def test_coembed_keeps_a_fixed_endpoint_and_its_source_unmoved(beta_hydride):
         np.testing.assert_array_equal(kept.mol.GetConformer(rebuilt.ids[0]).GetPositions(), supplied, err_msg=name)
         np.testing.assert_array_equal(sides[side].GetConformer().GetPositions(), supplied, err_msg=name)
         assert built.check()[rebuilt.ids[0]].ok, name
+
+
+def test_coembed_keeps_a_fixed_endpoint_outside_construction_windows():
+    """A supplied geometry is judged as a calculator's result, so a bond or M-L distance past its window is kept."""
+    found = rx.isomers(DIAMMINE_PD, geometry="SPL")
+    trans = rx.embed(found.select(label="trans"), n=1, seed=1).mol  # N0 Pd1 Cl2 Cl3 N4
+    for name, mol, partner, fixed, (a, b), length in (
+        ("acetone C=O, judged on entry", embedded("CC(=O)C"), "C=C(O)C", "reactant", (1, 2), 1.47),
+        ("Pd-Cl, judged after the joint pass", trans, found.select(label="cis"), "product", (1, 2), 2.54),
+    ):
+        pos = mol.GetConformer().GetPositions()
+        pos[b] = pos[a] + length * (pos[b] - pos[a]) / np.linalg.norm(pos[b] - pos[a])
+        mol.GetConformer().SetPositions(pos)
+        sides = (mol, partner) if fixed == "reactant" else (partner, mol)
+
+        pair = rx.coembed(*sides, fixed=fixed, n=1, seed=42, threads=1)
+
+        kept = pair.reactant if fixed == "reactant" else pair.product
+        np.testing.assert_array_equal(kept.mol.GetConformer(pair.ids[0]).GetPositions(), pos, err_msg=name)
 
 
 def test_coembed_refuses_a_failing_fixed_endpoint_unmoved():

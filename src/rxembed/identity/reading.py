@@ -231,7 +231,10 @@ def _enumerated(mol, stereo, *, selected=()):
                 if request.center is not None
                 else f"this source is {len(found)} stereoisomers"
             )
-        raise ValueError(f"{detail}; pick one with rx.isomers or pass stereo='free' to leave ligand stereo to the seed")
+        raise ValueError(
+            f"{detail}; pick one with rx.isomers, which reference= ranks against a reaction partner; "
+            "stereo='free' leaves only ligand stereo to the seed"
+        )
     return found[0]
 
 
@@ -283,6 +286,8 @@ class IsomerRequest:
     coordinate: CoordinateRequest | None = None  # `coordinate_request`, seated by `vacancy_seatings`
     observed: bool | None = None
     screen: bool = True
+    every_polyhedron: bool = False  # an unset geometry enumerates every polyhedron of the site count, not its default
+    held: tuple[Centre, ...] = ()  # centres kept as given, not enumerated: a reference's, where the bonds stay
 
 
 def requested_centre(mol, center):

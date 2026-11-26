@@ -23,6 +23,10 @@ LENGTHS = {
     "VOCl4": ("[O-2]->[V+4](<-[Cl-])(<-[Cl-])(<-[Cl-])<-[Cl-]", {0: (1.50, 1.70)}),  # an oxo
     "Fe(CO)5": ("[O+]#[C-]->[Fe](<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+]", {1: (1.70, 1.90)}),
     "FeCl2(BH4)": ("[BH3-][H]->[Fe+2](<-[Cl-])<-[Cl-]", {1: (1.55, 1.85)}),  # a B-H...Fe bridge
+    "[Pt(PH3)2(mu-H)]2 2+": (  # a hydride two metals share: Pt-H 1.73 by neutron diffraction in a Pt(mu-H)2Ir core
+        "P->[Pt+2]1(<-P)<-[H-]->[Pt+2](<-P)(<-P)<-[H-]->1",
+        {3: (1.68, 1.80), 7: (1.68, 1.80)},
+    ),
 }
 
 
@@ -46,7 +50,7 @@ def test_ml_distance_fits_crystal_lengths_or_the_covalent_sum():
         for donor, metal in facts.donor_bonds:
             z = facts.graph.GetAtomWithIdx(metal).GetAtomicNum()
             found[name, donor] = distances.ml_distance(
-                facts.mol, donor, z, facts.charges, hyb=facts.hybridisation, eta=0
+                facts.mol, donor, z, facts.charges, hyb=facts.hybridisation, eta=0, metals=facts.bound[donor]
             )
 
     windows = {(name, donor): window for name, (_smiles, rows) in LENGTHS.items() for donor, window in rows.items()}
@@ -87,16 +91,30 @@ def test_ff_terms_pull_lone_donors_and_floor_non_donors():
 
 
 def test_metals_sharing_a_donor_are_floored_apart():
-    """Only Pd0 and Pt1, which share Cl3, are floored; the embedded Pd2Cl6 keeps its unbonded Pd pair apart."""
-    floors = distances.bridge_floors([(3, 0), (3, 1), (4, 0), (5, 2)], {0: 46, 1: 78, 2: 46})
-    assert set(floors.floors) == set(floors.dg_floors) == {(0, 1)}
+    """Only Pd0 and Pt1, which share Cl3, are floored, where their held legs meet square at Cl3. The embedded Pd2Cl6
+    keeps each bridge near square, as crystal M(mu-X)2M rings are (83-107 deg), and a Pd grafted with its bridges keeps
+    the free Pd off it."""
+    legs = {(0, 3): (2.2, 2.4), (1, 3): (2.4, 2.6), (0, 4): (2.2, 2.4), (2, 5): (2.2, 2.4)}
+    mol = Chem.MolFromSmiles("[Pd].[Pt].[Pd].[Cl].[Cl].[Cl]")
+    floors = distances.bridge_floors(mol, legs, [(3, 0), (3, 1), (4, 0), (5, 2)], {0: 46, 1: 78, 2: 46})
+    assert floors.floors == floors.dg_floors == {(0, 1): pytest.approx(np.hypot(2.3, 2.5))}
 
-    ens = rx.embed(rx.isomers(pd2cl6(), center=1, stereo="free")[0], n=1, seed=2, threads=1)
-    pos = ens.mol.GetConformer(ens.ids[0]).GetPositions()
-    assert np.linalg.norm(pos[1] - pos[4]) > 2.8  # a Pd-Pd bond would be about 2.6 A
-    legs = [(pos[1] - pos[bridge], pos[4] - pos[bridge]) for bridge in (3, 7)]
-    angles = [np.degrees(np.arccos(a @ b / np.linalg.norm(a) / np.linalg.norm(b))) for a, b in legs]
-    assert angles == [pytest.approx(90.0, abs=15.0)] * 2  # an M(mu-Cl)2M rhombus, neither folded shut nor torn open
+    species = rx.isomers(pd2cl6())[0]  # keeps the fixture's coordinates for the graft
+    for fix in (None, [1, 3, 7]):
+        ens = rx.embed(species, fix=fix, n=1, seed=3, threads=1)
+        pos = ens.mol.GetConformer(ens.ids[0]).GetPositions()
+        legs = [(pos[1] - pos[bridge], pos[4] - pos[bridge]) for bridge in (3, 7)]
+        angles = [np.degrees(np.arccos(a @ b / np.linalg.norm(a) / np.linalg.norm(b))) for a, b in legs]
+        assert angles == [pytest.approx(92.0, abs=6.0)] * 2, fix
+
+
+def test_bond_floors_hold_only_an_outer_metal_partner_outside_a_bond():
+    """Only Pd2...H5 of a free H2 is floored, past its covalent sum: C0, bonded to donor C1, is the metal's own
+    geometry, and the organic C0...H6 has no metal."""
+    mol = Chem.MolFromSmiles("C[CH2-]->[Pd+2](<-[Cl-])<-N.[H][H]")
+    floors = distances.bond_floors(mol, [(5, 2), (0, 2), (0, 6)]).floors
+    assert floors.keys() == {(2, 5)}
+    assert floors[(2, 5)] > _PT.GetRcovalent(46) + _PT.GetRcovalent(1)
 
 
 def test_alkali_ion_embeds_at_ionic_contact_with_each_partner():

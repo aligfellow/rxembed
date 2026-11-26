@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
-from rdkit.Chem.rdMolTransforms import GetBondLength
+from rdkit.Chem.rdMolTransforms import GetAngleDeg, GetBondLength
 from rdkit.Geometry import Point3D
 
 import rxembed as rx
@@ -108,6 +108,24 @@ def test_restrained_uff_scores_each_conformer_on_its_own_field():
     assert restrained_uff(borane, Constraints(), max_iters=0, conf_ids=[9]) == pytest.approx(native[1:])
 
 
+def test_restrained_uff_keeps_three_centre_hydrogen_bridges_bent():
+    """UFF gives a two-legged hydrogen its linear angle term, which flattens a B2H2 ring and loses both boron hands."""
+    for smiles, widest in (("C[B@H-]1[H+][B@H-](C)[H+]1", 95.0), ("[BH3-][H+][BH3-]", 150.0)):
+        species = rx.isomers(smiles)[0]
+
+        mol = rx.embed(species, n=2, seed=17, threads=1).minimize().mol
+
+        angles = [
+            GetAngleDeg(conf, a.GetIdx(), h.GetIdx(), b.GetIdx())
+            for conf in mol.GetConformers()
+            for h in mol.GetAtoms()
+            if h.GetAtomicNum() == 1 and h.GetDegree() == 2
+            for a, b in [h.GetNeighbors()]
+        ]
+        assert max(angles) < widest, (smiles, angles)
+        assert rx.identity(mol).stereo == rx.identity(species).stereo, smiles
+
+
 def test_unbuildable_uff_objective_is_refused_and_restored():
     with pytest.raises(UFFTypingError, match=r"unsupported atom types \(B1\); use a different relaxation backend"):
         restrained_uff(placed("C=[B]B", np.zeros((3, 3))), Constraints(), max_iters=0)
@@ -205,6 +223,24 @@ def test_coupled_uff_relaxes_both_ends_on_one_budgeted_objective():
             mol.GetConformer().SetPositions(mol.GetConformer().GetPositions() + 0.05)
         fresh = [restrained_uff(mol, face, max_iters=0)[0] for mol in moved]
         assert joint.energies([mol.GetConformer().GetPositions() for mol in moved]) == pytest.approx(fresh)
+
+
+def test_coupled_uff_relaxes_on_a_stiffer_rung_and_keeps_the_base_objective():
+    """Methanol's C-O held at 1.2 A: a 10x rung pulls it nearer, and the score stays on the 1x restrained UFF."""
+    coupling = Coupling(atoms=np.array([0, 1]), weights=np.array([5.0, 5.0]), spectators=1)
+    short = Constraints(distances={(0, 1): (1.2, 1.2)})
+    spans = []
+    for rung in (1.0, 10.0):
+        left, right = _methanols((2.0, 0.2, 0.1))
+        endpoints = [Endpoint(mol=mol, cons=short, record=UFFRecord()) for mol in (left, right)]
+        joint = coupled_uff(endpoints, coupling, [0], 1.0, CoEmbedParams(), rung=rung)[0]
+        positions = [mol.GetConformer().GetPositions() for mol in (left, right)]
+        base = [restrained_uff(Chem.Mol(mol), short, max_iters=0)[0] for mol in (left, right)]
+        spans.append(np.linalg.norm(positions[0][0] - positions[0][1]))
+        assert joint.energies(positions) == pytest.approx(base)
+        assert joint.record["score"] == pytest.approx(sum(base) + coupling.penalty(*positions).value)
+        assert joint.record["stiffness"] == rung
+    assert spans[1] < spans[0]
 
 
 def test_unbuildable_coupling_registers_its_start_if_it_helps(caplog):

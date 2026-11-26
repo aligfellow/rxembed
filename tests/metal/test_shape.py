@@ -22,9 +22,9 @@ def _placed(smiles, points):
 
 
 def test_metal_overbond_floors_each_atom_by_its_tier():
-    """A declared donor is floored only at collapse, a non-donor by how many donors it bonds, and a bite apex not at
-    all; an undeclared metal reads its own shell, and a declared donor that left the shell leaves an atom on the
-    metal no donor."""
+    """A declared donor is floored only at collapse, a non-donor by how many donors it bonds, a bite apex not at all and
+    a metal sharing a donor by the angle at that bridge; an undeclared metal reads its own shell, and a declared donor
+    that left the shell leaves an atom on the metal no donor."""
     folded = _placed(  # the amine C folded 2.0 A from Pd, under its one-donor floor; Cl3 crushed to 0.9 A
         "C[NH2]->[Pd+2](<-[Cl-])(<-[Cl-])<-[Cl-]",
         [(1.6, 1.2, 0), (2.05, 0, 0), (0, 0, 0), (0, 0.9, 0), (-2.3, 0, 0), (0, -2.3, 0)],
@@ -53,11 +53,31 @@ def test_metal_overbond_floors_each_atom_by_its_tier():
         "CC1=[O]->[Pd+2](<-[Cl-])(<-[Cl-])<-[O-]1",
         [(3.95, 0, 0), (2.45, 0, 0), (1.72, 1.12, 0), (0, 0, 0), (-1.63, 1.63, 0), (-1.63, -1.63, 0), (1.72, -1.12, 0)],
     )
+    bridged = _placed(  # Pd1 and Pd4 share Cl3 and Cl7, 2.0 A apart: each bridge folded to 55 deg
+        "[Cl-]->[Pd+2]1(<-[Cl-])<-[Cl-]->[Pd+2](<-[Cl-])(<-[Cl-])<-[Cl-]->1",
+        [
+            (-2.6, 1.6, 0),
+            (-1.0, 0, 0),
+            (-2.6, -1.6, 0),
+            (0, 1.9, 0),
+            (1.0, 0, 0),
+            (2.6, 1.6, 0),
+            (2.6, -1.6, 0),
+            (0, -1.9, 0),
+        ],
+    )
+    hydrides, crushed = (  # the neutron [HRh(P(OiPr)3)2]2 core (Rh-H 1.81, Rh-H-Rh 94 deg), then squeezed to 1.30
+        _placed("[Rh+]1<-[H-]->[Rh+]<-[H-]->1", [(-x, 0, 0), (0, y, 0), (x, 0, 0), (0, -y, 0)])
+        for x, y in ((1.325, 1.2335), (0.92, 0.92))
+    )
     cases = {
         "folded amine": (folded, folded.GetConformer().GetPositions(), [1, 3, 4, 5]),
         "Pd2 declaring one": (dimer.GetMol(), dimer_pos, {0: {2, 3, 4, 5}}),
         "PtCl4 chlorides left": (left, left.GetConformer().GetPositions(), {1: {0, 2, 3, 4}}),
         "acetate apex": (acetate, acetate.GetConformer().GetPositions(), [2, 4, 5, 6]),
+        "Pd2 bridge folded shut": (bridged, bridged.GetConformer().GetPositions(), {1: {0, 2, 3, 7}, 4: {3, 5, 6, 7}}),
+        "Rh2 hydride bridges": (hydrides, hydrides.GetConformer().GetPositions(), {0: {1, 3}, 2: {1, 3}}),
+        "Rh2 hydride bridges crushed": (crushed, crushed.GetConformer().GetPositions(), {0: {1, 3}, 2: {1, 3}}),
     }
 
     found = {name: [(v.kind, v.atoms) for v in shape.metal_overbond(*case)] for name, case in cases.items()}
@@ -67,6 +87,9 @@ def test_metal_overbond_floors_each_atom_by_its_tier():
         "Pd2 declaring one": [("metal_overbond", (0, 8))],
         "PtCl4 chlorides left": [("metal_overbond", (1, 5))],
         "acetate apex": [],
+        "Pd2 bridge folded shut": [("metal_overbond", (1, 4)), ("metal_overbond", (4, 1))],
+        "Rh2 hydride bridges": [],
+        "Rh2 hydride bridges crushed": [("metal_overbond", (0, 2)), ("metal_overbond", (2, 0))],
     }
 
 

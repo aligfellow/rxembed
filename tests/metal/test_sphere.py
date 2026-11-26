@@ -216,6 +216,48 @@ def test_chelate_bite_opens_only_where_shells_read_the_sphere():
     assert kept == {name: {census} for name in kept}  # acac's six-ring census is the pincer's
 
 
+_BRIDGED_DIMERS = {
+    "MeZn(mu-H)2ZnMe, trigonal planar": "C[Zn-]1[H+][Zn-](C)[H+]1",
+    "[ZnCl2(mu-Cl)]2 2-, tetrahedral": (
+        "[Cl-]->[Zn+2]1(<-[Cl-])<-[Cl-]->[Zn+2](<-[Cl-])(<-[Cl-])<-[Cl-]->1 "
+        "|atomProp:0.atomNote.s0:1.atomNote.TET:2.atomNote.s1:3.atomNote.s2;s0:4.atomNote.TET:5.atomNote.s2"
+        ":6.atomNote.s3:7.atomNote.s3;s1|"
+    ),
+    "[Rh(CO)2(mu-Cl)]2, square planar": (
+        "[O+]#[C-]->[Rh+]1(<-[C-]#[O+])<-[Cl-]->[Rh+](<-[C-]#[O+])(<-[C-]#[O+])<-[Cl-]->1"
+    ),
+    "[Pt(PMe3)2(mu-H)]2 2+, square planar": (
+        "CP(C)(C)->[Pt+2]1(<-P(C)(C)C)<-[H-]->[Pt+2](<-P(C)(C)C)(<-P(C)(C)C)<-[H-]->1"
+    ),
+    "[Mn(NH3)4(mu-O)]2 4+, octahedral": "N->[Mn+4]1(<-N)(<-N)(<-N)<-[O-2]->[Mn+4](<-N)(<-N)(<-N)(<-N)<-[O-2]->1",
+}
+
+
+def test_two_metals_sharing_two_donors_keep_their_polyhedra():
+    """The ring through the second metal sets the shared donors' angle, as a backbone sets a chelate's bite, so each
+    metal keeps its polyhedron and its partner across the bridge is no M-M bond."""
+    for name, smiles in _BRIDGED_DIMERS.items():
+        found = rx.isomers(smiles)
+        assert found, name
+        wanted = [centre.geometry for centre in rx.identity(found[0]).centres]
+
+        ens = rx.embed(found[0], n=2, seed=1, threads=1)
+
+        assert [centre.geometry for centre in rx.identity(ens.mol, ens.ids[0]).centres] == wanted, name
+
+
+def test_a_hydride_two_metals_share_is_held_at_its_bridging_length():
+    """Each Pt-H leg of a Pt(mu-H)2Pt ring is a half bond, 1.73 A by neutron diffraction against a terminal 1.56."""
+    ens = rx.embed(_BRIDGED_DIMERS["[Pt(PMe3)2(mu-H)]2 2+, square planar"], n=1, seed=1, threads=1)
+    pos = ens.mol.GetConformer(ens.ids[0]).GetPositions()
+    legs = [
+        np.linalg.norm(pos[bond.GetBeginAtomIdx()] - pos[bond.GetEndAtomIdx()])
+        for bond in ens.mol.GetBonds()
+        if {bond.GetBeginAtom().GetAtomicNum(), bond.GetEndAtom().GetAtomicNum()} == {1, 78}
+    ]
+    assert legs == [pytest.approx(1.74, abs=0.06)] * 4
+
+
 _STYRENE_PALLADIUM = (
     "C[P:5](C)(C)->[Pd+2:4]1(<-[CH2:1]=[CH:2]->1c1ccccc1)(<-[H-:3])<-[P:6](C)(C)C "
     "|atomProp:1.atomNote.s0:4.atomNote.SPL:5.atomNote.s1+:6.atomNote.s1+:13.atomNote.s2:14.atomNote.s3|"

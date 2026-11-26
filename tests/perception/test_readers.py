@@ -15,7 +15,6 @@ from rdkit.Geometry import Point3D
 
 import rxembed as rx
 from rxembed.perception import readers
-from rxembed.perception.xyz2mol_tmc import get_tmc_mol
 from tests.geometry_fixtures import embedded
 
 
@@ -315,43 +314,34 @@ def test_read_xyz_without_bond_orders_reads_the_bonds_alone():
         assert not any(atom.GetFormalCharge() for atom in mol.GetAtoms()), smiles
 
 
-def test_read_xyz_records_its_backends_and_their_fallback(monkeypatch):
-    """xyz2mol connectivity needs a d-block metal, and xyz2mol orders one it has a charge model for."""
+def test_read_xyz_records_its_backends_and_their_fallback():
+    """xyz2mol orders a metal it has a charge model for; another graph keeps its connectivity, ranked another way."""
     magnesium_dichloride = [("Mg", (0, 0, 0)), ("Cl", (2.2, 0, 0)), ("Cl", (-2.2, 0, 0))]
     orders = {"charge": 0, "bond_orders": "xyz2mol"}
     for name, atoms, options, expected in (
         ("cisplatin", CISPLATIN, {"charge": 0}, ("xyzgraph", "xyzgraph", False)),
-        ("ethanol-xyz2mol", ETHANOL, orders | {"connectivity": "xyz2mol"}, ("xyzgraph", "xyzgraph", True)),
         ("ethanol-rdkit-connectivity", ETHANOL, orders | {"connectivity": "rdkit"}, ("rdkit", "rdkit", True)),
         ("MgCl2 xyz2mol orders", magnesium_dichloride, orders, ("xyzgraph", "xyzgraph", True)),
     ):
         assert _read_by(atoms, **options) == expected, name
-    _xyz2mol_reads(monkeypatch, lambda path, charge, graph: _no_reading() if graph else get_tmc_mol(path, charge)[0])
-    assert _read_by(CISPLATIN, **orders) == ("xyz2mol", "xyz2mol", True), "xyz2mol orders no xyzgraph graph"
-    _xyzgraph_reads(monkeypatch, _no_reading)
-    for name, atoms, expected in (("cisplatin", CISPLATIN, "xyz2mol"), ("ethanol", ETHANOL, "rdkit")):
-        assert _read_by(atoms, charge=0) == (expected, expected, True), f"xyzgraph failed on {name}"
 
 
-def test_read_xyz_refuses_where_no_backend_may_read(monkeypatch):
+def test_read_xyz_refuses_where_its_connectivity_backend_fails(monkeypatch):
+    """A connectivity backend that reads no graph raises: no other backend reads in its place."""
     rdkit, xyz2mol = ({"charge": 0, "connectivity": name, "bond_orders": "xyz2mol"} for name in ("rdkit", "xyz2mol"))
     for atoms, options, message in (
-        (ETHANOL, xyz2mol | {"fallback": False}, "no TM"),
+        (ETHANOL, xyz2mol, "no TM"),
         (ETHANOL, rdkit | {"fallback": False}, r"bond_orders='xyz2mol' cannot rank this graph"),
     ):
         with pytest.raises(ValueError, match=message):
             rx.read_xyz(atoms, **options)
     _xyz2mol_reads(monkeypatch, _no_reading)
-    with pytest.raises(ValueError, match=r"no bond orders on the rdkit graph .*xyz2mol connectivity also failed"):
+    with pytest.raises(ValueError, match=r"no bond orders on the rdkit graph \(.*no reading\)$"):
         rx.read_xyz(CISPLATIN, **rdkit)  # an RDKit graph has no charges of its own to keep
     _xyzgraph_reads(monkeypatch, _no_reading)
-    for options, message in (
-        ({}, "xyzgraph failed .*; pass charge= to read with RDKit"),
-        ({"charge": 0, "fallback": False}, "no reading"),
-        ({"charge": 1}, "RDKit fallback also failed .*use connectivity='xyzgraph'"),
-    ):
-        with pytest.raises(ValueError, match=message):
-            rx.read_xyz(ETHANOL, **options)
+    for atoms in (ETHANOL, CISPLATIN):
+        with pytest.raises(ValueError, match="no reading"):
+            rx.read_xyz(atoms, charge=0)
 
 
 def test_read_xyz_keeps_fewest_radicals_without_a_closed_shell(monkeypatch):
@@ -474,10 +464,13 @@ def test_read_xyz_refuses_a_graph_outside_the_kekule_contract(monkeypatch):
             graph.add_node(node, atomic_number=atomic_number, formal_charge=0, position=(x, 0.0, 0.0))
     unflagged.add_edge(0, 1, bond_order=0.0, NCI=False)
     off_total.add_edge(0, 1, bond_order=1)
-    for graph in (unflagged, off_total):
+    for graph, message in (
+        (unflagged, "gave edge 0-1 bond_order=0.0 under kekule=True; report the geometry to xyzgraph"),
+        (off_total, r"no Lewis structure at total charge \+1 \(atom charges sum to \+0\); check charge="),
+    ):
         _xyzgraph_reads(monkeypatch, lambda *_args, graph=graph, **_kwargs: graph)
-        with pytest.raises(ValueError, match="install the version rxembed requires"):
-            rx.read_xyz("unused.xyz", fallback=False)
+        with pytest.raises(ValueError, match=message):
+            rx.read_xyz("unused.xyz")
 
 
 def test_read_xyz_reads_back_a_pt_diphosphines_p_hands():

@@ -17,6 +17,7 @@ from rdkit.Geometry import Point3D
 from rxembed.geometry.mechanisms import MECHANISM_ORDER
 from rxembed.graph import (
     COORDINATION_METALS,
+    hydrogen_bond,
     materialise_phantoms,
     metal_indices,
     strip_phantoms,
@@ -209,6 +210,34 @@ def _ff_surrogate(mol, metals, phantoms=()):
     return out
 
 
+def _bent_bridges(graph, mol):
+    """Return `graph`, or a copy with each three-centre hydrogen bridge of `mol` (B-H-B) typed SP2 so UFF bends it.
+
+    RDKit types every hydrogen H_ (theta0 180) and never its bent bridge type H_b, and sanitisation tags a two-legged
+    hydrogen SP, so the bridge gets the linear angle term. The builder takes the angle form from hybridisation: SP2
+    gives RDKit's 90 degree term in a four-membered ring and 120 degrees elsewhere, where `TrigonalAngle`'s 90 degree
+    floor then applies too. A proton shared between lone pairs is a hydrogen bond (`hydrogen_bond`) and stays linear.
+    """
+    metals = set(metal_indices(mol))
+    bridges = [
+        atom.GetIdx()
+        for atom in mol.GetAtoms()
+        if atom.GetAtomicNum() == 1
+        and atom.GetDegree() == 2  # noqa: PLR2004  two-legged
+        and all(
+            bond.GetBondType() == Chem.BondType.SINGLE and not hydrogen_bond(atom, bond.GetOtherAtom(atom), metals)
+            for bond in atom.GetBonds()
+        )
+    ]
+    if not bridges:
+        return graph
+    out = Chem.Mol(graph)
+    for idx in bridges:
+        out.GetAtomWithIdx(idx).SetHybridization(Chem.HybridizationType.SP2)
+    logger.debug("UFF: private SP2 typing for bridging H %s", ", ".join(atom_label(mol, h) for h in bridges))
+    return out
+
+
 def _uff_typeable(mol, phantoms):
     """Return whether RDKit has a UFF atom type for every real atom."""
     with rdBase.BlockLogs():
@@ -386,6 +415,7 @@ def _uff_target(mol, cons, record):
     """
     work = _ff_surrogate(materialise_phantoms(mol, cons.haptic), cons.metals, cons.phantoms)
     target = UFFTarget(*_select_uff_graph(work, cons, set(cons.frozen)))
+    target = target._replace(mol=_bent_bridges(target.mol, mol))
     _report_uff_typing(mol, target.retyped, target.replacements, record)
     return target
 
@@ -433,11 +463,14 @@ def restrained_uff(
     energies = []
     try:
         target = _uff_target(mol, cons, out)
+        held = set(cons.frozen) >= set(range(target.mol.GetNumAtoms()))  # nothing is free, where RDKit's BFGS aborts
         for conf in confs:
             cid = conf.GetId()
             ff = _restrained_field(target, cid, stiffness)
             try:
-                if out.snapshots is None:
+                if held:
+                    status = 0  # the held geometry is final, so it counts as converged
+                elif out.snapshots is None:
                     status = ff.Minimize(maxIts=max_iters)
                 else:
                     status, frames = ff.MinimizeTrajectory(1, maxIts=max_iters)
@@ -479,14 +512,16 @@ class Energy(NamedTuple):
 class CoEmbedParams:
     """Hold the coupled relaxation's weights, stopping tolerances and step budgets for `rx.coembed`, validated.
 
-    `alignment_weight` and `react_weight` pull spectator and reacting atoms together, each normalized over its group.
+    `alignment_weight` and `react_weight` pull each spectator and each reacting atom toward its place in the other
+    endpoint, in kcal/mol/Å² per atom, so a pull does not depend on the size of its group or molecule; a stronger
+    spectator weight trades endpoint strain for alignment.
     `joint_gtol` and `joint_energy_tol` stop the joint relaxation; a score plateau gives no force guarantee.
     `seed_relax_iters` caps each endpoint's preparation, zero skipping it, and each endpoint takes at most
     `joint_max_iters` native steps per cycle for `max_cycles` cycles.
     """
 
-    alignment_weight: float = 25.0
-    react_weight: float = 1.25
+    alignment_weight: float = 0.5
+    react_weight: float = 2.5
     joint_gtol: float = 0.1
     joint_energy_tol: float = 1e-3
     seed_relax_iters: int = 100
@@ -568,11 +603,13 @@ class Joint(NamedTuple):
         return values
 
 
-def coupled_uff(endpoints, coupling, ids, stiffness, params, *, fixed=None):
+def coupled_uff(endpoints, coupling, ids, stiffness, params, *, fixed=None, rung=1.0):
     """Relax paired ids on one endpoint-UFF plus correspondence objective, kept for scoring.
 
-    Spectators are registered only when that lowers the coupling, and `fixed` is kept exactly. A pair whose objective
-    cannot be built or run keeps its start geometry with an infinite score; endpoint acceptance is the caller's.
+    Spectators are registered only when that lowers the coupling, and `fixed` is kept exactly. `rung` multiplies the
+    restraint stiffness of the relax, not of the kept objective: the record describes the run on the rung, and only its
+    ``score`` is the kept objective's, so a stiffer rung never reaches a score. A pair whose objective cannot be built
+    or run keeps its start geometry with an infinite score; endpoint acceptance is the caller's.
     """
     targets = [_uff_target(endpoint.mol, endpoint.cons, endpoint.record) for endpoint in endpoints]
     results = {}
@@ -583,9 +620,12 @@ def coupled_uff(endpoints, coupling, ids, stiffness, params, *, fixed=None):
         fields = None
         try:
             fields = [_restrained_field(target, cid, stiffness) for target in local]
-            relaxed, record = _coupled(Joint(local, fields, {}), coupling, cid, stiffness, params, fixed)
+            run = fields if rung == 1.0 else [_restrained_field(target, cid, stiffness * rung) for target in local]
+            relaxed, record = _coupled(Joint(local, run, {}), coupling, cid, stiffness * rung, params, fixed)
             if not all(np.isfinite(positions).all() for positions in relaxed):
                 raise FloatingPointError("non-finite joint coordinates")
+            if run is not fields:
+                record["score"] = _joint(fields, coupling, relaxed).value
         except (RuntimeError, FloatingPointError) as error:
             relaxed = pos
             record = {
@@ -609,7 +649,7 @@ def coupled_uff(endpoints, coupling, ids, stiffness, params, *, fixed=None):
         for endpoint, target, positions in zip(endpoints, local, relaxed, strict=True):
             endpoint.mol.GetConformer(cid).SetPositions(positions[: endpoint.mol.GetNumAtoms()])
             target.mol.GetConformer(cid).SetPositions(positions)
-        results[cid] = Joint(local, fields, {**record, "stiffness": stiffness})
+        results[cid] = Joint(local, fields, {**record, "stiffness": stiffness * rung})
     for endpoint, target in zip(endpoints, targets, strict=True):
         endpoint.record.surrogates.update(target.replacements)
         endpoint.record.retyped.update(target.retyped)

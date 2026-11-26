@@ -18,15 +18,17 @@ from rdkit.Chem import rdMolTransforms
 
 from rxembed.engine.acceptance import EmbeddingError, Failure, conformer_misses, describe_groups, group_failures
 from rxembed.engine.atom_mapping import bond_sides, point_inversion_branches, site_motions
-from rxembed.engine.conformers import BASE_STIFFNESS, Conformers, repeated_rejection
-from rxembed.engine.seeding import REPLACEMENT_FACTOR, seed_conformers, seed_takes_shape
+from rxembed.engine.conformers import BASE_STIFFNESS, RUNGS, Conformers, repeated_rejection
+from rxembed.engine.seeding import REPLACEMENT_FACTOR, prepare, seed_conformers, seed_takes_shape
 from rxembed.geometry.bounds import seed_bounds, seed_coordinates, seed_count
-from rxembed.geometry.constraints import Constraints
+from rxembed.geometry.constraints import Constraints, compose, resolve_core
 from rxembed.geometry.relax import Coupling, Endpoint, coupled_uff
 from rxembed.graph import frag_map, metal_indices
 from rxembed.identity.smiles_io import distinct
+from rxembed.identity.species import retold_centres
 from rxembed.identity.stereoisomers import unassigned_centres
 from rxembed.metal.centres import donor_bonds
+from rxembed.metal.distances import bond_floors
 from rxembed.metal.polyhedra import VACANT, vertex_dirs
 from rxembed.metal.sphere import LigandFacts
 from rxembed.metal.stereo import chelate_links, equivalent_site_assignments, site_classes
@@ -216,12 +218,12 @@ def pair_score(endpoints, coupling, cid):
     return value if np.isfinite(value) else math.inf
 
 
-def _bond_graphs(endpoints):
-    """Read endpoint bonds in their shared atom order, including dative direction and bond-order changes."""
+def _bond_graphs(mols):
+    """Read two endpoint Mols' bonds in their shared atom order, including dative direction and bond-order changes."""
     graphs = []
-    for endpoint in endpoints:
+    for mol in mols:
         edges = {}
-        for bond in endpoint.specification.mol.GetBonds():
+        for bond in mol.GetBonds():
             a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
             key = tuple(sorted((a, b)))
             direction = (a, b) if str(bond.GetBondType()).startswith("DATIVE") else key
@@ -277,15 +279,10 @@ def seed_union_conformers(endpoints, n, sampling):
     CPCI attracts changing edges with -1 and repels unbonded outer atoms of forming/breaking edge pairs with +1.
     Endpoint chemical graphs remain authoritative; caller-supplied native parameters retain their own CPCI.
     """
-    left, right, changed = _bond_graphs(endpoints)
+    left, right, changed = _bond_graphs([owner.specification.mol for owner in endpoints])
     union = _union_graph(endpoints, left, right, changed)
-    lowers, uppers = [], []
     real = endpoints[0]._mol.GetNumAtoms()
-    for owner in endpoints:
-        matrix = seed_bounds(owner._mol, owner.cons, sampling)[:real, :real]
-        lower, upper = np.tril(matrix, -1), np.triu(matrix, 1)
-        lowers.append(lower + lower.T)
-        uppers.append(upper + upper.T)
+    lowers, uppers = zip(*(_windows(owner._mol, owner.cons, sampling, real) for owner in endpoints), strict=True)
     compatible = np.maximum(*lowers) <= np.minimum(*uppers)
     lower = np.where(compatible, 0.5 * (lowers[0] + lowers[1]), np.minimum(*lowers))
     upper = np.where(compatible, 0.5 * (uppers[0] + uppers[1]), np.maximum(*uppers))
@@ -379,25 +376,53 @@ def _prepare_pairs(batch, params, need, *, fixed=None):
 
 
 def _relaxed_pairs(batch, coupling, params, unspecified, *, fixed=None):
-    """Run one joint pass, restore valid prepared pairs if rejected, and score the retained native objective."""
-    failed = _pair_failures(batch, unspecified)
-    checkpoint = {
-        cid: [endpoint._mol.GetConformer(cid).GetPositions().copy() for endpoint in batch]
-        for cid in batch[0].ids
-        if cid not in failed
+    """Climb the joint stiffness ladder, restore valid prepared pairs if rejected, and score the retained objective.
+
+    A pair whose endpoint fails a gate the ladder repairs reruns from its prepared coordinates at the next rung, as one
+    endpoint does in `Conformers._relax`; every pair is scored at base stiffness. Each endpoint is floored outside the
+    metal bonds only its partner has (`bond_floors`), since the coupling pulls toward them and a bond made would change
+    the species, which no rung repairs.
+    """
+    prepared = {
+        cid: [endpoint._mol.GetConformer(cid).GetPositions().copy() for endpoint in batch] for cid in batch[0].ids
     }
-    targets = [Endpoint(mol=endpoint._mol, cons=endpoint.cons, record=endpoint._uff) for endpoint in batch]
-    objectives = coupled_uff(targets, coupling, batch[0].ids, BASE_STIFFNESS, params, fixed=fixed)
+    failed = _pair_failures(batch, unspecified, fixed)
+    checkpoint = {cid: positions for cid, positions in prepared.items() if cid not in failed}
+    left, right, _changed = _bond_graphs([endpoint.specification.mol for endpoint in batch])
+    lacking = (right.keys() - left.keys(), left.keys() - right.keys())
+    targets = [
+        Endpoint(
+            mol=endpoint._mol,
+            cons=compose(endpoint.cons, bond_floors(endpoint.specification.mol, pairs)),
+            record=endpoint._uff,
+        )
+        for endpoint, pairs in zip(batch, lacking, strict=True)
+    ]
+    objectives, climbing = {}, list(batch[0].ids)
+    for rung in RUNGS:
+        run = coupled_uff(targets, coupling, climbing, BASE_STIFFNESS, params, fixed=fixed, rung=rung)
+        # a failed run left its pair on the prepared coordinates and stops it climbing; a lower rung's objective stays
+        ran = [cid for cid in climbing if run[cid].record["stopping_reason"] != "failure"]
+        objectives |= {cid: run[cid] for cid in climbing if cid in ran or cid not in objectives}
+        climbing = [cid for cid in ran if _climbs(batch, cid, rung, fixed)]
+        if not climbing:
+            break
+        for cid in climbing:
+            for endpoint, positions in zip(batch, prepared[cid], strict=True):
+                endpoint._mol.GetConformer(cid).SetPositions(positions)
+    stiffest = max((objective.record["stiffness"] for objective in objectives.values()), default=BASE_STIFFNESS)
+    if stiffest != BASE_STIFFNESS:
+        logger.debug("coembed: pairs climbed to joint restraint stiffness %gx", stiffest / BASE_STIFFNESS)
     optimized = {
         cid: [endpoint._mol.GetConformer(cid).GetPositions().copy() for endpoint in batch] for cid in batch[0].ids
     }
-    failures = _pair_failures(batch, unspecified)
+    failures = _pair_failures(batch, unspecified, fixed)
     restored = failures.keys() & checkpoint.keys()
     for cid in restored:
         for endpoint, pos in zip(batch, checkpoint[cid], strict=True):
             endpoint._mol.GetConformer(cid).SetPositions(pos)
     if restored:
-        failures = _pair_failures(batch, unspecified)
+        failures = _pair_failures(batch, unspecified, fixed)
     records = {}
     for cid, objective in objectives.items():
         positions = [endpoint._mol.GetConformer(cid).GetPositions() for endpoint in batch]
@@ -431,14 +456,29 @@ def _relaxed_pairs(batch, coupling, params, unspecified, *, fixed=None):
     return records, failures, raw
 
 
-def _pair_failures(batch, unspecified):
+def _climbs(batch, cid, rung, fixed):
+    """Return whether pair `cid` climbs past `rung`: an endpoint fails, and each failing one climbs alone."""
+    failing = [
+        endpoint
+        for side, endpoint in enumerate(batch)
+        if side != fixed and endpoint._first_failure(cid, endpoint.gates)
+    ]
+    return bool(failing) and all(
+        (reason := endpoint._ladder_failure(cid)) is not None and endpoint._climbs(reason, rung) for endpoint in failing
+    )
+
+
+def _pair_failures(batch, unspecified, fixed=None):
     """Return each pair id's first failure, named by endpoint: either endpoint's gates, the reactant's first.
 
+    A `fixed` endpoint is not judged again: it does not move, and `rx.coembed` judged it once as supplied geometry.
     A pair both endpoints accept fails as ``'unspecified_stereo'`` when an `Unspecified` element reads one configuration
     in its reactant and the other in its product, since its two frames are then two stereoisomers.
     """
     failures = {}
-    for name, endpoint in zip(_ENDPOINTS, batch, strict=True):
+    for side, (name, endpoint) in enumerate(zip(_ENDPOINTS, batch, strict=True)):
+        if side == fixed:
+            continue
         for reason, cids in endpoint._acceptance_failures().items():
             named = replace(reason, detail=f"{name}: {reason.detail}")
             for cid in cids:
@@ -513,15 +553,16 @@ def least_motion(left, right):
     improves; a tie keeps the given labelling.
     """
     options = [_labellings(species) for species in (left, right)]
+    told = {centres: retold_centres(left.mol, right.mol, centres) for centres in (left.centres, *options[0])}
     best = [left.centres, right.centres]
-    score = _cost(*best)
+    score = _cost(told[best[0]], best[1])
     improved = True
     while improved:
         improved = False
         for side in (1, 0):
             for centres in options[side]:
                 trial = [centres, best[1]] if side == 0 else [best[0], centres]
-                motion = _cost(*trial)
+                motion = _cost(told[trial[0]], trial[1])
                 if motion < (score[0], score[1] - _SAME):  # fewer moving sites, else a smaller shift
                     best, score, improved = trial, motion, True
     return tuple(
@@ -535,8 +576,8 @@ def _labellings(species):
 
     At each centre a relabelling moves the atoms of sites between slots of equal class and chelate links
     (`equivalent_site_assignments`), each slot keeping its face winding, as the canonical notes do
-    (`smiles_io.arrangement_notes`). Where a ligand binds two centres, a relabelling that changes how they stand names
-    another species (`distinct`).
+    (`smiles_io.arrangement_notes`). Where a ligand binds two centres, a relabelling that moves its sites can change how
+    they stand and name another species (`distinct`); one that moves only other ligands' sites cannot.
     """
     if species.mol.GetNumConformers():
         return [species.centres]
@@ -558,22 +599,34 @@ def _labellings(species):
                 for assignment in equivalent_site_assignments(classes, chelate_links(graph, vertices, haptic))
             ]
         )
-    labellings = list(itertools.product(*per_state))
     owner = frag_map(graph)
-    bound = {(owner[donor], metal) for donor, metal in donor_bonds(species.mol)}
-    if len(bound) == len({ligand for ligand, _metal in bound}):  # no ligand binds two centres
-        return labellings
-    return [centres for centres in labellings if len(distinct([species, replace(species, centres=centres)])) == 1]
+    ligands = [ligand for ligand, _metal in {(owner[donor], metal) for donor, metal in donor_bonds(species.mol)}]
+    bridging = {ligand for ligand in ligands if ligands.count(ligand) > 1}
+
+    def moves_bridge(centres):
+        return any(
+            owner[atom] in bridging
+            for given, state in zip(species.centres, centres, strict=True)
+            for site, other in zip(given.vertices, state.vertices, strict=True)
+            if site != other
+            for atom in (*site.atoms, *other.atoms)
+        )
+
+    return [
+        centres
+        for centres in itertools.product(*per_state)
+        if not moves_bridge(centres) or len(distinct([species, replace(species, centres=centres)])) == 1
+    ]
 
 
 def _cost(left, right):
-    """Return the sort key of how far centres `right` move against `left`: moving sites, then RMS slot shift."""
-    return sum(map(len, site_motions(left, right).values())), _slot_motion(left, right)
+    """Return the sort key of how far centres `right` move against `left`: moving sites, then summed RMS slot shift."""
+    moved = sum(map(len, site_motions(left, right).values()))
+    return moved, sum(proper for _metal, proper, _mirror in _slot_fits(left, right))
 
 
-def _slot_motion(left, right):
-    """Return the summed RMS shift of the slot directions of the sites both endpoints bind, one rotation per metal."""
-    total = 0.0
+def _slot_fits(left, right):
+    """Yield ``(metal, proper, mirror)``: the RMS fit of shared slot directions by a rotation and by a reflection."""
     for state in left:
         other = next((s for s in right if s.atom == state.atom), None)
         if other is None:
@@ -584,9 +637,56 @@ def _slot_motion(left, right):
             continue
         x, y = np.array([a[key] for key in shared]), np.array([b[key] for key in shared])
         u, _s, vt = np.linalg.svd(x.T @ y)
-        rotation = u @ np.diag([1.0, 1.0, np.sign(np.linalg.det(u @ vt))]) @ vt
-        total += float(np.sqrt(np.mean(np.sum((x @ rotation - y) ** 2, axis=1))))
-    return total
+        fits = []
+        for hand in (1.0, -1.0):
+            rotation = u @ np.diag([1.0, 1.0, hand * np.sign(np.linalg.det(u @ vt))]) @ vt
+            fits.append(float(np.sqrt(np.mean(np.sum((x @ rotation - y) ** 2, axis=1)))))
+        yield state.atom, *fits
+
+
+def follow(reference, candidates, sampling):
+    """Return ``(score, species)`` for each of `candidates` that follows `reference`, least motion first.
+
+    The candidates are one source's species on `reference`'s atom order. The reference's labelling is the reaction's,
+    so only a candidate relabels its equivalent sites, to move the fewest against it (`_cost`). A candidate whose metal
+    has a hand follows only where the shared sites fit by a rotation at least as well as by a reflection, since distance
+    bounds hold no hand; equal fits leave both hands, as from an achiral reference. The score is the summed conflict of
+    the two sides' distance bounds over the atom pairs whose bond changes, which must start and end in reach, then the
+    `_cost` motion: the sites that change slot or face, as at a metal the reaction leaves alone, then the summed RMS
+    shift of the shared slot directions. Other bounds stay out: a newcomer's contact windows against the spectators
+    reward open angles around it, not motion. Only the polyhedra the shared sites fit best by a rotation are followed,
+    so no candidate bends the ligands that stay into a shape another polyhedron holds them in. Symmetry makes equal
+    scores exact.
+    """
+    real, pins = reference.mol.GetNumAtoms(), resolve_core(reference.mol)
+    held = prepare(reference, pins, params=sampling.params)
+    lower, upper = _windows(held.mol, held.cons, sampling, real)
+    told = retold_centres(reference.mol, candidates[0].mol, reference.centres) if candidates else ()
+    scored = []
+    for k, candidate in enumerate(candidates):
+        cost, centres = min(((_cost(told, c), c) for c in _labellings(candidate)), key=lambda row: row[0])
+        handed = {state.atom for state in centres if state.hand}
+        if any(mirror < proper - _SAME for metal, proper, mirror in _slot_fits(told, centres) if metal in handed):
+            continue
+        other = prepare(replace(candidate, centres=centres), pins, params=sampling.params)
+        other_lower, other_upper = _windows(other.mol, other.cons, sampling, real)
+        conflict = np.clip(np.maximum(lower, other_lower) - np.minimum(upper, other_upper), 0, None)
+        changed = _bond_graphs((reference.mol, candidate.mol))[2]
+        score = round(float(sum(conflict[pair] for pair in changed)), 6), cost[0], round(cost[1], 6)
+        scored.append((score, k, candidate, tuple(state.geometry for state in centres)))
+    fit = {}
+    for score, _k, _candidate, shape in scored:
+        fit[shape] = min(fit.get(shape, math.inf), score[2])
+    best = min(fit.values(), default=0.0)
+    kept = sorted((row for row in scored if fit[row[3]] <= best + _SAME), key=lambda row: row[:2])
+    return [(score, candidate) for score, _k, candidate, _shape in kept]
+
+
+def _windows(mol, cons, sampling, real):
+    """Return the symmetric lower and upper seed bounds of `mol`'s first `real` atoms."""
+    matrix = seed_bounds(mol, cons, sampling)[:real, :real]
+    lower, upper = np.tril(matrix, -1), np.triu(matrix, 1)
+    return lower + lower.T, upper + upper.T
 
 
 def _slot_dirs(state):
@@ -596,10 +696,9 @@ def _slot_dirs(state):
 
 
 def coupling(spectators, reacting, params):
-    """Couple corresponding atoms at zero displacement with separately normalized spectator and reacting weights."""
+    """Couple corresponding atoms at zero displacement, each by its group's per-atom weight."""
     held = len(spectators)
-    weights = [params.alignment_weight / held for _atom in spectators]
-    weights += [params.react_weight / len(reacting) for _atom in reacting]
+    weights = [params.alignment_weight] * held + [params.react_weight] * len(reacting)
     return Coupling(
         atoms=np.asarray([*spectators, *reacting], dtype=int),
         weights=np.array(weights),

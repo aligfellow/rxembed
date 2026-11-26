@@ -75,7 +75,9 @@ def bond_changes(mol, conf_id=-1, cons=None):
         broken -= _in_window(mol, conf_id, broken, cons)
     metals = set(metal_indices(mol))
     for metal in metals:
-        wanted, found = ({a for pair in pairs if metal in pair for a in pair} - metals for pairs in (want, got))
+        wanted = {a for pair in want if metal in pair for a in pair} - metals
+        # another metal is a second-sphere atom too: bonded to a shared donor, its approach is the bridge's geometry
+        found = {a for pair in got if metal in pair for a in pair} - {metal}
         formed -= {frozenset((metal, a)) for a in found - wanted if overbond_tier(mol, wanted, a) != OUTER}
         for site in haptic_sites(mol, wanted):
             if found.intersection(site):

@@ -147,6 +147,25 @@ templated = rx.embed(trans, fix=rx.Template(trans_confs[0], {0: 0, 1: 1, 2: 2}),
 bound = rx.embed(rx.isomers("N->[Pt](Cl)Cl.CC(C)=O", geometry="SPL", coordinate="[OX1]").select(index=0), n=10)
 ```
 
+`reference=` gives a product the arrangement and stereo its reactant leads to, without embedding, for a graph edit
+such as a ligand binding or leaving or a proton moving. The reactant specifies its metal arrangement and pairs with
+the product as `rx.coembed` pairs endpoints, by atom maps or else the overlay keeping most bonds. A metal whose bonds
+stay keeps its arrangement and faces; one whose bonds change takes the polyhedra its kept ligands fit best, so H2
+adding to a square plane gives an octahedron. Stereo the reaction leaves untouched keeps the reactant's, a pyramidal
+centre such as P keeps its hand when it trades its lone pair for a bond or a bond for one, and a centre with no hand
+that only gains bonds takes the hand the reactant's conformer shows, when it has one. The species come least motion
+first; equal `.scores` are branches the reactant leaves open:
+
+```python
+reactant = rx.isomers("[NH2]1CC[NH-]->[Mn+]<-1(<-[C-]#[O+])(<-[C-]#[O+])<-[C-]#[O+].[H][H]", geometry="SPY")[0]
+products = rx.isomers("[H][H]->[Mn+]1(<-[C-]#[O+])(<-[C-]#[O+])(<-[C-]#[O+])<-[NH-]CC[NH2]->1", reference=reactant)
+branches = [m for m, score in zip(products, products.scores) if score == products.scores[0]]
+product_confs = rx.embed(products[0], n=4)  # H2 in the vacancy, trans to the amine
+```
+
+`rx.coembed` follows the same way when one endpoint leaves a metal arrangement open: it takes the first species, and
+ligand stereo the reaction makes is left to the shared seed.
+
 ### Stereo
 
 `stereo=` on `rx.isomers` controls point R/S, E/Z, atropisomer M/P and bound-donor hands:
@@ -196,9 +215,10 @@ By default xyzgraph perceives bonds and bond orders. xyz2mol bond orders optimiz
 xyzgraph's for reactive or multicentre bonds such as a TS or a bridging hydride. The alternatives
 `connectivity="rdkit"` and `"xyz2mol"` need xyz2mol bond orders. An XYZ stores no charge: pass the real charge for a
 radical, a charged complex or another connectivity, and `metal_charges={0: 2, 1: 1}` for a split the total does not
-fix. `read_xyz` warns when a metal looks like an ion read as neutral and on every perception change, which never
-alters the atoms, their order or the charge; `fallback=False` raises instead. `bond_orders=None` skips only the
-bond-order step, for checking which bonds a geometry has.
+fix. Connectivity comes from the backend asked for, which raises where it reads no graph. `read_xyz` warns when a metal
+looks like an ion read as neutral and when xyz2mol cannot rank a graph and another ranking of the same connectivity is
+kept, which never alters the atoms, their order or the charge; `fallback=False` raises instead. `bond_orders=None`
+skips only the bond-order step, for checking which bonds a geometry has.
 
 ```python
 mol = rx.read_graph(graph, charge=0)  # graph: a Mol whose bonds are known, hydrogens as atoms
@@ -231,10 +251,12 @@ pairs.product.dump("product.xyz", align=False)  # matching frames form a pair
 Supply the endpoints as SMILES, CX SMILES or Mols, including an `.xyz` read with `rx.read_xyz`, as two arguments, a
 pair or one `"reactant>>product"` SMILES. Each endpoint must specify one species, selected with `rx.isomers` when
 needed. Stereo neither endpoint states takes the hand the shared seed gives in both; to choose it, state it in the
-SMILES or pick a species. Atom maps resolve ambiguous overlays and stay on both endpoints. Atoms whose bonding or
-specified stereo differs between the endpoints react and the rest are spectators; a change of a metal's arrangement
-reacts at the metal and the fewest donors that move. `spectator_atoms=` and `react_atoms=` select the aligned and
-reacting atoms, and `constrain=` and `contacts=` hold both endpoints where they apply, all by reactant index.
+SMILES or pick a species. Atom maps resolve ambiguous overlays and stay on both endpoints. Atoms whose bonded
+partners, hybridization or specified stereo differ between the endpoints react, and a group a configuration change
+turns is neither reacting nor aligned; the rest are spectators, including atoms whose bond order or charge alone
+changes, as between resonance forms. A change of a metal's arrangement reacts at the metal and the fewest donors
+that move. `spectator_atoms=` and `react_atoms=` select the aligned and reacting atoms, and `constrain=` and
+`contacts=` hold both endpoints where they apply, all by reactant index.
 `contacts="auto"` gives a `CoembeddedSet`, one `Coembedded` per binding mode, with the failed modes in `.errors`. For
 reaction-path sampling, request more than three pairs and inspect their approach geometries. Keep the shared frame
 with `align=False` when writing and `auto_align=False` when drawing with `xyzrender`.
